@@ -29,6 +29,7 @@ impl SsoLoginRequest {
     }
 
     pub async fn verify_code(self, code: String) -> Result<SsoLoginResponse, SsoError> {
+        let username_claim_name = self.config.username_claim().map(ToString::to_string);
         let result = SsoClient::new(self.config)?
             .finish_login(self.pkce_verifier, self.redirect_url, &self.nonce, code)
             .await?;
@@ -45,10 +46,25 @@ impl SsoLoginRequest {
             };
         }
 
-        // If preferred_username is absent, fall back to `email`
-        let preferred_username = get_claim!(preferred_username)
-            .map(|x| x.as_str())
-            .map(ToString::to_string)
+        // Username resolution order:
+        // 1. Custom username_claim from SSO config (if configured)
+        // 2. preferred_username standard claim
+        // 3. email as fallback
+        let custom_username = username_claim_name.as_deref().and_then(|claim_name| {
+            result
+                .userinfo_claims
+                .as_ref()
+                .and_then(|x| x.additional_claims().extra.get(claim_name))
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string)
+        });
+
+        let preferred_username = custom_username
+            .or_else(|| {
+                get_claim!(preferred_username)
+                    .map(|x| x.as_str())
+                    .map(ToString::to_string)
+            })
             .or_else(|| {
                 get_claim!(email)
                     .map(|x| x.as_str())

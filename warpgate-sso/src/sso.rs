@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::ops::Deref;
 
 use futures::future::OptionFuture;
@@ -49,6 +50,9 @@ pub struct WarpgateClaims {
     pub warpgate_roles: Option<Vec<String>>,
     #[serde(default, deserialize_with = "string_or_vec")]
     pub warpgate_admin_roles: Option<Vec<String>>,
+    /// All additional claims as a flat map, used for custom username_claim lookup
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 impl AdditionalClaims for WarpgateClaims {}
