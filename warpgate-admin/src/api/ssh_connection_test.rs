@@ -60,6 +60,7 @@ impl Api {
                 auth: SSHTargetAuth::Password(SshTargetPasswordAuth {
                     password: "".to_string().into(),
                 }),
+                env: None,
             }),
             None,
         ));
