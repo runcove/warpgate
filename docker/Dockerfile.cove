@@ -67,6 +67,19 @@ FROM rust:1.97.1-bookworm@sha256:408fe88047cef61a2087653b0c5255fa51c0f2d6d94dded
 RUN cargo install --locked cargo-chef --version 0.1.78
 WORKDIR /opt/warpgate
 
+# The workspace pins nightly via rust-toolchain.toml (Cargo.toml declares
+# `cargo-features = ["profile-rustflags"]`, an unstable feature the stable
+# toolchain in this base image refuses to parse). `builder` below forks
+# directly from `chef` and never runs `COPY . .`, so without this it has no
+# rust-toolchain.toml at `cargo chef cook` time and fails with "the cargo
+# feature `profile-rustflags` requires a nightly version of Cargo, but this
+# is the `stable` channel" (hit in run 2372, 2026-09-15). Installing it here,
+# in the shared `chef` base both `planner` and `builder` fork from, means the
+# nightly download lands in a layer keyed only on rust-toolchain.toml — not
+# on recipe.json — so it isn't re-fetched every time dependencies change.
+COPY rust-toolchain.toml rust-toolchain.toml
+RUN cargo --version
+
 FROM chef AS planner
 # Recipe generation is static analysis over Cargo.toml/Cargo.lock — no JS
 # toolchain, no .git, no build outputs needed here.
