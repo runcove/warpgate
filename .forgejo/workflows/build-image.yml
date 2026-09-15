@@ -1,0 +1,64 @@
+name: build-image
+on:
+  push:
+    branches: ['cove-patches-v*', 'wip/**']
+  workflow_dispatch:
+concurrency: {group: warpgate-build, cancel-in-progress: false}
+jobs:
+  test-and-build:
+    runs-on: docker
+    timeout-minutes: 170
+    services:
+      dind:
+        image: docker:28-dind
+        options: --privileged
+        env: {DOCKER_TLS_CERTDIR: ""}
+    env:
+      DOCKER_HOST: tcp://dind:2375
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 0}
+      - name: docker cli
+        run: |
+          curl -fsSL https://download.docker.com/linux/static/stable/x86_64/docker-28.3.3.tgz | tar xz -C /tmp
+          install /tmp/docker/docker /usr/local/bin/docker
+          for i in $(seq 1 30); do docker info >/dev/null 2>&1 && break; sleep 2; done
+          docker info >/dev/null
+      - name: tests (capped, never on baba)
+        run: |
+          docker create --name wgtest --network host --cpus 4 --memory 7g --memory-swap 7g \
+            -e CARGO_BUILD_JOBS=2 -w /src docker.io/library/rust:1-bookworm \
+            bash -c 'rustup show && cargo test -p warpgate-common-http'
+          docker cp . wgtest:/src
+          docker start -a wgtest
+      - name: stop here for wip branches
+        if: startsWith(github.ref_name, 'wip/')
+        run: echo "tests only on wip/*"
+      - name: registry login
+        if: ${{ !startsWith(github.ref_name, 'wip/') }}
+        run: docker login git.tenfourty.site -u jeremy --password-stdin <<< "${{ secrets.REGISTRY_TOKEN }}"
+      - name: build (capped)
+        if: ${{ !startsWith(github.ref_name, 'wip/') }}
+        run: |
+          TAG=$(git describe --tags --long)
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          DOCKER_BUILDKIT=0 docker build --memory 7g --memory-swap 7g --cpu-quota 400000 \
+            --build-arg CARGO_BUILD_JOBS=2 -f docker/Dockerfile.cove \
+            -t git.tenfourty.site/jeremy/warpgate:$TAG .
+      - name: smoke test — the binary starts and serves
+        if: ${{ !startsWith(github.ref_name, 'wip/') }}
+        run: |
+          IMG=git.tenfourty.site/jeremy/warpgate:$TAG
+          docker volume create wgsmoke
+          docker run --rm -v wgsmoke:/data -e WARPGATE_ADMIN_PASSWORD=smoke-only $IMG \
+            unattended-setup --data-path /data --http-port 8888 --record-sessions
+          docker run -d --name wg --network host -v wgsmoke:/data $IMG run
+          for i in $(seq 1 30); do
+            code=$(curl -sk -o /dev/null -w '%{http_code}' https://127.0.0.1:8888/@warpgate/api/info || true)
+            [ "$code" = "200" ] && break; sleep 2
+          done
+          docker logs wg | tail -20
+          test "$code" = "200"
+      - name: push
+        if: ${{ !startsWith(github.ref_name, 'wip/') }}
+        run: docker push git.tenfourty.site/jeremy/warpgate:$TAG
