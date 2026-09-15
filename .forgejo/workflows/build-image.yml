@@ -371,17 +371,17 @@ jobs:
           # Assertion: this run's own volume must be gone. Anchored to the
           # exact name (`^...$`), never to the `wgsmoke-` prefix — about
           # 9.68 GB of orphaned volumes from earlier runs exist until the
-          # operator prunes them, so a prefix count would never read 0 and
-          # would fail this assertion for reasons unrelated to this run.
-          THIS_RUN_COUNT=$(docker volume ls -q --filter "name=^${VOL}$" | grep -c . || true)
-          echo "this run's volume ($VOL) count after cleanup, must be 0: $THIS_RUN_COUNT"
-          test "$THIS_RUN_COUNT" -eq 0
-          # OBSERVATION ONLY — not an assertion, must never gate this step.
-          # Total wgsmoke- volumes across all runs, orphans included: tells
-          # the operator when their one-off prune of the existing 9.68 GB is
-          # due, and lets them watch it stop growing on runs after this fix.
-          ALL_RUNS_COUNT=$(docker volume ls -q --filter "name=wgsmoke-" | grep -c . || true)
-          echo "OBSERVATION (not an assertion, do not gate on this): wgsmoke- volumes across all runs: $ALL_RUNS_COUNT"
+          # operator prunes them, so a prefix count could never be 0 and
+          # would fail this assertion for reasons unrelated to this run. The
+          # removals above are allowed to fail silently (`|| true`) because
+          # this assertion is the real gate — a swallowed removal error
+          # still fails the step honestly.
+          test "$(docker volume ls -q --filter "name=^${VOL}$" | grep -c .)" = "0"
+          # Observation only — never gate on this number, and don't "fix" it
+          # to expect 0. It tells the operator when their one-off prune of
+          # the existing orphans is due, and lets them watch it stop growing
+          # on runs after this fix.
+          echo "observation, not an assertion: $(docker volume ls -q --filter "name=wgsmoke-" | grep -c .) wgsmoke-* volume(s) remain on this runner (orphans from earlier runs; pruned separately)"
       - name: push
         if: ${{ !startsWith(github.ref_name, 'wip/') }}
         run: docker push git.tenfourty.site/jeremy/warpgate:$TAG
