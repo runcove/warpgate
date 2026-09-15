@@ -59,13 +59,29 @@ jobs:
             --cache-to type=registry,ref=git.tenfourty.site/jeremy/warpgate:buildcache,mode=max \
             --cache-from type=registry,ref=git.tenfourty.site/jeremy/warpgate:buildcache \
             --load -f docker/Dockerfile.cove -t git.tenfourty.site/jeremy/warpgate:$TAG .
-      - name: smoke test — the binary starts and serves
+      - name: smoke test — version matches the build, binary starts and serves
         if: ${{ !startsWith(github.ref_name, 'wip/') }}
         run: |
           IMG=git.tenfourty.site/jeremy/warpgate:$TAG
-          echo "=== binary version check (cargo-chef restructure, 2026-09-15) ==="
-          echo "built tag: $TAG"
-          docker run --rm $IMG warpgate --version || true
+          echo "=== binary version check (blocking) ==="
+          # `warpgate --version` (clap's auto flag) only ever prints
+          # CARGO_PKG_VERSION (e.g. "0.28.6") — it can never match $TAG. The
+          # binary's real build identity comes from the `version` subcommand
+          # (warpgate/src/main.rs Commands::Version), which prints
+          # `warpgate_version()` — warpgate-common/src/version.rs's
+          # git_version!(args = ["--tags", "--always", "--dirty=-modified",
+          # "--match", "v[0-9]*"]). Compute the expected string with the
+          # identical git-describe invocation rather than reusing $TAG
+          # (which is deliberately `--long` with no --match, for the image
+          # tag's own interface contract) so this check is correct even when
+          # the two formulas would otherwise diverge (e.g. HEAD sitting
+          # exactly on a v* tag).
+          EXPECTED_VERSION="warpgate $(git describe --tags --always --dirty=-modified --match 'v[0-9]*')"
+          ACTUAL_VERSION=$(docker run --rm $IMG warpgate version)
+          echo "built tag:        $TAG"
+          echo "expected version: $EXPECTED_VERSION"
+          echo "actual version:   $ACTUAL_VERSION"
+          [ "$ACTUAL_VERSION" = "$EXPECTED_VERSION" ] || { echo "VERSION MISMATCH — the binary does not report the commit it was built from"; exit 1; }
           docker volume create wgsmoke
           docker run --rm -v wgsmoke:/data -e WARPGATE_ADMIN_PASSWORD=smoke-only $IMG \
             unattended-setup --data-path /data --http-port 8888 --record-sessions
