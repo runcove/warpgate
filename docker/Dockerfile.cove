@@ -93,7 +93,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 RUN curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
     && apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates-java nodejs openjdk-17-jdk \
+    && apt-get install -y --no-install-recommends ca-certificates-java nodejs openjdk-17-jdk mold \
     && rm -rf /var/lib/apt/lists/* \
     && cargo install --locked just@1.4.0
 
@@ -107,6 +107,24 @@ ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
 # combination below replaces it as the real fix for repeat-build speed.
 ARG CARGO_INCREMENTAL=0
 ENV CARGO_INCREMENTAL=${CARGO_INCREMENTAL}
+
+# Overrides the [profile.release] lto setting from Cargo.toml (which stays
+# `true`, untouched — this is an env var override, not a source edit, so
+# there is nothing extra to carry across an upstream rebase). Exists because
+# fat LTO's single whole-workspace link unit OOM'd under the 7 GiB job cap
+# linking warpgate itself (run 2374, ~6-8 GB documented peak). Defaults to
+# "true" so an unset build-arg reproduces Cargo.toml's own setting exactly;
+# CI passes "thin" or "false" explicitly when it needs to fit the cap.
+ARG CARGO_PROFILE_RELEASE_LTO=true
+ENV CARGO_PROFILE_RELEASE_LTO=${CARGO_PROFILE_RELEASE_LTO}
+
+# mold is installed unconditionally (a few MB, part of the apt-get block
+# above) but not selected as the linker unless EXTRA_RUSTFLAGS asks for it —
+# the default build's actual link behaviour is unchanged. Used for the
+# linker-speed measurement Jeremy asked for across our Rust projects; not
+# (yet) this fork's shipping default.
+ARG EXTRA_RUSTFLAGS=""
+ENV RUSTFLAGS=${EXTRA_RUSTFLAGS}
 
 # The workspace's [patch.crates-io] table redirects ironrdp-async/-connector/
 # -session/picky/sspi to local forks under vendor/, and warpgate-protocol-vnc

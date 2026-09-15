@@ -54,11 +54,28 @@ jobs:
             --driver-opt cpu-quota=400000 --driver-opt cpu-period=100000 \
             --use
           docker buildx inspect --bootstrap
+          # CARGO_PROFILE_RELEASE_LTO=thin: fat LTO (Cargo.toml's own
+          # [profile.release] lto=true) OOM'd under this same 7g cap linking
+          # warpgate itself (run 2374, ~6-8 GB documented peak, a single
+          # whole-workspace link unit). This overrides it via env var only —
+          # Cargo.toml is untouched — per the coordinator's ruling: keep the
+          # AWS SDK dependency (a 9-crate refactor is a permanent rebase tax
+          # not worth paying), fix the actual cause (LTO's link-memory peak)
+          # instead. thin keeps most of fat LTO's runtime benefit at a
+          # fraction of the link memory; falls back to CARGO_PROFILE_RELEASE_LTO=false
+          # only if thin still OOMs.
+          BUILD_START=$(date +%s)
           docker buildx build \
             --build-arg CARGO_BUILD_JOBS=2 --build-arg CARGO_INCREMENTAL=0 \
+            --build-arg CARGO_PROFILE_RELEASE_LTO=thin \
             --cache-to type=registry,ref=git.tenfourty.site/jeremy/warpgate:buildcache,mode=max \
             --cache-from type=registry,ref=git.tenfourty.site/jeremy/warpgate:buildcache \
             --load -f docker/Dockerfile.cove -t git.tenfourty.site/jeremy/warpgate:$TAG .
+          BUILD_END=$(date +%s)
+          echo "BUILD_SECONDS=$((BUILD_END - BUILD_START))" >> "$GITHUB_ENV"
+          echo "=== build wall time: $((BUILD_END - BUILD_START))s ==="
+          echo "=== image size ==="
+          docker image inspect git.tenfourty.site/jeremy/warpgate:$TAG --format='{{.Size}} bytes'
       - name: smoke test — version matches the build, binary starts and serves
         if: ${{ !startsWith(github.ref_name, 'wip/') }}
         run: |
