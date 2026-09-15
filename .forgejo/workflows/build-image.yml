@@ -80,16 +80,46 @@ jobs:
             --driver-opt cpu-quota=400000 --driver-opt cpu-period=100000 \
             --use
           docker buildx inspect --bootstrap
+          # Assert the memory cap actually landed on the container that does
+          # the heavy work, not just that the flag was accepted. buildx's
+          # docker-container driver creates a companion container named
+          # buildx_buildkit_<builder>0 that executes every Dockerfile RUN
+          # step (cook, compile, link) — the --driver-opt memory=7g/
+          # memory-swap=7g above are supposed to land on THAT container, not
+          # on the job container or the dind service container beside it
+          # (both intentionally uncapped for memory at the runner level —
+          # verified 2026-09-15, see below). A silently-ignored driver-opt
+          # here is exactly the failure mode that let a 2026-09-15 build run
+          # uncapped past the runner pod's own cgroup and onto the node.
+          BUILDKIT_CONTAINER="buildx_buildkit_${BUILDER}0"
+          BUILDKIT_MEM=$(docker inspect "$BUILDKIT_CONTAINER" --format '{{.HostConfig.Memory}}')
+          echo "=== $BUILDKIT_CONTAINER memory cap: $BUILDKIT_MEM bytes ==="
+          if [ "$BUILDKIT_MEM" = "0" ]; then
+            echo "REFUSING TO BUILD: $BUILDKIT_CONTAINER has HostConfig.Memory=0 (no limit)."
+            echo "The --driver-opt memory=7g/memory-swap=7g above did not land on the"
+            echo "container that actually compiles and links. Building uncapped here can"
+            echo "consume node memory outside the runner pod's own 10Gi limit."
+            exit 1
+          fi
           # CARGO_PROFILE_RELEASE_LTO=thin: fat LTO (Cargo.toml's own
-          # [profile.release] lto=true) OOM'd under this same 7g cap linking
-          # warpgate itself (run 2374, ~6-8 GB documented peak, a single
-          # whole-workspace link unit). This overrides it via env var only —
-          # Cargo.toml is untouched — per the coordinator's ruling: keep the
-          # AWS SDK dependency (a 9-crate refactor is a permanent rebase tax
-          # not worth paying), fix the actual cause (LTO's link-memory peak)
-          # instead. thin keeps most of fat LTO's runtime benefit at a
-          # fraction of the link memory; falls back to CARGO_PROFILE_RELEASE_LTO=false
-          # only if thin still OOMs.
+          # [profile.release] lto=true) OOM'd linking warpgate itself (run
+          # 2374, ~6-8 GB documented peak, a single whole-workspace link
+          # unit) under the memory cap on buildx_buildkit_<builder>0 — the
+          # container asserted above, which is what actually executes every
+          # Dockerfile RUN step including this link. That cap is not just
+          # the driver-opt flag being accepted without error: verified live
+          # on 2026-09-15 by reading buildx_buildkit_capped0's own cgroup
+          # directly (/sys/fs/cgroup/memory.max matched HostConfig.Memory
+          # exactly, and memory.current sat within 73KB of it under real
+          # reclaim pressure) — a real, kernel-enforced ceiling on the
+          # container that compiles and links, confirmed rather than merely
+          # inferred from the flag being accepted. This overrides LTO via
+          # env var only — Cargo.toml is untouched — per the coordinator's
+          # ruling: keep the AWS SDK dependency (a 9-crate refactor is a
+          # permanent rebase tax not worth paying), fix the actual cause
+          # (LTO's link-memory peak) instead. thin keeps most of fat LTO's
+          # runtime benefit at a fraction of the link memory; falls back to
+          # CARGO_PROFILE_RELEASE_LTO=false only if thin still OOMs.
           BUILD_START=$(date +%s)
           docker buildx build --builder "$BUILDER" \
             --build-arg CARGO_BUILD_JOBS=2 --build-arg CARGO_INCREMENTAL=0 \
