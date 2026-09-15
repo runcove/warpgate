@@ -4,7 +4,7 @@
 # Cove-patched Warpgate build.
 #
 # Patches are already applied in the source tree (branch cove-patches-v0.28.6).
-# This Dockerfile tracks upstream's docker/Dockerfile with two deliberate
+# This Dockerfile tracks upstream's docker/Dockerfile with three deliberate
 # divergences:
 #
 #   1. DEBIAN 12 (bookworm), NOT bullseye. Upstream is still on
@@ -13,12 +13,36 @@
 #      upstream-identical image cannot be built at all. Both stages are
 #      pinned to bookworm by digest. Revisit when upstream moves.
 #
-#   2. Build caching. npm deps live in their own layer keyed on
-#      package-lock.json, and the cargo registry/git/target dirs are BuildKit
-#      cache mounts, so `cargo build` only recompiles crates whose sources
-#      actually changed. This cuts an iterative rebuild from ~20 min to
-#      ~3-5 min. REQUIRES BuildKit (DOCKER_BUILDKIT=1 or docker >= 23);
-#      without it the `--mount=type=cache` lines are a syntax error.
+#   2. Build caching, two layers of it. Within a single build, npm deps live
+#      in their own layer keyed on package-lock.json, and the cargo
+#      registry/git/target dirs are BuildKit cache mounts, so `cargo build`
+#      only recompiles crates whose sources actually changed. REQUIRES
+#      BuildKit (DOCKER_BUILDKIT=1 or docker >= 23); without it the
+#      `--mount=type=cache` lines are a syntax error. Across separate CI
+#      runs — where `--mount=type=cache` mounts don't survive, and neither
+#      does anything else on the runner's ephemeral per-job dind — the CI
+#      workflow imports/exports a BuildKit *registry* cache
+#      (the internal registry's build cache). That only helps if
+#      something in this Dockerfile is actually stable enough to hit: hence
+#      cargo-chef (divergence 3).
+#
+#   3. cargo-chef dependency layer (added 2026-09-15, after a cold compile
+#      with no working cache saturated shared cluster storage for 55 min
+#      and briefly took ~4% of cluster-wide Kubernetes API calls down with
+#      it — our internal incident notes). `chef`/`planner`/`builder`
+#      below split "compile the dependency graph" from "compile our own
+#      crates". `cargo chef prepare` distills the full source into
+#      recipe.json — a manifest of Cargo.toml/Cargo.lock only, not source
+#      code — and `cargo chef cook` builds *just* the dependencies from
+#      that. recipe.json's content only changes when Cargo.toml/Cargo.lock
+#      does, so on the common case (an upstream release or a patch that
+#      doesn't touch dependencies) the registry cache serves a hit on the
+#      expensive `cook` layer across *different* commits, not just a re-run
+#      of the same one — the thing plain `--mount=type=cache` mounts cannot
+#      do, since registry cache doesn't carry them. `--mount=type=cache` is
+#      kept below only for its original, single-build purpose (a fast
+#      *iterative* rebuild inside one `docker build` invocation); nothing
+#      here relies on it surviving between separate CI runs.
 #
 # Everything else is upstream's: Node 24 + openjdk-17 (the OpenAPI generator
 # needs a JRE), the just-driven frontend build, the mysql/postgres/rdp feature
@@ -28,8 +52,28 @@
 # Memory: aws-sdk-ec2 peaks around 6-8 GB during link at default all-cores
 # parallelism. On a memory-constrained host build with
 #   --build-arg CARGO_BUILD_JOBS=2
-# to cap rustc parallelism, otherwise the build OOMs.
-FROM rust:1.97.1-bookworm@sha256:408fe88047cef61a2087653b0c5255fa51c0f2d6d94ddedd7a2562a9b91a46f6 AS build
+# to cap rustc parallelism, otherwise the build OOMs. CARGO_INCREMENTAL=0
+# (2026-09-15, same incident as divergence 3) trades a little single-build
+# speed for a lot less write I/O; the registry cache above is what actually
+# keeps repeat builds fast, not incremental compilation.
+
+FROM rust:1.97.1-bookworm@sha256:408fe88047cef61a2087653b0c5255fa51c0f2d6d94ddedd7a2562a9b91a46f6 AS chef
+# Installed into our own already-proven, digest-pinned base rather than
+# switching to the lukemathwalker/cargo-chef image: that image is just a
+# rust base + cargo-chef too, and pulling a third-party one here would swap
+# out a toolchain this Dockerfile has already been verified against for one
+# we haven't, for no real benefit. Pinned to the latest stable release on
+# crates.io as of 2026-09-15.
+RUN cargo install --locked cargo-chef --version 0.1.78
+WORKDIR /opt/warpgate
+
+FROM chef AS planner
+# Recipe generation is static analysis over Cargo.toml/Cargo.lock — no JS
+# toolchain, no .git, no build outputs needed here.
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -40,6 +84,28 @@ RUN curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
     && rm -rf /var/lib/apt/lists/* \
     && cargo install --locked just@1.4.0
 
+ARG CARGO_BUILD_JOBS=default
+ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
+
+# Disabled in CI (2026-09-15 incident): incremental compilation's on-disk
+# artifacts added to the write volume that saturated shared cluster
+# storage during a cold compile (control-plane slowdown, ~4% cluster-wide API
+# failures). See the header comment for how the cargo-chef + registry-cache
+# combination below replaces it as the real fix for repeat-build speed.
+ARG CARGO_INCREMENTAL=0
+ENV CARGO_INCREMENTAL=${CARGO_INCREMENTAL}
+
+# Cook just the dependency graph, keyed on recipe.json alone — this is the
+# layer the registry cache exists to hit across commits. Same feature flags
+# as the real build below: a cook with different flags compiles a different
+# dependency set and the cache wouldn't line up with what `cargo build`
+# actually needs.
+COPY --from=planner /opt/warpgate/recipe.json recipe.json
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=warpgate-cargo-registry \
+    --mount=type=cache,target=/usr/local/cargo/git,id=warpgate-cargo-git \
+    --mount=type=cache,target=/opt/warpgate/target,id=warpgate-cargo-target \
+    cargo chef cook --release --features mysql,postgres,rdp-openssl-tls --recipe-path recipe.json
+
 # npm deps layer — invalidated only when package-lock.json changes.
 # --ignore-scripts skips the package.json postinstall (openapi client
 # generation), which needs source files not yet present in this layer;
@@ -49,8 +115,8 @@ COPY warpgate-web/package.json warpgate-web/package-lock.json ./
 RUN --mount=type=cache,target=/root/.npm,id=warpgate-npm \
     npm ci --ignore-scripts
 
-# Full source copy — this layer is busted on any edit, but the npm and cargo
-# caches around it are preserved.
+# Full source copy — this layer is busted on any edit, but the npm cache
+# above and the recipe-keyed dependency cook below survive it.
 WORKDIR /opt/warpgate
 COPY . .
 
@@ -66,21 +132,12 @@ ENV SOURCE_DATE_EPOCH=0
 RUN just openapi \
     && just npm run build
 
-# Rust release build with persistent caches. The binary is copied out of the
-# target cache mount so it lands in the image filesystem rather than
-# evaporating with the mount.
-ARG CARGO_BUILD_JOBS=default
-ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
-
-# Disabled in CI (2026-09-15 incident): incremental compilation's on-disk
-# artifacts added to the write volume that saturated shared cluster
-# storage during a cold compile (control-plane slowdown, ~4% cluster-wide API
-# failures). The CI workflow now also imports/exports a BuildKit registry
-# cache (the internal registry's build cache) so a same-commit
-# re-run skips this RUN layer entirely rather than depending on
-# incremental state that cache mounts don't preserve across runs anyway.
-ARG CARGO_INCREMENTAL=0
-ENV CARGO_INCREMENTAL=${CARGO_INCREMENTAL}
+# Rust release build. Dependencies are already compiled and sitting in the
+# warpgate-cargo-target cache mount from the `cargo chef cook` layer above
+# (same mount id, same buildkit cache store, populated earlier in this same
+# build) — this step only compiles our own crates against them. The binary
+# is copied out of the target cache mount so it lands in the image
+# filesystem rather than evaporating with the mount.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=warpgate-cargo-registry \
     --mount=type=cache,target=/usr/local/cargo/git,id=warpgate-cargo-git \
     --mount=type=cache,target=/opt/warpgate/target,id=warpgate-cargo-target \
@@ -100,7 +157,7 @@ RUN apt-get -y update -qq \
 
 RUN adduser warpgate --disabled-password --gecos "" --uid ${USER_ID} --home /data --shell /usr/sbin/nologin
 
-COPY --from=build /warpgate /usr/local/bin/warpgate
+COPY --from=builder /warpgate /usr/local/bin/warpgate
 
 VOLUME /data
 
