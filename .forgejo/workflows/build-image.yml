@@ -346,9 +346,23 @@ jobs:
             [ "$code" = "200" ] && break; sleep 2
           done
           docker logs "$WG" | tail -20 || true
-          docker rm -f "$WG"
-          docker volume rm "$VOL"
           test "$code" = "200"
+      - name: cleanup smoke test resources
+        # The removal used to sit at the end of the smoke test step above, so
+        # any earlier failure in that step (`set -e`) skipped it and left the
+        # run-scoped volume behind — measured at 9.68 GB of never-pruned
+        # per-run volumes on talos02's scratch. `always()` makes this step run
+        # even when the smoke test failed. The container is removed first:
+        # `docker volume rm` refuses a volume still attached to a container,
+        # running or not.
+        if: ${{ always() && !startsWith(github.ref_name, 'wip/') }}
+        run: |
+          WG="wg-${{ github.run_id }}"
+          VOL="wgsmoke-${{ github.run_id }}"
+          docker rm -f "$WG" 2>/dev/null || true
+          docker volume rm "$VOL" 2>/dev/null || true
+          echo "=== volumes after cleanup (this run's $VOL must be absent) ==="
+          docker volume ls
       - name: push
         if: ${{ !startsWith(github.ref_name, 'wip/') }}
         run: docker push git.tenfourty.site/jeremy/warpgate:$TAG
