@@ -133,17 +133,51 @@ jobs:
           # CARGO_BUILD_JOBS=2, so that comparison is no longer like-for-like;
           # noted, not hidden.
           BUILD_START=$(date +%s)
+          IMG=git.tenfourty.site/jeremy/warpgate:$TAG
+          # run 2389 (2026-09-15): the build SUCCEEDED -- every crate compiled,
+          # warpgate linked (27m21s), and `--load` put the image into this dind
+          # -- and the job still failed, because `--cache-to` could not resolve
+          # git.tenfourty.site during a WAN blip. buildx treats `--load` and
+          # `--cache-to` as two outputs of ONE invocation, so one output failing
+          # fails the whole command; `set -e` then killed the step before the
+          # size report, and the smoke test and push steps never ran. An hour of
+          # compute discarded because an upload to a CACHE failed.
+          #
+          # The image is this build's output. The cache is an optimisation. So
+          # the success criterion is "was an image produced", asserted directly
+          # against dockerd rather than inferred from buildx's exit code.
+          #
+          # The tag is removed first because TAG is a git-describe string, not
+          # run-scoped: two runs on the same commit share it, and a leftover
+          # image from the earlier one would otherwise answer this run's
+          # question. Without that line the check could pass having proved
+          # nothing about this build.
+          docker image rm -f "$IMG" >/dev/null 2>&1 || true
+          set +e
           docker buildx build --builder "$BUILDER" \
             --build-arg CARGO_BUILD_JOBS=1 --build-arg CARGO_INCREMENTAL=0 \
             --build-arg CARGO_PROFILE_RELEASE_LTO=thin \
             --cache-to type=registry,ref=git.tenfourty.site/jeremy/warpgate:buildcache,mode=max \
             --cache-from type=registry,ref=git.tenfourty.site/jeremy/warpgate:buildcache \
-            --load -f docker/Dockerfile.cove -t git.tenfourty.site/jeremy/warpgate:$TAG .
+            --load -f docker/Dockerfile.cove -t "$IMG" .
+          BUILD_RC=$?
+          set -e
+          if docker image inspect "$IMG" >/dev/null 2>&1; then
+            if [ "$BUILD_RC" -ne 0 ]; then
+              echo "=== buildx exited $BUILD_RC, but the image WAS built and loaded ==="
+              echo "Treating as success: the failing output is the registry cache export, not the image."
+              echo "Consequence: the buildcache is now stale, so the next build recompiles more. Not fatal."
+            fi
+          else
+            echo "=== buildx exited $BUILD_RC and no image was loaded -- a real build failure ==="
+            if [ "$BUILD_RC" -eq 0 ]; then BUILD_RC=1; fi
+            exit "$BUILD_RC"
+          fi
           BUILD_END=$(date +%s)
           echo "BUILD_SECONDS=$((BUILD_END - BUILD_START))" >> "$GITHUB_ENV"
           echo "=== build wall time: $((BUILD_END - BUILD_START))s ==="
           echo "=== image size ==="
-          docker image inspect git.tenfourty.site/jeremy/warpgate:$TAG --format='{{.Size}} bytes'
+          docker image inspect "$IMG" --format='{{.Size}} bytes'
           docker buildx rm "$BUILDER"
       - name: smoke test — version matches the build, binary starts and serves
         if: ${{ !startsWith(github.ref_name, 'wip/') }}
