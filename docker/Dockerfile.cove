@@ -108,11 +108,25 @@ ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
 ARG CARGO_INCREMENTAL=0
 ENV CARGO_INCREMENTAL=${CARGO_INCREMENTAL}
 
-# Cook just the dependency graph, keyed on recipe.json alone — this is the
-# layer the registry cache exists to hit across commits. Same feature flags
-# as the real build below: a cook with different flags compiles a different
-# dependency set and the cache wouldn't line up with what `cargo build`
-# actually needs.
+# The workspace's [patch.crates-io] table redirects ironrdp-async/-connector/
+# -session/picky/sspi to local forks under vendor/, and warpgate-protocol-vnc
+# path-depends on vendor/vnc-rs directly (see Cargo.toml's `exclude` comment:
+# they're kept out of [workspace] members only so Cranky's deny lints don't
+# apply to upstream code — they are still real, compiled path dependencies).
+# cargo-chef's dummy-source reconstruction only stubs out *workspace member*
+# crates; a path dependency excluded from the workspace isn't in that set, so
+# `cook` needs the real source on disk (it isn't self-contained in
+# recipe.json) — without this, cook fails with "failed to read
+# vendor/ironrdp-async/Cargo.toml: No such file or directory" (run 2373).
+# vendor/ is ~3.6 MB total and changes rarely (each fork carries its own
+# PATCHES.md), so this copy is cheap and cache-friendly on its own.
+COPY vendor/ vendor/
+
+# Cook just the dependency graph, keyed on recipe.json (and vendor/ above) —
+# this is the layer the registry cache exists to hit across commits. Same
+# feature flags as the real build below: a cook with different flags
+# compiles a different dependency set and the cache wouldn't line up with
+# what `cargo build` actually needs.
 COPY --from=planner /opt/warpgate/recipe.json recipe.json
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=warpgate-cargo-registry \
     --mount=type=cache,target=/usr/local/cargo/git,id=warpgate-cargo-git \
