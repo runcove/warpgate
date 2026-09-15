@@ -107,10 +107,17 @@ jobs:
         if: ${{ !startsWith(github.ref_name, 'wip/') }}
         run: |
           IMG=git.tenfourty.site/jeremy/warpgate:$TAG
-          # Run-scoped name: wg is a fixed name in the same shared dockerd
-          # as wgtest/capped. Removed by this exact name below at the end
+          # Run-scoped names: wg and wgsmoke are fixed names in the same
+          # shared dockerd. wgsmoke matters more than idempotent creation
+          # suggests: the runner has two slots, so two runs can overlap,
+          # and a shared /data means one run's unattended-setup seeds state
+          # the other inherits — a pass could mean "the other run set this
+          # up", not "this image works". The same risk exists across time
+          # too: a leftover volume means the next run's setup isn't
+          # touching a clean volume. Removed by exact name below at the end
           # of this step — never by prune, pattern or age.
           WG="wg-${{ github.run_id }}"
+          VOL="wgsmoke-${{ github.run_id }}"
           echo "=== binary version check (blocking) ==="
           # `warpgate --version` (clap's auto flag) only ever prints
           # CARGO_PKG_VERSION (e.g. "0.28.6") — it can never match $TAG. The
@@ -130,10 +137,10 @@ jobs:
           echo "expected version: $EXPECTED_VERSION"
           echo "actual version:   $ACTUAL_VERSION"
           [ "$ACTUAL_VERSION" = "$EXPECTED_VERSION" ] || { echo "VERSION MISMATCH — the binary does not report the commit it was built from"; exit 1; }
-          docker volume create wgsmoke
-          docker run --rm -v wgsmoke:/data -e WARPGATE_ADMIN_PASSWORD=smoke-only $IMG \
+          docker volume create "$VOL"
+          docker run --rm -v "$VOL":/data -e WARPGATE_ADMIN_PASSWORD=smoke-only $IMG \
             unattended-setup --data-path /data --http-port 8888 --record-sessions
-          docker run -d --name "$WG" -v wgsmoke:/data $IMG run
+          docker run -d --name "$WG" -v "$VOL":/data $IMG run
           for i in $(seq 1 30); do
             code=$(docker run --rm --network container:"$WG" docker.io/curlimages/curl:8.22.0 \
               -sk -o /dev/null -w '%{http_code}' https://127.0.0.1:8888/@warpgate/api/info || true)
@@ -141,6 +148,7 @@ jobs:
           done
           docker logs "$WG" | tail -20 || true
           docker rm -f "$WG"
+          docker volume rm "$VOL"
           test "$code" = "200"
       - name: push
         if: ${{ !startsWith(github.ref_name, 'wip/') }}
