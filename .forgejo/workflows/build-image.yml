@@ -57,6 +57,19 @@ jobs:
           # 7g -> 10g (2026-09-15, ops-approved as ONE measurement run). Kept
           # in step with the builder cap below purely so the two do not drift;
           # this test container has never been the one pressing a ceiling.
+          # COST OF THE SCHEMA REGENERATION, MEASURED — not reasoned about.
+          # When this was added the claim was "cargo test already compiles
+          # warpgate-common, so `cargo run --bin config-schema` reuses the
+          # target dir and costs seconds". That was wrong, and run 2460's log
+          # says so: the bin profile does NOT share the `lib test` artefacts,
+          # so schemars, aws-smithy-schema and their neighbours all rebuild.
+          # Measured 2m20s between the "tests passed" banner and the binary
+          # actually running, taking a wip run from ~6min to ~8.5min.
+          #
+          # That is accepted, deliberately: 2m20s per wip run is the price of
+          # the checked-in schema never silently drifting again. Recorded here
+          # so nobody removes it later on the strength of the "it's only
+          # seconds" claim, which was never true.
           docker create --name "$NAME" --network bridge --cpus 4 --memory 10g --memory-swap 10g \
             -e CARGO_BUILD_JOBS=2 -w /src docker.io/library/rust:1-bookworm \
             bash -c 'rustup show && cargo test -p warpgate-common-http && echo "---- tests passed; regenerating config schema ----" && cargo run -p warpgate-common --bin config-schema > /tmp/config-schema.generated.json'
