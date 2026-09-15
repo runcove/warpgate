@@ -83,8 +83,20 @@ jobs:
       - name: config schema is current (blocking)
         run: |
           # config-schema.json is a GENERATED file that is checked in, so its
-          # only proof is the generator. Nothing used to re-run the generator,
-          # so the file could drift silently — and did, from 2026-09-11 onward.
+          # only proof is the generator. Nothing re-ran the generator, so the
+          # file could drift silently and nobody would find out. That gap is
+          # structural — it is not a response to a drift anyone observed.
+          #
+          # CORRECTION: an earlier version of this comment, and the body of
+          # commit 1a9e5d92, said the file HAD drifted since 2026-09-11. That
+          # was asserted by two people and checked by neither, and it is false.
+          # The only commit touching warpgate-common/src/config/ since the last
+          # regeneration (bd6f2b9a) is 7918ac9a: +7 lines, the client_ip_header
+          # field and its doc comment. No other changed file mentions
+          # JsonSchema, and Cargo.lock is unchanged, so there is no schemars
+          # bump either. 1a9e5d92 cannot be amended in a shared tree, so the
+          # correction lives here and in this commit's message.
+          #
           # This asserts the checked-in file equals what the generator emits.
           #
           # It sits BEFORE "stop here for wip branches" deliberately: every
@@ -94,13 +106,50 @@ jobs:
           #
           # "the file is missing" and "the file matches" are different answers,
           # and only one of them is good news (trap 35).
-          if [ ! -f /tmp/config-schema.generated.json ]; then
-            echo "UNKNOWN: no generated schema was produced, so nothing was compared."
-            echo "         This is not a pass. See the tests step above for why."
+          # -s not -f: a zero-byte generated file exists but compares against
+          # nothing useful, and would otherwise sail through as "no drift".
+          if [ ! -s /tmp/config-schema.generated.json ]; then
+            echo "UNKNOWN: no generated schema was produced (missing or empty),"
+            echo "         so nothing was compared. This is not a pass."
+            echo "         See the tests step above for why."
             exit 1
           fi
           if diff -u config-schema.json /tmp/config-schema.generated.json; then
             echo "config-schema.json matches the generator's output."
+            # Positive control, every run, not once.
+            #
+            # A gate that has only ever been green has never been shown able to
+            # go red, and gating on a predicate that was never seen to fail is
+            # what CLAUDE.md forbids. So prove the comparison can still detect a
+            # difference, in the SAME run that reports there is none: mutate a
+            # copy and require diff to notice.
+            #
+            # Asserting "exit is non-zero" would not do. diff exits 0 for same,
+            # 1 for differ, and 2 for ERROR — so "non-zero" would count a broken
+            # diff as proof that diff works, which is the exact confusion this
+            # control exists to rule out (trap 35). Require exactly 1.
+            sed '1s/^/X/' /tmp/config-schema.generated.json > /tmp/config-schema.mutated.json
+            set +e
+            diff -q /tmp/config-schema.generated.json /tmp/config-schema.mutated.json >/dev/null 2>&1
+            PC=$?
+            set -e
+            if [ "$PC" -ne 1 ]; then
+              echo "POSITIVE CONTROL FAILED (diff exit $PC, expected 1 = files differ)."
+              # if/elif, not `[ ... ] && echo`: whether a short-circuited &&
+              # list aborts under `set -e` is a subtlety, and a `set -e` that
+              # swallows the diagnostics of a failing check is the exact defect
+              # this step exists to prevent. if/elif needs no such reasoning.
+              if [ "$PC" -eq 0 ]; then
+                echo "  exit 0: diff called two different files identical — it cannot see changes."
+              elif [ "$PC" -eq 2 ]; then
+                echo "  exit 2: diff errored — it did not perform the comparison at all."
+              else
+                echo "  exit $PC: undocumented diff status; treat the comparison as unproven."
+              fi
+              echo "  Either way the match reported above proves nothing, so this run stops."
+              exit 1
+            fi
+            echo "positive control: diff detects a change: yes"
             exit 0
           fi
           echo "---------------------------------------------------------------"
