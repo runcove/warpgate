@@ -352,17 +352,36 @@ jobs:
         # any earlier failure in that step (`set -e`) skipped it and left the
         # run-scoped volume behind — measured at 9.68 GB of never-pruned
         # per-run volumes on talos02's scratch. `always()` makes this step run
-        # even when the smoke test failed. The container is removed first:
-        # `docker volume rm` refuses a volume still attached to a container,
-        # running or not.
-        if: ${{ always() && !startsWith(github.ref_name, 'wip/') }}
+        # even when the smoke test failed (or never ran, e.g. a wip/ branch —
+        # then $VOL never existed and both counts below are unaffected).
+        if: always()
         run: |
           WG="wg-${{ github.run_id }}"
           VOL="wgsmoke-${{ github.run_id }}"
-          docker rm -f "$WG" 2>/dev/null || true
-          docker volume rm "$VOL" 2>/dev/null || true
-          echo "=== volumes after cleanup (this run's $VOL must be absent) ==="
-          docker volume ls
+          # The container is removed first: `docker volume rm` refuses a
+          # volume still attached to a container, running or not. Guarded on
+          # non-empty so a job that failed before these were computed does
+          # nothing here rather than run `rm -f` against an empty name.
+          if [ -n "$WG" ]; then
+            docker rm -f "$WG" 2>/dev/null || true
+          fi
+          if [ -n "$VOL" ]; then
+            docker volume rm -f "$VOL" 2>/dev/null || true
+          fi
+          # Assertion: this run's own volume must be gone. Anchored to the
+          # exact name (`^...$`), never to the `wgsmoke-` prefix — about
+          # 9.68 GB of orphaned volumes from earlier runs exist until the
+          # operator prunes them, so a prefix count would never read 0 and
+          # would fail this assertion for reasons unrelated to this run.
+          THIS_RUN_COUNT=$(docker volume ls -q --filter "name=^${VOL}$" | grep -c . || true)
+          echo "this run's volume ($VOL) count after cleanup, must be 0: $THIS_RUN_COUNT"
+          test "$THIS_RUN_COUNT" -eq 0
+          # OBSERVATION ONLY — not an assertion, must never gate this step.
+          # Total wgsmoke- volumes across all runs, orphans included: tells
+          # the operator when their one-off prune of the existing 9.68 GB is
+          # due, and lets them watch it stop growing on runs after this fix.
+          ALL_RUNS_COUNT=$(docker volume ls -q --filter "name=wgsmoke-" | grep -c . || true)
+          echo "OBSERVATION (not an assertion, do not gate on this): wgsmoke- volumes across all runs: $ALL_RUNS_COUNT"
       - name: push
         if: ${{ !startsWith(github.ref_name, 'wip/') }}
         run: docker push git.tenfourty.site/jeremy/warpgate:$TAG
