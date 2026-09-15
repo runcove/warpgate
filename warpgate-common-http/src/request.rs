@@ -151,7 +151,8 @@ mod tests {
                 &req,
                 &Secret::new("".into()),
                 Some("10.0.0.1".to_string()),
-                true
+                true,
+                None
             ),
             Some("203.0.113.10".to_string())
         );
@@ -166,7 +167,8 @@ mod tests {
                 &req,
                 &Secret::new("".into()),
                 Some("10.0.0.1".to_string()),
-                true
+                true,
+                None
             ),
             Some("10.0.0.1".to_string())
         );
@@ -183,7 +185,8 @@ mod tests {
                 &req,
                 &Secret::new("".into()),
                 Some("10.0.0.1".to_string()),
-                false
+                false,
+                None
             ),
             Some("10.0.0.1".to_string())
         );
@@ -201,7 +204,8 @@ mod tests {
                 &req,
                 &Secret::new("s3cret".into()),
                 Some("10.0.0.1".to_string()),
-                false
+                false,
+                None
             ),
             Some("203.0.113.10".to_string())
         );
@@ -219,9 +223,83 @@ mod tests {
                 &req,
                 &Secret::new("s3cret".into()),
                 Some("10.0.0.1".to_string()),
-                false
+                false,
+                None
             ),
             Some("10.0.0.1".to_string())
+        );
+    }
+
+    #[test]
+    fn client_ip_header_wins_over_forwarded_for() {
+        let req = Request::builder()
+            .header(&X_FORWARDED_FOR, "198.51.100.66")
+            .header("cf-connecting-ip", "203.0.113.10")
+            .finish();
+
+        assert_eq!(
+            trusted_client_ip(
+                &req,
+                &Secret::new("".into()),
+                Some("10.244.1.5".to_string()),
+                false,
+                Some("CF-Connecting-IP")
+            ),
+            Some("203.0.113.10".to_string())
+        );
+    }
+
+    #[test]
+    fn client_ip_header_missing_falls_back_to_peer_not_forwarded_for() {
+        let req = Request::builder()
+            .header(&X_FORWARDED_FOR, "198.51.100.66")
+            .finish();
+
+        assert_eq!(
+            trusted_client_ip(
+                &req,
+                &Secret::new("".into()),
+                Some("10.244.1.5".to_string()),
+                true,
+                Some("CF-Connecting-IP")
+            ),
+            Some("10.244.1.5".to_string())
+        );
+    }
+
+    #[test]
+    fn client_ip_header_rejects_a_value_that_is_not_an_address() {
+        let req = Request::builder()
+            .header("cf-connecting-ip", "203.0.113.10, 198.51.100.66")
+            .finish();
+
+        assert_eq!(
+            trusted_client_ip(
+                &req,
+                &Secret::new("".into()),
+                Some("10.244.1.5".to_string()),
+                false,
+                Some("CF-Connecting-IP")
+            ),
+            Some("10.244.1.5".to_string())
+        );
+    }
+
+    #[test]
+    fn client_ip_header_accepts_ipv6() {
+        let req = Request::builder()
+            .header("cf-connecting-ip", "2001:db8::7")
+            .finish();
+
+        assert_eq!(
+            trusted_client_ip(
+                &req,
+                &Secret::new("".into()),
+                None,
+                false,
+                Some("CF-Connecting-IP")
+            ),
+            Some("2001:db8::7".to_string())
         );
     }
 }
