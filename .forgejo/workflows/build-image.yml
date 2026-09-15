@@ -39,6 +39,13 @@ jobs:
           # run's container unique, and it is removed by that exact name
           # below — never by prune, pattern or age.
           NAME="wgtest-${{ github.run_id }}"
+          # Runners are reused, so /tmp may hold an earlier run's generated
+          # schema. Clear it first: after this line, the file existing can only
+          # mean THIS run produced it, which is what the assertion step below
+          # relies on. Today a failed tests step would stop the job before that
+          # step runs, but that is an argument three steps long — one `rm` makes
+          # it a local fact instead, and survives someone adding `if: always()`.
+          rm -f /tmp/config-schema.generated.json
           # Ordinary bridge network, not --network host: inside dind,
           # --network host is dind's OWN network namespace, i.e. the shared
           # daemon's namespace, not an isolated one. The test binary
@@ -52,14 +59,60 @@ jobs:
           # this test container has never been the one pressing a ceiling.
           docker create --name "$NAME" --network bridge --cpus 4 --memory 10g --memory-swap 10g \
             -e CARGO_BUILD_JOBS=2 -w /src docker.io/library/rust:1-bookworm \
-            bash -c 'rustup show && cargo test -p warpgate-common-http'
+            bash -c 'rustup show && cargo test -p warpgate-common-http && echo "---- tests passed; regenerating config schema ----" && cargo run -p warpgate-common --bin config-schema > /tmp/config-schema.generated.json'
           docker cp . "$NAME":/src
           set +e
           docker start -a "$NAME"
           RC=$?
           set -e
+          # The generated schema must come out of the container BEFORE it is
+          # removed, and it goes to /tmp on the runner rather than into the
+          # workspace so it can never reach the image build context below.
+          # Only meaningful when the container succeeded; when it failed, that
+          # failure is the report and the next step says nothing was compared.
+          # A successful container whose file cannot be copied out is UNKNOWN,
+          # never "the schema is current" (trap 35).
+          if [ "$RC" -eq 0 ] && ! docker cp "$NAME":/tmp/config-schema.generated.json /tmp/config-schema.generated.json; then
+            echo "UNKNOWN: the container succeeded but its generated schema could not be copied out."
+            echo "         That is not the same as 'the checked-in schema is current', so this run stops here."
+            docker rm -f "$NAME" >/dev/null 2>&1 || true
+            exit 1
+          fi
           docker rm -f "$NAME"
           exit $RC
+      - name: config schema is current (blocking)
+        run: |
+          # config-schema.json is a GENERATED file that is checked in, so its
+          # only proof is the generator. Nothing used to re-run the generator,
+          # so the file could drift silently — and did, from 2026-09-11 onward.
+          # This asserts the checked-in file equals what the generator emits.
+          #
+          # It sits BEFORE "stop here for wip branches" deliberately: every
+          # wip/** run exercises it, so the assertion is proven able to fail on
+          # a cheap tests-only run before it is ever trusted to pass on a
+          # branch that ships an image.
+          #
+          # "the file is missing" and "the file matches" are different answers,
+          # and only one of them is good news (trap 35).
+          if [ ! -f /tmp/config-schema.generated.json ]; then
+            echo "UNKNOWN: no generated schema was produced, so nothing was compared."
+            echo "         This is not a pass. See the tests step above for why."
+            exit 1
+          fi
+          if diff -u config-schema.json /tmp/config-schema.generated.json; then
+            echo "config-schema.json matches the generator's output."
+            exit 0
+          fi
+          echo "---------------------------------------------------------------"
+          echo "DRIFT: the checked-in config-schema.json is not what the"
+          echo "generator produces. The diff above is the discrepancy."
+          echo ""
+          echo "To fix: commit the generator's full output, which follows"
+          echo "verbatim between the markers below, as config-schema.json."
+          echo "----------8<---------- generated config-schema.json ----------"
+          cat /tmp/config-schema.generated.json
+          echo "----------8<---------- end generated schema -------------------"
+          exit 1
       - name: stop here for wip branches
         if: startsWith(github.ref_name, 'wip/')
         run: echo "tests only on wip/*"
