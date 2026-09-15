@@ -17,6 +17,7 @@ use tracing::info;
 use warpgate_common::{SessionId, WarpgateError};
 use warpgate_common_http::SessionKeepalive;
 use warpgate_common_http::auth::UnauthenticatedRequestContext;
+use warpgate_common_http::logging::get_client_ip_addr;
 use warpgate_core::{SessionStateInit, State, WarpgateServerHandle};
 use warpgate_db_entities::HttpSession;
 
@@ -211,7 +212,26 @@ impl SessionStore {
             return Ok(handle);
         }
 
-        let remote_address = <&RemoteAddr>::from_request_without_body(req).await?;
+        let use_header = ctx
+            .services()
+            .config
+            .lock()
+            .await
+            .store
+            .http
+            .client_ip_header
+            .is_some();
+        let remote_address = if use_header {
+            get_client_ip_addr(req, ctx.services())
+                .await
+                .map(|ip| std::net::SocketAddr::new(ip, 0))
+        } else {
+            <&RemoteAddr>::from_request_without_body(req)
+                .await?
+                .0
+                .as_socket_addr()
+                .copied()
+        };
         let session_storage = Data::<&SharedSessionStorage>::from_request_without_body(req).await?;
 
         let (session_handle, mut session_handle_rx) = HttpSessionHandle::new();
@@ -220,7 +240,7 @@ impl SessionStore {
             &ctx.services().state,
             PROTOCOL_NAME,
             SessionStateInit {
-                remote_address: remote_address.0.as_socket_addr().copied(),
+                remote_address,
                 handle: Box::new(session_handle),
             },
         )

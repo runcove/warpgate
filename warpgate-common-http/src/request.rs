@@ -49,11 +49,17 @@ pub fn trusted_client_ip(
     cluster_token: &Secret<String>,
     remote_ip: Option<String>,
     trust_x_forwarded: bool,
+    client_ip_header: Option<&str>,
 ) -> Option<String> {
     if is_cluster_peer_request(req, cluster_token)
         && let Some(ip) = req.header(&X_WARPGATE_CLUSTER_CLIENT_IP)
     {
         Some(ip.to_string())
+    } else if let Some(name) = client_ip_header {
+        req.header(name)
+            .and_then(|value| value.trim().parse::<std::net::IpAddr>().ok())
+            .map(|ip| ip.to_string())
+            .or(remote_ip)
     } else if trust_x_forwarded
         && let Some(ip) = req
             .header(&X_FORWARDED_FOR)

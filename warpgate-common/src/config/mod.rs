@@ -520,6 +520,12 @@ pub struct HttpConfig {
     #[serde(default)]
     pub trust_x_forwarded_headers: bool,
 
+    /// Take the client address from this request header alone (e.g. `CF-Connecting-IP`
+    /// behind Cloudflare). A missing or malformed value falls back to the socket peer,
+    /// never to `X-Forwarded-For`. Independent of `trust_x_forwarded_headers`.
+    #[serde(default)]
+    pub client_ip_header: Option<String>,
+
     #[serde(default = "_default_session_max_age", with = "humantime_serde")]
     #[schemars(with = "String")]
     pub session_max_age: Duration,
@@ -542,6 +548,7 @@ impl Default for HttpConfig {
             certificate: "".into(),
             key: "".into(),
             trust_x_forwarded_headers: false,
+            client_ip_header: None,
             session_max_age: _default_session_max_age(),
             cookie_max_age: _default_cookie_max_age(),
             sni_certificates: vec![],
