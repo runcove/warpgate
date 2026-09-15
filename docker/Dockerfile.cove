@@ -118,13 +118,19 @@ ENV CARGO_INCREMENTAL=${CARGO_INCREMENTAL}
 ARG CARGO_PROFILE_RELEASE_LTO=true
 ENV CARGO_PROFILE_RELEASE_LTO=${CARGO_PROFILE_RELEASE_LTO}
 
-# mold is installed unconditionally (a few MB, part of the apt-get block
-# above) but not selected as the linker unless EXTRA_RUSTFLAGS asks for it —
-# the default build's actual link behaviour is unchanged. Used for the
-# linker-speed measurement Jeremy asked for across our Rust projects; not
-# (yet) this fork's shipping default.
-ARG EXTRA_RUSTFLAGS=""
-ENV RUSTFLAGS=${EXTRA_RUSTFLAGS}
+# mold is installed here (a few MB) but NOT wired as the linker by default —
+# deliberately no RUSTFLAGS/EXTRA_RUSTFLAGS ARG here. .cargo/config.toml sets
+# `[target.'cfg(all())'] rustflags = ["--cfg", "tokio_unstable", ...]`
+# (required: warpgate-common/src/helpers/net.rs uses tokio::task::Builder,
+# gated behind tokio_unstable). Cargo's RUSTFLAGS env var REPLACES config.toml
+# rustflags outright rather than merging with it, even when set to an empty
+# string — an env var ARG/ENV pair here broke the default build with
+# `error[E0433]: cannot find Builder in task` (run 2375) purely by existing.
+# The mold-as-linker measurement (a separate ask, its own throwaway branch)
+# needs a RUSTFLAGS value that reproduces --cfg tokio_unstable plus the mold
+# flags together, done there — not as a standing option on this shared file.
+# Used for the linker-speed measurement Jeremy asked for across our Rust
+# projects; not (yet) this fork's shipping default.
 
 # The workspace's [patch.crates-io] table redirects ironrdp-async/-connector/
 # -session/picky/sspi to local forks under vendor/, and warpgate-protocol-vnc
