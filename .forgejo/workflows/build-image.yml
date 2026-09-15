@@ -120,9 +120,21 @@ jobs:
           # (LTO's link-memory peak) instead. thin keeps most of fat LTO's
           # runtime benefit at a fraction of the link memory; falls back to
           # CARGO_PROFILE_RELEASE_LTO=false only if thin still OOMs.
+          # CARGO_BUILD_JOBS=1 (2026-09-15, run 490/2386): 2 let aws-sdk-rds and
+          # aws-sdk-ec2 compile concurrently during `cargo chef cook`, and the
+          # two together OOM'd under the 7g cap — a dependency-compile-phase
+          # OOM, distinct from run 2374's final-link OOM under fat LTO. 1 keeps
+          # every crate's own compile serialized so no two large crates share
+          # the cap at once. Talos01 (the storage-migration node) had no
+          # memory headroom to raise the cap instead (ops: ~3.3 GB available
+          # at the kill, node 72% used running etcd) — CARGO_BUILD_JOBS=1 was
+          # ops' choice over a bigger cap for that reason, not a Cargo/LTO
+          # concern. Changes wall time and I/O rate versus run 488's
+          # CARGO_BUILD_JOBS=2, so that comparison is no longer like-for-like;
+          # noted, not hidden.
           BUILD_START=$(date +%s)
           docker buildx build --builder "$BUILDER" \
-            --build-arg CARGO_BUILD_JOBS=2 --build-arg CARGO_INCREMENTAL=0 \
+            --build-arg CARGO_BUILD_JOBS=1 --build-arg CARGO_INCREMENTAL=0 \
             --build-arg CARGO_PROFILE_RELEASE_LTO=thin \
             --cache-to type=registry,ref=git.tenfourty.site/jeremy/warpgate:buildcache,mode=max \
             --cache-from type=registry,ref=git.tenfourty.site/jeremy/warpgate:buildcache \
