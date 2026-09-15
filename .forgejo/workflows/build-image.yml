@@ -63,6 +63,9 @@ jobs:
         if: ${{ !startsWith(github.ref_name, 'wip/') }}
         run: |
           IMG=git.tenfourty.site/jeremy/warpgate:$TAG
+          echo "=== binary version check (cargo-chef restructure, 2026-09-15) ==="
+          echo "built tag: $TAG"
+          docker run --rm $IMG warpgate --version || true
           docker volume create wgsmoke
           docker run --rm -v wgsmoke:/data -e WARPGATE_ADMIN_PASSWORD=smoke-only $IMG \
             unattended-setup --data-path /data --http-port 8888 --record-sessions
