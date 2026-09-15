@@ -368,20 +368,33 @@ jobs:
           if [ -n "$VOL" ]; then
             docker volume rm -f "$VOL" 2>/dev/null || true
           fi
-          # Assertion: this run's own volume must be gone. Anchored to the
-          # exact name (`^...$`), never to the `wgsmoke-` prefix — about
-          # 9.68 GB of orphaned volumes from earlier runs exist until the
-          # operator prunes them, so a prefix count could never be 0 and
-          # would fail this assertion for reasons unrelated to this run. The
-          # removals above are allowed to fail silently (`|| true`) because
-          # this assertion is the real gate — a swallowed removal error
-          # still fails the step honestly.
-          test "$(docker volume ls -q --filter "name=^${VOL}$" | grep -c .)" = "0"
+          # The read is split from the count so a failed read stays visible.
+          # `grep -c . || true` on the counts below is only safe once the
+          # read itself is known-good: swallowing `docker volume ls`'s own
+          # failure (e.g. daemon unreachable) would make the zero it
+          # produces on failure indistinguishable from a genuine "volume is
+          # gone", certifying cleanup on a run where nothing could be read.
+          if ! ALL_VOLS=$(docker volume ls -q); then
+            echo "UNKNOWN: 'docker volume ls' failed — cannot tell whether $VOL was removed"
+            exit 1
+          fi
+          # Assertion: this run's own volume must be gone. Matched exactly
+          # (`^...$`) against the plain list, never against the `wgsmoke-`
+          # prefix — about 9.68 GB of orphaned volumes from earlier runs
+          # exist until the operator prunes them, so a prefix count could
+          # never be 0 and would fail this assertion for reasons unrelated
+          # to this run. The removals above are allowed to fail silently
+          # (`|| true`) because this assertion is the real gate — a
+          # swallowed removal error still fails the step honestly.
+          THIS_RUN_COUNT=$(printf '%s\n' "$ALL_VOLS" | grep -c "^${VOL}$" || true)
+          echo "this run's volume ($VOL) count after cleanup, must be 0: $THIS_RUN_COUNT"
+          test "$THIS_RUN_COUNT" -eq 0
           # Observation only — never gate on this number, and don't "fix" it
           # to expect 0. It tells the operator when their one-off prune of
           # the existing orphans is due, and lets them watch it stop growing
           # on runs after this fix.
-          echo "observation, not an assertion: $(docker volume ls -q --filter "name=wgsmoke-" | grep -c .) wgsmoke-* volume(s) remain on this runner (orphans from earlier runs; pruned separately)"
+          ALL_RUNS_COUNT=$(printf '%s\n' "$ALL_VOLS" | grep -c '^wgsmoke-' || true)
+          echo "OBSERVATION (not an assertion, do not gate on this): wgsmoke- volumes across all runs: $ALL_RUNS_COUNT"
       - name: push
         if: ${{ !startsWith(github.ref_name, 'wip/') }}
         run: docker push git.tenfourty.site/jeremy/warpgate:$TAG
