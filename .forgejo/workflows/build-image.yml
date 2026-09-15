@@ -33,11 +33,30 @@ jobs:
           docker buildx version
       - name: tests (capped, never on baba)
         run: |
-          docker create --name wgtest --network host --cpus 4 --memory 7g --memory-swap 7g \
+          # Run-scoped name: wgtest is a fixed name in dind's shared dockerd,
+          # so a leftover from a prior failed run would collide with `docker
+          # create` on the next one. Suffixing with the run id makes every
+          # run's container unique, and it is removed by that exact name
+          # below — never by prune, pattern or age.
+          NAME="wgtest-${{ github.run_id }}"
+          # Ordinary bridge network, not --network host: inside dind,
+          # --network host is dind's OWN network namespace, i.e. the shared
+          # daemon's namespace, not an isolated one. The test binary
+          # (`cargo test -p warpgate-common-http`) doesn't bind or listen on
+          # anything — its tests are pure in-process assertions (CSP header
+          # construction, request-URI building, hostname-string comparison) —
+          # so it has no need to share dind's namespace; bridge still gives
+          # it normal outbound access to fetch crates.
+          docker create --name "$NAME" --network bridge --cpus 4 --memory 7g --memory-swap 7g \
             -e CARGO_BUILD_JOBS=2 -w /src docker.io/library/rust:1-bookworm \
             bash -c 'rustup show && cargo test -p warpgate-common-http'
-          docker cp . wgtest:/src
-          docker start -a wgtest
+          docker cp . "$NAME":/src
+          set +e
+          docker start -a "$NAME"
+          RC=$?
+          set -e
+          docker rm -f "$NAME"
+          exit $RC
       - name: stop here for wip branches
         if: startsWith(github.ref_name, 'wip/')
         run: echo "tests only on wip/*"
@@ -49,7 +68,14 @@ jobs:
         run: |
           TAG=$(git describe --tags --long)
           echo "TAG=$TAG" >> "$GITHUB_ENV"
-          docker buildx create --name capped --driver docker-container \
+          # Run-scoped name: capped is a fixed buildx builder name in the
+          # same shared dockerd as wgtest/wg. A leftover builder (and its
+          # companion buildx_buildkit_capped0 container) from a prior failed
+          # run would collide with `buildx create` on the next one. Suffix
+          # with the run id and remove it by that exact name at the end of
+          # this step — never by prune, pattern or age.
+          BUILDER="capped-${{ github.run_id }}"
+          docker buildx create --name "$BUILDER" --driver docker-container \
             --driver-opt memory=7g --driver-opt memory-swap=7g \
             --driver-opt cpu-quota=400000 --driver-opt cpu-period=100000 \
             --use
@@ -65,7 +91,7 @@ jobs:
           # fraction of the link memory; falls back to CARGO_PROFILE_RELEASE_LTO=false
           # only if thin still OOMs.
           BUILD_START=$(date +%s)
-          docker buildx build \
+          docker buildx build --builder "$BUILDER" \
             --build-arg CARGO_BUILD_JOBS=2 --build-arg CARGO_INCREMENTAL=0 \
             --build-arg CARGO_PROFILE_RELEASE_LTO=thin \
             --cache-to type=registry,ref=git.tenfourty.site/jeremy/warpgate:buildcache,mode=max \
@@ -76,10 +102,15 @@ jobs:
           echo "=== build wall time: $((BUILD_END - BUILD_START))s ==="
           echo "=== image size ==="
           docker image inspect git.tenfourty.site/jeremy/warpgate:$TAG --format='{{.Size}} bytes'
+          docker buildx rm "$BUILDER"
       - name: smoke test — version matches the build, binary starts and serves
         if: ${{ !startsWith(github.ref_name, 'wip/') }}
         run: |
           IMG=git.tenfourty.site/jeremy/warpgate:$TAG
+          # Run-scoped name: wg is a fixed name in the same shared dockerd
+          # as wgtest/capped. Removed by this exact name below at the end
+          # of this step — never by prune, pattern or age.
+          WG="wg-${{ github.run_id }}"
           echo "=== binary version check (blocking) ==="
           # `warpgate --version` (clap's auto flag) only ever prints
           # CARGO_PKG_VERSION (e.g. "0.28.6") — it can never match $TAG. The
@@ -102,13 +133,14 @@ jobs:
           docker volume create wgsmoke
           docker run --rm -v wgsmoke:/data -e WARPGATE_ADMIN_PASSWORD=smoke-only $IMG \
             unattended-setup --data-path /data --http-port 8888 --record-sessions
-          docker run -d --name wg -v wgsmoke:/data $IMG run
+          docker run -d --name "$WG" -v wgsmoke:/data $IMG run
           for i in $(seq 1 30); do
-            code=$(docker run --rm --network container:wg docker.io/curlimages/curl:8.22.0 \
+            code=$(docker run --rm --network container:"$WG" docker.io/curlimages/curl:8.22.0 \
               -sk -o /dev/null -w '%{http_code}' https://127.0.0.1:8888/@warpgate/api/info || true)
             [ "$code" = "200" ] && break; sleep 2
           done
-          docker logs wg | tail -20 || true
+          docker logs "$WG" | tail -20 || true
+          docker rm -f "$WG"
           test "$code" = "200"
       - name: push
         if: ${{ !startsWith(github.ref_name, 'wip/') }}
