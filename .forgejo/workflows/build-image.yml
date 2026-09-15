@@ -47,7 +47,10 @@ jobs:
           # construction, request-URI building, hostname-string comparison) —
           # so it has no need to share dind's namespace; bridge still gives
           # it normal outbound access to fetch crates.
-          docker create --name "$NAME" --network bridge --cpus 4 --memory 7g --memory-swap 7g \
+          # 7g -> 10g (2026-09-15, ops-approved as ONE measurement run). Kept
+          # in step with the builder cap below purely so the two do not drift;
+          # this test container has never been the one pressing a ceiling.
+          docker create --name "$NAME" --network bridge --cpus 4 --memory 10g --memory-swap 10g \
             -e CARGO_BUILD_JOBS=2 -w /src docker.io/library/rust:1-bookworm \
             bash -c 'rustup show && cargo test -p warpgate-common-http'
           docker cp . "$NAME":/src
@@ -75,8 +78,32 @@ jobs:
           # with the run id and remove it by that exact name at the end of
           # this step — never by prune, pattern or age.
           BUILDER="capped-${{ github.run_id }}"
+          # network=host (2026-09-15): the buildkit container does NOT inherit
+          # the cluster's resolver. Its /etc/resolv.conf, captured from run
+          # 493/2439, reads `nameserver 8.8.8.8 / 8.8.4.4` with the note
+          # "Based on host file: '/etc/resolv.conf' (legacy) / Used default
+          # nameservers" — it inherited the cluster SEARCH DOMAINS
+          # (ci.svc.cluster.local ...) but not the nameservers, so dockerd
+          # substituted its public fallback. git.tenfourty.site has no public
+          # record, so every cache import and export has been failing:
+          #   dial tcp: lookup git.tenfourty.site on 8.8.8.8:53: no such host
+          # That is why every build recompiles from scratch despite a
+          # registry cache being configured — the cache has never once been
+          # read or written. Worth more than the memory cap.
+          #
+          # `network=host` here means the DIND DAEMON's network namespace (the
+          # service container this job's DOCKER_HOST points at), not the
+          # cluster node's — the same namespace the registry login and image
+          # push already resolve from successfully. If a later change ever
+          # gives buildkit its own namespace again, the alternative is a
+          # buildkitd.toml with the registry's LAN address under [dns].
+          #
+          # PROOF THIS WORKED is one line in the build output: "exporting
+          # cache to registry". Its absence means the cache is still dead, no
+          # matter how the build itself exits.
           docker buildx create --name "$BUILDER" --driver docker-container \
-            --driver-opt memory=7g --driver-opt memory-swap=7g \
+            --driver-opt network=host \
+            --driver-opt memory=10g --driver-opt memory-swap=10g \
             --driver-opt cpu-quota=400000 --driver-opt cpu-period=100000 \
             --use
           docker buildx inspect --bootstrap
@@ -84,8 +111,8 @@ jobs:
           # the heavy work, not just that the flag was accepted. buildx's
           # docker-container driver creates a companion container named
           # buildx_buildkit_<builder>0 that executes every Dockerfile RUN
-          # step (cook, compile, link) — the --driver-opt memory=7g/
-          # memory-swap=7g above are supposed to land on THAT container, not
+          # step (cook, compile, link) — the --driver-opt memory=10g/
+          # memory-swap=10g above are supposed to land on THAT container, not
           # on the job container or the dind service container beside it
           # (both intentionally uncapped for memory at the runner level —
           # verified 2026-09-15, see below). A silently-ignored driver-opt
@@ -96,9 +123,9 @@ jobs:
           echo "=== $BUILDKIT_CONTAINER memory cap: $BUILDKIT_MEM bytes ==="
           if [ "$BUILDKIT_MEM" = "0" ]; then
             echo "REFUSING TO BUILD: $BUILDKIT_CONTAINER has HostConfig.Memory=0 (no limit)."
-            echo "The --driver-opt memory=7g/memory-swap=7g above did not land on the"
+            echo "The --driver-opt memory=10g/memory-swap=10g above did not land on the"
             echo "container that actually compiles and links. Building uncapped here can"
-            echo "consume node memory outside the runner pod's own 10Gi limit."
+            echo "consume node memory outside the runner pod's own dind limit."
             exit 1
           fi
           # CARGO_PROFILE_RELEASE_LTO=thin: fat LTO (Cargo.toml's own
@@ -120,18 +147,78 @@ jobs:
           # (LTO's link-memory peak) instead. thin keeps most of fat LTO's
           # runtime benefit at a fraction of the link memory; falls back to
           # CARGO_PROFILE_RELEASE_LTO=false only if thin still OOMs.
-          # CARGO_BUILD_JOBS=1 (2026-09-15, run 490/2386): 2 let aws-sdk-rds and
-          # aws-sdk-ec2 compile concurrently during `cargo chef cook`, and the
-          # two together OOM'd under the 7g cap — a dependency-compile-phase
-          # OOM, distinct from run 2374's final-link OOM under fat LTO. 1 keeps
-          # every crate's own compile serialized so no two large crates share
-          # the cap at once. Talos01 (the storage-migration node) had no
-          # memory headroom to raise the cap instead (ops: ~3.3 GB available
-          # at the kill, node 72% used running etcd) — CARGO_BUILD_JOBS=1 was
-          # ops' choice over a bigger cap for that reason, not a Cargo/LTO
-          # concern. Changes wall time and I/O rate versus run 488's
-          # CARGO_BUILD_JOBS=2, so that comparison is no longer like-for-like;
-          # noted, not hidden.
+          # CARGO_BUILD_JOBS=1 (2026-09-15, run 490/2386). CORRECTED from the
+          # run's own log on 2026-09-15: an earlier version of this comment
+          # said JOBS=2 "let aws-sdk-rds and aws-sdk-ec2 compile concurrently
+          # and the two together OOM'd". That is WRONG and must not be
+          # reinstated. What the log shows: the run died in `cargo chef cook`
+          # (not the final link), the SIGKILLed process was
+          # `rustc --crate-name aws_sdk_ec2 --crate-type lib` (a dependency
+          # rlib), concurrency was real (cargo printed "build failed, waiting
+          # for other jobs to finish") but the OTHER slot held unrelated small
+          # crates — aws-sdk-rds started 1.4s before aws-sdk-ec2 and
+          # aws-sdk-ec2 lived 175s longer, with 15 small crates (picky,
+          # x25519-dalek, syn, vt100 ...) starting in the final 15.5s. So it
+          # was one long AWS SDK crate beside a fast churn of small ones, not
+          # two heavyweights coinciding.
+          #
+          # AND THE LEVER IS NOT WHAT THIS COMMENT ASSUMED. Run 493/2439 ran
+          # with CARGO_BUILD_JOBS=1 — read from the live process's own
+          # /proc/<pid>/environ, with exactly ONE resident rustc — and still
+          # held the cap for 2m51s (memory.events max 0 -> 12970, oom_kill 0).
+          # The ceiling is therefore reached with ZERO contribution from
+          # parallel crate count. The mechanism is `-Zthreads=8` in
+          # .cargo/config.toml under [target.'cfg(all())'] — intra-crate
+          # codegen parallelism that CARGO_BUILD_JOBS does not bound, applying
+          # to every profile including cook, fixed at 8 regardless of the
+          # container's --cpus=4. Upstream's own choice (introduced 9f24f0f7,
+          # v0.28.6), not a cove patch.
+          #
+          # So JOBS=1 is retained as a conservative floor, NOT because it is
+          # the lever. Whether parallel crates add peak on top of the
+          # intra-crate floor at higher JOBS is UNMEASURED — no run isolates
+          # it. Talos01 had no headroom to raise the cap at the time (~3.3 GB
+          # available at the kill, node 72% used running etcd); talos02 now
+          # does, which is what this run tests. Wall time and I/O rate are not
+          # like-for-like against run 488's JOBS=2; noted, not hidden.
+          # ---- self-measurement (2026-09-15) ----
+          # The point of raising the cap is to find out whether 10g is a PEAK
+          # the build reaches or another CEILING it is pressed against. A
+          # single reading at the end cannot tell those apart: memory.peak is
+          # a high-water mark with no timestamp, so finding it at the cap says
+          # only "at some point", never when or for how long. What separates
+          # them is memory.events `max` — reclaim events under the ceiling.
+          # Zero of them means 10g was never reached and the peak is real; a
+          # climbing count means we have simply moved the wall.
+          #
+          # Sampled from inside the job, through the same DOCKER_HOST the
+          # build already uses. Deliberately NOT read by an operator reaching
+          # into the container from outside: that needs cluster access this
+          # job does not have and should not need, and it makes the numbers
+          # someone's report rather than the build's own output. Scope is the
+          # buildkit container's own cgroup — the one that executes every RUN
+          # step. It does not reach the runner pod or the node.
+          #
+          # The loop exits on its own when the container goes away, so a
+          # failed build cannot leave it running; the kill below is belt and
+          # braces. Sampling is one `docker exec` every 15s against a local
+          # socket -- negligible beside a 30-minute compile.
+          (
+            while docker inspect "$BUILDKIT_CONTAINER" >/dev/null 2>&1; do
+              echo "MEMSAMPLE $(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                "$(docker exec "$BUILDKIT_CONTAINER" cat /sys/fs/cgroup/memory.current /sys/fs/cgroup/memory.peak 2>/dev/null | tr '\n' ' ')" \
+                "$(docker exec "$BUILDKIT_CONTAINER" cat /sys/fs/cgroup/memory.events 2>/dev/null | tr '\n' ' ')" \
+                "io $(docker exec "$BUILDKIT_CONTAINER" cat /sys/fs/cgroup/io.stat 2>/dev/null | tr '\n' ' ')"
+              sleep 15
+            done
+          ) &
+          SAMPLER_PID=$!
+          # Every sample carries its own UTC timestamp and names its cgroup in
+          # this comment rather than in each line, because three figures have
+          # been misattributed on this cluster by being read at the wrong
+          # level. These are buildx_buildkit_<builder>0's OWN cgroup: not the
+          # service dind's hierarchical total (which includes this container
+          # and reads high for the wrong reason), and not the node's.
           BUILD_START=$(date +%s)
           IMG=git.tenfourty.site/jeremy/warpgate:$TAG
           # run 2389 (2026-09-15): the build SUCCEEDED -- every crate compiled,
@@ -162,6 +249,15 @@ jobs:
             --load -f docker/Dockerfile.cove -t "$IMG" .
           BUILD_RC=$?
           set -e
+          # Stop sampling before anything else can exit the step. Placed after
+          # `set -e` is restored but before the image checks below, so a build
+          # failure still leaves the samples in the log for exactly the run we
+          # most want to understand. `|| true` because the loop may already
+          # have exited on its own when the container went away, and a kill of
+          # a dead pid must not fail the step that is reporting the build.
+          kill "$SAMPLER_PID" 2>/dev/null || true
+          wait "$SAMPLER_PID" 2>/dev/null || true
+          echo "=== memory sampling ended; grep MEMSAMPLE above for the series ==="
           if docker image inspect "$IMG" >/dev/null 2>&1; then
             if [ "$BUILD_RC" -ne 0 ]; then
               echo "=== buildx exited $BUILD_RC, but the image WAS built and loaded ==="
@@ -208,10 +304,37 @@ jobs:
           # the two formulas would otherwise diverge (e.g. HEAD sitting
           # exactly on a v* tag).
           EXPECTED_VERSION="warpgate $(git describe --tags --always --dirty=-modified --match 'v[0-9]*')"
-          ACTUAL_VERSION=$(docker run --rm $IMG warpgate version)
+          # NOT `docker run $IMG warpgate version` (2026-09-15, run 493/2439):
+          # the image's ENTRYPOINT is already ["warpgate"] (Dockerfile.cove:221),
+          # so passing "warpgate" as the first ARG runs `warpgate warpgate
+          # version` and clap answers `error: unrecognized subcommand`, exit 2.
+          # The `version` subcommand is present and correct — main.rs:148
+          # Commands::Version, printing "warpgate {warpgate_version()}" at :171 —
+          # so this was never a missing subcommand, only a duplicated binary
+          # name. It exits 2 before anything later in the workflow, so the smoke
+          # test and push steps after it have never run.
+          #
+          # Second defect in this step, found by the same run: under `set -e`
+          # a bare `ACTUAL_VERSION=$(docker run ...)` ABORTS the step the
+          # instant docker exits nonzero, so the three echo lines below and
+          # the "VERSION MISMATCH" message are unreachable on any docker
+          # failure — confirmed by their total absence from 2439's log. The
+          # step could only ever report a mismatch it was able to compute.
+          # Capturing the status keeps the diagnostics reachable, so a future
+          # failure here says what happened instead of just exiting 2.
+          set +e
+          ACTUAL_VERSION=$(docker run --rm "$IMG" version 2>&1)
+          VERSION_RC=$?
+          set -e
           echo "built tag:        $TAG"
           echo "expected version: $EXPECTED_VERSION"
           echo "actual version:   $ACTUAL_VERSION"
+          if [ "$VERSION_RC" -ne 0 ]; then
+            echo "VERSION CHECK COULD NOT RUN — \`docker run \$IMG version\` exited $VERSION_RC."
+            echo "That is not a version mismatch: the binary never reported a version at all."
+            echo "Check the ENTRYPOINT against the arguments passed here before assuming the build is wrong."
+            exit 1
+          fi
           [ "$ACTUAL_VERSION" = "$EXPECTED_VERSION" ] || { echo "VERSION MISMATCH — the binary does not report the commit it was built from"; exit 1; }
           docker volume create "$VOL"
           docker run --rm -v "$VOL":/data -e WARPGATE_ADMIN_PASSWORD=smoke-only $IMG \
