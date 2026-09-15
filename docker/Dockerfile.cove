@@ -71,6 +71,16 @@ RUN just openapi \
 # evaporating with the mount.
 ARG CARGO_BUILD_JOBS=default
 ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
+
+# Disabled in CI (2026-09-15 incident): incremental compilation's on-disk
+# artifacts added to the write volume that saturated shared Talos node
+# storage during a cold compile (etcd slowdown, ~4% cluster-wide API
+# failures). The CI workflow now also imports/exports a BuildKit registry
+# cache (git.tenfourty.site/jeremy/warpgate:buildcache) so a same-commit
+# re-run skips this RUN layer entirely rather than depending on
+# incremental state that cache mounts don't preserve across runs anyway.
+ARG CARGO_INCREMENTAL=0
+ENV CARGO_INCREMENTAL=${CARGO_INCREMENTAL}
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=warpgate-cargo-registry \
     --mount=type=cache,target=/usr/local/cargo/git,id=warpgate-cargo-git \
     --mount=type=cache,target=/opt/warpgate/target,id=warpgate-cargo-target \

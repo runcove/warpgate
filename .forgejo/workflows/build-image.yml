@@ -44,17 +44,21 @@ jobs:
       - name: registry login
         if: ${{ !startsWith(github.ref_name, 'wip/') }}
         run: docker login git.tenfourty.site -u jeremy --password-stdin <<< "${{ secrets.REGISTRY_TOKEN }}"
-      - name: build (BuildKit, capped via docker-container driver-opts)
+      - name: build (BuildKit, capped via docker-container driver-opts, registry cache)
         if: ${{ !startsWith(github.ref_name, 'wip/') }}
         run: |
           TAG=$(git describe --tags --long)
           echo "TAG=$TAG" >> "$GITHUB_ENV"
           docker buildx create --name capped --driver docker-container \
-            --driver-opt memory=7g --driver-opt memory-swap=7g --driver-opt cpu-quota=400000 \
+            --driver-opt memory=7g --driver-opt memory-swap=7g \
+            --driver-opt cpu-quota=400000 --driver-opt cpu-period=100000 \
             --use
           docker buildx inspect --bootstrap
-          docker buildx build --build-arg CARGO_BUILD_JOBS=2 --load \
-            -f docker/Dockerfile.cove -t git.tenfourty.site/jeremy/warpgate:$TAG .
+          docker buildx build \
+            --build-arg CARGO_BUILD_JOBS=2 --build-arg CARGO_INCREMENTAL=0 \
+            --cache-to type=registry,ref=git.tenfourty.site/jeremy/warpgate:buildcache,mode=max \
+            --cache-from type=registry,ref=git.tenfourty.site/jeremy/warpgate:buildcache \
+            --load -f docker/Dockerfile.cove -t git.tenfourty.site/jeremy/warpgate:$TAG .
       - name: smoke test — the binary starts and serves
         if: ${{ !startsWith(github.ref_name, 'wip/') }}
         run: |
