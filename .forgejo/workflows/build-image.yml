@@ -216,10 +216,56 @@ jobs:
           # PROOF THIS WORKED is one line in the build output: "exporting
           # cache to registry". Its absence means the cache is still dead, no
           # matter how the build itself exits.
+          # Pre-pull buildkit, with retries, BEFORE the builder is created.
+          #
+          # `buildx inspect --bootstrap` below boots the docker-container
+          # driver, and booting it pulls moby/buildkit from Docker Hub. That
+          # pull is unretried and it is the single un-cached internet fetch
+          # standing between a push and a build: run 500 (2026-09-16) died
+          # exactly there, after the tests and the registry login had both
+          # passed --
+          #   #1 pulling image moby/buildkit:buildx-stable-1
+          #   #1 ERROR: Head "https://registry-1.docker.io/v2/moby/buildkit/
+          #      manifests/buildx-stable-1": unable to decode token response:
+          #      context deadline exceeded
+          # -- ten minutes of test work thrown away by a Docker Hub timeout.
+          #
+          # Pulling it here puts the image in dind's local store, so the
+          # bootstrap finds it locally and never reaches Docker Hub. Six
+          # attempts with a 10 s gap covers the flapping this link does
+          # (~40-50 s outages, measured 2026-09-15) without masking a real
+          # outage: if Docker Hub is genuinely gone this still fails, but it
+          # fails HERE with a message naming the cause, instead of inside
+          # buildx's boot output.
+          #
+          # This is a workaround, not a fix. The durable answer is a mirror
+          # of this image in our own registry so the build has no Docker Hub
+          # dependency at all; that is a roadmap item, not this step's job.
+          BUILDKIT_IMAGE=moby/buildkit:buildx-stable-1
+          pulled=no
+          for i in 1 2 3 4 5 6; do
+            if docker pull "$BUILDKIT_IMAGE"; then pulled=yes; break; fi
+            echo "buildkit pull attempt $i failed; retrying in 10s"
+            sleep 10
+          done
+          if [ "$pulled" != yes ]; then
+            echo "FAILING HERE ON PURPOSE: could not pull $BUILDKIT_IMAGE from"
+            echo "Docker Hub after 6 attempts. This is the unretried internet"
+            echo "fetch that booting buildkit depends on -- not a build fault."
+            exit 1
+          fi
+          # Assert it is actually in the local store, rather than trusting the
+          # pull's exit status: the bootstrap below only avoids Docker Hub if
+          # the image is really here, and `docker pull` succeeding is not the
+          # same claim as `docker image inspect` finding it.
+          docker image inspect "$BUILDKIT_IMAGE" >/dev/null
+          echo "buildkit image present locally; bootstrap will not reach Docker Hub"
+
           docker buildx create --name "$BUILDER" --driver docker-container \
             --driver-opt network=host \
             --driver-opt memory=10g --driver-opt memory-swap=10g \
             --driver-opt cpu-quota=400000 --driver-opt cpu-period=100000 \
+            --driver-opt "image=$BUILDKIT_IMAGE" \
             --use
           docker buildx inspect --bootstrap
           # Assert the memory cap actually landed on the container that does
