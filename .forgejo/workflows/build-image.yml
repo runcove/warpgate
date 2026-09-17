@@ -98,6 +98,32 @@ jobs:
           # insists on. If it proves too slow or hits the ceiling, the fix is a
           # bigger cap or a split job, NOT dropping crates back out and
           # inventing a reason why their tests do not matter.
+          #
+          # WHY warpgate-protocol-http IS STILL ABSENT, and it is NOT the
+          # excuse the old comment made (run 503, 2026-09-17). Adding all three
+          # crates turned the run red in 19 minutes, and not on a test: on a
+          # COMPILE error, `no associated function named 'get' for struct
+          # Assets`, in warpgate-web. That crate is `#[derive(RustEmbed)]` over
+          # `../warpgate-web/dist`, which does not exist in a fresh checkout --
+          # it is git-ignored and produced by `just openapi && just npm run
+          # build` in docker/Dockerfile.cove, after installing Node 24. This
+          # container is bare rust:1-bookworm with no Node, so ANY crate
+          # depending on warpgate-web cannot compile here. Exactly one of the
+          # three does: warpgate-protocol-http. Its 37 tests are still owed.
+          #
+          # I could have known that before pushing with one grep of the five
+          # Cargo.toml files. I added crates to a -p list without once checking
+          # what they pull in against what this container can build. The
+          # correction for asserting instead of counting was itself pushed
+          # without checking -- so warpgate-protocol-ssh's 17 and
+          # warpgate-core's 27 did not run either, because cargo aborts the
+          # whole invocation on the first crate that will not compile.
+          #
+          # These four ARE the crates that compile without a frontend, worth 61
+          # of our own tests. The remaining 37 need either a stub dist/ (does
+          # rust-embed accept an empty folder? unverified -- that is a CI
+          # measurement, not something to assert here) or Node in this
+          # container. Next step, not a closed question.
           # 7g -> 10g (2026-09-15, ops-approved as ONE measurement run). Kept
           # in step with the builder cap below purely so the two do not drift;
           # this test container has never been the one pressing a ceiling.
@@ -116,7 +142,7 @@ jobs:
           # seconds" claim, which was never true.
           docker create --name "$NAME" --network bridge --cpus 4 --memory 10g --memory-swap 10g \
             -e CARGO_BUILD_JOBS=2 -w /src docker.io/library/rust:1-bookworm \
-            bash -c 'rustup show && cargo test -p warpgate-common-http -p warpgate-common -p warpgate-protocol-http -p warpgate-protocol-ssh -p warpgate-core && echo "---- tests passed; regenerating config schema ----" && cargo run -p warpgate-common --bin config-schema > /tmp/config-schema.generated.json'
+            bash -c 'rustup show && cargo test -p warpgate-common-http -p warpgate-common -p warpgate-protocol-ssh -p warpgate-core && echo "---- tests passed; regenerating config schema ----" && cargo run -p warpgate-common --bin config-schema > /tmp/config-schema.generated.json'
           docker cp . "$NAME":/src
           set +e
           docker start -a "$NAME"
