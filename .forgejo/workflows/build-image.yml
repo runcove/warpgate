@@ -67,9 +67,37 @@ jobs:
           # The four client-ip tests DID run, but only because they happen to
           # live in warpgate-common-http. That was luck, not design, and the
           # gate "the four new tests pass in CI" was being met by accident.
-          # warpgate-protocol-http is deliberately NOT added: our patches added
-          # no tests there, and pulling in a protocol crate would invalidate
-          # the no-bind reasoning above.
+          #
+          # WHY FIVE -p FLAGS (2026-09-17, later the same day). The version of
+          # this comment written a few hours ago said "warpgate-protocol-http
+          # is deliberately NOT added: our patches added no tests there, and
+          # pulling in a protocol crate would invalidate the no-bind reasoning
+          # above". BOTH halves of that were wrong, and the first half was the
+          # one doing the work:
+          #
+          #   1. Counting `#[test]`/`#[tokio::test]` at each ref rather than
+          #      assuming: upstream v0.28.6 has 35 tests in
+          #      warpgate-protocol-http and our branch has 72. Our patches
+          #      added 37 there, 17 to warpgate-protocol-ssh and 27 to
+          #      warpgate-core. Eighty-one of our own tests, none of which had
+          #      ever executed. Fixing the -p list for ONE crate this morning
+          #      and not re-running the count for the others repeated, within
+          #      hours, the exact mistake that comment was written to record.
+          #   2. Binding would not invalidate anything anyway. The choice above
+          #      is bridge over HOST; a test binding 127.0.0.1 is fine in a
+          #      bridge namespace and in fact safer there, since host would put
+          #      it in dind's shared namespace. And it is moot: every network
+          #      primitive in these three crates (reqwest::Client construction
+          #      in client_cache.rs and analytics.rs, UdpSocket::bind in
+          #      cluster.rs) sits in production code, not in a #[cfg(test)]
+          #      module. Their tests are in-process assertions like the rest.
+          #
+          # COST: unmeasured on purpose. These are large crates and this
+          # container is capped at 4 CPUs / 10g / CARGO_BUILD_JOBS=2, so this
+          # run IS the measurement -- the same discipline the schema note below
+          # insists on. If it proves too slow or hits the ceiling, the fix is a
+          # bigger cap or a split job, NOT dropping crates back out and
+          # inventing a reason why their tests do not matter.
           # 7g -> 10g (2026-09-15, ops-approved as ONE measurement run). Kept
           # in step with the builder cap below purely so the two do not drift;
           # this test container has never been the one pressing a ceiling.
@@ -88,7 +116,7 @@ jobs:
           # seconds" claim, which was never true.
           docker create --name "$NAME" --network bridge --cpus 4 --memory 10g --memory-swap 10g \
             -e CARGO_BUILD_JOBS=2 -w /src docker.io/library/rust:1-bookworm \
-            bash -c 'rustup show && cargo test -p warpgate-common-http -p warpgate-common && echo "---- tests passed; regenerating config schema ----" && cargo run -p warpgate-common --bin config-schema > /tmp/config-schema.generated.json'
+            bash -c 'rustup show && cargo test -p warpgate-common-http -p warpgate-common -p warpgate-protocol-http -p warpgate-protocol-ssh -p warpgate-core && echo "---- tests passed; regenerating config schema ----" && cargo run -p warpgate-common --bin config-schema > /tmp/config-schema.generated.json'
           docker cp . "$NAME":/src
           set +e
           docker start -a "$NAME"
