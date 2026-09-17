@@ -1,0 +1,213 @@
+# Watch upstream warp-tech/warpgate for a new STABLE release and replay our
+# patches onto it. Stage 1, Step 14 of the front-door plan.
+#
+# What it does NOT do, deliberately:
+#   - it never touches an existing cove-patches-* branch. A successful replay
+#     pushes a NEW branch, cove-patches-<new tag>, and the build runs from that.
+#     Nothing that currently works can be broken by this job.
+#   - on a conflict it pushes NOTHING and reports instead. A half-replayed
+#     branch that builds is more dangerous than no branch at all, because the
+#     image would look legitimate.
+#   - it ignores prereleases. GitHub's releases/latest excludes them, which is
+#     the behaviour we want: the gate is "no missed STABLE release" (operator
+#     ruling 2026-09-17). Upstream's v0.29.0-beta.* are correctly invisible here.
+#
+# PREREQUISITE, without which the conflict path is silent:
+#   the forge repo secret OPS_INBOX_TOKEN must exist. It comes from a
+#   `warpgate-upstream=` line in ansible/secrets/homelab-ops.env, deployed by the
+#   homelab_ops role into ~/.config/homelab-ops/tokens.env (never hand-edit that
+#   file), and copied into the forge repo's secrets by someone with forge admin.
+#   If the secret is absent the report step fails loudly rather than skipping --
+#   see the guard in `report`. A watcher whose only failure path is silent is
+#   worse than no watcher.
+name: upstream-watch
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+    inputs:
+      new_tag:
+        description: 'Override the upstream tag to replay onto (rehearsal)'
+        required: false
+      old_tag:
+        description: 'Override the base tag to replay FROM (rehearsal)'
+        required: false
+      branch_prefix:
+        description: 'Prefix for the pushed branch. Use rehearsal/ to dry-run: the build ignores it.'
+        required: false
+        default: ''
+concurrency: {group: warpgate-upstream, cancel-in-progress: false}
+jobs:
+  watch:
+    runs-on: docker
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 0, fetch-tags: true}
+
+      - name: resolve what is new and what we are on
+        id: resolve
+        # Inputs reach the shell as ENVIRONMENT VARIABLES, never interpolated
+        # into the script text, for two independent reasons:
+        #
+        # 1. RENDERING. A `schedule` event supplies no inputs at all. `${{
+        #    inputs.x }}` on that path has nothing to resolve; the `|| ''`
+        #    fallback makes it an empty string instead of depending on how this
+        #    runner treats an absent context. The first scheduled fire must not
+        #    be able to fail on template rendering before it runs a line.
+        #
+        # 2. INJECTION. A dispatch input is attacker-controlled in the sense
+        #    that matters: whoever can dispatch chooses the text. Interpolated
+        #    directly into `run:`, a tag like `x"; rm -rf /; #` becomes shell
+        #    source. As an env var it is only ever data. The first draft of this
+        #    file did interpolate them; that was my mistake and this is the fix.
+        env:
+          IN_NEW:    ${{ inputs.new_tag || '' }}
+          IN_OLD:    ${{ inputs.old_tag || '' }}
+          IN_PREFIX: ${{ inputs.branch_prefix || '' }}
+        run: |
+          set -euo pipefail
+
+          # NEW: the input, or upstream's latest STABLE release.
+          if [ -n "$IN_NEW" ]; then
+            NEW="$IN_NEW"
+            echo "NEW from input: $NEW"
+          else
+            NEW=$(curl -fsSL --max-time 30 \
+                  https://api.github.com/repos/warp-tech/warpgate/releases/latest \
+                  | jq -r '.tag_name')
+            echo "NEW from releases/latest: $NEW"
+          fi
+          # jq prints the string "null" rather than failing when the key is
+          # absent, so an API shape change or a rate-limit body would otherwise
+          # sail through as a tag literally named "null" and get rebased onto.
+          case "$NEW" in
+            ''|null) echo "could not resolve an upstream tag -- refusing to guess"; exit 1 ;;
+          esac
+
+          # OLD: the input, or the highest-versioned cove-patches-v* branch.
+          if [ -n "$IN_OLD" ]; then
+            OLD="$IN_OLD"
+          else
+            OLD=$(git branch -r --list 'origin/cove-patches-v*' \
+                  | sed 's|.*origin/cove-patches-||' \
+                  | sort -V | tail -1)
+          fi
+          case "$OLD" in
+            '') echo "no cove-patches-v* branch found -- nothing to replay from"; exit 1 ;;
+          esac
+          echo "OLD: $OLD"
+
+          {
+            echo "new=$NEW"
+            echo "old=$OLD"
+            echo "branch=${IN_PREFIX}cove-patches-$NEW"
+            echo "source_branch=cove-patches-$OLD"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: already current?
+        id: check
+        env:
+          NEW: ${{ steps.resolve.outputs.new }}
+          OLD: ${{ steps.resolve.outputs.old }}
+        run: |
+          set -euo pipefail
+          if [ "$NEW" = "$OLD" ]; then
+            echo "already current ($OLD)"
+            echo "todo=no" >> "$GITHUB_OUTPUT"
+          else
+            echo "upstream $NEW is ahead of ours $OLD"
+            echo "todo=yes" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: replay our patches onto the new release
+        id: replay
+        if: steps.check.outputs.todo == 'yes'
+        # Same rule as the resolve step: through env, never into the script
+        # text. These are our own step outputs, but `new` is derived from a
+        # dispatch input, and single-quoting is not a defence — a value
+        # containing a single quote closes the quote and the rest is shell.
+        env:
+          NEW: ${{ steps.resolve.outputs.new }}
+          OLD: ${{ steps.resolve.outputs.old }}
+          SRC: ${{ steps.resolve.outputs.source_branch }}
+          DST: ${{ steps.resolve.outputs.branch }}
+        run: |
+          set -uo pipefail          # NOT -e: a failed rebase is an outcome here
+
+          git config user.email "ops@tenfourty.site"
+          git config user.name  "warpgate-upstream-watch"
+
+          if ! git fetch --no-tags https://github.com/warp-tech/warpgate.git "refs/tags/$NEW:refs/tags/$NEW"; then
+            echo "could not fetch upstream tag $NEW"; echo "outcome=fetch-failed" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+
+          COUNT=$(git rev-list --count "$OLD..origin/$SRC")
+          echo "replaying $COUNT patches from $SRC onto $NEW"
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+
+          git checkout -q -B "$DST" "origin/$SRC"
+          if git rebase --onto "$NEW" "$OLD" "$DST"; then
+            echo "rebase clean"
+            echo "outcome=clean" >> "$GITHUB_OUTPUT"
+          else
+            # Capture the conflicting paths BEFORE aborting -- the abort clears
+            # them, and a report naming no files is a report nobody can act on.
+            CONFLICTS=$(git diff --name-only --diff-filter=U | tr '\n' ' ')
+            echo "conflicts: $CONFLICTS"
+            git rebase --abort || true
+            echo "conflicts=$CONFLICTS" >> "$GITHUB_OUTPUT"
+            echo "outcome=conflict" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: push the replayed branch
+        if: steps.replay.outputs.outcome == 'clean'
+        env:
+          DST: ${{ steps.resolve.outputs.branch }}
+        run: |
+          set -euo pipefail
+          git push origin "$DST"
+          echo "pushed $DST -- the build runs from here"
+
+      - name: report a conflict to the ops inbox
+        if: steps.replay.outputs.outcome == 'conflict' || steps.replay.outputs.outcome == 'fetch-failed'
+        env:
+          TOKEN:     ${{ secrets.OPS_INBOX_TOKEN }}
+          NEW:       ${{ steps.resolve.outputs.new }}
+          COUNT:     ${{ steps.replay.outputs.count }}
+          CONFLICTS: ${{ steps.replay.outputs.conflicts }}
+        run: |
+          set -euo pipefail
+          # Fail loudly if the token is missing. The alternative -- skipping the
+          # post -- means a conflict is discovered only when someone wonders why
+          # no new branch appeared, which could be months.
+          if [ -z "$TOKEN" ]; then
+            echo "OPS_INBOX_TOKEN is not set, so this conflict cannot be reported."
+            echo "Fix the secret; do not let this job pass quietly."
+            exit 1
+          fi
+          # Build the body with jq, not string interpolation. CONFLICTS is a
+          # list of paths that came from UPSTREAM's tree, so it is not ours to
+          # trust: a filename containing a quote or backslash would produce
+          # malformed JSON and the report would be lost at the exact moment it
+          # matters. jq --arg escapes it correctly whatever it contains.
+          jq -n --arg new "$NEW" --arg count "$COUNT" --arg conflicts "$CONFLICTS" \
+            '{source: "warpgate-upstream", severity: "warning",
+              title: "Warpgate \($new) needs a hand",
+              message: "replaying \($count) patches onto \($new) stopped at: \($conflicts)"}' \
+          | curl -fsS -X POST http://192.168.10.240:9099/v1/events/warpgate-upstream \
+              -H "Authorization: Bearer $TOKEN" \
+              -H 'Content-Type: application/json' \
+              --data-binary @-
+          echo "reported"
+
+      - name: summary
+        if: always()
+        env:
+          NEW:    ${{ steps.resolve.outputs.new }}
+          OLD:    ${{ steps.resolve.outputs.old }}
+          ACTION: ${{ steps.check.outputs.todo == 'no' && 'already current' || steps.replay.outputs.outcome }}
+        run: |
+          echo "upstream: $NEW"
+          echo "ours:     $OLD"
+          echo "action:   $ACTION"
