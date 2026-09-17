@@ -250,7 +250,21 @@ jobs:
         run: echo "tests only on wip/*"
       - name: registry login
         if: ${{ !startsWith(github.ref_name, 'wip/') }}
-        run: docker login git.tenfourty.site -u jeremy --password-stdin <<< "${{ secrets.REGISTRY_TOKEN }}"
+        # The token travels in env:, not spliced into the script. An
+        # expression inside `run:` is substituted into the script TEXT before
+        # any shell sees it, so the secret becomes part of the rendered
+        # source: a `set -x`, a shell trace, or an error message quoting the
+        # failing line can surface it, and the runner's log masking is the
+        # last line of defence rather than the first. As an env var it is only
+        # ever data, and `--password-stdin` keeps it off the argv where every
+        # local process could read it via /proc.
+        #
+        # Concretely: until this changed, reading a failed run's log meant
+        # piping it through a grep filter so a whole log could never reach a
+        # transcript. That constraint is gone now, which is most of the point.
+        run: docker login git.tenfourty.site -u jeremy --password-stdin <<< "$REGISTRY_TOKEN"
+        env:
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
       - name: build (BuildKit, capped via docker-container driver-opts, registry cache)
         if: ${{ !startsWith(github.ref_name, 'wip/') }}
         run: |
