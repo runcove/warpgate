@@ -119,11 +119,25 @@ jobs:
           # warpgate-core's 27 did not run either, because cargo aborts the
           # whole invocation on the first crate that will not compile.
           #
-          # These four ARE the crates that compile without a frontend, worth 61
-          # of our own tests. The remaining 37 need either a stub dist/ (does
-          # rust-embed accept an empty folder? unverified -- that is a CI
-          # measurement, not something to assert here) or Node in this
-          # container. Next step, not a closed question.
+          # ANSWERED, by measurement (run 506, wip/protocol-http-tests,
+          # 2026-09-17): rust-embed's derive DOES accept an empty folder. It
+          # generates a normal Assets::get that returns None for everything, so
+          # `mkdir -p warpgate-web/dist` below is enough to compile
+          # warpgate-web in a container with no Node at all. warpgate-protocol-
+          # http then built and ran its 72 tests green -- 35 upstream's and the
+          # 37 of ours that had never executed. Total 279 tests, 0 failed.
+          #
+          # The stub is CORRECT here and would be WRONG in the image build:
+          # these tests are in-process assertions that never serve an asset, so
+          # an Assets::get returning None is never called. The real image is
+          # built by docker/Dockerfile.cove, which runs `just npm run build`
+          # and embeds the real dist. If a test is ever added here that DOES
+          # serve an asset, it will fail against the stub rather than silently
+          # pass -- which is the right failure.
+          #
+          # Do not remove the mkdir to "tidy up": crate-closure.py reads this
+          # file for that exact string, and deleting it makes the gate start
+          # refusing the frontend crates again, correctly.
           # 7g -> 10g (2026-09-15, ops-approved as ONE measurement run). Kept
           # in step with the builder cap below purely so the two do not drift;
           # this test container has never been the one pressing a ceiling.
@@ -142,7 +156,7 @@ jobs:
           # seconds" claim, which was never true.
           docker create --name "$NAME" --network bridge --cpus 4 --memory 10g --memory-swap 10g \
             -e CARGO_BUILD_JOBS=2 -w /src docker.io/library/rust:1-bookworm \
-            bash -c 'rustup show && cargo test -p warpgate-common-http -p warpgate-common -p warpgate-protocol-ssh -p warpgate-core && echo "---- tests passed; regenerating config schema ----" && cargo run -p warpgate-common --bin config-schema > /tmp/config-schema.generated.json'
+            bash -c 'rustup show && mkdir -p warpgate-web/dist && cargo test -p warpgate-common-http -p warpgate-common -p warpgate-protocol-ssh -p warpgate-core -p warpgate-protocol-http && echo "---- tests passed; regenerating config schema ----" && cargo run -p warpgate-common --bin config-schema > /tmp/config-schema.generated.json'
           docker cp . "$NAME":/src
           set +e
           docker start -a "$NAME"
