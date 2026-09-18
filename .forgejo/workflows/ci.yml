@@ -29,15 +29,34 @@ jobs:
     # archive went EOL 2026-08-31, so an upstream-identical bullseye image
     # can no longer even be built.
     #
-    # This image is free: it carries `cargo` and `find`, two of the eight
-    # tools checks.yaml's checks declare between them. `jq`/`helm`/`biome`
-    # cost seconds and are installed below. `just`/`taplo`/`cargo-deny` are
-    # `cargo install` and cost minutes each -- deliberately NOT added here;
-    # see the task brief. Their checks (`cargo-deny`, `fmt-toml`, `clippy`,
-    # `schema-compat`) keep refusing 97, naming exactly the tool they
-    # wanted, until part (c) decides how the compiler cache pays for that.
-    container:
-      image: rust:1.97.1-bookworm@sha256:408fe88047cef61a2087653b0c5255fa51c0f2d6d94ddedd7a2562a9b91a46f6
+    # WITHDRAWN 2026-09-19, after the run it was written for. Runs 518, 523
+    # and 525 all died in the same place, and it is not our checks:
+    #
+    #   OCI runtime exec failed: exec: "node": executable file not found
+    #
+    # act_runner executes JavaScript actions -- `actions/checkout@v4` among
+    # them -- with `node` INSIDE the job container. A Rust image has no
+    # node, so checkout cannot run and the job dies before any check
+    # exists. Two facts were proven by those runs and are worth keeping:
+    # the runner DOES honour a job-level `container:` (it pulled and
+    # started this exact digest, with dind alongside), and this digest is
+    # pullable. The override works; the image was the wrong one.
+    #
+    # Not replaced with a rust+node image, because that treats the symptom.
+    # `run-check.sh:118-127` runs the tools gate with `command -v` in the
+    # JOB container, then `:166-176` runs capped checks in the SANDBOX --
+    # so for every compiling check the gate interrogates a filesystem the
+    # command will never execute on. `cargo` was being demanded where it is
+    # never used. The fix is to move that question to where the work
+    # happens (Ruling 55, its own task, its own tests -- a safety gate
+    # moving across a boundary is not folded into an image change).
+    #
+    # So: back to the runner's stock `node:22-bookworm`, plus the four
+    # small tools installed below. That returns `lockfile`, `biome` and
+    # `helm-lint` to being able to genuinely pass -- they need `jq`,
+    # `biome`, `helm` and `find`, all present -- while the compiling checks
+    # keep refusing 97 naming `cargo`, which is honest and is exactly what
+    # run 514 measured. Honest refusals beat a job that cannot start.
     services:
       dind:
         image: docker:28-dind
