@@ -179,5 +179,20 @@ out=$(FORGEJO_ACTIONS=true HARDENED_RUN_FAKE_INSPECT_CPUS=4000000000 \
 grep -q "HARDENED_RUN_FAKE_INSPECT_CPUS" <<<"$out" && ok "names HARDENED_RUN_FAKE_INSPECT_CPUS as the offender" \
   || bad "did not name the offending variable: $out"
 
+# 15. TASK 4 FIX ROUND 1 (contract fix, authorised there): a missing
+#     HARDENED_RUN_IMAGE must exit 93 ("required configuration missing"),
+#     not bash's own `${VAR:?}` exit status 1 -- which is indistinguishable
+#     from an ordinary script crash and sits outside this file's exit-code
+#     contract entirely, defeating any caller (run-check.sh included) that
+#     tries to treat the 89-99 band as "did not run safely". Deliberately no
+#     stub docker on PATH: the fix must refuse before ever trying to invoke
+#     docker, real or fake, so a leftover attempt to run it would surface
+#     here as some other rc (e.g. 127, command not found), not 93.
+out=$(unset HARDENED_RUN_IMAGE; "$SCRIPT" --cpus 4 --memory 7g -- true 2>&1); rc=$?
+[ "$rc" -eq 93 ] && ok "missing HARDENED_RUN_IMAGE exits 93, not a bare 1" \
+  || bad "missing HARDENED_RUN_IMAGE did not exit 93 (rc=$rc): $out"
+grep -qi "HARDENED_RUN_IMAGE" <<<"$out" && ok "names the missing configuration" \
+  || bad "did not name what configuration is missing: $out"
+
 echo; [ "$fails" -eq 0 ] && echo "PASS" || echo "FAILURES"
 exit "$fails"

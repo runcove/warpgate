@@ -15,6 +15,16 @@
 # (fix round 1: a stub whose `docker inspect` exited 1 let the command run
 # with no cap at all, silently, because the old check only ever compared the
 # read-back against the literal string "0").
+#
+# Exit codes 89-99 are this script's reserved "could not run safely" band --
+# not a statement about whatever command was asked to run. Every caller
+# (run-check.sh, and anything else that wraps this script) must treat the
+# whole band as a refusal, not just the specific codes documented here:
+# enumerating known codes is how a new one gets misread as an ordinary
+# result. Documented codes so far: 90 cap read-back failed or didn't match,
+# 91 the container could not be created, 92 a test hook leaked into a real
+# CI run, 93 required configuration is missing (e.g. HARDENED_RUN_IMAGE
+# unset).
 set -uo pipefail
 
 # The test hooks below exist so this script's failure paths are testable on a
@@ -145,7 +155,17 @@ fi
 if [ "${HARDENED_RUN_DRY:-}" = "1" ]; then
   : # nothing further to read back; whatever was injected above is all there is
 elif [ "$HAVE_MEM" -eq 0 ] || [ "$HAVE_CPUS" -eq 0 ]; then
-  docker run -d "${ARGS[@]}" --entrypoint sleep "${HARDENED_RUN_IMAGE:?set HARDENED_RUN_IMAGE}" 86400 >/dev/null || {
+  # Not `"${HARDENED_RUN_IMAGE:?set HARDENED_RUN_IMAGE}"` -- that form kills the
+  # script via bash's own parameter-expansion error, exit 1, before `docker run`
+  # is ever reached, which is indistinguishable from an ordinary script failure
+  # and outside this file's own exit-code contract. A missing required setting is
+  # a refusal like the ones above it, not a bare crash, so it gets its own code
+  # in the same reserved band: 93, "required configuration missing".
+  [ -n "${HARDENED_RUN_IMAGE:-}" ] || {
+    echo "hardened-run: FATAL -- HARDENED_RUN_IMAGE is not set. Refusing to run." >&2
+    exit 93
+  }
+  docker run -d "${ARGS[@]}" --entrypoint sleep "$HARDENED_RUN_IMAGE" 86400 >/dev/null || {
     echo "hardened-run: could not start the capped container" >&2; exit 91; }
   if [ "$HAVE_MEM" -eq 0 ]; then
     MEM_ACTUAL="$(docker inspect -f '{{.HostConfig.Memory}}' "$NAME" 2>/dev/null)"; MEM_RC=$?
