@@ -18,6 +18,28 @@ fails=0
 ok()  { echo "  ok    $1"; }
 bad() { echo "  FAIL  $1"; fails=1; }
 
+# FIX ROUND 1 ADDENDUM: a missing required input is a refusal (93), not an
+# ordinary exit 1 indistinguishable from any other failure -- same defect,
+# same fix, as hardened-run.sh's HARDENED_RUN_IMAGE case and run-check.sh's
+# missing check-name case.
+out=$("$SCRIPT" 2>&1); rc=$?
+[ "$rc" -eq 93 ] && ok "missing bucket argument exits 93, not a bare 1" \
+  || bad "missing bucket argument did not exit 93 (rc=$rc): $out"
+
+out=$(unset S3_ENDPOINT; "$SCRIPT" warpgate-sccache 2>&1); rc=$?
+[ "$rc" -eq 93 ] && ok "missing S3_ENDPOINT exits 93, not a bare 1" \
+  || bad "missing S3_ENDPOINT did not exit 93 (rc=$rc): $out"
+grep -qi "S3_ENDPOINT" <<<"$out" && ok "names the missing configuration" \
+  || bad "did not name what configuration is missing: $out"
+
+# THE TRAP THIS MATTERS FOR: `eval "$(cache-env.sh ...)"` of a refusal that
+# printed nothing still `eval`s to success (exit 0), so a caller checking
+# only "did eval fail" would never see this. Confirm the refusal itself
+# prints no partial KEY=VALUE line an eval could pick up.
+out=$(unset S3_ENDPOINT; "$SCRIPT" warpgate-sccache 2>/dev/null)
+[ -z "$out" ] && ok "no partial KEY=VALUE output leaks out on refusal" \
+  || bad "refusal still printed output an eval would pick up: $out"
+
 out=$(S3_ENDPOINT=https://oga2.example:443 "$SCRIPT" warpgate-sccache 2>&1)
 grep -q "RUSTC_WRAPPER=sccache"            <<<"$out" && ok "sets the compiler wrapper" || bad "no RUSTC_WRAPPER: $out"
 grep -q "SCCACHE_BUCKET=warpgate-sccache"  <<<"$out" && ok "bucket is the one passed"  || bad "wrong bucket: $out"

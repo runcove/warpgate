@@ -25,7 +25,15 @@ done
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CHECKS="${CHECKS_FILE:-$HERE/../checks.yaml}"
-NAME="${1:?usage: run-check.sh <check-name>}"
+
+# Not `"${1:?...}"` -- that form kills the script via bash's own
+# parameter-expansion error, exit 1, indistinguishable from an ordinary
+# failure. A missing required argument is a refusal like the ones below it.
+if [ $# -lt 1 ] || [ -z "${1:-}" ]; then
+  echo "run-check: FATAL -- usage: run-check.sh <check-name> (required argument missing). Refusing to run." >&2
+  exit 93
+fi
+NAME="$1"
 
 # The lookup is done by a helper so the shell never parses YAML, under a
 # timeout so a hung lookup (a wedged interpreter, a filesystem stall on

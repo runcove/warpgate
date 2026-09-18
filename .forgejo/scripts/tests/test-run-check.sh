@@ -52,6 +52,13 @@ grep -q "hardened-run" <<<"$out" && ok "'unverified' is treated as compiling" \
 "$SCRIPT" no-such-check >/dev/null 2>&1
 [ $? -ne 0 ] && ok "unknown check name is refused" || bad "unknown check passed"
 
+# FIX ROUND 1 ADDENDUM: a missing check-name argument is a refusal (93), not
+# an ordinary exit 1 -- same defect, same fix, as hardened-run.sh's
+# HARDENED_RUN_IMAGE case and cache-env.sh's missing-bucket/S3_ENDPOINT cases.
+out=$("$SCRIPT" 2>&1); rc=$?
+[ "$rc" -eq 93 ] && ok "missing check-name argument exits 93, not a bare 1" \
+  || bad "missing check-name argument did not exit 93 (rc=$rc): $out"
+
 # FIX ROUND 1, Major 1: exit codes 89-99 are hardened-run.sh's reserved
 # "could not run safely" band. A refusal there is not a statement about the
 # check, so it must NEVER be downgraded by state: reporting -- nine of the

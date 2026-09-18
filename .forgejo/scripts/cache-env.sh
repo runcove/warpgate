@@ -18,6 +18,11 @@
 # from a genuine first build unless compile requests is also checked. That is
 # why sccache's own account of its startup, wherever it appears in the blob,
 # outranks every counter below.
+#
+# Exit 93 ("required configuration missing") joins the same reserved refusal
+# band hardened-run.sh documents (89-99) and run-check.sh checks for as a
+# whole -- bucket mode uses only this one code from it; --verdict's own
+# COLD/WARM/FAILED vocabulary and exit 0/1 are unrelated and unaffected.
 set -uo pipefail
 
 if [ "${1:-}" = "--verdict" ]; then
@@ -107,8 +112,30 @@ if [ "${1:-}" = "--verdict" ]; then
   echo "WARM"; exit 0
 fi
 
-BUCKET="${1:?usage: cache-env.sh <bucket> | --verdict <stats>}"
-: "${S3_ENDPOINT:?S3_ENDPOINT must be set}"
+# Not `"${1:?...}"`/`": ${S3_ENDPOINT:?...}"` -- either form kills the script
+# via bash's own parameter-expansion error, exit 1, which is indistinguishable
+# from an ordinary failure. Missing required configuration is a refusal like
+# hardened-run.sh's and run-check.sh's, so it gets the same code: 93.
+#
+# THIS EXIT STATUS IS LOAD-BEARING. This script's only output in bucket mode
+# is a run of `KEY=VALUE` lines meant to be captured and `eval`'d by a
+# caller. `eval "$(cache-env.sh <bucket>)"` of a refusal that printed
+# nothing is `eval` of an empty string, which succeeds (exit 0) regardless
+# of why this script refused. A caller that does not check `$?` before
+# evaluating gets a build that silently runs with no compiler cache at
+# all -- correct, just an hour slower, and nothing reports why. Check the
+# exit status before evaluating the output; do not assume a non-empty
+# capture just because the command "ran".
+if [ $# -lt 1 ] || [ -z "${1:-}" ]; then
+  echo "cache-env.sh: FATAL -- usage: cache-env.sh <bucket> | --verdict <stats> (required argument missing). Refusing to run." >&2
+  exit 93
+fi
+BUCKET="$1"
+
+if [ -z "${S3_ENDPOINT:-}" ]; then
+  echo "cache-env.sh: FATAL -- S3_ENDPOINT must be set. Refusing to run." >&2
+  exit 93
+fi
 
 # A bucket name becomes a single KEY=VALUE line below; a stray newline in it
 # would inject an extra line into whatever reads this script's output next.
