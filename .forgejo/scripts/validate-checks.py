@@ -33,8 +33,9 @@ def main(argv):
         return 1
     present = {line.split("/")[-1] for line in listing.stdout.split()}
     if not present:
-        print(f"INVALID: {tag} has no .github/workflows — refusing to validate "
-              "against an empty listing, which would pass everything",
+        print(f"INVALID: {tag} has no .github/workflows — an empty listing cannot "
+              "tell 'the tag or path is wrong' apart from 'every check was removed', "
+              "so refuse rather than blame the checks",
               file=sys.stderr)
         return 1
 
