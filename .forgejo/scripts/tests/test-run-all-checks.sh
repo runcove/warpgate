@@ -49,8 +49,14 @@ out=$(run_with_map "check-a=93 check-b=1 check-c=0" 2>&1); rc=$?
 grep -q "checks refused: 1, checks failed: 1" <<<"$out" \
   && ok "counts one refused and one failed, distinctly" || bad "counters wrong: $out"
 
-# 4. Same property, reversed order: an ordinary failure THEN a refusal must
-#    still end on the refusal -- order must not change the outcome.
+# 4. An ordinary failure THEN a refusal, with nothing after the refusal:
+#    true of the current code, and worth keeping, but it does NOT
+#    discriminate old from new -- the reviewer reconstructed the pre-fix
+#    last-writer-wins loop and ran it against this exact sequence: with the
+#    refusal already last, "last write" and "first refusal" agree by
+#    coincidence (rc=93 either way). Case 6 below is the version of this
+#    ordering that does discriminate: a failure AFTER the refusal too, so
+#    last-writer-wins and first-refusal-wins actually disagree.
 out=$(run_with_map "check-a=1 check-b=93 check-c=0" 2>&1); rc=$?
 [ "$rc" -eq 93 ] && ok "a refusal after an ordinary failure still wins" \
   || bad "the refusal did not win when it came second (rc=$rc): $out"
@@ -62,6 +68,19 @@ out=$(run_with_map "check-a=93 check-b=90 check-c=0" 2>&1); rc=$?
   || bad "a later refusal overwrote the first (rc=$rc): $out"
 grep -q "checks refused: 2, checks failed: 0" <<<"$out" \
   && ok "counts both refusals" || bad "counters wrong: $out"
+
+# 6. THE ordering case 4 could not prove: a refusal with an ordinary
+#    failure both BEFORE and AFTER it. Last-writer-wins would report the
+#    LAST check's code (2) here, not the refusal's (93) -- unlike case 4,
+#    where the refusal already being last made the two algorithms agree by
+#    accident. This is what actually discriminates "failure, then refusal"
+#    from the old code, by giving last-writer-wins one more chance to be
+#    wrong after the refusal.
+out=$(run_with_map "check-a=1 check-b=93 check-c=2" 2>&1); rc=$?
+[ "$rc" -eq 93 ] && ok "a refusal survives an ordinary failure both before and after it" \
+  || bad "a failure after the refusal overwrote it (rc=$rc) -- last-writer-wins is back: $out"
+grep -q "checks refused: 1, checks failed: 2" <<<"$out" \
+  && ok "counts both surrounding failures plus the one refusal" || bad "counters wrong: $out"
 
 echo; [ "$fails" -eq 0 ] && echo "PASS" || echo "FAILURES"
 exit "$fails"

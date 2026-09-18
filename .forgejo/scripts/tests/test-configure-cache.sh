@@ -48,10 +48,18 @@ out=$(unset GITHUB_ENV; S3_ENDPOINT=https://oga2.example:443 "$SCRIPT" warpgate-
 [ "$rc" -eq 0 ] && ok "runs fine with GITHUB_ENV entirely unset" \
   || bad "crashed or failed with GITHUB_ENV unset (rc=$rc): $out"
 
-# 4. A missing bucket argument is a caller error, not a silent success.
+# 4. A missing bucket argument is a caller error, not a silent success --
+#    and specifically a REFUSAL (93), not a bare bash `${1:?}` exit 1. `-ne
+#    0` alone cannot tell "the refusal branch fired" from "it failed the
+#    ordinary way and also happened to be non-zero" -- the coarse-signal gap
+#    that let a mutation of the thing this case is named for slip through
+#    unnoticed elsewhere in this arc. Assert the exact code.
 out=$("$SCRIPT" 2>&1); rc=$?
-[ "$rc" -ne 0 ] && ok "a missing bucket argument is refused, not silently accepted" \
-  || bad "ran with no bucket argument"
+[ "$rc" -eq 93 ] && ok "missing bucket argument exits 93, not a bare 1" \
+  || bad "missing bucket argument did not exit 93 (rc=$rc): $out"
+grep -q "configure-cache: FATAL -- usage: configure-cache.sh <bucket>" <<<"$out" \
+  && ok "names it as a refusal in this script's own message, not bash's builtin :? text" \
+  || bad "did not produce our own refusal message: $out"
 
 echo; [ "$fails" -eq 0 ] && echo "PASS" || echo "FAILURES"
 exit "$fails"

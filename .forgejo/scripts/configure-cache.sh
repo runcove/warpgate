@@ -12,7 +12,20 @@
 # warns loudly and the checks still run, capped, just uncached.
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
-BUCKET="${1:?usage: configure-cache.sh <bucket>}"
+
+# Not `"${1:?...}"` -- that form kills the script via bash's own
+# parameter-expansion error, exit 1, indistinguishable from an ordinary
+# failure and outside this codebase's exit-code contract (the same defect
+# already fixed in cache-env.sh, run-check.sh and hardened-run.sh). A
+# missing required argument is a refusal like the ones in its neighbours,
+# so it gets the same code: 93. Unreachable from ci.yml today, which always
+# hardcodes the bucket -- fixed anyway, on the same reasoning the operator
+# used to overrule "moot today" for the refusal-collapse fix.
+if [ $# -lt 1 ] || [ -z "${1:-}" ]; then
+  echo "configure-cache: FATAL -- usage: configure-cache.sh <bucket> (required argument missing). Refusing to run." >&2
+  exit 93
+fi
+BUCKET="$1"
 
 out=$("$HERE/cache-env.sh" "$BUCKET" 2>&1) || rc=$?
 rc="${rc:-0}"
