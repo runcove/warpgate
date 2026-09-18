@@ -240,6 +240,7 @@ jobs:
           NEW:       ${{ steps.resolve.outputs.new }}
           COUNT:     ${{ steps.replay.outputs.count }}
           CONFLICTS: ${{ steps.replay.outputs.conflicts }}
+          DRIFT:     ${{ env.DRIFT }}
         run: |
           set -euo pipefail
           # Fail loudly if the token is missing. The alternative -- skipping the
@@ -254,15 +255,38 @@ jobs:
           # a local listener in a test. The fallback IS the real inbox, so CI
           # behaviour is unchanged and nothing has to be remembered at fire time.
           INBOX_URL="${INBOX_URL:-http://192.168.10.240:9099/v1/events/warpgate-upstream}"
+
+          # A one-line, BOUNDED summary of the CI-drift check -- counts only,
+          # never the full DRIFT text. DRIFT is built from upstream's own
+          # filenames, which are unbounded and not ours to trust in a message
+          # bound for another session's inbox -- same family as the
+          # GITHUB_ENV delimiter risk above: content we don't control
+          # flowing into a structured context. The full list already lives
+          # in this run's summary.
+          DRIFT_SUMMARY=""
+          if [ -z "${DRIFT:-}" ]; then
+            :  # todo=='no' can't reach this step, but stay honest if it ever does
+          elif printf '%s\n' "$DRIFT" | grep -q '^no change:'; then
+            DRIFT_SUMMARY="upstream CI did not change between these releases."
+          elif printf '%s\n' "$DRIFT" | grep -q '^DRIFT-CHECK DID NOT COMPLETE'; then
+            DRIFT_SUMMARY="the CI-drift check did not complete -- see this run's summary/log, not reported as clean."
+          else
+            FILES_CHANGED=$(printf '%s\n' "$DRIFT" | grep -cE '^[[:space:]]*-[[:space:]]') || true
+            CHECKS_AFFECTED=$(printf '%s\n' "$DRIFT" | grep -cE '^[[:space:]]*\*[[:space:]]') || true
+            DRIFT_SUMMARY="upstream CI also changed: ${FILES_CHANGED} workflow file(s), ${CHECKS_AFFECTED} of our checks affected -- see this run's summary for the full list."
+          fi
+
           # Build the body with jq, not string interpolation. CONFLICTS is a
           # list of paths that came from UPSTREAM's tree, so it is not ours to
           # trust: a filename containing a quote or backslash would produce
           # malformed JSON and the report would be lost at the exact moment it
           # matters. jq --arg escapes it correctly whatever it contains.
           jq -n --arg new "$NEW" --arg count "$COUNT" --arg conflicts "$CONFLICTS" \
+                --arg drift "$DRIFT_SUMMARY" \
             '{source: "warpgate-upstream", severity: "warning",
               title: "Warpgate \($new) needs a hand",
-              message: "replaying \($count) patches onto \($new) stopped at: \($conflicts)"}' \
+              message: ("replaying \($count) patches onto \($new) stopped at: \($conflicts)"
+                        + (if $drift == "" then "" else "\n\n" + $drift end))}' \
           | curl -fsS -X POST "$INBOX_URL" \
               -H "Authorization: Bearer $TOKEN" \
               -H 'Content-Type: application/json' \
