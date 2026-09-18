@@ -82,16 +82,22 @@ done
 [ -n "$MEM" ]  || { echo "hardened-run: --memory is required. Running without a
 memory cap is the failure mode this script exists to prevent." >&2; exit 2; }
 [ $# -gt 0 ]   || { echo "hardened-run: no command given" >&2; exit 2; }
+# Both --workdir and --verify-file require --source -- checked together, in
+# one message naming EVERY flag that actually triggered it, not just
+# whichever happened to be checked first. `--workdir X --verify-file Y` with
+# no --source used to print only "--source is required when --workdir is
+# given" and never mention --verify-file at all, even though --verify-file
+# was equally the reason this refused -- silently dropping half of a
+# two-flag mistake from the one message a caller gets to read.
+NEEDS_SOURCE=()
+[ -n "$WORKDIR" ]     && NEEDS_SOURCE+=("--workdir")
+[ -n "$VERIFY_FILE" ] && NEEDS_SOURCE+=("--verify-file")
+if [ -z "$SOURCE" ] && [ "${#NEEDS_SOURCE[@]}" -gt 0 ]; then
+  echo "hardened-run: --source is required when ${NEEDS_SOURCE[*]} is given" >&2
+  exit 2
+fi
 if [ -n "$SOURCE" ] && [ -z "$WORKDIR" ]; then
   echo "hardened-run: --workdir is required when --source is given" >&2
-  exit 2
-fi
-if [ -n "$WORKDIR" ] && [ -z "$SOURCE" ]; then
-  echo "hardened-run: --source is required when --workdir is given" >&2
-  exit 2
-fi
-if [ -n "$VERIFY_FILE" ] && [ -z "$SOURCE" ]; then
-  echo "hardened-run: --verify-file requires --source (there is nothing to verify without a copy)" >&2
   exit 2
 fi
 

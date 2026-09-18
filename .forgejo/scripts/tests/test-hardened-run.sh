@@ -340,11 +340,15 @@ else
 
     # 24. Positive: a real copy + verification lets the command run, and the
     #     command genuinely sees the copied file's content -- not a stub
-    #     claiming it did.
+    #     claiming it did. Passes --verify-file Cargo.toml -- the exact flag
+    #     run-check.sh passes in production -- so this exercises the STRONG
+    #     `test -f` branch for real, not just the weaker fallback (Finding 1,
+    #     fix round 1's review: without this flag, no real-engine case ever
+    #     touched the strong branch at all).
     out=$(
       PATH="${ENGINE_PATH_PREFIX}$PATH" HARDENED_RUN_IMAGE="$TEST_IMAGE" \
       "$SCRIPT" --cpus 1 --memory 256m --source "$SRC_DIR" --workdir /src \
-        -- cat /src/marker.txt 2>&1
+        --verify-file Cargo.toml -- cat /src/marker.txt 2>&1
     ); rc=$?
     [ "$rc" -eq 0 ] && ok "real source delivery + verification lets the command run" \
       || bad "real source delivery failed (rc=$rc): $out"
@@ -352,21 +356,23 @@ else
       || bad "copied content not visible inside the real container: $out"
 
     # 25. --workdir is genuinely applied to the real `docker exec`, not just
-    #     asserted -- checked via `pwd` inside the running container.
+    #     asserted -- checked via `pwd` inside the running container. Same
+    #     --verify-file Cargo.toml as case 24, for the same reason.
     out=$(
       PATH="${ENGINE_PATH_PREFIX}$PATH" HARDENED_RUN_IMAGE="$TEST_IMAGE" \
       "$SCRIPT" --cpus 1 --memory 256m --source "$SRC_DIR" --workdir /src \
-        -- pwd 2>&1
+        --verify-file Cargo.toml -- pwd 2>&1
     )
     grep -qx "/src" <<<"$out" && ok "the real docker exec actually runs with --workdir /src" \
       || bad "workdir not applied to the real exec: $out"
 
     # 26. Contents form, not nested: Cargo.toml lands directly at
     #     $WORKDIR/Cargo.toml, proving "SRC/." (contents) was used, not
-    #     "SRC" (which would nest everything one level deeper).
+    #     "SRC" (which would nest everything one level deeper). Same
+    #     --verify-file Cargo.toml as cases 24-25.
     PATH="${ENGINE_PATH_PREFIX}$PATH" HARDENED_RUN_IMAGE="$TEST_IMAGE" \
       "$SCRIPT" --cpus 1 --memory 256m --source "$SRC_DIR" --workdir /src \
-        -- test -f /src/Cargo.toml >/dev/null 2>&1
+        --verify-file Cargo.toml -- test -f /src/Cargo.toml >/dev/null 2>&1
     [ $? -eq 0 ] && ok "source landed unnested at \$WORKDIR/Cargo.toml (contents form)" \
       || bad "source nested one level deeper than expected -- SRC vs SRC/. got mixed up"
 
@@ -396,13 +402,24 @@ else
     grep -qi "could not create" <<<"$out" && ok "names the mkdir step as the failing one, distinctly" \
       || bad "did not distinguish the mkdir failure from a cp or verify failure: $out"
 
-    # 29. THE MUTATION: on a disposable copy of the script (never the shared
-    #     checkout, never git stash -- several sessions share this tree),
-    #     neuter the real `docker cp` call so it silently no-ops. If the
-    #     verification step were decorative, this mutant would report
+    # 29. THE MUTATION, WEAK BRANCH: on a disposable copy of the script
+    #     (never the shared checkout, never git stash -- several sessions
+    #     share this tree), neuter the real `docker cp` call so it silently
+    #     no-ops. If verification were decorative, this mutant would report
     #     success against an empty $WORKDIR exactly like the bug this task
     #     exists to close. The diff is checked to touch exactly the one
-    #     intended line before the mutant is trusted.
+    #     intended line before the mutant is trusted. No --verify-file is
+    #     passed here, deliberately: this is the weak, workdir-non-empty
+    #     fallback branch, which still ships and still has real callers that
+    #     pass no --verify-file, so it keeps its own real-engine mutation
+    #     coverage rather than being folded into case 29b below. (Before fix
+    #     round 1 added --verify-file, this same unedited command was the
+    #     ONLY mutation coverage and proved the strong Cargo.toml check --
+    #     Finding 1 from that round's review: a green test whose meaning had
+    #     silently changed underneath it, still reading as though it proved
+    #     what it used to. Case 29b restores real coverage of the strong
+    #     branch; this case now correctly represents what it actually
+    #     covers.)
     MUTANT_DIR="$MARKER_DIR/mutant"
     mkdir -p "$MUTANT_DIR"
     sed 's#docker cp "\$SOURCE/\."#true "$SOURCE/."#' "$SCRIPT" > "$MUTANT_DIR/hardened-run.sh"
@@ -421,8 +438,26 @@ else
         -- true 2>&1
     ); mutant_rc=$?
     [ "$mutant_rc" -eq 98 ] && \
-      ok "a neutered docker cp is still caught by the verification step and refuses with 98" \
-      || bad "a silently no-op'd copy step was NOT caught (rc=$mutant_rc) -- the verification is decorative: $mutant_out"
+      ok "a neutered docker cp is still caught by the WEAK (no --verify-file) check and refuses with 98" \
+      || bad "a silently no-op'd copy step was NOT caught by the weak check (rc=$mutant_rc) -- the verification is decorative: $mutant_out"
+
+    # 29b. THE MUTATION, STRONG BRANCH: the identical mutant from case 29
+    #     (built once, reused here -- the mutation itself doesn't depend on
+    #     which flags a later invocation passes), now invoked WITH
+    #     --verify-file Cargo.toml -- the exact flag run-check.sh actually
+    #     uses in production. Proves the strong `test -f` check is
+    #     independently load-bearing, not just the weak fallback case 29
+    #     covers. This is the case Finding 1 (fix round 1's review) asked
+    #     for: real, un-fakeable mutation coverage of the branch production
+    #     traffic actually takes.
+    mutant_out_29b=$(
+      PATH="${ENGINE_PATH_PREFIX}$PATH" HARDENED_RUN_IMAGE="$TEST_IMAGE" \
+      "$MUTANT_DIR/hardened-run.sh" --cpus 1 --memory 256m --source "$SRC_DIR" --workdir /src \
+        --verify-file Cargo.toml -- true 2>&1
+    ); mutant_rc_29b=$?
+    [ "$mutant_rc_29b" -eq 98 ] && \
+      ok "a neutered docker cp is still caught by the STRONG (--verify-file) check and refuses with 98" \
+      || bad "a silently no-op'd copy step was NOT caught by the strong check (rc=$mutant_rc_29b) -- the verification is decorative: $mutant_out_29b"
   else
     skip "could not pull $TEST_IMAGE (no network?) -- cases 24-29 (real --source delivery) skipped"
   fi
@@ -451,6 +486,20 @@ fi
 out=$(HARDENED_RUN_DRY=1 "$SCRIPT" --cpus 4 --memory 7g --verify-file Cargo.toml -- true 2>&1); rc=$?
 [ "$rc" -eq 2 ] && ok "refuses --verify-file without --source (exit 2)" \
   || bad "did not refuse --verify-file without --source (rc=$rc): $out"
+
+# 30b. FIX ROUND 2, Finding 2 (LOW): --workdir AND --verify-file together,
+#     with no --source, used to name only --workdir in the refusal and
+#     silently drop --verify-file from the message even though it was
+#     equally the reason for the refusal. The message must now name every
+#     flag that actually triggered it, not just whichever was checked
+#     first. No container involved.
+out=$(HARDENED_RUN_DRY=1 "$SCRIPT" --cpus 4 --memory 7g --workdir /src --verify-file Cargo.toml -- true 2>&1); rc=$?
+[ "$rc" -eq 2 ] && ok "refuses --workdir + --verify-file without --source (exit 2)" \
+  || bad "did not refuse --workdir + --verify-file without --source (rc=$rc): $out"
+grep -q -- "--workdir" <<<"$out" && ok "names --workdir as one of the triggering flags" \
+  || bad "dropped --workdir from the refusal message: $out"
+grep -q -- "--verify-file" <<<"$out" && ok "names --verify-file as one of the triggering flags" \
+  || bad "dropped --verify-file from the refusal message: $out"
 
 # 31. --verify-file given, the container-side `test -f` fails: refuses 98,
 #     names the specific file, and the real command never runs.
