@@ -68,7 +68,7 @@ out=$("$SCRIPT" 2>&1); rc=$?
 # deliberately undocumented mid-band code (95), plus the band's own edges
 # (89, 99), to prove the whole range is covered, not just the codes named
 # in a comment somewhere.
-for code in 89 90 91 92 93 95 99; do
+for code in 89 90 91 92 93 95 97 99; do
   out=$(RUN_CHECK_FORCE_RC=$code "$SCRIPT" clippy 2>&1); rc=$?
   [ $rc -ne 0 ] && ok "exit $code on a reporting check still fails the job" \
     || bad "exit $code was swallowed by reporting state -- read as a lint result"
@@ -181,6 +181,77 @@ out=$(CHECKS_FILE="$FAKE_CHECKS" STUB_HARDENED_RUN_ARGS_FILE="$ARGS_FILE" \
 [ ! -e "$ARGS_FILE" ] && ok "an uncapped check never invokes hardened-run.sh at all" \
   || bad "fake-uncapped still called hardened-run.sh: $(cat "$ARGS_FILE" 2>/dev/null)"
 rm -rf "$FORWARD_DIR"
+
+# ---------------------------------------------------------------------------
+# Task 7A: a check whose declared `tools:` are missing refuses (97) before
+# running anything, instead of running and reporting whatever the missing
+# tool's own failure happens to look like (measured 2026-09-18:
+# `check-lockfile.sh` reported PASS with jq missing).
+# ---------------------------------------------------------------------------
+TOOLS_FIXTURE="$HERE/fixtures/checks-tools-test.yaml"
+
+# A self-contained PATH: only what run-check.sh itself needs to execute at
+# all (bash for its own shebang, dirname/timeout/cut/python3 for its own
+# body) -- never a PATH="" or similarly total restriction, which would break
+# bash's own execution and produce a 127 from the wrong thing, proving
+# nothing. "cargo" is deliberately absent from it -- not uninstalled
+# anywhere on this machine, just left out of this self-contained PATH -- so
+# the ONLY thing missing, from run-check.sh's point of view, is the
+# declared tool under test.
+TOOLS_BIN="${TMPDIR:-/tmp}/run-check-tools-test.$$"
+mkdir -p "$TOOLS_BIN"
+for b in bash dirname timeout cut python3; do
+  ln -sf "$(command -v "$b")" "$TOOLS_BIN/$b"
+done
+
+# Step 4(a): declared tool absent exits 97 BEFORE running anything -- proven
+# by the check's own distinctive output never appearing, not merely by the
+# exit code (a check that ran and happened to also exit 97 would pass a
+# bare `rc -eq 97` just as well).
+out=$(CHECKS_FILE="$TOOLS_FIXTURE" PATH="$TOOLS_BIN" "$SCRIPT" fake-missing-tool 2>&1); rc=$?
+[ "$rc" -eq 97 ] && ok "declared tool absent: exits 97" \
+  || bad "declared tool absent: expected rc=97, got rc=$rc: $out"
+grep -q "cargo" <<<"$out" && ok "declared tool absent: names the missing tool" \
+  || bad "declared tool absent: message does not name cargo: $out"
+grep -q "SHOULD_NOT_RUN_MARKER" <<<"$out" \
+  && bad "declared tool absent: the check's command ran anyway: $out" \
+  || ok "declared tool absent: the command never ran"
+
+# Every missing tool is reported, not just the first -- reporting only one
+# per run is how a four-tool gap takes four CI runs to discover, and each
+# of those runs costs a human a read.
+out=$(CHECKS_FILE="$TOOLS_FIXTURE" PATH="$TOOLS_BIN" "$SCRIPT" fake-missing-multi 2>&1); rc=$?
+[ "$rc" -eq 97 ] && ok "multiple declared tools absent: exits 97" \
+  || bad "multiple declared tools absent: expected rc=97, got rc=$rc: $out"
+grep -q "cargo" <<<"$out" && grep -q "made-up-tool-zzz" <<<"$out" \
+  && ok "multiple declared tools absent: names all of them, not just the first" \
+  || bad "multiple declared tools absent: did not name both missing tools: $out"
+
+# Step 4(c): a state: reporting check that refuses with 97 is NOT printed as
+# an ordinary report-only FAIL -- reuse the same declared-missing-tool case
+# (state: reporting) and assert both the non-zero exit AND the absence of
+# report-only wording, since `rc -ne 0` alone would not catch a regression
+# that kept the refusal but mislabelled it.
+out=$(CHECKS_FILE="$TOOLS_FIXTURE" PATH="$TOOLS_BIN" "$SCRIPT" fake-missing-tool 2>&1); rc=$?
+[ "$rc" -eq 97 ] && ok "reporting check's tool refusal is not downgraded to 0" \
+  || bad "reporting check's tool refusal was downgraded (rc=$rc): $out"
+grep -qi "report-only" <<<"$out" \
+  && bad "reporting check's tool refusal was printed as an ordinary report-only FAIL: $out" \
+  || ok "reporting check's tool refusal is not printed as report-only"
+
+rm -rf "$TOOLS_BIN"
+
+# Step 4(b): a check whose command exits 127 with its declared tools present
+# still exits 97 -- the backstop (Step 2), independent of Step 1. No PATH
+# restriction needed: RUN_CHECK_FORCE_RC bypasses running the command
+# entirely, so this proves the CONVERSION logic, not any particular tool's
+# absence (Step 1 is itself skipped whenever RUN_CHECK_FORCE_RC is set --
+# see run-check.sh's own comment on that guard).
+out=$(CHECKS_FILE="$TOOLS_FIXTURE" RUN_CHECK_FORCE_RC=127 "$SCRIPT" fake-present-tool 2>&1); rc=$?
+[ "$rc" -eq 97 ] && ok "command exits 127 with tools present: converted to 97" \
+  || bad "command exits 127 with tools present: expected rc=97, got rc=$rc: $out"
+grep -qi "command not found" <<<"$out" && ok "127-to-97 conversion names \"command not found\"" \
+  || bad "127-to-97 conversion did not explain itself: $out"
 
 echo; [ "$fails" -eq 0 ] && echo "PASS" || echo "FAILURES"
 exit "$fails"

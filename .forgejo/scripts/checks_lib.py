@@ -6,7 +6,7 @@ import datetime
 import yaml
 
 STATES = ("reporting", "blocking", "excepted")
-REQUIRED = ("name", "upstream", "command", "compiles", "state")
+REQUIRED = ("name", "upstream", "command", "compiles", "state", "tools")
 UPSTREAM_TAG = "v0.28.6"
 
 
@@ -35,6 +35,17 @@ def load(path):
         if raw["compiles"] not in (True, False, "unverified"):
             raise ValueError(
                 f"check {name!r}: compiles must be true, false, or 'unverified'")
+
+        # A LIST, not a scalar: a check can need more than one binary (e.g.
+        # cargo-deny needs both cargo and cargo-deny). An empty list is
+        # refused too -- almost always a check whose author did not look,
+        # and the one shape `key in raw` above cannot catch on its own,
+        # since the key IS present.
+        if not isinstance(raw["tools"], list) or not raw["tools"]:
+            raise ValueError(
+                f"check {name!r}: tools must be a non-empty list of required "
+                "binaries -- a check that declares it needs nothing is almost "
+                "always a check whose author did not look")
 
         if raw["state"] == "excepted":
             if not raw.get("reason"):

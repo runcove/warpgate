@@ -11,8 +11,10 @@ checks:
     command: "true"
     compiles: true
     state: reporting
+    tools: [bash]
   - name: fake-uncapped
     upstream: build.yml
     command: "true"
     compiles: false
     state: reporting
+    tools: [bash]

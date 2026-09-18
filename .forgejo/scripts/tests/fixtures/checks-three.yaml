@@ -8,13 +8,16 @@ checks:
     command: "true"
     compiles: false
     state: reporting
+    tools: [bash]
   - name: check-b
     upstream: build.yml
     command: "true"
     compiles: false
     state: reporting
+    tools: [bash]
   - name: check-c
     upstream: build.yml
     command: "true"
     compiles: false
     state: reporting
+    tools: [bash]

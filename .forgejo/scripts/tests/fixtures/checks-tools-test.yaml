@@ -1,0 +1,26 @@
+# Synthetic checks.yaml for testing run-check.sh's declared `tools:`
+# precondition (Task 7A) in isolation from the real checks.yaml -- whose
+# tools (cargo, jq, helm, ...) really are installed on a dev host, which
+# would make a PATH-restriction test pass by accident rather than by the
+# logic under test. "cargo" here is a stand-in for any real tool a check
+# might declare; it is never actually invoked by these fixture commands.
+upstream_tag: v0.28.6
+checks:
+  - name: fake-missing-tool
+    upstream: build.yml
+    command: "echo SHOULD_NOT_RUN_MARKER"
+    compiles: false
+    state: reporting
+    tools: [cargo]
+  - name: fake-missing-multi
+    upstream: build.yml
+    command: "echo SHOULD_NOT_RUN_MULTI"
+    compiles: false
+    state: reporting
+    tools: [cargo, made-up-tool-zzz]
+  - name: fake-present-tool
+    upstream: build.yml
+    command: "true"
+    compiles: false
+    state: reporting
+    tools: [bash]

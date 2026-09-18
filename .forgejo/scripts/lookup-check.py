@@ -23,7 +23,14 @@ def main(argv):
                 # checks_lib defines as the one true spelling. Interpolating
                 # the raw value here would make every compiling check match
                 # neither branch downstream and silently run uncapped.
-                print(f"{c['state']}|{checks_lib.compiles_token(c)}|{c['command']}")
+                #
+                # tools is comma-joined into its own field, inserted BEFORE
+                # command and read with `cut -f3` (not `-f3-`) on the shell
+                # side -- command stays LAST and is read with `-f4-`,
+                # because a check's command may itself contain a `|` and
+                # only the last field is safe to cut with an open range.
+                tools = ",".join(c["tools"])
+                print(f"{c['state']}|{checks_lib.compiles_token(c)}|{tools}|{c['command']}")
             return 0
     return 1
 

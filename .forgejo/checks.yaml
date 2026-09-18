@@ -8,56 +8,67 @@ checks:
     command: cargo deny check
     compiles: false
     state: reporting
+    tools: [cargo, cargo-deny]
   - name: lockfile
     upstream: lockfile.yml
     command: .forgejo/scripts/check-lockfile.sh
     compiles: false
     state: reporting
+    tools: [jq, find]
   - name: fmt-toml
     upstream: fmt-toml.yml
     command: cargo fmt-toml --check
     compiles: false
     state: reporting
+    tools: [cargo, taplo]
   - name: biome
     upstream: biome.yml
     command: cd warpgate-web && biome ci .
     compiles: false
     state: reporting
+    tools: [biome]
   - name: helm-lint
     upstream: helm-publish.yaml
     command: helm lint --strict helm && helm template helm >/dev/null
     compiles: false
     state: reporting
+    tools: [helm]
   - name: clippy
     upstream: clippy.yml
     command: just clippy
     compiles: true
     state: reporting
+    tools: [just, cargo]
   - name: schema-compat
     upstream: check-schema-compatibility.yml
     command: just openapi-all
     compiles: unverified
     state: reporting
+    tools: [just, cargo]
   - name: unit-tests
     upstream: test.yml
     command: cargo llvm-cov test --workspace
     compiles: true
     state: reporting
+    tools: [cargo]
   - name: release-build
     upstream: build.yml
     command: cargo build --all-features --release
     compiles: true
     state: reporting
+    tools: [cargo]
   - name: sbom
     upstream: build.yml
     command: cargo cyclonedx --all-features
     compiles: true
     state: reporting
+    tools: [cargo]
   - name: reprotest
     upstream: reprotest.yml
     command: .forgejo/scripts/reprotest.sh
     compiles: true
     state: excepted
+    tools: [cargo]
     reason: >-
       Manual-only upstream (workflow_dispatch) and stays manual here; it re-runs a
       full release build several times under a variance matrix and is not routine

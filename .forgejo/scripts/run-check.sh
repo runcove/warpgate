@@ -53,13 +53,24 @@ elif [ "$lookup_rc" -ne 0 ]; then
 fi
 STATE=$(cut -d'|' -f1 <<<"$LOOKUP")
 COMPILES=$(cut -d'|' -f2 <<<"$LOOKUP")
-COMMAND=$(cut -d'|' -f3- <<<"$LOOKUP")
+TOOLS=$(cut -d'|' -f3 <<<"$LOOKUP")
+COMMAND=$(cut -d'|' -f4- <<<"$LOOKUP")
 
 # A lookup that "succeeded" but handed back nothing to run is not a pass --
 # running an empty command would silently look identical to a check that ran
 # and passed. Refuse instead of pretending.
 [ -n "$COMMAND" ] || {
   echo "run-check: lookup for '$NAME' returned no command -- refusing to run nothing as if it passed" >&2
+  exit 2
+}
+
+# Same reasoning, for the tools field: checks_lib.load() refuses an empty
+# `tools:` list at YAML-load time, so this should be unreachable against a
+# validated checks.yaml -- but lookup-check.py is a separate program from
+# that validation, and a lookup that came back with no declared tools at all
+# is exactly as untrustworthy as one that came back with no command.
+[ -n "$TOOLS" ] || {
+  echo "run-check: lookup for '$NAME' returned no required tools -- refusing to run without checking preconditions" >&2
   exit 2
 }
 
@@ -70,6 +81,42 @@ if [ "$STATE" = "excepted" ]; then
     || REASON="(reason unavailable)"
   echo "SKIP $NAME — excepted. $REASON"
   exit 0
+fi
+
+# The declared precondition: a check that names a tool it needs and doesn't
+# have it never gets to run at all -- checked before either run path below
+# (capped or uncapped), so a check that "PASS"es having never touched its
+# own tool (measured 2026-09-18: `check-lockfile.sh` did exactly this with
+# jq) is refused before it gets the chance. Deliberately AFTER the excepted
+# check above, not before it: an excepted check never reaches a run path
+# either, and demanding its tools be installed would block CI on a tool a
+# permanently-opted-out check's own SKIP means nobody needs today.
+#
+# Also skipped when a test hook (RUN_CHECK_DRY / RUN_CHECK_FORCE_RC /
+# RUN_CHECK_FORCE_STATE) is active: those exist precisely so this script's
+# control flow is testable "without a real check command or a container
+# runtime" (see the CI-leak guard above), and a real tool's presence on PATH
+# is exactly the kind of real-environment fact they exist to let a test skip
+# past -- without this, every existing FORCE_RC/FORCE_STATE/DRY case against
+# a compiling check would start depending on cargo/just actually being
+# installed wherever this test suite runs, which is the opposite of what
+# those hooks are for. This cannot mask a real gap in production: the guard
+# at the top of this script already refuses to run at all if any of these is
+# set alongside CI/GITHUB_ACTIONS/FORGEJO_ACTIONS.
+#
+# Every declared tool is checked, not just the first -- reporting only one
+# missing tool per run is how a four-tool gap takes four CI runs to
+# discover, and each of those runs costs a human a read.
+if [ -z "${RUN_CHECK_DRY:-}" ] && [ -z "${RUN_CHECK_FORCE_RC:-}" ] && [ -z "${RUN_CHECK_FORCE_STATE:-}" ]; then
+  missing_tools=()
+  IFS=',' read -r -a TOOL_LIST <<<"$TOOLS"
+  for t in "${TOOL_LIST[@]}"; do
+    command -v "$t" >/dev/null 2>&1 || missing_tools+=("$t")
+  done
+  if [ "${#missing_tools[@]}" -gt 0 ]; then
+    echo "REFUSE $NAME — required tool(s) not installed: ${missing_tools[*]} (exit 97). The environment cannot run this check; it never ran." >&2
+    exit 97
+  fi
 fi
 
 # Whether a check is capped is a safety decision, not a convenience one: an
@@ -116,6 +163,19 @@ elif [ "$CAPPED" = "yes" ]; then
 else
   bash -lc "$COMMAND"
   rc=$?
+fi
+
+# The backstop: 127 is the shell's own "command not found", and Step 1 above
+# only catches a tool someone remembered to declare. This catches the rest
+# -- a tools: list that has drifted from what the command actually invokes,
+# or a tool missing deeper inside the check (e.g. one `just` recipe shells
+# out to) -- by converting it to the same 97 Step 1 would have used had the
+# gap been declared. Applied uniformly, including the RUN_CHECK_FORCE_RC
+# test-hook path above, so this conversion is exercised without needing a
+# real command that exits 127.
+if [ "$rc" -eq 127 ]; then
+  echo "run-check: $NAME hit \"command not found\" (exit 127) -- converting to 97: the environment is missing a tool this check needs, so nothing was proven." >&2
+  rc=97
 fi
 
 # Exit codes 89-99 are hardened-run.sh's reserved "could not run safely"

@@ -18,6 +18,7 @@ checks:
     command: cargo deny check
     compiles: false
     state: reporting
+    tools: [cargo, cargo-deny]
 """
 
 class TestLoad(unittest.TestCase):
@@ -61,6 +62,36 @@ class TestLoad(unittest.TestCase):
         with self.assertRaises(ValueError) as e:
             checks_lib.load(write(bad))
         self.assertIn("duplicate", str(e.exception).lower())
+
+    def test_missing_tools_field_is_refused(self):
+        """Task 7A: tools is now REQUIRED, same shape as the other required
+        fields -- missing entirely raises ValueError, not a KeyError further
+        downstream where the message would no longer name the check."""
+        bad = GOOD.replace("\n    tools: [cargo, cargo-deny]", "")
+        with self.assertRaises(ValueError) as e:
+            checks_lib.load(write(bad))
+        self.assertIn("cargo-deny", str(e.exception))
+        self.assertIn("tools", str(e.exception))
+
+    def test_empty_tools_list_is_refused(self):
+        """A check that declares it needs nothing is almost always a check
+        whose author did not look -- the key being present is not enough."""
+        bad = GOOD.replace("tools: [cargo, cargo-deny]", "tools: []")
+        with self.assertRaises(ValueError) as e:
+            checks_lib.load(write(bad))
+        self.assertIn("cargo-deny", str(e.exception))
+        self.assertIn("tools", str(e.exception))
+
+    def test_scalar_tools_is_refused(self):
+        """tools must be a LIST, not a scalar -- a check can need more than
+        one binary. A bare string would still validate as non-empty/truthy
+        in Python, so this has to be checked explicitly, not inferred from
+        the empty-list check above."""
+        bad = GOOD.replace("tools: [cargo, cargo-deny]", "tools: cargo")
+        with self.assertRaises(ValueError) as e:
+            checks_lib.load(write(bad))
+        self.assertIn("cargo-deny", str(e.exception))
+        self.assertIn("tools", str(e.exception))
 
 class TestCompilesToken(unittest.TestCase):
     """A later task's shell compares this string to decide whether a check
