@@ -199,6 +199,10 @@ jobs:
             echo "Fix the secret; do not let this job pass quietly."
             exit 1
           fi
+          # A shell default, not a literal, so this step can be executed against
+          # a local listener in a test. The fallback IS the real inbox, so CI
+          # behaviour is unchanged and nothing has to be remembered at fire time.
+          INBOX_URL="${INBOX_URL:-http://192.168.10.240:9099/v1/events/warpgate-upstream}"
           # Build the body with jq, not string interpolation. CONFLICTS is a
           # list of paths that came from UPSTREAM's tree, so it is not ours to
           # trust: a filename containing a quote or backslash would produce
@@ -208,7 +212,7 @@ jobs:
             '{source: "warpgate-upstream", severity: "warning",
               title: "Warpgate \($new) needs a hand",
               message: "replaying \($count) patches onto \($new) stopped at: \($conflicts)"}' \
-          | curl -fsS -X POST http://192.168.10.240:9099/v1/events/warpgate-upstream \
+          | curl -fsS -X POST "$INBOX_URL" \
               -H "Authorization: Bearer $TOKEN" \
               -H 'Content-Type: application/json' \
               --data-binary @-

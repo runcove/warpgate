@@ -15,18 +15,24 @@ that decides if anything runs at all can return both of its answers, and
 whether a conflicting rebase leaves the tree clean and names the files it
 stopped on.
 
-Deliberately NOT covered here: the report step's POST, which needs a real
-credential and a real endpoint. Its guards are what upstream-watch-check.py
-asserts statically.
+NOTHING IS EXCLUDED ANY MORE. All five of the workflow's logic-bearing steps
+are executed here -- resolve, the already-current gate, replay, push and the
+conflict report. What remains is actions/checkout and a summary step that only
+echoes.
 
-The push step used to be on that list too, as "needs credentials or a remote".
-Checking the premise rather than the sentence: the fixture's origin is a local
-clone, so it already IS a remote and no credential is involved. It is now
-covered, including the one property that matters most in a job that pushes on a
-schedule with nobody watching -- that a push which would overwrite history on
-the remote is REFUSED rather than resolved. "Needs a remote" was true of the
-words and false of the situation, which is the shape a stale exclusion always
-has.
+That took three exclusions apart in a row, and each was the same shape: a
+sentence that was true of the words and false of the situation.
+
+- "the push step needs credentials or a remote" -- the fixture's origin is a
+  local clone, so it already IS a remote and no credential is involved.
+- "the report's POST needs a credential and an endpoint" -- it needs *a* token,
+  not *the* token, and a loopback listener on an ephemeral port is an endpoint.
+- the already-current gate was on no exclusion list at all, which is worse: a
+  declared gap is a decision, an undeclared one is an assumption nobody made.
+
+The lesson worth keeping is not "test everything". It is that an exclusion
+written once is never re-read as a claim, only as a boundary, and the cost of
+checking one is usually an afternoon less than it looks.
 
 The "already current?" step was in neither list when this file was first
 written -- not covered, and not declared uncovered either, which is the worse
@@ -46,12 +52,15 @@ lived as a scratch script in /tmp for a day, which meant the proof that this
 test refuses anything would have vanished at the next reboot along with the
 harness -- so it is here, in git, next to the thing it proves.
 """
+import http.server
+import json
 import os
 import pathlib
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 
 import yaml
 
@@ -97,6 +106,37 @@ def git_ok(repo, *args) -> bool:
     """
     return subprocess.run(["git", "-C", str(repo), *args],
                           capture_output=True, text=True).returncode == 0
+
+
+def inbox_listener():
+    """A throwaway HTTP endpoint on loopback, so the report step's POST can run.
+
+    The step needs *a* token, not *the* token: a dummy string proves the header
+    is formed and sent, and no credential is involved. Binding to 127.0.0.1 on
+    an ephemeral port means nothing leaves this machine, and the real inbox is
+    never contacted -- INBOX_URL is a shell default in the workflow for exactly
+    this reason, the same shape as UPSTREAM_URL in the replay step.
+    """
+    received = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length", 0))
+            received.append({"path": self.path,
+                             "auth": self.headers.get("Authorization", ""),
+                             "ctype": self.headers.get("Content-Type", ""),
+                             "body": self.rfile.read(n).decode()})
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b"{}")
+
+        def log_message(self, *args):
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, received
 
 
 def build_fixture(root: pathlib.Path) -> pathlib.Path:
@@ -386,6 +426,70 @@ def main() -> int:
                git_ok(conflicted, "merge-base", "--is-ancestor",
                       "v0.29.0", "cove-patches-v0.29.0"), False)
 
+    # --- report a conflict to the ops inbox -------------------------------
+    # The last step that had never executed. Two of its three parts need no
+    # credential at all, and the third needs *a* token rather than *the* token.
+    report = step_run(doc, "report a conflict to the ops inbox")
+
+    # The token guard decides whether a conflict is ever seen by a human. If it
+    # ever skips instead of failing, a conflicted release is discovered when
+    # somebody eventually wonders why no new branch appeared -- the workflow's
+    # own comment says "could be months". INBOX_URL points at a closed port so
+    # that even a removed guard cannot put traffic anywhere real.
+    out.write_text("")
+    rc, log, _ = run_step(report, repo,
+                          {"TOKEN": "", "NEW": "v0.29.0", "COUNT": "3",
+                           "CONFLICTS": "PATCH0",
+                           "INBOX_URL": "http://127.0.0.1:1/never"}, out)
+    expect("a missing token fails the job", rc, 1)
+    expect("...naming the secret to fix", "OPS_INBOX_TOKEN is not set" in log, True)
+    # Matched as a WHOLE LINE, not a substring. The first draft asked whether
+    # "reported" appeared anywhere in the log and it always did -- the guard's
+    # own message is "this conflict cannot be reported". A detector that greps
+    # for a word finds it inside sentences about that word (trap 41), and this
+    # one would have called every run a silent success.
+    expect("...and does not quietly report success",
+           "reported" in [ln.strip() for ln in log.splitlines()], False)
+
+    # The POST itself, and the claim that has only ever existed in a comment:
+    # CONFLICTS holds paths from UPSTREAM's tree, so a filename containing a
+    # quote or a backslash must not be able to produce malformed JSON and lose
+    # the report at the exact moment it matters.
+    srv, received = inbox_listener()
+    nasty = 'src/a"b.rs src/back\\slash.rs'
+    out.write_text("")
+    rc, log, _ = run_step(
+        report, repo,
+        {"TOKEN": "dummy-not-a-real-token", "NEW": "v0.29.0", "COUNT": "3",
+         "CONFLICTS": nasty,
+         "INBOX_URL": f"http://127.0.0.1:{srv.server_port}/v1/events/warpgate-upstream"}, out)
+    expect("the report step posts and exits clean", rc, 0)
+    expect("...with exactly one request reaching the inbox", len(received), 1)
+    if len(received) != 1:
+        expect("PRECONDITION: a request arrived (everything below is void "
+               f"without one; step said rc={rc})", False, True)
+    else:
+        req = received[0]
+        expect("...carrying the bearer token it was handed",
+               req["auth"], "Bearer dummy-not-a-real-token")
+        expect("...declared as JSON", "application/json" in req["ctype"], True)
+        body = None
+        try:
+            body = json.loads(req["body"])
+        except ValueError as exc:
+            expect(f"...and the body survives a hostile filename as valid JSON ({exc})",
+                   False, True)
+        if body is not None:
+            expect("...routed to the right source", body.get("source"), "warpgate-upstream")
+            expect("...naming the release a human has to act on",
+                   body.get("title"), "Warpgate v0.29.0 needs a hand")
+            # Intact, not merely parseable: an escaping bug that dropped or
+            # mangled the paths would still yield valid JSON and a useless
+            # report naming nothing.
+            expect("...with the quote-and-backslash paths intact in the message",
+                   nasty in body.get("message", ""), True)
+    srv.shutdown()
+
     print(f"\n  {passed}/{total} assertions passed")
     print(f"  fixture: {root}")
     return 0 if passed == total else 1
@@ -446,6 +550,28 @@ MUTATIONS = [
     # which is how a watcher becomes decorative without anyone noticing.
     ("push-failure-swallowed", 'git push origin "$DST"', 'git push origin "$DST" || true',
      "overwrite the remote is REFUSED"),
+    # A missing token that exits 0 means a conflicted release is never reported
+    # and the job still goes green -- the failure the step's own comment says
+    # could go unnoticed for months.
+    ("missing-token-passes-quietly",
+     '            echo "Fix the secret; do not let this job pass quietly."\n'
+     '            exit 1\n',
+     '            echo "Fix the secret; do not let this job pass quietly."\n'
+     '            exit 0\n',
+     "a missing token fails the job"),
+    # Build the report body by string interpolation instead of jq --arg. The
+    # workflow's comment says this would lose the report when a conflicting
+    # filename contains a quote; this is that comment turned into a test.
+    ("report-body-interpolated-not-escaped",
+     '          jq -n --arg new "$NEW" --arg count "$COUNT" --arg conflicts "$CONFLICTS" \\\n'
+     '            \'{source: "warpgate-upstream", severity: "warning",\n'
+     '              title: "Warpgate \\($new) needs a hand",\n'
+     '              message: "replaying \\($count) patches onto \\($new) stopped at: \\($conflicts)"}\' \\\n',
+     '          printf \'{"source":"warpgate-upstream","severity":"warning",'
+     '"title":"Warpgate %s needs a hand",'
+     '"message":"replaying %s patches onto %s stopped at: %s"}\' '
+     '"$NEW" "$COUNT" "$NEW" "$CONFLICTS" \\\n',
+     "hostile filename"),
 ]
 
 
