@@ -89,10 +89,16 @@ for code in 88 100; do
 done
 
 # The reviewer's own reproduction: a refusal must fail even a *blocking*
-# check that was told, via the test hooks, to report PASS.
+# check that was told, via the test hooks, to report PASS. `[ $rc -ne 0 ]`
+# alone cannot tell this apart from an ORDINARY blocking failure -- a
+# blocking check that fails also exits non-zero, so disabling the whole
+# refusal-band check would still leave this "ok" (a real regression the
+# review caught by mutation). Must also assert the REFUSE-specific message,
+# which only the refusal branch prints.
 out=$(RUN_CHECK_FORCE_STATE=blocking RUN_CHECK_FORCE_RC=90 "$SCRIPT" clippy 2>&1); rc=$?
-[ $rc -ne 0 ] && ok "a refusal fails a blocking check too" \
-  || bad "a refusal passed a blocking check (rc=$rc): $out"
+[ $rc -ne 0 ] && grep -q "^REFUSE clippy" <<<"$out" \
+  && ok "a refusal fails a blocking check too, reported as REFUSE not an ordinary blocking FAIL" \
+  || bad "a refusal on a blocking check either passed (rc=$rc) or wasn't reported as REFUSE (indistinguishable from an ordinary blocking FAIL): $out"
 
 # FIX ROUND 1, Major 2: run-check.sh's own test hooks need the same CI-leak
 # guard hardened-run.sh already has (same three markers, same exit code) --

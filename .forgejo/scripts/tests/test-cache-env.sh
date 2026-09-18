@@ -29,8 +29,15 @@ out=$("$SCRIPT" 2>&1); rc=$?
 out=$(unset S3_ENDPOINT; "$SCRIPT" warpgate-sccache 2>&1); rc=$?
 [ "$rc" -eq 93 ] && ok "missing S3_ENDPOINT exits 93, not a bare 1" \
   || bad "missing S3_ENDPOINT did not exit 93 (rc=$rc): $out"
-grep -qi "S3_ENDPOINT" <<<"$out" && ok "names the missing configuration" \
-  || bad "did not name what configuration is missing: $out"
+# NOT `grep -qi "S3_ENDPOINT"` -- bash's own pre-fix `${VAR:?}` error
+# ("...: line N: S3_ENDPOINT: S3_ENDPOINT must be set") ALSO mentions the
+# variable name (it's the same custom :? message this fix's own text
+# happens to reuse), so that grep alone survives the very mutation it
+# exists to catch. Anchor to the "FATAL --" prefix only this script's own
+# refusal message produces.
+grep -q "cache-env.sh: FATAL -- S3_ENDPOINT must be set" <<<"$out" \
+  && ok "names the missing configuration in our own refusal message, not bash's builtin :? text" \
+  || bad "did not produce our own refusal message: $out"
 
 # THE TRAP THIS MATTERS FOR: `eval "$(cache-env.sh ...)"` of a refusal that
 # printed nothing still `eval`s to success (exit 0), so a caller checking

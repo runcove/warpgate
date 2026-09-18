@@ -191,8 +191,13 @@ grep -q "HARDENED_RUN_FAKE_INSPECT_CPUS" <<<"$out" && ok "names HARDENED_RUN_FAK
 out=$(unset HARDENED_RUN_IMAGE; "$SCRIPT" --cpus 4 --memory 7g -- true 2>&1); rc=$?
 [ "$rc" -eq 93 ] && ok "missing HARDENED_RUN_IMAGE exits 93, not a bare 1" \
   || bad "missing HARDENED_RUN_IMAGE did not exit 93 (rc=$rc): $out"
-grep -qi "HARDENED_RUN_IMAGE" <<<"$out" && ok "names the missing configuration" \
-  || bad "did not name what configuration is missing: $out"
+# NOT `grep -qi "HARDENED_RUN_IMAGE"` -- bash's own pre-fix `${VAR:?}` error
+# ("...: line N: HARDENED_RUN_IMAGE: set HARDENED_RUN_IMAGE") ALSO mentions
+# the variable name, so that grep alone survives the very mutation it exists
+# to catch. Anchor to text only this script's own refusal message produces.
+grep -q "hardened-run: FATAL -- HARDENED_RUN_IMAGE is not set" <<<"$out" \
+  && ok "names the missing configuration in our own refusal message, not bash's builtin :? text" \
+  || bad "did not produce our own refusal message: $out"
 
 echo; [ "$fails" -eq 0 ] && echo "PASS" || echo "FAILURES"
 exit "$fails"
