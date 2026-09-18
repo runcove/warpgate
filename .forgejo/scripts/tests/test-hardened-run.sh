@@ -354,6 +354,14 @@ else
       || bad "real source delivery failed (rc=$rc): $out"
     grep -q "marker-content-24" <<<"$out" && ok "the command saw the copied file's real content" \
       || bad "copied content not visible inside the real container: $out"
+    # FIX ROUND 3 (re-review): rc/content alone don't prove the STRONG
+    # branch fired -- $SRC_DIR holds Cargo.toml AND marker.txt, so these
+    # assertions would hold identically if --verify-file were silently
+    # dropped and the weak branch ran instead. The branches' own messages
+    # are the one observable that distinguishes them.
+    grep -q "verified source present at" <<<"$out" \
+      && ok "the STRONG branch's own message fired, not just a bare rc" \
+      || bad "strong-branch verification message did not appear: $out"
 
     # 25. --workdir is genuinely applied to the real `docker exec`, not just
     #     asserted -- checked via `pwd` inside the running container. Same
@@ -365,16 +373,24 @@ else
     )
     grep -qx "/src" <<<"$out" && ok "the real docker exec actually runs with --workdir /src" \
       || bad "workdir not applied to the real exec: $out"
+    grep -q "verified source present at" <<<"$out" \
+      && ok "the STRONG branch's own message fired here too" \
+      || bad "strong-branch verification message did not appear: $out"
 
     # 26. Contents form, not nested: Cargo.toml lands directly at
     #     $WORKDIR/Cargo.toml, proving "SRC/." (contents) was used, not
     #     "SRC" (which would nest everything one level deeper). Same
     #     --verify-file Cargo.toml as cases 24-25.
-    PATH="${ENGINE_PATH_PREFIX}$PATH" HARDENED_RUN_IMAGE="$TEST_IMAGE" \
+    out=$(
+      PATH="${ENGINE_PATH_PREFIX}$PATH" HARDENED_RUN_IMAGE="$TEST_IMAGE" \
       "$SCRIPT" --cpus 1 --memory 256m --source "$SRC_DIR" --workdir /src \
-        --verify-file Cargo.toml -- test -f /src/Cargo.toml >/dev/null 2>&1
-    [ $? -eq 0 ] && ok "source landed unnested at \$WORKDIR/Cargo.toml (contents form)" \
+        --verify-file Cargo.toml -- test -f /src/Cargo.toml 2>&1
+    ); rc=$?
+    [ "$rc" -eq 0 ] && ok "source landed unnested at \$WORKDIR/Cargo.toml (contents form)" \
       || bad "source nested one level deeper than expected -- SRC vs SRC/. got mixed up"
+    grep -q "verified source present at" <<<"$out" \
+      && ok "the STRONG branch's own message fired here too" \
+      || bad "strong-branch verification message did not appear: $out"
 
     # 27. A --source directory that does not exist: docker cp itself fails,
     #     refused with 98, naming docker cp as the failing step.
@@ -441,23 +457,78 @@ else
       ok "a neutered docker cp is still caught by the WEAK (no --verify-file) check and refuses with 98" \
       || bad "a silently no-op'd copy step was NOT caught by the weak check (rc=$mutant_rc) -- the verification is decorative: $mutant_out"
 
-    # 29b. THE MUTATION, STRONG BRANCH: the identical mutant from case 29
-    #     (built once, reused here -- the mutation itself doesn't depend on
-    #     which flags a later invocation passes), now invoked WITH
-    #     --verify-file Cargo.toml -- the exact flag run-check.sh actually
-    #     uses in production. Proves the strong `test -f` check is
-    #     independently load-bearing, not just the weak fallback case 29
-    #     covers. This is the case Finding 1 (fix round 1's review) asked
-    #     for: real, un-fakeable mutation coverage of the branch production
-    #     traffic actually takes.
-    mutant_out_29b=$(
+    # 29b. THE MUTATION, DISCRIMINATING (fix round 3, re-review): the round-2
+    #     version of this case reused case 29's mutant -- `docker cp` swapped
+    #     for a bare `true` that discards its arguments -- and merely added
+    #     --verify-file to the invocation. That does NOT prove the strong
+    #     branch independently, because by the time `docker cp` no-ops,
+    #     $WORKDIR has already been `mkdir -p`'d for real, so it exists and
+    #     is COMPLETELY EMPTY -- not "missing Cargo.toml", empty. Against an
+    #     empty workdir, `test -f "$WORKDIR/Cargo.toml"` fails AND
+    #     `find "$WORKDIR" -mindepth 1 -maxdepth 1` prints nothing: both
+    #     branches exit 98, from identical container state, for reasons that
+    #     happen to look the same from the outside. Asserting on rc alone
+    #     (as round 2's case did) cannot tell "the strong check fired" from
+    #     "the workdir was empty and either check would have caught it" --
+    #     exactly the regression Finding 1 was raised about would have
+    #     sailed straight through unnoticed.
+    #
+    #     A mutant that DISCRIMINATES must leave $WORKDIR genuinely
+    #     non-empty but without the named file: here, `docker cp` is
+    #     redirected to copy a DECOY directory (real content, no Cargo.toml)
+    #     instead of $SOURCE -- simulating a wrong-directory copy, the exact
+    #     failure mode --verify-file exists to catch. Now the two branches
+    #     must diverge for real: the weak check only asks "is $WORKDIR
+    #     non-empty", which the decoy satisfies, so it must NOT refuse; the
+    #     strong check asks for Cargo.toml specifically, which the decoy
+    #     doesn't have, so it must refuse with 98. Proven by asserting each
+    #     branch's own distinguishing message, not rc alone -- rc alone is
+    #     the thing that let the previous version of this case pass for the
+    #     wrong reason.
+    DECOY_DIR="$MARKER_DIR/decoy-src-29b"
+    mkdir -p "$DECOY_DIR"
+    echo "not the repo -- this is what a wrong-directory docker cp would deliver" \
+      > "$DECOY_DIR/unrelated-file.txt"
+    MUTANT2_DIR="$MARKER_DIR/mutant-decoy"
+    mkdir -p "$MUTANT2_DIR"
+    sed 's#docker cp "\$SOURCE/\."#docker cp "'"$DECOY_DIR"'/."#' "$SCRIPT" > "$MUTANT2_DIR/hardened-run.sh"
+    chmod +x "$MUTANT2_DIR/hardened-run.sh"
+    DIFF_OUT2=$(diff "$SCRIPT" "$MUTANT2_DIR/hardened-run.sh")
+    DIFF_LINES2=$(wc -l <<<"$DIFF_OUT2")
+    if [ "$DIFF_LINES2" -eq 4 ] && grep -q '^< .*docker cp "\$SOURCE' <<<"$DIFF_OUT2" \
+       && grep -q '^> .*docker cp "'"$DECOY_DIR"'/\."' <<<"$DIFF_OUT2"; then
+      ok "the decoy mutation touched exactly the intended docker cp line, nothing else"
+    else
+      bad "the decoy mutation diff is not the single expected line change -- not trusting this mutant: $DIFF_OUT2"
+    fi
+
+    # With --verify-file Cargo.toml: the strong check must refuse, because
+    # the decoy has no Cargo.toml even though $WORKDIR is genuinely non-empty.
+    strong_out=$(
       PATH="${ENGINE_PATH_PREFIX}$PATH" HARDENED_RUN_IMAGE="$TEST_IMAGE" \
-      "$MUTANT_DIR/hardened-run.sh" --cpus 1 --memory 256m --source "$SRC_DIR" --workdir /src \
+      "$MUTANT2_DIR/hardened-run.sh" --cpus 1 --memory 256m --source "$SRC_DIR" --workdir /src \
         --verify-file Cargo.toml -- true 2>&1
-    ); mutant_rc_29b=$?
-    [ "$mutant_rc_29b" -eq 98 ] && \
-      ok "a neutered docker cp is still caught by the STRONG (--verify-file) check and refuses with 98" \
-      || bad "a silently no-op'd copy step was NOT caught by the strong check (rc=$mutant_rc_29b) -- the verification is decorative: $mutant_out_29b"
+    ); strong_rc=$?
+    [ "$strong_rc" -eq 98 ] && ok "a wrong-directory copy is caught by the STRONG check (98)" \
+      || bad "a wrong-directory copy was NOT caught by the strong check (rc=$strong_rc): $strong_out"
+    grep -q "Cargo.toml is not" <<<"$strong_out" \
+      && ok "the strong branch's own distinguishing message fired, not just a bare rc" \
+      || bad "strong-branch message did not appear -- rc alone proves nothing about which branch ran: $strong_out"
+
+    # With NO --verify-file: the SAME mutant, on the weak check, must NOT
+    # refuse -- the decoy makes $WORKDIR genuinely non-empty, which is all
+    # the weak check asks for. This is the divergence that proves the two
+    # branches are actually independent, not just two rc==98 paths.
+    weak_out=$(
+      PATH="${ENGINE_PATH_PREFIX}$PATH" HARDENED_RUN_IMAGE="$TEST_IMAGE" \
+      "$MUTANT2_DIR/hardened-run.sh" --cpus 1 --memory 256m --source "$SRC_DIR" --workdir /src \
+        -- true 2>&1
+    ); weak_rc=$?
+    [ "$weak_rc" -eq 0 ] && ok "the SAME wrong-directory copy passes the WEAK check (0)" \
+      || bad "the weak check unexpectedly refused a non-empty (if wrong) workdir (rc=$weak_rc): $weak_out"
+    grep -qi "weaker check" <<<"$weak_out" \
+      && ok "the weak branch's own distinguishing message fired, not just a bare rc" \
+      || bad "weak-branch message did not appear: $weak_out"
   else
     skip "could not pull $TEST_IMAGE (no network?) -- cases 24-29 (real --source delivery) skipped"
   fi
