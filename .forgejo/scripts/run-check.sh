@@ -93,16 +93,23 @@ fi
 # permanently-opted-out check's own SKIP means nobody needs today.
 #
 # Also skipped when a test hook (RUN_CHECK_DRY / RUN_CHECK_FORCE_RC /
-# RUN_CHECK_FORCE_STATE) is active: those exist precisely so this script's
-# control flow is testable "without a real check command or a container
-# runtime" (see the CI-leak guard above), and a real tool's presence on PATH
-# is exactly the kind of real-environment fact they exist to let a test skip
-# past -- without this, every existing FORCE_RC/FORCE_STATE/DRY case against
-# a compiling check would start depending on cargo/just actually being
-# installed wherever this test suite runs, which is the opposite of what
-# those hooks are for. This cannot mask a real gap in production: the guard
-# at the top of this script already refuses to run at all if any of these is
-# set alongside CI/GITHUB_ACTIONS/FORGEJO_ACTIONS.
+# RUN_CHECK_FORCE_STATE) is active. This is a deliberate bypass of a safety
+# check, so it earns an explicit reason, not just a mention: those hooks
+# exist precisely so this script's control flow is testable "without a real
+# check command or a container runtime" (see the CI-leak guard above), and a
+# real tool's presence on PATH is exactly the kind of real-environment fact
+# they exist to let a test skip past. Concretely: this test suite itself is
+# meant to run wherever this repo's CI does, and that runner is MEASURED
+# (2026-09-18) to have no Rust toolchain at all -- without this bypass,
+# every existing FORCE_RC/FORCE_STATE/DRY case against a compiling check
+# (cargo-deny, clippy, schema-compat) would start failing at this
+# precondition, for an environment reason unrelated to the control-flow
+# logic those hooks exist to isolate and test. This cannot mask a real gap
+# in production: the guard at the top of this script already refuses to run
+# at all if any of these three is set alongside
+# CI/GITHUB_ACTIONS/FORGEJO_ACTIONS, and the precondition itself still has
+# its own direct test (tests/test-run-check.sh, "declared tool absent")
+# that does not use any of these hooks.
 #
 # Every declared tool is checked, not just the first -- reporting only one
 # missing tool per run is how a four-tool gap takes four CI runs to

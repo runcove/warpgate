@@ -15,7 +15,13 @@
 # -- the while loop's body never runs, rc stays 0, "PASS" with nothing
 # examined. A check that examined nothing cannot say PASS (trap 3,
 # agent_docs/verification-and-gating.md), so a positive count is asserted
-# below.
+# below -- and it exits 99, not 1: exit 1 reads as an ordinary FAIL, which
+# asserts the check LOOKED and found a problem. "I examined nothing" is
+# neither a pass nor a fail, it is the same "did not run safely" fact 97
+# reports for a missing tool, just for a different cause (no source
+# delivered into an empty directory is exactly the shape Task 7B's own gap
+# would produce today, before it lands: this refuses that instead of
+# blaming the code).
 set -uo pipefail
 
 for t in jq find; do
@@ -48,8 +54,8 @@ while IFS= read -r lock; do
 done < <(find . -name package-lock.json -not -path "*/node_modules/*")
 
 if [ "$examined" -eq 0 ]; then
-  echo "check-lockfile.sh: found zero package-lock.json files -- cannot verify anything, refusing to report a pass with nothing examined" >&2
-  exit 1
+  echo "check-lockfile.sh: FATAL -- found zero package-lock.json files. Refusing to report a pass or a fail: nothing was examined." >&2
+  exit 99
 fi
 
 exit "$rc"

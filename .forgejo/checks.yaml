@@ -68,6 +68,11 @@ checks:
     command: .forgejo/scripts/reprotest.sh
     compiles: true
     state: excepted
+    # UNVERIFIED -- this check has never run here (excepted since it was
+    # written), so unlike every other tools: value above, this one was never
+    # measured against a real run's log. cargo is a guess based on the
+    # "capped Rust checks" bucket, not a confirmed fact. Re-check this the
+    # day reprotest stops being excepted, before trusting it.
     tools: [cargo]
     reason: >-
       Manual-only upstream (workflow_dispatch) and stays manual here; it re-runs a

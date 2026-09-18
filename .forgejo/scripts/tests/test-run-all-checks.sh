@@ -82,5 +82,49 @@ out=$(run_with_map "check-a=1 check-b=93 check-c=2" 2>&1); rc=$?
 grep -q "checks refused: 1, checks failed: 2" <<<"$out" \
   && ok "counts both surrounding failures plus the one refusal" || bad "counters wrong: $out"
 
+# ---------------------------------------------------------------------------
+# Fix round 1 (Task 7A): this script's own enumeration must not be a silent
+# zero. `while read ... done < <(python3 list-checks.py ...)` used to hide
+# list-checks.py's exit status from the loop entirely -- a checks.yaml that
+# failed to load would run zero iterations and report "refused: 0, failed:
+# 0" with exit 0, a false green covering the ENTIRE suite. Proven here by
+# shadowing list-checks.py with a stub, on a disposable RUN_DIR -- never the
+# real list-checks.py or checks.yaml -- exactly the technique
+# fixtures/run-check-stub.sh already uses for run-check.sh above.
+# ---------------------------------------------------------------------------
+
+# 7. list-checks.py itself fails (simulates a checks.yaml that fails to
+#    load): must refuse (99), not report a clean, empty pass.
+FAIL_DIR="${TMPDIR:-/tmp}/run-all-checks-enum-fail-test.$$"
+mkdir -p "$FAIL_DIR"
+ln -sf "$SCRIPT" "$FAIL_DIR/run-all-checks.sh"
+ln -sf "$FIXTURES/list-checks-stub-fail.py" "$FAIL_DIR/list-checks.py"
+ln -sf "$FIXTURES/run-check-stub.sh" "$FAIL_DIR/run-check.sh"
+out=$(CHECKS_FILE="$FIXTURES/checks-three.yaml" "$FAIL_DIR/run-all-checks.sh" 2>&1); rc=$?
+[ "$rc" -eq 99 ] && ok "an enumeration failure refuses (99), does not report success" \
+  || bad "an enumeration failure did not refuse (rc=$rc): $out"
+grep -q "checks refused: 0, checks failed: 0" <<<"$out" \
+  && bad "an enumeration failure was reported as a clean, empty pass: $out" \
+  || ok "an enumeration failure is not reported as a clean, empty pass"
+rm -rf "$FAIL_DIR"
+
+# 8. list-checks.py exits 0 but enumerates nothing -- the defence-in-depth
+#    positive-count guard, tested independently of the status check above
+#    (unreachable through a real checks.yaml, since checks_lib.load()
+#    already refuses an empty `checks:` list -- but this task exists
+#    specifically to stop trusting "should be unreachable").
+EMPTY_DIR="${TMPDIR:-/tmp}/run-all-checks-enum-empty-test.$$"
+mkdir -p "$EMPTY_DIR"
+ln -sf "$SCRIPT" "$EMPTY_DIR/run-all-checks.sh"
+ln -sf "$FIXTURES/list-checks-stub-empty.py" "$EMPTY_DIR/list-checks.py"
+ln -sf "$FIXTURES/run-check-stub.sh" "$EMPTY_DIR/run-check.sh"
+out=$(CHECKS_FILE="$FIXTURES/checks-three.yaml" "$EMPTY_DIR/run-all-checks.sh" 2>&1); rc=$?
+[ "$rc" -eq 99 ] && ok "zero checks enumerated (exit 0, no output) refuses (99)" \
+  || bad "zero checks enumerated did not refuse (rc=$rc): $out"
+grep -q "checks refused: 0, checks failed: 0" <<<"$out" \
+  && bad "zero checks enumerated was reported as a clean, empty pass: $out" \
+  || ok "zero checks enumerated is not reported as a clean, empty pass"
+rm -rf "$EMPTY_DIR"
+
 echo; [ "$fails" -eq 0 ] && echo "PASS" || echo "FAILURES"
 exit "$fails"

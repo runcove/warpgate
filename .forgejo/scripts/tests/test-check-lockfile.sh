@@ -41,11 +41,16 @@ grep -qi "^PASS\|missing resolved or integrity" <<<"$out" \
 rm -rf "$BIN" "$REPO_STUB"
 
 # --- Step 4(d), part 2: zero lockfiles found refuses instead of passing ----
+# Fix round 1: exits 99 specifically, not the ordinary FAIL (1) it used to.
+# "found nothing to examine" is neither a pass nor a fail -- exit 1 would be
+# indistinguishable from "ran and found a real problem", which is exactly
+# the confusion this whole task exists to remove. rc -ne 0 alone would not
+# catch a regression that kept refusing but downgraded it back to 1.
 EMPTY_REPO="${TMPDIR:-/tmp}/check-lockfile-test-empty.$$"
 mkdir -p "$EMPTY_REPO"
 out=$(cd "$EMPTY_REPO" && "$SCRIPT" 2>&1); rc=$?
-[ "$rc" -ne 0 ] && ok "zero lockfiles: refuses, does not pass" \
-  || bad "zero lockfiles: exited 0 with nothing examined: $out"
+[ "$rc" -eq 99 ] && ok "zero lockfiles: refuses (99), not an ordinary FAIL" \
+  || bad "zero lockfiles: expected rc=99, got rc=$rc: $out"
 grep -qi "zero package-lock" <<<"$out" && ok "zero lockfiles: says why" \
   || bad "zero lockfiles: silent about examining nothing: $out"
 rm -rf "$EMPTY_REPO"
@@ -70,8 +75,8 @@ cat > "$BAD_REPO/package-lock.json" <<'EOF'
 {"packages": {"": {}, "node_modules/x": {"resolved": "", "integrity": ""}}}
 EOF
 out=$(cd "$BAD_REPO" && "$SCRIPT" 2>&1); rc=$?
-[ "$rc" -ne 0 ] && ok "a lockfile missing resolved/integrity still fails" \
-  || bad "a real problem was not caught (rc=$rc): $out"
+[ "$rc" -eq 1 ] && ok "a lockfile missing resolved/integrity still fails (1), not refused (99)" \
+  || bad "a real problem was not caught as an ordinary FAIL (rc=$rc): $out"
 grep -q "missing resolved or integrity" <<<"$out" \
   && ok "names the problem" || bad "did not name the problem: $out"
 rm -rf "$BAD_REPO"

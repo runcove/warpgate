@@ -253,5 +253,43 @@ out=$(CHECKS_FILE="$TOOLS_FIXTURE" RUN_CHECK_FORCE_RC=127 "$SCRIPT" fake-present
 grep -qi "command not found" <<<"$out" && ok "127-to-97 conversion names \"command not found\"" \
   || bad "127-to-97 conversion did not explain itself: $out"
 
+# ---------------------------------------------------------------------------
+# Fix round 1: 99 ("found nothing to examine") must flow through
+# run-check.sh's whole-band handling unmolested -- not just proven
+# generically via RUN_CHECK_FORCE_RC above (the "exit 97/99 on a reporting
+# check still fails the job" loop earlier in this file), but end to end
+# through the REAL check-lockfile.sh, genuinely finding zero lockfiles. A
+# synthetic checks.yaml (generated here, not committed -- it embeds this
+# checkout's own absolute path) whose command `cd`s into a FRESH empty
+# directory, created at COMMAND-run time via an unescaped `$(mktemp -d)` in
+# the command string, before invoking the real check-lockfile.sh by
+# absolute path. This is the concrete scenario fix round 1 named: a check
+# running before source is delivered into the capped container (Task 7B's
+# gap today) looks exactly like this.
+# ---------------------------------------------------------------------------
+REAL_LOCKFILE="$HERE/../check-lockfile.sh"
+LOCKFILE_INT_FIXTURE="${TMPDIR:-/tmp}/run-check-lockfile-integration.$$.yaml"
+cat > "$LOCKFILE_INT_FIXTURE" <<EOF
+upstream_tag: v0.28.6
+checks:
+  - name: fake-lockfile-empty
+    upstream: lockfile.yml
+    command: cd \$(mktemp -d) && $REAL_LOCKFILE
+    compiles: false
+    state: reporting
+    tools: [jq, find]
+EOF
+
+out=$(CHECKS_FILE="$LOCKFILE_INT_FIXTURE" "$SCRIPT" fake-lockfile-empty 2>&1); rc=$?
+[ "$rc" -eq 99 ] && ok "check-lockfile.sh's own 99 (nothing examined) reaches run-check.sh intact" \
+  || bad "expected rc=99 end-to-end through the real check-lockfile.sh, got rc=$rc: $out"
+grep -q "^REFUSE fake-lockfile-empty" <<<"$out" \
+  && ok "reported as REFUSE, not as an ordinary result" \
+  || bad "not reported as REFUSE: $out"
+grep -qi "report-only" <<<"$out" \
+  && bad "a 'nothing examined' refusal was printed as an ordinary report-only FAIL: $out" \
+  || ok "a 'nothing examined' refusal is not printed as report-only"
+rm -f "$LOCKFILE_INT_FIXTURE"
+
 echo; [ "$fails" -eq 0 ] && echo "PASS" || echo "FAILURES"
 exit "$fails"
