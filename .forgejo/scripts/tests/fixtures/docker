@@ -17,7 +17,27 @@
 #                                (one per line) is written there -- a test
 #                                asserts which `-e VAR` flags actually reached
 #                                the call, not just that the script claims to.
-#   STUB_DOCKER_EXEC_ARGS_FILE  same, for `docker exec`.
+#   STUB_DOCKER_EXEC_ARGS_FILE  same, for `docker exec` (the caller's real
+#                                command only -- see below).
+#   STUB_DOCKER_CP_RC        exit code for `docker cp`          (default 0)
+#   STUB_DOCKER_EXEC_MKDIR_RC  exit code when the exec'd command is `mkdir`
+#                                (hardened-run.sh's --source delivery step)
+#   STUB_DOCKER_EXEC_TEST_RC   exit code when the exec'd command is `test`
+#                                (the --verify-file check)
+#   STUB_DOCKER_EXEC_FIND_RC     exit code when the exec'd command is `find`
+#                                (the weaker, no-`--verify-file` check)
+#   STUB_DOCKER_EXEC_FIND_OUTPUT  if set, printed as that `find`'s stdout --
+#                                unset/empty means an empty workdir listing.
+#
+# `docker exec` is called four different ways by hardened-run.sh once
+# --source is in play: the mkdir, the --verify-file `test`, the weaker
+# `find`, and finally the caller's own real command. This stub tells them
+# apart by scanning for the literal verb (mkdir/test/find) among the args --
+# crude, but sufficient for a test double, and safe because no existing or
+# new test here ever uses "mkdir", "test", or "find" as ITS OWN real command
+# (all use "true"). Only the last of the four -- the caller's real command --
+# touches STUB_DOCKER_EXEC_MARKER / STUB_DOCKER_EXEC_ARGS_FILE / the plain
+# STUB_DOCKER_EXEC_RC, exactly as before this stub knew about --source.
 set -uo pipefail
 
 cmd="${1:-}"
@@ -42,7 +62,30 @@ case "$cmd" in
     esac
     exit 0
     ;;
+  cp)
+    exit "${STUB_DOCKER_CP_RC:-0}"
+    ;;
   exec)
+    is_mkdir=0 is_test=0 is_find=0
+    for a in "$@"; do
+      case "$a" in
+        mkdir) is_mkdir=1 ;;
+        test)  is_test=1 ;;
+        find)  is_find=1 ;;
+      esac
+    done
+    if [ "$is_mkdir" -eq 1 ]; then
+      exit "${STUB_DOCKER_EXEC_MKDIR_RC:-0}"
+    fi
+    if [ "$is_test" -eq 1 ]; then
+      exit "${STUB_DOCKER_EXEC_TEST_RC:-0}"
+    fi
+    if [ "$is_find" -eq 1 ]; then
+      if [ -n "${STUB_DOCKER_EXEC_FIND_OUTPUT:-}" ]; then
+        printf '%s\n' "$STUB_DOCKER_EXEC_FIND_OUTPUT"
+      fi
+      exit "${STUB_DOCKER_EXEC_FIND_RC:-0}"
+    fi
     if [ -n "${STUB_DOCKER_EXEC_MARKER:-}" ]; then
       touch "$STUB_DOCKER_EXEC_MARKER"
     fi

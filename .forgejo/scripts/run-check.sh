@@ -168,9 +168,11 @@ elif [ "$CAPPED" = "yes" ]; then
   # no -v, no docker cp, nothing puts the repo inside it on its own. Every
   # capped check needs the source tree where it runs, so this is not
   # optional here even though hardened-run.sh itself keeps the flags
-  # optional for other callers.
+  # optional for other callers. --verify-file names Cargo.toml because THIS
+  # repo is a cargo workspace -- hardened-run.sh itself names no project, so
+  # that fact belongs here, not there.
   "$HERE/hardened-run.sh" --cpus "${CI_CPUS:-4}" --memory "${CI_MEMORY:-7g}" \
-    --label "check-$NAME" --source "$PWD" --workdir /src \
+    --label "check-$NAME" --source "$PWD" --workdir /src --verify-file Cargo.toml \
     "${FORWARD_FLAGS[@]}" -- bash -lc "$COMMAND"
   rc=$?
 else

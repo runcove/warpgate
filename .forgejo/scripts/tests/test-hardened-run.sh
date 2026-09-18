@@ -428,6 +428,132 @@ else
   fi
 fi
 
+# ---------------------------------------------------------------------------
+# TASK 7B, FIX ROUND 1: --verify-file. The original submission hardcoded
+# "Cargo.toml" inside hardened-run.sh itself, which contradicts this file's
+# own header ("Reusable: nothing in here names a project") -- that knowledge
+# now belongs to the CALLER (run-check.sh passes --verify-file Cargo.toml;
+# see run-check.sh's own tests for that assertion). Cases 30-36 below cover
+# the new flag and its four 98 paths using ONLY the stub docker fixture
+# above -- never a real container -- because control of podman/docker in
+# THIS session was withdrawn mid-arc pending a permissions ruling the
+# controller escalated to Jeremy (the standing rule: a lead's limits are its
+# workers' limits). Cases 24-29 above, which DO use a real engine, are left
+# exactly as originally committed and were NOT re-run after this change:
+# reasoning through them says they still hold (none of their assertions
+# depend on which of the two verification strengths ran -- they either fail
+# before reaching verification at all, or only check the outcome of the
+# caller's own real command), but that is analysis, not evidence, and is
+# reported as such rather than re-proven by the now-off-limits route.
+# ---------------------------------------------------------------------------
+
+# 30. Usage: --verify-file requires --source. No container involved.
+out=$(HARDENED_RUN_DRY=1 "$SCRIPT" --cpus 4 --memory 7g --verify-file Cargo.toml -- true 2>&1); rc=$?
+[ "$rc" -eq 2 ] && ok "refuses --verify-file without --source (exit 2)" \
+  || bad "did not refuse --verify-file without --source (rc=$rc): $out"
+
+# 31. --verify-file given, the container-side `test -f` fails: refuses 98,
+#     names the specific file, and the real command never runs.
+marker31="$MARKER_DIR/exec-ran-31"
+out=$(
+  PATH="$FIXTURES:$PATH" HARDENED_RUN_IMAGE=stub-image \
+  STUB_DOCKER_MEM=7516192768 STUB_DOCKER_NANOCPUS=4000000000 \
+  STUB_DOCKER_EXEC_TEST_RC=1 STUB_DOCKER_EXEC_MARKER="$marker31" \
+  "$SCRIPT" --cpus 4 --memory 7g --source /fake/src --workdir /src \
+    --verify-file Cargo.toml -- true 2>&1
+); rc=$?
+[ "$rc" -eq 98 ] && ok "a --verify-file that isn't found refuses with 98" \
+  || bad "missing --verify-file did not refuse with 98 (rc=$rc): $out"
+grep -q "src/Cargo.toml" <<<"$out" && ok "names the specific verify-file path" \
+  || bad "did not name the verify-file path: $out"
+[ ! -e "$marker31" ] && ok "the real command never ran after a failed verify-file check" \
+  || bad "the real command ran despite a failed verify-file check"
+
+# 32. --verify-file given, the container-side `test -f` succeeds: the real
+#     command actually runs.
+marker32="$MARKER_DIR/exec-ran-32"
+out=$(
+  PATH="$FIXTURES:$PATH" HARDENED_RUN_IMAGE=stub-image \
+  STUB_DOCKER_MEM=7516192768 STUB_DOCKER_NANOCPUS=4000000000 \
+  STUB_DOCKER_EXEC_TEST_RC=0 STUB_DOCKER_EXEC_MARKER="$marker32" \
+  "$SCRIPT" --cpus 4 --memory 7g --source /fake/src --workdir /src \
+    --verify-file Cargo.toml -- true 2>&1
+); rc=$?
+[ "$rc" -eq 0 ] && ok "a --verify-file that IS found lets the run succeed" \
+  || bad "a satisfied --verify-file still failed (rc=$rc): $out"
+[ -e "$marker32" ] && ok "the real command actually ran after a satisfied verify-file check" \
+  || bad "the real command never ran despite a satisfied verify-file check"
+
+# 33. No --verify-file: the weaker check. An empty workdir (the `find`
+#     reports nothing) refuses with 98, says the check was the weaker one,
+#     and the real command never runs.
+marker33="$MARKER_DIR/exec-ran-33"
+out=$(
+  PATH="$FIXTURES:$PATH" HARDENED_RUN_IMAGE=stub-image \
+  STUB_DOCKER_MEM=7516192768 STUB_DOCKER_NANOCPUS=4000000000 \
+  STUB_DOCKER_EXEC_MARKER="$marker33" \
+  "$SCRIPT" --cpus 4 --memory 7g --source /fake/src --workdir /src -- true 2>&1
+); rc=$?
+[ "$rc" -eq 98 ] && ok "no --verify-file, empty workdir: refuses with 98" \
+  || bad "empty workdir with no --verify-file did not refuse with 98 (rc=$rc): $out"
+grep -qi "empty" <<<"$out" && ok "says the workdir came back empty" \
+  || bad "did not say the workdir was empty: $out"
+grep -qi "verify-file" <<<"$out" && ok "flags this as the weaker, no --verify-file check" \
+  || bad "did not say this was the weaker check: $out"
+[ ! -e "$marker33" ] && ok "the real command never ran against an empty workdir" \
+  || bad "the real command ran despite an empty workdir"
+
+# 34. No --verify-file, a non-empty workdir (`find` reports something): the
+#     weaker check is satisfied and the real command runs.
+marker34="$MARKER_DIR/exec-ran-34"
+out=$(
+  PATH="$FIXTURES:$PATH" HARDENED_RUN_IMAGE=stub-image \
+  STUB_DOCKER_MEM=7516192768 STUB_DOCKER_NANOCPUS=4000000000 \
+  STUB_DOCKER_EXEC_FIND_OUTPUT="/src/some-file" STUB_DOCKER_EXEC_MARKER="$marker34" \
+  "$SCRIPT" --cpus 4 --memory 7g --source /fake/src --workdir /src -- true 2>&1
+); rc=$?
+[ "$rc" -eq 0 ] && ok "no --verify-file, non-empty workdir: succeeds" \
+  || bad "non-empty workdir with no --verify-file still failed (rc=$rc): $out"
+[ -e "$marker34" ] && ok "the real command actually ran with a non-empty workdir" \
+  || bad "the real command never ran despite a non-empty workdir"
+
+# 35. The mkdir step itself failing refuses with 98, names mkdir
+#     specifically, and the real command never runs -- the stub-driven
+#     counterpart of case 28 above (which proved this against a real
+#     container before this session's container access was withdrawn).
+marker35="$MARKER_DIR/exec-ran-35"
+out=$(
+  PATH="$FIXTURES:$PATH" HARDENED_RUN_IMAGE=stub-image \
+  STUB_DOCKER_MEM=7516192768 STUB_DOCKER_NANOCPUS=4000000000 \
+  STUB_DOCKER_EXEC_MKDIR_RC=1 STUB_DOCKER_EXEC_MARKER="$marker35" \
+  "$SCRIPT" --cpus 4 --memory 7g --source /fake/src --workdir /src \
+    --verify-file Cargo.toml -- true 2>&1
+); rc=$?
+[ "$rc" -eq 98 ] && ok "a failed mkdir refuses with 98" \
+  || bad "failed mkdir did not refuse with 98 (rc=$rc): $out"
+grep -qi "could not create" <<<"$out" && ok "names mkdir as the failing step" \
+  || bad "did not name mkdir as the failing step: $out"
+[ ! -e "$marker35" ] && ok "the real command never ran after a failed mkdir" \
+  || bad "the real command ran despite a failed mkdir"
+
+# 36. docker cp itself failing refuses with 98, names docker cp
+#     specifically, and the real command never runs -- the stub-driven
+#     counterpart of case 27 above.
+marker36="$MARKER_DIR/exec-ran-36"
+out=$(
+  PATH="$FIXTURES:$PATH" HARDENED_RUN_IMAGE=stub-image \
+  STUB_DOCKER_MEM=7516192768 STUB_DOCKER_NANOCPUS=4000000000 \
+  STUB_DOCKER_CP_RC=1 STUB_DOCKER_EXEC_MARKER="$marker36" \
+  "$SCRIPT" --cpus 4 --memory 7g --source /fake/src --workdir /src \
+    --verify-file Cargo.toml -- true 2>&1
+); rc=$?
+[ "$rc" -eq 98 ] && ok "a failed docker cp refuses with 98" \
+  || bad "failed docker cp did not refuse with 98 (rc=$rc): $out"
+grep -qi "docker cp itself failed" <<<"$out" && ok "names docker cp as the failing step" \
+  || bad "did not name docker cp as the failing step: $out"
+[ ! -e "$marker36" ] && ok "the real command never ran after a failed docker cp" \
+  || bad "the real command ran despite a failed docker cp"
+
 echo
 echo "skipped: $skips"
 [ "$fails" -eq 0 ] && echo "PASS" || echo "FAILURES"

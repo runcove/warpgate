@@ -44,7 +44,7 @@ CI it would silently defeat the cap assertion. Refusing to run." >&2
   fi
 done
 
-CPUS="" MEM="" LABEL="hardened" SOURCE="" WORKDIR=""
+CPUS="" MEM="" LABEL="hardened" SOURCE="" WORKDIR="" VERIFY_FILE=""
 FORWARD_VARS=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -57,8 +57,16 @@ while [ $# -gt 0 ]; do
     # neither gets exactly today's behaviour. A caller that passes one
     # without the other has made a mistake, not a choice -- caught below,
     # once parsing has seen everything.
-    --source)  SOURCE="$2"; shift 2 ;;
-    --workdir) WORKDIR="$2"; shift 2 ;;
+    --source)      SOURCE="$2"; shift 2 ;;
+    --workdir)     WORKDIR="$2"; shift 2 ;;
+    # Relative to --workdir. Optional even when --source is given: this
+    # script names no project (see the file header), so it has no business
+    # hardcoding a project's manifest filename -- that knowledge belongs to
+    # the caller (run-check.sh passes --verify-file Cargo.toml, because it
+    # already knows this is a cargo workspace). Without it, delivery is
+    # still verified, just more weakly -- see the source-delivery block
+    # below for what that means.
+    --verify-file) VERIFY_FILE="$2"; shift 2 ;;
     # The caller names a VARIABLE, never a value -- so no secret is ever a
     # command-line argument, and none shows up in a `set -x` trace or a
     # process listing. This script still names no project (the caller
@@ -80,6 +88,10 @@ if [ -n "$SOURCE" ] && [ -z "$WORKDIR" ]; then
 fi
 if [ -n "$WORKDIR" ] && [ -z "$SOURCE" ]; then
   echo "hardened-run: --source is required when --workdir is given" >&2
+  exit 2
+fi
+if [ -n "$VERIFY_FILE" ] && [ -z "$SOURCE" ]; then
+  echo "hardened-run: --verify-file requires --source (there is nothing to verify without a copy)" >&2
   exit 2
 fi
 
@@ -267,14 +279,36 @@ $NAME:$WORKDIR. Refusing to run with no source delivered." >&2
   # alone would make a `docker cp` that reports success having copied the
   # wrong thing indistinguishable from a workdir that doesn't exist -- both
   # would otherwise reach the check silently.
-  if ! docker exec "$NAME" test -f "$WORKDIR/Cargo.toml"; then
-    echo "hardened-run: FATAL -- docker cp exited 0 but $WORKDIR/Cargo.toml is not
+  #
+  # Strongest when the caller names a file it actually expects
+  # (--verify-file, relative to --workdir): a wrong-directory copy is still
+  # caught, because the named file only exists in the right one. Without
+  # --verify-file the check is deliberately weaker -- only "the workdir is
+  # non-empty" -- and says so out loud, because a wrong-directory copy that
+  # happens to land somewhere non-empty would sail straight through it; a
+  # caller that can name a file should.
+  if [ -n "$VERIFY_FILE" ]; then
+    if ! docker exec "$NAME" test -f "$WORKDIR/$VERIFY_FILE"; then
+      echo "hardened-run: FATAL -- docker cp exited 0 but $WORKDIR/$VERIFY_FILE is not
 present inside the container afterwards -- the copy landed in the wrong place, or
 copied the wrong thing. Refusing to run against a container with no verified
 source." >&2
-    exit 98
+      exit 98
+    fi
+    echo "hardened-run: verified source present at $NAME:$WORKDIR/$VERIFY_FILE"
+  else
+    echo "hardened-run: no --verify-file given -- only checking that $WORKDIR is
+non-empty, which a wrong-directory copy could also satisfy. Pass --verify-file for a
+stronger check." >&2
+    LISTING=$(docker exec "$NAME" find "$WORKDIR" -mindepth 1 -maxdepth 1 2>/dev/null)
+    if [ -z "$LISTING" ]; then
+      echo "hardened-run: FATAL -- docker cp exited 0 but $WORKDIR is empty inside the
+container afterwards. Refusing to run against a container with no verified source." >&2
+      exit 98
+    fi
+    echo "hardened-run: verified $NAME:$WORKDIR is non-empty (weaker check -- no
+--verify-file was given)"
   fi
-  echo "hardened-run: verified source present at $NAME:$WORKDIR/Cargo.toml"
 fi
 
 EXEC_ARGS=("${FORWARD_ARGS[@]}")

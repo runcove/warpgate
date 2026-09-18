@@ -185,6 +185,13 @@ grep -qx -- "--workdir" "$ARGS_FILE" 2>/dev/null && grep -qx "/src" "$ARGS_FILE"
   && ok "passes --workdir /src to hardened-run.sh on the capped path" \
   || bad "did not pass --workdir /src to hardened-run.sh: $(cat "$ARGS_FILE" 2>/dev/null)"
 
+# FIX ROUND 1: hardened-run.sh names no project, so it does not know
+# "Cargo.toml" is the right file to look for -- that knowledge is
+# run-check.sh's own (this IS a cargo workspace), passed through explicitly.
+grep -qx -- "--verify-file" "$ARGS_FILE" 2>/dev/null && grep -qx "Cargo.toml" "$ARGS_FILE" 2>/dev/null \
+  && ok "passes --verify-file Cargo.toml to hardened-run.sh on the capped path" \
+  || bad "did not pass --verify-file Cargo.toml to hardened-run.sh: $(cat "$ARGS_FILE" 2>/dev/null)"
+
 rm -f "$ARGS_FILE"
 out=$(CHECKS_FILE="$FAKE_CHECKS" STUB_HARDENED_RUN_ARGS_FILE="$ARGS_FILE" \
   "$FORWARD_DIR/run-check.sh" fake-uncapped 2>&1); rc=$?
