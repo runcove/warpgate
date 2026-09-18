@@ -1,0 +1,65 @@
+# The translation of upstream's CI. Upstream's .github/workflows/* are never run;
+# this file says which of their checks we run and how. Diff this against upstream
+# when the drift detector fires.
+upstream_tag: v0.28.6
+checks:
+  - name: cargo-deny
+    upstream: cargo-deny.yml
+    command: cargo deny check
+    compiles: false
+    state: reporting
+  - name: lockfile
+    upstream: lockfile.yml
+    command: .forgejo/scripts/check-lockfile.sh
+    compiles: false
+    state: reporting
+  - name: fmt-toml
+    upstream: fmt-toml.yml
+    command: cargo fmt-toml --check
+    compiles: false
+    state: reporting
+  - name: biome
+    upstream: biome.yml
+    command: cd warpgate-web && biome ci .
+    compiles: false
+    state: reporting
+  - name: helm-lint
+    upstream: helm-publish.yaml
+    command: helm lint --strict helm && helm template helm >/dev/null
+    compiles: false
+    state: reporting
+  - name: clippy
+    upstream: clippy.yml
+    command: just clippy
+    compiles: true
+    state: reporting
+  - name: schema-compat
+    upstream: check-schema-compatibility.yml
+    command: just openapi-all
+    compiles: unverified
+    state: reporting
+  - name: unit-tests
+    upstream: test.yml
+    command: cargo llvm-cov test --workspace
+    compiles: true
+    state: reporting
+  - name: release-build
+    upstream: build.yml
+    command: cargo build --all-features --release
+    compiles: true
+    state: reporting
+  - name: sbom
+    upstream: build.yml
+    command: cargo cyclonedx --all-features
+    compiles: true
+    state: reporting
+  - name: reprotest
+    upstream: reprotest.yml
+    command: .forgejo/scripts/reprotest.sh
+    compiles: true
+    state: excepted
+    reason: >-
+      Manual-only upstream (workflow_dispatch) and stays manual here; it re-runs a
+      full release build several times under a variance matrix and is not routine
+      load. Not a failure, a deliberate opt-out.
+    review_by: 2026-12-18
