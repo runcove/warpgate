@@ -133,7 +133,42 @@ jobs:
           OLD: ${{ steps.resolve.outputs.old }}
           NEW: ${{ steps.resolve.outputs.new }}
         run: |
-          set -uo pipefail   # NOT -e: drift-check.py's own exit code (0/3) IS the result
+          # `set -uo pipefail` does NOT clear an -e inherited from the shell
+          # this step is launched with, and the runner launches `bash -e`.
+          # The previous version of this line said "NOT -e" as though writing
+          # it turned -e off; measured, it does not (`case "$-" in *e*)` still
+          # matches). Every non-zero command below therefore killed the step
+          # WHERE IT STOOD, before the echo that was supposed to report it --
+          # which is how run 520 on 2026-09-18 produced exit 1 with no output
+          # at all and skipped everything downstream. `set +e` is explicit and
+          # works whether or not -e arrived from outside.
+          set +e
+          set -uo pipefail
+
+          # drift-check.py imports checks_lib, which imports yaml. The runner's
+          # job image is node:22-bookworm and carries no PyYAML, so without
+          # this the script dies at import with ModuleNotFoundError before it
+          # compares anything -- the second half of run 520's silent failure.
+          # ci.yml installs the same package for the same reason; this
+          # workflow never did, and nothing noticed because this step had no
+          # test covering it anywhere.
+          #
+          # Installed HERE rather than as its own job-level step so the daily
+          # scheduled run, which almost always has nothing to do, does not
+          # apt-get update every morning to prepare for work it will not do.
+          # python3-yaml not pip: this image's Python is externally managed
+          # (PEP 668) and a bare pip install refuses outright.
+          apt-get update -qq && apt-get install -y -qq python3-yaml
+          APT_RC=$?
+          # Verified by importing, not by apt's exit code: apt can succeed
+          # while installing the module for a different python3 than the one
+          # on PATH, which would leave this green and drift-check.py failing
+          # exactly as before.
+          python3 -c "import yaml" 2>/dev/null
+          YAML_RC=$?
+          if [ "$APT_RC" -ne 0 ] || [ "$YAML_RC" -ne 0 ]; then
+            echo "::warning::could not make PyYAML importable (apt=$APT_RC import=$YAML_RC) -- the drift report will be a refusal, not a clean 'no change'"
+          fi
 
           # Run-scoped path -- a fixed name in a shared runner's /tmp would
           # collide between concurrent runs.
@@ -184,7 +219,15 @@ jobs:
           SRC: ${{ steps.resolve.outputs.source_branch }}
           DST: ${{ steps.resolve.outputs.branch }}
         run: |
-          set -uo pipefail          # NOT -e: a failed rebase is an outcome here
+          # Same correction as the drift step: `set -uo pipefail` does not
+          # clear an inherited -e, and the runner launches `bash -e`. A failed
+          # rebase IS an outcome here -- it is the conflict path, the one this
+          # workflow exists to report -- so -e would have killed the step at
+          # the rebase and reported nothing, turning the case we most need to
+          # hear about into a bare non-zero exit. Never exercised in CI before
+          # 2026-09-18 because the step above it died first.
+          set +e
+          set -uo pipefail
 
           git config user.email "ops@tenfourty.site"
           git config user.name  "warpgate-upstream-watch"
