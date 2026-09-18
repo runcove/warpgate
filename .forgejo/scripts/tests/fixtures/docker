@@ -13,11 +13,19 @@
 #   STUB_DOCKER_EXEC_RC      exit code for `docker exec`       (default 0)
 #   STUB_DOCKER_EXEC_MARKER  if set, `docker exec` touches this path -- a test
 #                            asserts its absence to prove the command never ran
+#   STUB_DOCKER_RUN_ARGS_FILE   if set, the full `docker run` argument list
+#                                (one per line) is written there -- a test
+#                                asserts which `-e VAR` flags actually reached
+#                                the call, not just that the script claims to.
+#   STUB_DOCKER_EXEC_ARGS_FILE  same, for `docker exec`.
 set -uo pipefail
 
 cmd="${1:-}"
 case "$cmd" in
   run)
+    if [ -n "${STUB_DOCKER_RUN_ARGS_FILE:-}" ]; then
+      printf '%s\n' "$@" > "$STUB_DOCKER_RUN_ARGS_FILE"
+    fi
     exit "${STUB_DOCKER_RUN_RC:-0}"
     ;;
   inspect)
@@ -37,6 +45,9 @@ case "$cmd" in
   exec)
     if [ -n "${STUB_DOCKER_EXEC_MARKER:-}" ]; then
       touch "$STUB_DOCKER_EXEC_MARKER"
+    fi
+    if [ -n "${STUB_DOCKER_EXEC_ARGS_FILE:-}" ]; then
+      printf '%s\n' "$@" > "$STUB_DOCKER_EXEC_ARGS_FILE"
     fi
     exit "${STUB_DOCKER_EXEC_RC:-0}"
     ;;

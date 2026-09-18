@@ -199,5 +199,77 @@ grep -q "hardened-run: FATAL -- HARDENED_RUN_IMAGE is not set" <<<"$out" \
   && ok "names the missing configuration in our own refusal message, not bash's builtin :? text" \
   || bad "did not produce our own refusal message: $out"
 
+# 16-20. TASK 5 FIX ROUND 1 (gap traced to Task 2's own brief text, authorised
+# there): --forward-env crosses the cap boundary that used to forward
+# nothing at all. The caller passes a variable NAME; the VALUE is read from
+# this script's own environment by docker's `-e VAR` (name-only) form, so it
+# is never a command-line argument, never in a `set -x` trace, never in a
+# process listing. Cases 19 exercise the stub `docker`'s own recorded argv,
+# not just this script's claim about itself.
+
+# 16. Dry preview must show the -e flag -- the preview is the only handle a
+#     dry test has on the flag's effect, and HARDENED_RUN_DRY=1 must include
+#     it per the fix-round brief.
+out=$(HARDENED_RUN_DRY=1 FOO_VAR=somevalue \
+      "$SCRIPT" --cpus 4 --memory 7g --forward-env FOO_VAR -- true 2>&1)
+grep -q -- "-e FOO_VAR" <<<"$out" && ok "dry preview includes the forwarded -e flag" \
+  || bad "dry preview omitted the forwarded flag: $out"
+grep -q "forwarded 1 variable(s) into the capped container: FOO_VAR" <<<"$out" \
+  && ok "names what it forwarded, by name and count" \
+  || bad "did not report the forward by name and count: $out"
+
+# 17. A variable that is genuinely unset must not be forwarded -- this is the
+#     exact shape of a cache-env.sh refusal (Task 3): GITHUB_ENV never gets
+#     RUSTC_WRAPPER, so the job process never has it at all. `-e VAR` on an
+#     unset VAR would still define it as empty inside the container.
+out=$(unset MISSING_VAR; HARDENED_RUN_DRY=1 \
+      "$SCRIPT" --cpus 4 --memory 7g --forward-env MISSING_VAR -- true 2>&1)
+grep -q -- "-e MISSING_VAR" <<<"$out" \
+  && bad "forwarded an unset variable -- would define it empty in the container: $out" \
+  || ok "an unset variable is not forwarded"
+grep -q "forwarded 0 variable(s)" <<<"$out" && ok "count reflects nothing forwarded" \
+  || bad "count did not reflect the skip: $out"
+
+# 18. A variable that is SET but empty (an unconfigured Actions secret still
+#     lands in job env as "") must also not be forwarded -- an empty
+#     AWS_SECRET_ACCESS_KEY inside the container is worse than an absent
+#     one: sccache starts, fails auth, and the failure reads as a
+#     configuration bug rather than the absent-cache problem it is.
+out=$(EMPTY_VAR="" HARDENED_RUN_DRY=1 \
+      "$SCRIPT" --cpus 4 --memory 7g --forward-env EMPTY_VAR -- true 2>&1)
+grep -q -- "-e EMPTY_VAR" <<<"$out" \
+  && bad "forwarded an empty-but-set variable: $out" \
+  || ok "an empty-but-set variable is not forwarded"
+
+# 19. The stub docker's OWN recorded argv -- not this script's claim about
+#     itself -- must show the -e flag on both `docker run -d` and
+#     `docker exec`. Runs the real (non-dry) path via the stub so both calls
+#     actually happen.
+RUN_ARGS_FILE="$MARKER_DIR/run-args-19"
+EXEC_ARGS_FILE="$MARKER_DIR/exec-args-19"
+out=$(
+  PATH="$FIXTURES:$PATH" HARDENED_RUN_IMAGE=stub-image \
+  STUB_DOCKER_MEM=7516192768 STUB_DOCKER_NANOCPUS=4000000000 \
+  STUB_DOCKER_RUN_ARGS_FILE="$RUN_ARGS_FILE" STUB_DOCKER_EXEC_ARGS_FILE="$EXEC_ARGS_FILE" \
+  FORWARD_ME=abc123 \
+  "$SCRIPT" --cpus 4 --memory 7g --forward-env FORWARD_ME -- true 2>&1
+); rc=$?
+[ "$rc" -eq 0 ] && ok "a forwarded run still succeeds" || bad "forwarded run failed (rc=$rc): $out"
+grep -qx -- "-e" "$RUN_ARGS_FILE" 2>/dev/null && grep -qx "FORWARD_ME" "$RUN_ARGS_FILE" \
+  && ok "docker run actually received -e FORWARD_ME" \
+  || bad "docker run's real argv did not carry -e FORWARD_ME: $(cat "$RUN_ARGS_FILE" 2>/dev/null)"
+grep -qx -- "-e" "$EXEC_ARGS_FILE" 2>/dev/null && grep -qx "FORWARD_ME" "$EXEC_ARGS_FILE" \
+  && ok "docker exec actually received -e FORWARD_ME" \
+  || bad "docker exec's real argv did not carry -e FORWARD_ME: $(cat "$EXEC_ARGS_FILE" 2>/dev/null)"
+
+# 20. Never the value -- only the name -- in anything this script itself
+#     prints. The dummy value is deliberately distinctive so it would be easy
+#     to spot if it leaked into the "forwarded" report or the dry preview.
+out=$(HARDENED_RUN_DRY=1 SECRETY_VAR="do-not-print-me-98765" \
+      "$SCRIPT" --cpus 4 --memory 7g --forward-env SECRETY_VAR -- true 2>&1)
+grep -q "do-not-print-me-98765" <<<"$out" \
+  && bad "the forwarded value leaked into this script's own output: $out" \
+  || ok "only the variable name is reported, never its value"
+
 echo; [ "$fails" -eq 0 ] && echo "PASS" || echo "FAILURES"
 exit "$fails"

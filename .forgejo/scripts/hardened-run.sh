@@ -43,11 +43,18 @@ CI it would silently defeat the cap assertion. Refusing to run." >&2
 done
 
 CPUS="" MEM="" LABEL="hardened"
+FORWARD_VARS=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --cpus)   CPUS="$2"; shift 2 ;;
     --memory) MEM="$2";  shift 2 ;;
     --label)  LABEL="$2"; shift 2 ;;
+    # The caller names a VARIABLE, never a value -- so no secret is ever a
+    # command-line argument, and none shows up in a `set -x` trace or a
+    # process listing. This script still names no project (the caller
+    # decides what crosses the boundary); repeatable so a caller can forward
+    # as many names as it needs.
+    --forward-env) FORWARD_VARS+=("$2"); shift 2 ;;
     --) shift; break ;;
     *) echo "hardened-run: unknown argument $1" >&2; exit 2 ;;
   esac
@@ -66,8 +73,28 @@ ARGS=(--rm --name "$NAME"
       "--cpus=${CPUS}"
       "--memory=${MEM}" "--memory-swap=${MEM}")
 
+# Only a variable that is actually SET, with a non-empty value, in this
+# script's own environment gets forwarded. `-e VAR` (name-only) tells docker
+# to copy the value from here -- for a variable that is unset OR set to "",
+# that copies an empty string into the container, which is worse than the
+# variable being absent there too: sccache would start, try to authenticate
+# with an empty credential, and fail in a way that looks like a
+# configuration problem rather than the absent-cache problem it actually is.
+# Reported by name and count below -- never by value, and never omitted:
+# a silent forward is exactly as untestable as the gap this flag exists to
+# close.
+FORWARD_ARGS=()
+FORWARDED_NAMES=()
+for v in "${FORWARD_VARS[@]}"; do
+  if [ -n "${!v:-}" ]; then
+    FORWARD_ARGS+=(-e "$v")
+    FORWARDED_NAMES+=("$v")
+  fi
+done
+echo "hardened-run: forwarded ${#FORWARDED_NAMES[@]} variable(s) into the capped container: ${FORWARDED_NAMES[*]:-(none)}"
+
 if [ "${HARDENED_RUN_DRY:-}" = "1" ]; then
-  echo "would run: docker run ${ARGS[*]} -- $*"
+  echo "would run: docker run ${ARGS[*]} ${FORWARD_ARGS[*]} -- $*"
 fi
 
 # Convert what we asked for into the units the runtime reports back (bytes
@@ -165,7 +192,7 @@ elif [ "$HAVE_MEM" -eq 0 ] || [ "$HAVE_CPUS" -eq 0 ]; then
     echo "hardened-run: FATAL -- HARDENED_RUN_IMAGE is not set. Refusing to run." >&2
     exit 93
   }
-  docker run -d "${ARGS[@]}" --entrypoint sleep "$HARDENED_RUN_IMAGE" 86400 >/dev/null || {
+  docker run -d "${ARGS[@]}" "${FORWARD_ARGS[@]}" --entrypoint sleep "$HARDENED_RUN_IMAGE" 86400 >/dev/null || {
     echo "hardened-run: could not start the capped container" >&2; exit 91; }
   if [ "$HAVE_MEM" -eq 0 ]; then
     MEM_ACTUAL="$(docker inspect -f '{{.HostConfig.Memory}}' "$NAME" 2>/dev/null)"; MEM_RC=$?
@@ -189,4 +216,4 @@ fi
 if [ "${HARDENED_RUN_DRY:-}" = "1" ]; then exit 0; fi
 
 trap 'docker rm -f "$NAME" >/dev/null 2>&1' EXIT
-docker exec "$NAME" "$@"
+docker exec "${FORWARD_ARGS[@]}" "$NAME" "$@"
