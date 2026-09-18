@@ -15,27 +15,28 @@ that decides if anything runs at all can return both of its answers, and
 whether a conflicting rebase leaves the tree clean and names the files it
 stopped on.
 
-COVERAGE, AS AT 2026-09-18 21:00 -- FIVE OF THE WORKFLOW'S SIX LOGIC-BEARING
-STEPS. Executed here: resolve, the already-current gate, replay, push and the
-conflict report. NOT executed anywhere, by this file or any other: the `drift`
-step (`id: drift`, "report how upstream's CI changed"). Also untouched, and
-fine: actions/checkout and a summary step that only echoes.
+COVERAGE IS NOT CLAIMED IN THIS PARAGRAPH. `assert_full_coverage` walks the
+workflow at the end of every run, counts the steps carrying a `run:` block
+against the ones this file actually executed, and requires the remainder to be
+named in UNCOVERED_BY_DESIGN with a reason. It prints the three numbers it
+computed. Read those; do not read this header for them.
 
-⚠ THIS PARAGRAPH PREVIOUSLY READ "NOTHING IS EXCLUDED ANY MORE ... all five of
-the workflow's logic-bearing steps". That was true when written and false by
-the time it mattered: the fork-CI arc added the `drift` step between the gate
-and replay, and nothing re-read this header as a claim. Six steps, five run.
-The sentence went on asserting completeness about a file that had grown a new
-step underneath it -- which is precisely the failure the rest of this header
-congratulates itself for having fixed three times. Counting the `id:` lines in
-the workflow against the ids this file extracts is the check; the header's own
-account of itself is not.
+That machinery exists because the sentence that used to sit here -- "nothing is
+excluded any more ... all five of the workflow's logic-bearing steps" -- was
+true when written and false by the time it mattered: the fork-CI arc added the
+`drift` step between the gate and replay, and nothing re-read the header as a
+claim. A prose count is a snapshot of a file that keeps moving; a computed one
+cannot drift from its subject.
 
-It matters beyond tidiness: on 2026-09-18 the first real rehearsal of this
-workflow failed on the replay path in CI, at a point between the gate and
-replay, with no output at all -- and `drift` is the step that sits there and
-has never executed. It is not proven to be the cause. It is the one candidate
-that no test could ever have cleared.
+It mattered beyond tidiness. On 2026-09-18 the first real rehearsal of this
+workflow failed on the replay path in CI, between the gate and replay, with an
+exit code and no text -- and `drift` was the step that sat there, the one step
+no test could have cleared. It WAS the cause, twice over: drift-check.py
+imports PyYAML and this workflow never installed it, and the step's `set -uo
+pipefail` did not clear the `-e` the runner supplies, so the failing import
+killed the step one line before the echo meant to report it. Both fixed
+2026-09-19, and both are now assertions here rather than fixes someone
+remembers making.
 
 That took three exclusions apart in a row, and each was the same shape: a
 sentence that was true of the words and false of the situation.
@@ -111,11 +112,13 @@ UNCOVERED_BY_DESIGN = {
     "summary": "echoes three values it is handed and branches on none of them; "
                "there is no behaviour here a test could distinguish from a "
                "working one.",
-    "report how upstream's CI changed": "TODO (homelab-br5.13): needs upstream "
-               "CI files at two tags inside the fixture, which nothing here "
-               "builds yet. This is the gap that let the -e defect through, so "
-               "it is a TODO with an id, not a permanent exemption.",
 }
+# The `drift` step was here as a TODO carrying homelab-br5.13 -- "needs upstream
+# CI files at two tags inside the fixture, which nothing here builds yet". It is
+# executed as of 2026-09-19: build_fixture writes .github/workflows at every tag
+# and the drift section of main() runs the step's own text four ways. The gap
+# that let the inherited--e defect through is closed, and the TODO is gone
+# rather than left to read as caution while covering nothing.
 
 _PULLED: set = set()
 
@@ -221,10 +224,35 @@ def build_fixture(root: pathlib.Path) -> pathlib.Path:
 
     # Release tags, including two that a LEXICAL sort would order wrongly:
     # v0.28.10 must beat v0.28.6, and v0.9.0 must not beat either.
+    #
+    # Each tag also carries upstream's own .github/workflows, because the drift
+    # step compares exactly that path between two tags and had nothing to read
+    # here until 2026-09-19. The contents are chosen so one adjacent pair has no
+    # CI change at all (v0.9.0 -> v0.22.0) and the pair the drift assertions use
+    # (v0.28.6 -> v0.28.10) exercises all three verdicts drift-check.py can
+    # print about a file: build.yml CHANGED, clippy.yml ADDED, biome.yml
+    # REMOVED. build.yml is not an arbitrary pick -- checks.yaml translates it
+    # TWICE (release-build and sbom), which is the duplicate-key case
+    # drift-check.py has a long comment about and no test.
+    WF_AT_TAG = {
+        "v0.9.0": {"build.yml": "name: build\n", "biome.yml": "name: biome\n"},
+        "v0.22.0": {"build.yml": "name: build\n", "biome.yml": "name: biome\n"},
+        "v0.28.6": {"build.yml": "name: build\n", "biome.yml": "name: biome\n"},
+        "v0.28.10": {"build.yml": "name: build\non: [push]\n",
+                     "clippy.yml": "name: clippy\n"},
+    }
+    wfdir = up / ".github/workflows"
     for tag, body in [("v0.9.0", "nine\n"), ("v0.22.0", "twentytwo\n"),
                       ("v0.28.6", "release\n"), ("v0.28.10", "newer\n")]:
         (up / "UPSTREAM").write_text(body)
         git(up, "add", "UPSTREAM")
+        shutil.rmtree(wfdir, ignore_errors=True)
+        wfdir.mkdir(parents=True)
+        for fn, text in WF_AT_TAG[tag].items():
+            (wfdir / fn).write_text(text)
+        # -A so a file DROPPED at this tag is staged as a deletion; scoped by
+        # pathspec to the directory this loop owns, inside a throwaway repo.
+        git(up, "add", "-A", "--", ".github/workflows")
         git(up, "commit", "-qm", f"upstream {tag}")
         git(up, "tag", tag)
 
@@ -255,14 +283,111 @@ def build_fixture(root: pathlib.Path) -> pathlib.Path:
     git(ours, "checkout", "-q", "-B", "rehearsal/cove-patches-v9.9.9", "v0.28.6")
     git(ours, "push", "-q", "origin", "rehearsal/cove-patches-v9.9.9")
 
+    # The drift step shells out to `.forgejo/scripts/drift-check.py` relative to
+    # cwd, and that script resolves checks.yaml relative to ITSELF, so the
+    # fixture needs all three at the real layout. Copied, never reimplemented:
+    # a reimplementation would test the copy, and the copy is not what runs.
+    # This is the first covered step needing anything from the real repo inside
+    # the fixture; every other step uses only git.
+    here = pathlib.Path(__file__).resolve().parent
+    (ours / ".forgejo/scripts").mkdir(parents=True)
+    for f in ("drift-check.py", "checks_lib.py"):
+        shutil.copy2(here / f, ours / ".forgejo/scripts" / f)
+    shutil.copy2(here.parent / "checks.yaml", ours / ".forgejo/checks.yaml")
+    # Excluded rather than committed, for one specific reason: the conflict
+    # assertions require `git status --porcelain` to come back EMPTY, and three
+    # untracked files would make that assertion fail for a reason that has
+    # nothing to do with the rebase it is about. Committing them instead would
+    # change the patch counts the replay assertions check.
+    (ours / ".git/info/exclude").write_text("/.forgejo/\n")
+
     git(ours, "checkout", "-q", "cove-patches-v0.28.6")
     git(ours, "fetch", "-q", "origin")
     return ours
 
 
-def run_step(script, repo, env_extra, outputs: pathlib.Path):
+def fake_apt(root: pathlib.Path, rc: int) -> pathlib.Path:
+    """A bin directory whose `apt-get` does nothing and exits `rc`.
+
+    The drift step apt-get installs python3-yaml. Left unstubbed this test gives
+    a different answer on every host it runs on: 127 on a machine with no apt at
+    all, a real network install inside a Debian job image, a permission failure
+    as a non-root user. None of those is the thing under test, and one of them
+    reaches the network. Stubbed, whether PyYAML ends up importable is decided
+    by this file and nothing else.
+    """
+    d = root / f"fake-apt-{rc}"
+    d.mkdir(exist_ok=True)
+    p = d / "apt-get"
+    p.write_text(f'#!/bin/sh\nexit {rc}\n')
+    p.chmod(0o755)
+    return d
+
+
+def yaml_blocker(root: pathlib.Path) -> pathlib.Path:
+    """A PYTHONPATH entry that makes `import yaml` raise, as the job image does.
+
+    Shadows the real PyYAML with a module that raises ModuleNotFoundError -- the
+    same exception node:22-bookworm's Python produces, from the same import
+    line, and the first half of run 520's silent failure on 2026-09-18.
+
+    The caution that comes with this: the FIRST attempt to simulate that case
+    (18 Sep, in a scratch script) ran `python3 -c "import yaml"` on a host where
+    yaml was importable, so nothing failed, and the green result was read as the
+    hypothesis holding. Every use of this blocker is therefore paired with a
+    precondition that the import really does fail under it, and a control that
+    it succeeds without it.
+    """
+    d = root / "no-yaml"
+    d.mkdir(exist_ok=True)
+    (d / "yaml.py").write_text(
+        'raise ModuleNotFoundError("No module named \'yaml\'")\n')
+    return d
+
+
+def can_import_yaml(repo: pathlib.Path, env_extra: dict) -> bool:
+    """Does `python3 -c "import yaml"` succeed under exactly this environment?"""
+    return subprocess.run(["bash", "-c", 'python3 -c "import yaml"'],
+                          cwd=str(repo), capture_output=True, text=True,
+                          env={**os.environ, **env_extra}).returncode == 0
+
+
+def github_env_value(path: pathlib.Path, key: str):
+    """One value out of a GITHUB_ENV file, including the `KEY<<DELIM` form.
+
+    Returns None when the key is absent, which is deliberately distinguishable
+    from a key present and empty: "the step wrote nothing" and "the step wrote
+    an empty report" are the two cases this whole bead is about not confusing.
+    """
+    lines = path.read_text().splitlines() if path.exists() else []
+    i = 0
+    while i < len(lines):
+        ln = lines[i]
+        if ln.startswith(f"{key}<<"):
+            delim = ln.split("<<", 1)[1]
+            body, i = [], i + 1
+            while i < len(lines) and lines[i] != delim:
+                body.append(lines[i])
+                i += 1
+            return "\n".join(body)
+        if ln.startswith(f"{key}="):
+            return ln.split("=", 1)[1]
+        i += 1
+    return None
+
+
+def run_step(script, repo, env_extra, outputs: pathlib.Path,
+             env_file: pathlib.Path = None):
     env = dict(os.environ)
     env.update({"GITHUB_OUTPUT": str(outputs)})
+    if env_file is not None:
+        # Truncated here rather than by the caller so a step that writes nothing
+        # leaves an EMPTY file, not the previous step's report to be misread as
+        # this one's. GITHUB_ENV must also be set for any step that appends to
+        # it: those steps run under `set -u`, where an unset one is a fatal
+        # unbound variable and not the behaviour CI would show.
+        env_file.write_text("")
+        env["GITHUB_ENV"] = str(env_file)
     env.update(env_extra)
     r = subprocess.run(["bash", "-c", script], cwd=str(repo),
                        capture_output=True, text=True, env=env)
@@ -370,6 +495,124 @@ def main() -> int:
     # vary, and it is the one assertion here that no single-case test can make.
     expect("the gate is capable of both answers, not wired to one",
            sorted(a for a in answers if a), ["no", "yes"])
+
+    # --- report how upstream's CI changed ---------------------------------
+    # The last step in this workflow that had never executed anywhere, and the
+    # one that sits exactly where run 520 died on 2026-09-18 -- between the gate
+    # and replay, producing an exit code and no text. Everything below is a
+    # property that only running it can establish.
+    drift = step_run(doc, "report how upstream's CI changed")
+    denv = root / "gh-env"
+    blocker = yaml_blocker(root)
+    apt_ok, apt_bad = fake_apt(root, 0), fake_apt(root, 100)
+    path = os.environ.get("PATH", "")
+    with_yaml = {"PATH": f"{apt_ok}:{path}"}
+    no_yaml = {"PATH": f"{apt_bad}:{path}", "PYTHONPATH": str(blocker)}
+
+    # The fixture's CI has to differ between the two tags or every assertion
+    # below is about the "no change" path wearing a different label.
+    expect("PRECONDITION: upstream's CI really does differ across the tags "
+           "under test",
+           sorted(git(repo, "diff", "--name-only", "v0.28.6", "v0.28.10", "--",
+                      ".github/workflows", check=False).split()),
+           [".github/workflows/biome.yml",
+            ".github/workflows/build.yml",
+            ".github/workflows/clippy.yml"])
+
+    # Nothing changed: the only case where a blank-looking report is honest.
+    out.write_text("")
+    rc, log, _ = run_step(drift, repo,
+                          {"OLD": "v0.9.0", "NEW": "v0.22.0", **with_yaml},
+                          out, env_file=denv)
+    expect("an unchanged upstream CI succeeds", rc, 0)
+    expect("...and says which exit code it read", "drift-check.py exited 0" in log, True)
+    body = github_env_value(denv, "DRIFT")
+    expect("...and reports 'no change' into GITHUB_ENV",
+           str(body).startswith("no change:"), True)
+
+    # A real change. Three verdicts in one comparison, and the duplicate-key
+    # cross-reference that has only ever been argued for in a comment.
+    out.write_text("")
+    rc, log, _ = run_step(drift, repo,
+                          {"OLD": "v0.28.6", "NEW": "v0.28.10", **with_yaml},
+                          out, env_file=denv)
+    changed_body = github_env_value(denv, "DRIFT") or ""
+    expect("a changed upstream CI still succeeds -- drift is information, "
+           "never a build failure", rc, 0)
+    expect("...and drift-check.py returns its own code for it, not a failure",
+           "drift-check.py exited 3" in log, True)
+    expect("...naming the file that changed",
+           "build.yml: changed" in changed_body, True)
+    expect("...the file upstream ADDED", "clippy.yml: ADDED" in changed_body, True)
+    expect("...and the file upstream REMOVED",
+           "biome.yml: REMOVED" in changed_body, True)
+    # A real result must not be dressed as a refusal, which is the same
+    # confusion as the reverse and just as invisible in a one-line summary.
+    expect("...and a real verdict is NOT stamped as a failure to complete",
+           "DID NOT COMPLETE" in changed_body, False)
+    # checks.yaml maps build.yml to TWO of our checks. A 1:1 {upstream: name}
+    # dict -- the shape drift-check.py warns against and the obvious way to
+    # write it -- keeps only the last and silently under-reports the blast
+    # radius. Both names, or this proves nothing.
+    #
+    # Limit worth knowing: --selftest mutates the workflow and never the scripts
+    # it calls, so this pair is outside that harness. It was proven by hand
+    # instead, on a throwaway copy of .forgejo (2026-09-19): flattening the dict
+    # to `{c["upstream"]: [c["name"]]}` takes the run to 79/80 with exactly
+    # "cross-referencing to release-build" red.
+    #
+    # That result is the argument for asserting BOTH names rather than one. The
+    # flattened map does not lose the cross-reference -- it keeps the LAST entry
+    # written for the key, so `sbom` still appears and a test that checked only
+    # `sbom`, or only "some check was named", would have stayed green through
+    # it. Half the answer is the shape of failure this file exists to catch.
+    for name in ("release-build (mirrors build.yml)", "sbom (mirrors build.yml)"):
+        expect(f"...cross-referencing to {name.split()[0]}",
+               name in changed_body, True)
+
+    # THE case. PyYAML unavailable is not hypothetical: it is what the job image
+    # actually looks like, and on 2026-09-18 it killed this step one line before
+    # the echo meant to report it, leaving exit 1 and no text at all.
+    expect("PRECONDITION: PyYAML really is unimportable under the blocked "
+           "environment (the first simulation of this case, 18 Sep, ran the "
+           "probe where yaml WAS importable and proved nothing)",
+           can_import_yaml(repo, no_yaml), False)
+    expect("CONTROL: ...and importable without the blocker, so the line above "
+           "is the blocker's doing and not a missing python3",
+           can_import_yaml(repo, with_yaml), True)
+
+    out.write_text("")
+    rc, log, _ = run_step(drift, repo,
+                          {"OLD": "v0.28.6", "NEW": "v0.28.10", **no_yaml},
+                          out, env_file=denv)
+    incomplete_body = github_env_value(denv, "DRIFT") or ""
+    expect("a step that cannot run the check still EXITS CLEAN -- a CI change "
+           "must never fail this job", rc, 0)
+    expect("...and says PyYAML could not be made importable",
+           "could not make PyYAML importable" in log, True)
+    expect("...and reports the exit code instead of dying at it",
+           "drift-check.py exited 1" in log, True)
+    expect("...stamping GITHUB_ENV so the refusal survives into the report",
+           incomplete_body.startswith("DRIFT-CHECK DID NOT COMPLETE"), True)
+    # The distinction this whole step exists to preserve. An absence that reads
+    # as 'no change' is the one outcome nobody would ever investigate.
+    expect("...and a refusal never reads as a clean 'no change'",
+           "no change:" in incomplete_body, False)
+    expect("...carrying the real reason, not just a code",
+           "ModuleNotFoundError" in incomplete_body, True)
+
+    # apt SUCCEEDING while the module is still unimportable -- the exact hazard
+    # the step's comment describes (apt installing for a different python3 than
+    # the one on PATH). Verified by importing, not by apt's exit code; this is
+    # that sentence turned into a test.
+    out.write_text("")
+    rc, log, _ = run_step(
+        drift, repo,
+        {"OLD": "v0.28.6", "NEW": "v0.28.10",
+         "PATH": f"{apt_ok}:{path}", "PYTHONPATH": str(blocker)},
+        out, env_file=denv)
+    expect("a green apt-get is not taken as proof PyYAML is importable",
+           "could not make PyYAML importable (apt=0 import=1)" in log, True)
 
     # --- replay, clean --------------------------------------------------
     # UPSTREAM_URL points at the local fixture's own origin, so the step's fetch
@@ -551,6 +794,40 @@ def main() -> int:
             # report naming nothing.
             expect("...with the quote-and-backslash paths intact in the message",
                    nasty in body.get("message", ""), True)
+
+    # The JOIN between the two steps, fed with what the drift step ACTUALLY
+    # wrote rather than a hand-typed lookalike. The drift step stamps a refusal
+    # and this step greps for that stamp, anchored at line start: two halves
+    # written at different times that have to agree on one exact string, with
+    # nothing to notice if they stop agreeing. A human reading the inbox gets
+    # only this sentence -- if it says "did not change" when the check never
+    # ran, the failure is invisible at the one place it is read.
+    for label, drift_body, want, must_not in [
+        ("a drift check that could not complete",
+         incomplete_body, "did not complete", "did not change"),
+        ("a real upstream CI change", changed_body,
+         "3 workflow file(s)", "did not change"),
+    ]:
+        out.write_text("")
+        rc, log, _ = run_step(
+            report, repo,
+            {"TOKEN": "dummy-not-a-real-token", "NEW": "v0.29.0", "COUNT": "3",
+             "CONFLICTS": "PATCH0", "DRIFT": drift_body,
+             "INBOX_URL": f"http://127.0.0.1:{srv.server_port}/v1/events/warpgate-upstream"},
+            out)
+        expect(f"the report step summarises {label}", rc, 0)
+        msg = ""
+        if received:
+            try:
+                msg = json.loads(received[-1]["body"]).get("message", "")
+            except ValueError:
+                pass
+        expect(f"...saying {want!r}", want in msg, True)
+        expect(f"...and never {must_not!r}", must_not in msg, False)
+    # Bounded on purpose: upstream's filenames are not ours to put in another
+    # session's inbox. Counts reach the human; the list stays in the run log.
+    expect("...and the summary carries counts, not upstream's filenames",
+           "build.yml" in msg, False)
     srv.shutdown()
 
     # Last, so it sees every step_run() this run made.
@@ -638,6 +915,44 @@ MUTATIONS = [
     # hits and refuses an anchor that matched 0 times. If you change the report
     # body in upstream-watch.yml, this anchor changes with it, in the same
     # commit; the selftest is what will tell you if you forget.
+    # THE regression, and the one that actually happened: put back the -e the
+    # step inherits from `bash -e`. The step then dies at the first non-zero
+    # command with no output at all -- run 520 on 2026-09-18 exactly, which cost
+    # three dispatches to narrow down because nothing could distinguish it from
+    # a step that had not run.
+    ("drift-set-e-restored",
+     "          set +e\n"
+     "          set -uo pipefail\n"
+     "\n"
+     "          # drift-check.py imports checks_lib",
+     "          set -e\n"
+     "          set -uo pipefail\n"
+     "\n"
+     "          # drift-check.py imports checks_lib",
+     "must never fail this job"),
+    # Stop stamping the refusal: the report goes into GITHUB_ENV unmarked, and
+    # a check that never ran becomes indistinguishable from one that ran and
+    # found nothing -- at the one place a human reads it.
+    ("drift-failure-reads-as-clean",
+     '            { echo "DRIFT-CHECK DID NOT COMPLETE (exit $DRIFT_RC):"; cat "$DRIFT_FILE"; } > "$DRIFT_FILE.tmp"\n'
+     '            mv "$DRIFT_FILE.tmp" "$DRIFT_FILE"\n',
+     "",
+     "stamping GITHUB_ENV"),
+    # The same confusion in reverse: treat drift-check.py's 3 (a real verdict:
+    # upstream's CI changed) as a failure to complete. The drift IS the answer,
+    # and this would file it under "could not tell".
+    ("drift-real-result-read-as-refusal",
+     'if [ "$DRIFT_RC" -ne 0 ] && [ "$DRIFT_RC" -ne 3 ]; then',
+     'if [ "$DRIFT_RC" -ne 0 ]; then',
+     "NOT stamped as a failure to complete"),
+    # Trust apt's exit code instead of importing. The step's own comment says
+    # apt can succeed while installing the module for a different python3; this
+    # is that sentence as an executable claim.
+    ("drift-yaml-trusted-from-apt-exit-code",
+     '          python3 -c "import yaml" 2>/dev/null\n'
+     '          YAML_RC=$?\n',
+     "          YAML_RC=0\n",
+     "not taken as proof PyYAML is importable"),
     ("report-body-interpolated-not-escaped",
      '          jq -n --arg new "$NEW" --arg count "$COUNT" --arg conflicts "$CONFLICTS" \\\n'
      '                --arg drift "$DRIFT_SUMMARY" \\\n'
