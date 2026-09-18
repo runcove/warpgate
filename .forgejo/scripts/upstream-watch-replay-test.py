@@ -99,12 +99,55 @@ def expect(name, got, want):
         print(f"  FAIL  {name}\n          got  {got!r}\n          want {want!r}")
 
 
+# Steps with a run: block that this file deliberately does NOT execute, each
+# with the reason. A DECLARED gap is a decision; an undeclared one is an
+# assumption nobody made -- and on 2026-09-18 an undeclared one is exactly what
+# happened: the header claimed every logic-bearing step was covered, the
+# fork-CI arc later added `drift` between the gate and replay, and the claim
+# silently became false. `assert_full_coverage` below now makes that
+# impossible: a new step is either executed here or named in this dict, and
+# nothing else passes.
+UNCOVERED_BY_DESIGN = {
+    "summary": "echoes three values it is handed and branches on none of them; "
+               "there is no behaviour here a test could distinguish from a "
+               "working one.",
+    "report how upstream's CI changed": "TODO (homelab-br5.13): needs upstream "
+               "CI files at two tags inside the fixture, which nothing here "
+               "builds yet. This is the gap that let the -e defect through, so "
+               "it is a TODO with an id, not a permanent exemption.",
+}
+
+_PULLED: set = set()
+
+
 def step_run(doc, name):
     """The step's run: block, straight from the workflow -- never a copy."""
     for s in doc["jobs"]["watch"]["steps"]:
         if s.get("name") == name:
+            _PULLED.add(name)
             return s["run"]
     raise SystemExit(f"no step named {name!r} in the workflow")
+
+
+def assert_full_coverage(doc, expect):
+    """Count the parts against the coverage, rather than trusting a sentence.
+
+    Every step carrying a `run:` block must either have been executed by this
+    file or be named in UNCOVERED_BY_DESIGN with a reason. Checked by walking
+    the workflow, so it cannot go stale the way prose does.
+    """
+    logic = [s.get("name") for s in doc["jobs"]["watch"]["steps"] if "run" in s]
+    unaccounted = [n for n in logic
+                   if n not in _PULLED and n not in UNCOVERED_BY_DESIGN]
+    expect(f"every run: step is executed here or declared uncovered "
+           f"({len(_PULLED)} executed, {len(UNCOVERED_BY_DESIGN)} declared, "
+           f"{len(logic)} in the workflow)",
+           unaccounted, [])
+    # The other direction: a declared exemption for a step that no longer
+    # exists is a stale claim too, and reads as caution while covering nothing.
+    stale = [n for n in UNCOVERED_BY_DESIGN if n not in logic]
+    expect("no declared exemption names a step that has since been removed",
+           stale, [])
 
 
 def git(repo, *args, check=True):
@@ -509,6 +552,9 @@ def main() -> int:
             expect("...with the quote-and-backslash paths intact in the message",
                    nasty in body.get("message", ""), True)
     srv.shutdown()
+
+    # Last, so it sees every step_run() this run made.
+    assert_full_coverage(doc, expect)
 
     print(f"\n  {passed}/{total} assertions passed")
     print(f"  fixture: {root}")
