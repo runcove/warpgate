@@ -21,10 +21,11 @@
 # (run-check.sh, and anything else that wraps this script) must treat the
 # whole band as a refusal, not just the specific codes documented here:
 # enumerating known codes is how a new one gets misread as an ordinary
-# result. Documented codes so far: 90 cap read-back failed or didn't match,
-# 91 the container could not be created, 92 a test hook leaked into a real
-# CI run, 93 required configuration is missing (e.g. HARDENED_RUN_IMAGE
-# unset).
+# result. This script's own codes are 90 (cap read-back failed or didn't
+# match), 91 (the container could not be created) and 92/93 (below). The
+# full, current registry of every code in the band -- including the ones
+# other scripts have added since -- is EXIT_CODES.md; that is the one to
+# check before allocating a new one, not this comment.
 set -uo pipefail
 
 # The test hooks below exist so this script's failure paths are testable on a

@@ -13,16 +13,24 @@
 # cache-env.sh, run-check.sh, hardened-run.sh and configure-cache.sh -- the
 # thing never ran, rather than ran and failed. 93 keeps its meaning from
 # those four scripts: a required argument (here, the subcommand or its
-# operand) is missing or unrecognised. This script adds two more of its own:
+# operand) is missing or unrecognised. This script adds two more of its own
+# (95, 96, below); the full, current registry of every code in the band is
+# EXIT_CODES.md.
 #   95 -- --next found no upstream vX.Y.Z tag reachable from HEAD, so there
 #         is no base to build a version on.
-#   96 -- --next found no existing <base>-cove.* tag, but cannot tell "no
-#         cove release exists yet for this base" from "this clone's tags are
-#         incomplete" (a shallow clone, a fetch without --tags, a checkout
-#         that skipped them). The two look byte-identical, and reissuing a
-#         version number that already exists publishes over a release, so
-#         this refuses rather than guesses. A refusal costs a rerun; a
-#         collision costs a release.
+#   96 -- --next could not establish that its view of existing <base>-cove.*
+#         tags is complete before trusting an empty result to mean "no cove
+#         release exists yet for this base". A shallow clone is one way to
+#         be wrong about that (git rev-parse --is-shallow-repository); a
+#         full, non-shallow clone whose fetch simply never brought tags (no
+#         --tags, a checkout step that skipped them) is another, and looks
+#         identical locally -- Round 1 review reproduced exactly that case
+#         and got back an already-released cove.1. Local git state alone
+#         cannot tell the two apart; only the remote's own tag list can, so
+#         --next checks that too (git ls-remote) before trusting silence.
+#         Reissuing a version number that already exists publishes over a
+#         release, so this refuses rather than guesses. A refusal costs a
+#         rerun; a collision costs a release.
 #
 # --validate's and --sort-key's own 0/1 exits are a separate, narrower
 # contract ("well-formed or not") that predates this file's use of the
@@ -95,16 +103,49 @@ case "${1:-}" in
       exit 95
     fi
 
-    # Positive evidence the local tag set is trustworthy, before an empty
-    # search for OUR tags is allowed to mean "no releases yet". A shallow
-    # clone (or one whose depth cannot even be determined) can still resolve
-    # $base above -- git only needs the one nearest matching tag for that --
-    # while missing every other tag in the repository, including real cove
-    # releases. The workflow sets fetch-depth: 0 and fetch-tags: true today;
-    # that makes this check pass today, not unnecessary to have.
+    # Door 1 of 2: a shallow clone. It can still resolve $base above -- git
+    # only needs the one nearest matching tag for that -- while missing every
+    # other tag in the repository, including real cove releases.
     shallow=$(git rev-parse --is-shallow-repository 2>/dev/null)
     if [ "$shallow" != "false" ]; then
       echo "version.sh: FATAL -- refusing to trust an empty release search: this clone is shallow (or its depth could not be determined), which looks identical to \"no releases yet\" but can hide real ones. Fetch full history and tags (fetch-depth: 0, fetch-tags: true) and retry." >&2
+      exit 96
+    fi
+
+    # Door 2 of 2: a full, non-shallow clone whose fetch simply never brought
+    # tags (no --tags, or a checkout step that skipped them). is-shallow-
+    # repository says "false" here too -- Round 1 review reproduced exactly
+    # this and got back an already-released cove.1. Zero local cove tags for
+    # $base is legitimately correct before the first release, so the ONLY
+    # authoritative answer is the remote's own tag list: if the remote has a
+    # release tag this clone lacks, the local view is incomplete, full stop.
+    #
+    # REMOTE defaults to the name every workflow's checkout gives its own
+    # remote ("origin", from Forgejo Actions). Override with
+    # VERSION_SH_REMOTE for a different name or a raw URL -- e.g. in *this*
+    # dev clone, "origin" is upstream's GitHub, not the fork, so a real cut
+    # here needs VERSION_SH_REMOTE=forge. A timeout is a refusal, not a hang:
+    # this is exactly the discipline run-check.sh's lookup timeout applies.
+    REMOTE="${VERSION_SH_REMOTE:-origin}"
+    REMOTE_TIMEOUT="${VERSION_SH_REMOTE_TIMEOUT:-15}"
+    remote_list=$(timeout "$REMOTE_TIMEOUT" git ls-remote --tags --refs "$REMOTE" "${base}-cove.*" 2>/dev/null)
+    remote_rc=$?
+    if [ "$remote_rc" -eq 124 ]; then
+      echo "version.sh: FATAL -- timed out after ${REMOTE_TIMEOUT}s contacting remote '$REMOTE' for existing ${base}-cove.* tags. Refusing to guess blind." >&2
+      exit 96
+    elif [ "$remote_rc" -ne 0 ]; then
+      echo "version.sh: FATAL -- could not query remote '$REMOTE' for existing ${base}-cove.* tags (exit $remote_rc). Refusing to trust a local search that might be incomplete." >&2
+      exit 96
+    fi
+
+    missing=""
+    while IFS= read -r line; do
+      [ -z "$line" ] && continue
+      t="${line#*refs/tags/}"
+      git rev-parse -q --verify "refs/tags/$t" >/dev/null 2>&1 || missing="$missing $t"
+    done <<<"$remote_list"
+    if [ -n "$missing" ]; then
+      echo "version.sh: FATAL -- remote '$REMOTE' has release tag(s) this clone does not:$missing -- local view is incomplete, refusing to guess the next version." >&2
       exit 96
     fi
 

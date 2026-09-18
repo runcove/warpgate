@@ -1,0 +1,28 @@
+# Exit codes 89-99: the "could not run safely" band
+
+Shared across every script under `.forgejo/scripts/`. A code in this band is
+never a statement about whatever command was asked to run — it means the
+thing never ran (or never finished) safely at all, so it must never be
+treated as an ordinary pass/fail result. `run-check.sh` treats the *whole*
+band this way for exactly that reason: enumerating only the codes it
+recognises is how a new one would get misread as an ordinary check result.
+
+This file is the single registry. A script's own header may still note its
+own codes for a reader working in just that file, but the authoritative,
+complete list — the one to check before allocating a new code, so it doesn't
+collide with one owned by a script you didn't happen to open — lives here.
+Add a row here in the same commit that adds a new code.
+
+| Code | Script | Meaning |
+|------|--------|---------|
+| 90 | `hardened-run.sh` | The CPU/memory cap was read back after the container started and either the read-back failed or didn't match what was requested — the one bound this script exists to guarantee did not hold. |
+| 91 | `hardened-run.sh` | The capped container could not be created/started at all. |
+| 92 | `hardened-run.sh`, `run-check.sh` | A test hook (`HARDENED_RUN_*` / `RUN_CHECK_*`) was set while `CI`/`GITHUB_ACTIONS`/`FORGEJO_ACTIONS` is present — those hooks exist only to test the script without a container runtime, and left set in real CI they would silently defeat the logic they're meant to test. |
+| 93 | `cache-env.sh`, `configure-cache.sh`, `hardened-run.sh`, `run-check.sh`, `version.sh` | A required argument or piece of configuration is missing or unrecognised (a bucket name, `S3_ENDPOINT`, `HARDENED_RUN_IMAGE`, a check name, a `version.sh` subcommand/operand). Never bash's own `${1:?}`/`${2:?}` — that form exits 1, indistinguishable from an ordinary failure and outside this band entirely. |
+| 94 | `run-check.sh` | The check lookup (`lookup-check.py`) timed out — a hung lookup fails the job instead of hanging forever; a timeout is a refusal, not a pass. |
+| 95 | `version.sh` | `--next` found no upstream `vX.Y.Z` tag reachable from `HEAD` — there is no base to build a version on. |
+| 96 | `version.sh` | `--next` could not establish that its view of existing `<base>-cove.*` tags is complete before trusting an empty result to mean "no cove release yet for this base". Covers a shallow clone (`git rev-parse --is-shallow-repository` != `false`) and a full clone whose fetch simply never brought tags (no `--tags`, a checkout step that skipped them) — the latter is caught by comparing against `git ls-remote`, since local history alone can't tell "no releases yet" from "my tags never arrived" apart. Also covers the remote query itself failing or timing out: a refusal costs a rerun, a wrong guess here republishes an existing release. |
+
+Codes outside 89-99 (e.g. `run-check.sh`'s plain `2` for "no such check", or a
+wrapped command's own exit code) are ordinary results, not refusals, and are
+not tracked here.
