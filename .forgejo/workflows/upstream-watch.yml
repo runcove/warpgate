@@ -138,7 +138,20 @@ jobs:
           git config user.email "ops@tenfourty.site"
           git config user.name  "warpgate-upstream-watch"
 
-          if ! git fetch --no-tags https://github.com/warp-tech/warpgate.git "refs/tags/$NEW:refs/tags/$NEW"; then
+          # The upstream URL is a shell default, not a literal, for one reason:
+          # with it hardcoded, this step could not be executed anywhere except
+          # against github.com, so its logic could only ever be READ. Overriding
+          # UPSTREAM_URL lets upstream-watch-replay-test.py point it at a local
+          # fixture and actually run the replay. CI sets nothing, so the default
+          # is what fires. Plain shell, no workflow expression -- an expression
+          # spliced in here would be shell injection, see the resolve step. (The
+          # validator refuses the expression syntax anywhere in a run: block,
+          # comments included. It caught this comment when it first said the
+          # syntax out loud, which is the check being blunt rather than wrong:
+          # teaching it to parse comments would add a way to be wrong about the
+          # one thing it exists to be certain of.)
+          UPSTREAM_URL="${UPSTREAM_URL:-https://github.com/warp-tech/warpgate.git}"
+          if ! git fetch --no-tags "$UPSTREAM_URL" "refs/tags/$NEW:refs/tags/$NEW"; then
             echo "could not fetch upstream tag $NEW"; echo "outcome=fetch-failed" >> "$GITHUB_OUTPUT"; exit 0
           fi
 
