@@ -15,10 +15,27 @@ that decides if anything runs at all can return both of its answers, and
 whether a conflicting rebase leaves the tree clean and names the files it
 stopped on.
 
-NOTHING IS EXCLUDED ANY MORE. All five of the workflow's logic-bearing steps
-are executed here -- resolve, the already-current gate, replay, push and the
-conflict report. What remains is actions/checkout and a summary step that only
-echoes.
+COVERAGE, AS AT 2026-09-18 21:00 -- FIVE OF THE WORKFLOW'S SIX LOGIC-BEARING
+STEPS. Executed here: resolve, the already-current gate, replay, push and the
+conflict report. NOT executed anywhere, by this file or any other: the `drift`
+step (`id: drift`, "report how upstream's CI changed"). Also untouched, and
+fine: actions/checkout and a summary step that only echoes.
+
+⚠ THIS PARAGRAPH PREVIOUSLY READ "NOTHING IS EXCLUDED ANY MORE ... all five of
+the workflow's logic-bearing steps". That was true when written and false by
+the time it mattered: the fork-CI arc added the `drift` step between the gate
+and replay, and nothing re-read this header as a claim. Six steps, five run.
+The sentence went on asserting completeness about a file that had grown a new
+step underneath it -- which is precisely the failure the rest of this header
+congratulates itself for having fixed three times. Counting the `id:` lines in
+the workflow against the ids this file extracts is the check; the header's own
+account of itself is not.
+
+It matters beyond tidiness: on 2026-09-18 the first real rehearsal of this
+workflow failed on the replay path in CI, at a point between the gate and
+replay, with no output at all -- and `drift` is the step that sits there and
+has never executed. It is not proven to be the cause. It is the one candidate
+that no test could ever have cleared.
 
 That took three exclusions apart in a row, and each was the same shape: a
 sentence that was true of the words and false of the situation.
@@ -29,6 +46,9 @@ sentence that was true of the words and false of the situation.
   not *the* token, and a loopback listener on an ephemeral port is an endpoint.
 - the already-current gate was on no exclusion list at all, which is worse: a
   declared gap is a decision, an undeclared one is an assumption nobody made.
+- and now `drift`, which is the same shape a fourth time, arriving by a new
+  route: not an exclusion someone wrote, but a step someone added after the
+  claim of completeness was made.
 
 The lesson worth keeping is not "test everything". It is that an exclusion
 written once is never re-read as a claim, only as a boundary, and the cost of
