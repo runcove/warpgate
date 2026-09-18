@@ -22,10 +22,11 @@
 # whole band as a refusal, not just the specific codes documented here:
 # enumerating known codes is how a new one gets misread as an ordinary
 # result. This script's own codes are 90 (cap read-back failed or didn't
-# match), 91 (the container could not be created) and 92/93 (below). The
-# full, current registry of every code in the band -- including the ones
-# other scripts have added since -- is EXIT_CODES.md; that is the one to
-# check before allocating a new one, not this comment.
+# match), 91 (the container could not be created), 92/93 (below) and 98 (the
+# source could not be delivered into the container, below). The full,
+# current registry of every code in the band -- including the ones other
+# scripts have added since -- is EXIT_CODES.md; that is the one to check
+# before allocating a new one, not this comment.
 set -uo pipefail
 
 # The test hooks below exist so this script's failure paths are testable on a
@@ -43,13 +44,21 @@ CI it would silently defeat the cap assertion. Refusing to run." >&2
   fi
 done
 
-CPUS="" MEM="" LABEL="hardened"
+CPUS="" MEM="" LABEL="hardened" SOURCE="" WORKDIR=""
 FORWARD_VARS=()
 while [ $# -gt 0 ]; do
   case "$1" in
-    --cpus)   CPUS="$2"; shift 2 ;;
-    --memory) MEM="$2";  shift 2 ;;
-    --label)  LABEL="$2"; shift 2 ;;
+    --cpus)    CPUS="$2"; shift 2 ;;
+    --memory)  MEM="$2";  shift 2 ;;
+    --label)   LABEL="$2"; shift 2 ;;
+    # Both optional, and independent of --cpus/--memory: this script is
+    # reusable by any caller, including one that wants a bare capped
+    # container with nothing copied into it, so a caller that passes
+    # neither gets exactly today's behaviour. A caller that passes one
+    # without the other has made a mistake, not a choice -- caught below,
+    # once parsing has seen everything.
+    --source)  SOURCE="$2"; shift 2 ;;
+    --workdir) WORKDIR="$2"; shift 2 ;;
     # The caller names a VARIABLE, never a value -- so no secret is ever a
     # command-line argument, and none shows up in a `set -x` trace or a
     # process listing. This script still names no project (the caller
@@ -65,6 +74,14 @@ done
 [ -n "$MEM" ]  || { echo "hardened-run: --memory is required. Running without a
 memory cap is the failure mode this script exists to prevent." >&2; exit 2; }
 [ $# -gt 0 ]   || { echo "hardened-run: no command given" >&2; exit 2; }
+if [ -n "$SOURCE" ] && [ -z "$WORKDIR" ]; then
+  echo "hardened-run: --workdir is required when --source is given" >&2
+  exit 2
+fi
+if [ -n "$WORKDIR" ] && [ -z "$SOURCE" ]; then
+  echo "hardened-run: --source is required when --workdir is given" >&2
+  exit 2
+fi
 
 NAME="${LABEL}-${GITHUB_RUN_ID:-local}-$$"
 
@@ -217,4 +234,49 @@ fi
 if [ "${HARDENED_RUN_DRY:-}" = "1" ]; then exit 0; fi
 
 trap 'docker rm -f "$NAME" >/dev/null 2>&1' EXIT
-docker exec "${FORWARD_ARGS[@]}" "$NAME" "$@"
+
+# Deliver the source tree, when the caller asked for one (run-check.sh does,
+# for every capped check). `docker cp` is the established mechanism on this
+# platform -- the forge's own runner uses it to place files in job
+# containers -- and, critically, is not a bind mount: this runner is
+# docker-in-docker, so a `-v "$PWD:/work"` would have the DAEMON resolve the
+# path against its own filesystem and silently mount an empty or unrelated
+# directory, and every check would then fail exactly as though the code
+# under test were broken, with nothing in the output to tell the two apart.
+# `docker cp SRC/. DEST` (trailing `/.`) copies SRC's contents; `docker cp
+# SRC DEST` copies SRC itself, nesting everything one level deeper -- get
+# this wrong and every relative path inside the container misses. This
+# copies the working directory as it stands, not `git archive HEAD`: an
+# archive would be tidier (no .git, no target/) but would silently drop
+# anything a previous CI step generated into the tree, and at least one
+# check (`just openapi-all`) may depend on generated files.
+if [ -n "$SOURCE" ]; then
+  docker exec "$NAME" mkdir -p "$WORKDIR" || {
+    echo "hardened-run: FATAL -- could not create $WORKDIR inside the container
+(docker exec mkdir failed). Refusing to run with no source delivered." >&2
+    exit 98
+  }
+  if ! docker cp "$SOURCE/." "$NAME:$WORKDIR"; then
+    echo "hardened-run: FATAL -- docker cp itself failed copying $SOURCE into
+$NAME:$WORKDIR. Refusing to run with no source delivered." >&2
+    exit 98
+  fi
+  # The cheap positive assertion that is the whole difference between "your
+  # code is broken" and "your code is not there": checked separately from
+  # docker cp's own exit status above, because relying on the exit status
+  # alone would make a `docker cp` that reports success having copied the
+  # wrong thing indistinguishable from a workdir that doesn't exist -- both
+  # would otherwise reach the check silently.
+  if ! docker exec "$NAME" test -f "$WORKDIR/Cargo.toml"; then
+    echo "hardened-run: FATAL -- docker cp exited 0 but $WORKDIR/Cargo.toml is not
+present inside the container afterwards -- the copy landed in the wrong place, or
+copied the wrong thing. Refusing to run against a container with no verified
+source." >&2
+    exit 98
+  fi
+  echo "hardened-run: verified source present at $NAME:$WORKDIR/Cargo.toml"
+fi
+
+EXEC_ARGS=("${FORWARD_ARGS[@]}")
+[ -n "$SOURCE" ] && EXEC_ARGS+=(--workdir "$WORKDIR")
+docker exec "${EXEC_ARGS[@]}" "$NAME" "$@"

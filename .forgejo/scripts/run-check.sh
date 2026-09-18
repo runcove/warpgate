@@ -164,8 +164,14 @@ fi
 if [ -n "${RUN_CHECK_FORCE_RC:-}" ]; then
   rc="$RUN_CHECK_FORCE_RC"
 elif [ "$CAPPED" = "yes" ]; then
+  # --source/--workdir: hardened-run.sh's capped container starts empty --
+  # no -v, no docker cp, nothing puts the repo inside it on its own. Every
+  # capped check needs the source tree where it runs, so this is not
+  # optional here even though hardened-run.sh itself keeps the flags
+  # optional for other callers.
   "$HERE/hardened-run.sh" --cpus "${CI_CPUS:-4}" --memory "${CI_MEMORY:-7g}" \
-    --label "check-$NAME" "${FORWARD_FLAGS[@]}" -- bash -lc "$COMMAND"
+    --label "check-$NAME" --source "$PWD" --workdir /src \
+    "${FORWARD_FLAGS[@]}" -- bash -lc "$COMMAND"
   rc=$?
 else
   bash -lc "$COMMAND"

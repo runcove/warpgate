@@ -174,6 +174,17 @@ for v in RUSTC_WRAPPER SCCACHE_BUCKET SCCACHE_ENDPOINT SCCACHE_S3_USE_SSL \
     || bad "did not forward $v to hardened-run.sh: $(cat "$ARGS_FILE" 2>/dev/null)"
 done
 
+# TASK 7B: the capped container starts empty -- hardened-run.sh puts nothing
+# in it on its own -- so every capped check must be given --source/--workdir,
+# or its command runs against nothing and fails looking exactly like a real
+# bug in the code under test.
+grep -qx -- "--source" "$ARGS_FILE" 2>/dev/null \
+  && ok "passes --source to hardened-run.sh on the capped path" \
+  || bad "did not pass --source to hardened-run.sh: $(cat "$ARGS_FILE" 2>/dev/null)"
+grep -qx -- "--workdir" "$ARGS_FILE" 2>/dev/null && grep -qx "/src" "$ARGS_FILE" 2>/dev/null \
+  && ok "passes --workdir /src to hardened-run.sh on the capped path" \
+  || bad "did not pass --workdir /src to hardened-run.sh: $(cat "$ARGS_FILE" 2>/dev/null)"
+
 rm -f "$ARGS_FILE"
 out=$(CHECKS_FILE="$FAKE_CHECKS" STUB_HARDENED_RUN_ARGS_FILE="$ARGS_FILE" \
   "$FORWARD_DIR/run-check.sh" fake-uncapped 2>&1); rc=$?

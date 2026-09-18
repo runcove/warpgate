@@ -7,8 +7,10 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT="${HARDENED_RUN:-$HERE/../hardened-run.sh}"
 FIXTURES="$HERE/fixtures"
 fails=0
+skips=0
 ok()   { echo "  ok    $1"; }
 bad()  { echo "  FAIL  $1"; fails=1; }
+skip() { echo "  SKIP  $1"; skips=$((skips + 1)); }
 
 # Cases 1-11 drive hardened-run.sh's own test hooks (HARDENED_RUN_DRY,
 # HARDENED_RUN_FAKE_INSPECT*), which fix round 1 makes fatal to use inside a
@@ -271,5 +273,162 @@ grep -q "do-not-print-me-98765" <<<"$out" \
   && bad "the forwarded value leaked into this script's own output: $out" \
   || ok "only the variable name is reported, never its value"
 
-echo; [ "$fails" -eq 0 ] && echo "PASS" || echo "FAILURES"
+# 21. TASK 7B: regression. With no --source, the final `docker exec` must
+#     carry no --workdir flag at all -- "when --source is absent, behaviour
+#     is exactly as today" is the explicit contract, checked against the
+#     stub docker's own recorded argv, not this script's claim about itself.
+EXEC_ARGS_FILE_21="$MARKER_DIR/exec-args-21"
+out=$(
+  PATH="$FIXTURES:$PATH" HARDENED_RUN_IMAGE=stub-image \
+  STUB_DOCKER_MEM=7516192768 STUB_DOCKER_NANOCPUS=4000000000 \
+  STUB_DOCKER_EXEC_ARGS_FILE="$EXEC_ARGS_FILE_21" \
+  "$SCRIPT" --cpus 4 --memory 7g -- true 2>&1
+); rc=$?
+[ "$rc" -eq 0 ] && ok "a bare run with no --source still succeeds" \
+  || bad "bare run regressed (rc=$rc): $out"
+grep -qx -- "--workdir" "$EXEC_ARGS_FILE_21" 2>/dev/null \
+  && bad "docker exec carries --workdir even though --source was never given: $(cat "$EXEC_ARGS_FILE_21" 2>/dev/null)" \
+  || ok "no --source: docker exec carries no --workdir flag"
+
+# 22-23. Usage errors: --source and --workdir must be given together (run-check.sh
+# always passes both). No container runtime involved -- refused at parse time.
+out=$(HARDENED_RUN_DRY=1 "$SCRIPT" --cpus 4 --memory 7g --source /tmp -- true 2>&1); rc=$?
+[ "$rc" -eq 2 ] && ok "refuses --source without --workdir (exit 2)" \
+  || bad "did not refuse --source without --workdir (rc=$rc): $out"
+
+out=$(HARDENED_RUN_DRY=1 "$SCRIPT" --cpus 4 --memory 7g --workdir /src -- true 2>&1); rc=$?
+[ "$rc" -eq 2 ] && ok "refuses --workdir without --source (exit 2)" \
+  || bad "did not refuse --workdir without --source (rc=$rc): $out"
+
+# 24-29. --source delivery, proven against a REAL container -- not a stub.
+# `docker cp`'s contents-vs-directory distinction (the actual bug class this
+# task exists to close) cannot be proven by a stub that just returns
+# whatever exit code a test tells it to; only a genuine copy into a genuine
+# container proves the trailing "/." landed the files unnested. Prefers a
+# real `docker` binary when present (real CI: docker:28-dind); this
+# development host has no docker at all, so this falls back to a `docker`
+# shim over `podman` -- verified by hand against `alpine` beforehand
+# (run/exec/cp/inspect/rm all match docker's documented behaviour, including
+# the cp contents-vs-directory distinction) before being relied on here.
+# With neither available, these cases are SKIPPED and say so loudly -- never
+# silently counted as passing.
+REAL_ENGINE=""
+ENGINE_PATH_PREFIX=""
+if command -v docker >/dev/null 2>&1; then
+  REAL_ENGINE=docker
+elif command -v podman >/dev/null 2>&1; then
+  REAL_ENGINE=podman
+  ENGINE_BIN_DIR="$MARKER_DIR/engine-bin"
+  mkdir -p "$ENGINE_BIN_DIR"
+  cat > "$ENGINE_BIN_DIR/docker" <<'SHIM'
+#!/usr/bin/env bash
+exec podman "$@"
+SHIM
+  chmod +x "$ENGINE_BIN_DIR/docker"
+  ENGINE_PATH_PREFIX="$ENGINE_BIN_DIR:"
+fi
+
+if [ -z "$REAL_ENGINE" ]; then
+  skip "no real container runtime (docker or podman) on PATH -- cases 24-29 (real --source delivery) cannot be proven here"
+else
+  TEST_IMAGE="${HARDENED_RUN_TEST_IMAGE:-docker.io/library/alpine:latest}"
+  if PATH="${ENGINE_PATH_PREFIX}$PATH" timeout 90 docker pull "$TEST_IMAGE" >/dev/null 2>&1; then
+    SRC_DIR="$MARKER_DIR/real-src"
+    mkdir -p "$SRC_DIR"
+    echo "[package]" > "$SRC_DIR/Cargo.toml"
+    echo "marker-content-24" > "$SRC_DIR/marker.txt"
+
+    # 24. Positive: a real copy + verification lets the command run, and the
+    #     command genuinely sees the copied file's content -- not a stub
+    #     claiming it did.
+    out=$(
+      PATH="${ENGINE_PATH_PREFIX}$PATH" HARDENED_RUN_IMAGE="$TEST_IMAGE" \
+      "$SCRIPT" --cpus 1 --memory 256m --source "$SRC_DIR" --workdir /src \
+        -- cat /src/marker.txt 2>&1
+    ); rc=$?
+    [ "$rc" -eq 0 ] && ok "real source delivery + verification lets the command run" \
+      || bad "real source delivery failed (rc=$rc): $out"
+    grep -q "marker-content-24" <<<"$out" && ok "the command saw the copied file's real content" \
+      || bad "copied content not visible inside the real container: $out"
+
+    # 25. --workdir is genuinely applied to the real `docker exec`, not just
+    #     asserted -- checked via `pwd` inside the running container.
+    out=$(
+      PATH="${ENGINE_PATH_PREFIX}$PATH" HARDENED_RUN_IMAGE="$TEST_IMAGE" \
+      "$SCRIPT" --cpus 1 --memory 256m --source "$SRC_DIR" --workdir /src \
+        -- pwd 2>&1
+    )
+    grep -qx "/src" <<<"$out" && ok "the real docker exec actually runs with --workdir /src" \
+      || bad "workdir not applied to the real exec: $out"
+
+    # 26. Contents form, not nested: Cargo.toml lands directly at
+    #     $WORKDIR/Cargo.toml, proving "SRC/." (contents) was used, not
+    #     "SRC" (which would nest everything one level deeper).
+    PATH="${ENGINE_PATH_PREFIX}$PATH" HARDENED_RUN_IMAGE="$TEST_IMAGE" \
+      "$SCRIPT" --cpus 1 --memory 256m --source "$SRC_DIR" --workdir /src \
+        -- test -f /src/Cargo.toml >/dev/null 2>&1
+    [ $? -eq 0 ] && ok "source landed unnested at \$WORKDIR/Cargo.toml (contents form)" \
+      || bad "source nested one level deeper than expected -- SRC vs SRC/. got mixed up"
+
+    # 27. A --source directory that does not exist: docker cp itself fails,
+    #     refused with 98, naming docker cp as the failing step.
+    out=$(
+      PATH="${ENGINE_PATH_PREFIX}$PATH" HARDENED_RUN_IMAGE="$TEST_IMAGE" \
+      "$SCRIPT" --cpus 1 --memory 256m --source "$MARKER_DIR/no-such-source-27" --workdir /src \
+        -- true 2>&1
+    ); rc=$?
+    [ "$rc" -eq 98 ] && ok "a nonexistent --source dir refuses with 98" \
+      || bad "nonexistent --source did not refuse with 98 (rc=$rc): $out"
+    grep -qi "docker cp" <<<"$out" && ok "names docker cp as the failing step" \
+      || bad "did not say docker cp failed: $out"
+
+    # 28. A --workdir that cannot be created (an existing FILE of that name
+    #     inside the image) fails the mkdir step specifically, worded
+    #     distinctly from the docker-cp and verification failures -- so a
+    #     reader can tell which of the three things went wrong.
+    out=$(
+      PATH="${ENGINE_PATH_PREFIX}$PATH" HARDENED_RUN_IMAGE="$TEST_IMAGE" \
+      "$SCRIPT" --cpus 1 --memory 256m --source "$SRC_DIR" --workdir /bin/busybox \
+        -- true 2>&1
+    ); rc=$?
+    [ "$rc" -eq 98 ] && ok "a workdir that cannot be created refuses with 98" \
+      || bad "uncreatable workdir did not refuse with 98 (rc=$rc): $out"
+    grep -qi "could not create" <<<"$out" && ok "names the mkdir step as the failing one, distinctly" \
+      || bad "did not distinguish the mkdir failure from a cp or verify failure: $out"
+
+    # 29. THE MUTATION: on a disposable copy of the script (never the shared
+    #     checkout, never git stash -- several sessions share this tree),
+    #     neuter the real `docker cp` call so it silently no-ops. If the
+    #     verification step were decorative, this mutant would report
+    #     success against an empty $WORKDIR exactly like the bug this task
+    #     exists to close. The diff is checked to touch exactly the one
+    #     intended line before the mutant is trusted.
+    MUTANT_DIR="$MARKER_DIR/mutant"
+    mkdir -p "$MUTANT_DIR"
+    sed 's#docker cp "\$SOURCE/\."#true "$SOURCE/."#' "$SCRIPT" > "$MUTANT_DIR/hardened-run.sh"
+    chmod +x "$MUTANT_DIR/hardened-run.sh"
+    DIFF_OUT=$(diff "$SCRIPT" "$MUTANT_DIR/hardened-run.sh")
+    DIFF_LINES=$(wc -l <<<"$DIFF_OUT")
+    if [ "$DIFF_LINES" -eq 4 ] && grep -q '^< .*docker cp' <<<"$DIFF_OUT" \
+       && grep -q '^> .*true ' <<<"$DIFF_OUT"; then
+      ok "mutation touched exactly the intended docker cp line, nothing else"
+    else
+      bad "mutation diff is not the single expected line change -- not trusting this mutant: $DIFF_OUT"
+    fi
+    mutant_out=$(
+      PATH="${ENGINE_PATH_PREFIX}$PATH" HARDENED_RUN_IMAGE="$TEST_IMAGE" \
+      "$MUTANT_DIR/hardened-run.sh" --cpus 1 --memory 256m --source "$SRC_DIR" --workdir /src \
+        -- true 2>&1
+    ); mutant_rc=$?
+    [ "$mutant_rc" -eq 98 ] && \
+      ok "a neutered docker cp is still caught by the verification step and refuses with 98" \
+      || bad "a silently no-op'd copy step was NOT caught (rc=$mutant_rc) -- the verification is decorative: $mutant_out"
+  else
+    skip "could not pull $TEST_IMAGE (no network?) -- cases 24-29 (real --source delivery) skipped"
+  fi
+fi
+
+echo
+echo "skipped: $skips"
+[ "$fails" -eq 0 ] && echo "PASS" || echo "FAILURES"
 exit "$fails"
