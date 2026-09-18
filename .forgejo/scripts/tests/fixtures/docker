@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# A stub `docker` for testing hardened-run.sh's real (non-dry) code path --
+# the branch the shipped test suite's HARDENED_RUN_DRY/HARDENED_RUN_FAKE_INSPECT
+# hooks never reach. Controlled entirely by env vars so a test can make any of
+# `docker run` / `docker inspect` / `docker exec` succeed, fail, or return
+# whatever value is under test, with no real container runtime involved.
+#
+# Recognised env vars:
+#   STUB_DOCKER_RUN_RC       exit code for `docker run`        (default 0)
+#   STUB_DOCKER_INSPECT_RC   exit code for `docker inspect`    (default 0)
+#   STUB_DOCKER_MEM          value to print for a Memory inspect
+#   STUB_DOCKER_NANOCPUS     value to print for a NanoCpus inspect
+#   STUB_DOCKER_EXEC_RC      exit code for `docker exec`       (default 0)
+#   STUB_DOCKER_EXEC_MARKER  if set, `docker exec` touches this path -- a test
+#                            asserts its absence to prove the command never ran
+set -uo pipefail
+
+cmd="${1:-}"
+case "$cmd" in
+  run)
+    exit "${STUB_DOCKER_RUN_RC:-0}"
+    ;;
+  inspect)
+    fmt="${3:-}"
+    rc="${STUB_DOCKER_INSPECT_RC:-0}"
+    if [ "$rc" -ne 0 ]; then
+      echo "stub docker: inspect failed (STUB_DOCKER_INSPECT_RC=$rc)" >&2
+      exit "$rc"
+    fi
+    case "$fmt" in
+      *NanoCpus*) echo "${STUB_DOCKER_NANOCPUS:-}" ;;
+      *Memory*)   echo "${STUB_DOCKER_MEM:-}" ;;
+      *)          echo "" ;;
+    esac
+    exit 0
+    ;;
+  exec)
+    if [ -n "${STUB_DOCKER_EXEC_MARKER:-}" ]; then
+      touch "$STUB_DOCKER_EXEC_MARKER"
+    fi
+    exit "${STUB_DOCKER_EXEC_RC:-0}"
+    ;;
+  rm)
+    exit 0
+    ;;
+  *)
+    echo "stub docker: unhandled subcommand '$cmd'" >&2
+    exit 1
+    ;;
+esac
