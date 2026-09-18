@@ -1,0 +1,72 @@
+# Runs the checks named in .forgejo/checks.yaml. Upstream's .github/workflows/*
+# are NEVER executed -- see docs/plans/2026-09-18-warpgate-fork-ci-design.md.
+name: checks
+on:
+  push:
+    branches: ['**']
+  workflow_dispatch:
+
+jobs:
+  checks:
+    runs-on: docker
+    services:
+      dind:
+        image: docker:28-dind
+        options: --privileged
+        env: {DOCKER_TLS_CERTDIR: ""}
+    env:
+      DOCKER_HOST: tcp://dind:2375
+      # Not yet provisioned by any task in this plan -- referencing it now
+      # means the compiling checks below pick it up the moment it exists,
+      # with no further ci.yml edit. Until then this is empty, and
+      # hardened-run.sh's own guard turns that into a clean exit 93, not a
+      # crash (Task 2).
+      HARDENED_RUN_IMAGE: ${{ vars.HARDENED_RUN_IMAGE }}
+      S3_ENDPOINT: ${{ vars.OGA2_S3_ENDPOINT }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_ACCESS_KEY }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_SECRET_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 0, fetch-tags: true}
+
+      # The check list must be valid before anything runs from it. A malformed
+      # list that silently ran zero checks would look exactly like a green build.
+      - name: validate the check list
+        run: python3 .forgejo/scripts/validate-checks.py .forgejo/checks.yaml
+
+      - name: prove the check list is not empty
+        run: |
+          n=$(python3 .forgejo/scripts/list-checks.py .forgejo/checks.yaml | wc -l)
+          echo "checks to run: $n"
+          [ "$n" -ge 10 ] || { echo "FAILING ON PURPOSE: only $n check(s) found.
+          A run that executes no checks reports green and proves nothing."; exit 1; }
+
+      # cache-env.sh's own exit status is load-bearing (Task 3): on refusal it
+      # prints nothing, and appending nothing to GITHUB_ENV "succeeds" exactly
+      # as quietly as a real bucket would -- the compiling checks below would
+      # then just run without a cache, with no line anywhere saying why.
+      # Capture output and rc separately and trust the output only once rc is
+      # 0. A refusal here does not fail the run: the cache is what makes
+      # eleven checks on one runner affordable, not what makes them correct,
+      # so this warns loudly and the checks still run, capped, just uncached.
+      - name: configure the compiler cache (best-effort)
+        run: |
+          out=$(.forgejo/scripts/cache-env.sh warpgate-sccache 2>&1) || rc=$?
+          rc="${rc:-0}"
+          if [ "$rc" -ne 0 ]; then
+            echo "::warning::cache-env.sh refused (exit $rc) -- compiling checks run uncached this time, not unsafely: still CPU/memory-capped, just slower."
+            echo "$out"
+          else
+            echo "$out" >> "$GITHUB_ENV"
+            echo "compiler cache configured: bucket warpgate-sccache"
+          fi
+
+      - name: run every check
+        run: |
+          rc=0
+          while read -r name; do
+            echo "::group::$name"
+            .forgejo/scripts/run-check.sh "$name" || rc=$?
+            echo "::endgroup::"
+          done < <(python3 .forgejo/scripts/list-checks.py .forgejo/checks.yaml)
+          exit "$rc"
