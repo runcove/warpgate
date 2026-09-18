@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Stub docker whose daemon is reachable -- `docker info` succeeds.
+case "${1:-}" in
+  info) exit 0 ;;
+  *) exit 0 ;;
+esac

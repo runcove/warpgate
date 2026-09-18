@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Stub docker whose CLI is present but whose daemon is not reachable --
+# `docker info` fails, simulating dind not being up yet or an unreachable
+# DOCKER_HOST, without needing a real container runtime.
+case "${1:-}" in
+  info) exit 1 ;;
+  *) exit 1 ;;
+esac

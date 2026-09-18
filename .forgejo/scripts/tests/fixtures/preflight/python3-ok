@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Stub python3 that simulates the yaml module being importable, so a
+# preflight test can isolate a LATER condition (docker missing/unreachable)
+# without needing a real Python install with PyYAML.
+case "$*" in
+  *"import yaml"*) exit 0 ;;
+  *) exit 0 ;;
+esac

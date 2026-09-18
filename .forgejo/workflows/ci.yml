@@ -29,6 +29,48 @@ jobs:
       - uses: actions/checkout@v4
         with: {fetch-depth: 0, fetch-tags: true}
 
+      # Mirrors build-image.yml's own "docker cli" step verbatim. Confirmed
+      # absent here until fix round 3 (2026-09-18): this job's container has
+      # the same shape as build-image.yml's (runs-on: docker, a dind service,
+      # DOCKER_HOST pointed at it) but no CLI installed and no wait for dind
+      # to actually be ready to accept connections -- had the first real run
+      # reached this far, every `docker` call in hardened-run.sh would have
+      # hit "command not found" before even getting to its own cap checks.
+      - name: docker cli
+        run: |
+          curl -fsSL https://download.docker.com/linux/static/stable/x86_64/docker-28.3.3.tgz | tar xz -C /tmp
+          install /tmp/docker/docker /usr/local/bin/docker
+          for i in $(seq 1 30); do docker info >/dev/null 2>&1 && break; sleep 2; done
+          docker info >/dev/null
+
+      # PyYAML missing is what actually killed the first real run, 3 seconds
+      # after checkout: `ModuleNotFoundError: No module named 'yaml'` in
+      # checks_lib.py -- an ordinary exit 1, nowhere in this repo's 89-99
+      # refusal band, from a job container that could not run a single check.
+      # python3-yaml (not pip): this image's Python is externally managed
+      # (PEP 668, Debian bookworm), so a bare `pip install pyyaml` refuses
+      # outright, and `--break-system-packages` would be fighting the
+      # platform's own package manager rather than using it. Verified here
+      # rather than trusted from apt's exit code: apt can report success
+      # while installing the module for a different python3 than the one on
+      # PATH (more than one interpreter on the same image), which would leave
+      # this step green and preflight.sh -- and every real check -- failing
+      # exactly as before.
+      - name: python yaml module
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq python3-yaml
+          python3 -c "import yaml; print('PyYAML', yaml.__version__, 'importable at', yaml.__file__)"
+
+      # The gate for everything above: if python3, the yaml module, the
+      # docker CLI or the docker daemon is not actually usable, no check
+      # below can produce a meaningful result. Exits 93 -- this codebase's
+      # refusal band -- naming exactly which one is missing, rather than
+      # letting the first script that happens to need it fail with an
+      # ordinary, unlabelled exit 1 the way validate-checks.py did.
+      - name: preflight
+        run: .forgejo/scripts/preflight.sh
+
       # The check list must be valid before anything runs from it. A malformed
       # list that silently ran zero checks would look exactly like a green build.
       - name: validate the check list

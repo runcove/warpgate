@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Stub python3 that is present (command -v finds it) but whose 'yaml'
+# module is not importable -- simulates PyYAML missing without touching
+# the real Python install.
+case "$*" in
+  *"import yaml"*) exit 1 ;;
+  *) exit 0 ;;
+esac
