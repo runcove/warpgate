@@ -9,6 +9,35 @@ on:
 jobs:
   checks:
     runs-on: docker
+    # Task 7C part (a). The runner's own default for `runs-on: docker` is
+    # `node:22-bookworm` (mapped in the homelab repo's k8s/platform/ci/
+    # runner.yaml for every repository on the forge) -- never a Rust
+    # toolchain, which is why the 18 Sep run refused all ten non-excepted
+    # checks with exit 97. `container:` overrides the image for THIS job
+    # only, in this fork's own workflow; it does not touch that shared
+    # mapping (out of scope and explicitly prohibited for this task -- a
+    # change there would swap the default image for every repo on the
+    # forge, homelab's own CI included).
+    #
+    # Pinned by digest, not the bare `rust:1.97.1-bookworm` tag: a tag can
+    # be re-pushed (a point release replaced, a base image respun) and
+    # silently move the toolchain under a run that was green yesterday.
+    # This is the exact digest docker/Dockerfile.cove already builds with
+    # (its `chef` stage) -- reusing an image this repo has already proven,
+    # rather than trusting an unvetted one, and it settles bookworm-vs-
+    # bullseye the same way that Dockerfile did: Debian 11's security
+    # archive went EOL 2026-08-31, so an upstream-identical bullseye image
+    # can no longer even be built.
+    #
+    # This image is free: it carries `cargo` and `find`, two of the eight
+    # tools checks.yaml's checks declare between them. `jq`/`helm`/`biome`
+    # cost seconds and are installed below. `just`/`taplo`/`cargo-deny` are
+    # `cargo install` and cost minutes each -- deliberately NOT added here;
+    # see the task brief. Their checks (`cargo-deny`, `fmt-toml`, `clippy`,
+    # `schema-compat`) keep refusing 97, naming exactly the tool they
+    # wanted, until part (c) decides how the compiler cache pays for that.
+    container:
+      image: rust:1.97.1-bookworm@sha256:408fe88047cef61a2087653b0c5255fa51c0f2d6d94ddedd7a2562a9b91a46f6
     services:
       dind:
         image: docker:28-dind
@@ -28,6 +57,43 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with: {fetch-depth: 0, fetch-tags: true}
+
+      # The three tools that turn `lockfile`, `helm-lint` and `biome` from
+      # REFUSE 97 into a real verdict (Task 7C part (a); see checks.yaml's
+      # own `tools:` lists). Each pinned -- apt to an exact bookworm package
+      # build, the two binaries to an exact release verified against a
+      # sha256 computed from the downloaded file before anything trusts it
+      # -- so a run that passes today cannot silently start running a
+      # different build tomorrow, the same reasoning as the digest pin
+      # above. `just`, `taplo` and `cargo-deny` are deliberately absent:
+      # they are `cargo install`, cost minutes each, and are out of scope
+      # for this part.
+      - name: check tools (jq, helm, biome)
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq jq=1.6-2.1+deb12u2
+          jq --version
+
+          HELM_VERSION=3.22.0
+          HELM_SHA256=1e4ab49e429626cf6c6958d914248b78c9730803c2751b87627e171dc800e7bb
+          curl -fsSL -o /tmp/helm.tgz "https://get.helm.sh/helm-v${HELM_VERSION}-linux-amd64.tar.gz"
+          echo "${HELM_SHA256}  /tmp/helm.tgz" | sha256sum -c -
+          tar -xzf /tmp/helm.tgz -C /tmp linux-amd64/helm
+          install /tmp/linux-amd64/helm /usr/local/bin/helm
+          rm -rf /tmp/helm.tgz /tmp/linux-amd64
+          helm version
+
+          # Pinned to the same 2.5.9 warpgate-web/package.json already
+          # declares (^2.5.9) -- so the CLI running here and the one `npm
+          # install` would give a contributor stay the same build, not just
+          # the same semver range.
+          BIOME_VERSION=2.5.9
+          BIOME_SHA256=013eb5158b9e53235dbbf31255cb3b776fb9338b32fa6ff4a44ee1ceed65ee63
+          curl -fsSL -o /usr/local/bin/biome \
+            "https://github.com/biomejs/biome/releases/download/%40biomejs%2Fbiome%40${BIOME_VERSION}/biome-linux-x64"
+          echo "${BIOME_SHA256}  /usr/local/bin/biome" | sha256sum -c -
+          chmod +x /usr/local/bin/biome
+          biome --version
 
       # Mirrors build-image.yml's own "docker cli" step verbatim. Confirmed
       # absent here until fix round 3 (2026-09-18): this job's container has
