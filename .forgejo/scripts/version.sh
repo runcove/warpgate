@@ -27,10 +27,13 @@
 #         identical locally -- Round 1 review reproduced exactly that case
 #         and got back an already-released cove.1. Local git state alone
 #         cannot tell the two apart; only the remote's own tag list can, so
-#         --next checks that too (git ls-remote) before trusting silence.
-#         Reissuing a version number that already exists publishes over a
-#         release, so this refuses rather than guesses. A refusal costs a
-#         rerun; a collision costs a release.
+#         --next checks that too (git ls-remote against REMOTE, "origin" by
+#         default -- override with VERSION_SH_REMOTE if that name doesn't
+#         point at this fork; in this dev checkout, for instance, "origin"
+#         is upstream's GitHub and the fork is "forge") before trusting
+#         silence. Reissuing a version number that already exists publishes
+#         over a release, so this refuses rather than guesses. A refusal
+#         costs a rerun; a collision costs a release.
 #
 # --validate's and --sort-key's own 0/1 exits are a separate, narrower
 # contract ("well-formed or not") that predates this file's use of the

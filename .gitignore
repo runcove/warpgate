@@ -36,3 +36,10 @@ node_modules
 .github
 *.md
 .env
+
+# Fork-specific exception: *.md above is upstream's own rule (predates the
+# fork, e29c3813a, 2026-06-01) and silently drops anything we commit under
+# .forgejo/ with no error -- the next doc written there would just vanish.
+# Scoped to .forgejo/, which does not exist upstream, so this cannot affect
+# or collide with upstream's own tree. Do not broaden past .forgejo/.
+!.forgejo/**/*.md
