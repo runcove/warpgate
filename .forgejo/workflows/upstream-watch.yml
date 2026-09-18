@@ -120,6 +120,57 @@ jobs:
             echo "todo=yes" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: report how upstream's CI changed
+        id: drift
+        if: steps.check.outputs.todo == 'yes'
+        # Non-fatal: a CI change is information, not a build failure -- it
+        # must never fail this job. But non-fatal must not mean invisible: a
+        # crash here must not read like a clean "no change" in the summary
+        # or the conflict report, so its exit code is captured explicitly
+        # (not lost through a pipe to tee) and checked before anything is
+        # written to GITHUB_ENV.
+        env:
+          OLD: ${{ steps.resolve.outputs.old }}
+          NEW: ${{ steps.resolve.outputs.new }}
+        run: |
+          set -uo pipefail   # NOT -e: drift-check.py's own exit code (0/3) IS the result
+
+          # Run-scoped path -- a fixed name in a shared runner's /tmp would
+          # collide between concurrent runs.
+          DRIFT_FILE="$(mktemp /tmp/drift-report.XXXXXX)"
+          python3 .forgejo/scripts/drift-check.py "$OLD" "$NEW" >"$DRIFT_FILE" 2>&1
+          DRIFT_RC=$?
+          echo "drift-check.py exited $DRIFT_RC"
+
+          # 0 (no change) and 3 (drift) are its only real results; anything
+          # else means it never finished a comparison. An empty or truncated
+          # report from that case must not be emitted as if it were a clean
+          # "no change" -- stamp it so the difference survives into
+          # GITHUB_ENV instead of disappearing into a look-alike blank.
+          if [ "$DRIFT_RC" -ne 0 ] && [ "$DRIFT_RC" -ne 3 ]; then
+            echo "::warning::drift-check.py exited $DRIFT_RC (did not complete a comparison) -- see output below, this is not a clean 'no change'"
+            { echo "DRIFT-CHECK DID NOT COMPLETE (exit $DRIFT_RC):"; cat "$DRIFT_FILE"; } > "$DRIFT_FILE.tmp"
+            mv "$DRIFT_FILE.tmp" "$DRIFT_FILE"
+          fi
+
+          # A random delimiter per run, plus a refusal rather than silent
+          # corruption if upstream's own filenames ever collide with it: this
+          # content comes from upstream's tree, which we do not control, so a
+          # fixed "EOF" could be terminated early by a line that happens to
+          # match it, injecting the rest as job environment variables.
+          DELIM="DRIFT_${GITHUB_RUN_ID:-0}_$$_$RANDOM"
+          if grep -qF "$DELIM" "$DRIFT_FILE"; then
+            echo "::error::drift report contains the delimiter $DELIM verbatim -- refusing to write GITHUB_ENV"
+            rm -f "$DRIFT_FILE"
+            exit 1  # collision with upstream's own text, not our tooling failing
+          fi
+          {
+            echo "DRIFT<<$DELIM"
+            cat "$DRIFT_FILE"
+            echo "$DELIM"
+          } >> "$GITHUB_ENV"
+          rm -f "$DRIFT_FILE"
+
       - name: replay our patches onto the new release
         id: replay
         if: steps.check.outputs.todo == 'yes'
@@ -224,7 +275,12 @@ jobs:
           NEW:    ${{ steps.resolve.outputs.new }}
           OLD:    ${{ steps.resolve.outputs.old }}
           ACTION: ${{ steps.check.outputs.todo == 'no' && 'already current' || steps.replay.outputs.outcome }}
+          DRIFT:  ${{ env.DRIFT }}
         run: |
           echo "upstream: $NEW"
           echo "ours:     $OLD"
           echo "action:   $ACTION"
+          if [ -n "${DRIFT:-}" ]; then
+            echo "ci drift:"
+            echo "$DRIFT"
+          fi

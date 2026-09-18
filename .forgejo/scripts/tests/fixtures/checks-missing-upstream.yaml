@@ -1,0 +1,11 @@
+# Synthetic checks.yaml for test_drift.py's TestCrossReferenceIsHarmless:
+# the "cargo-deny" entry has no `upstream` key at all. checks_lib.load()
+# refuses this with ValueError before returning anything -- drift-check.py's
+# cross-reference must swallow that (and any other failure shape) without
+# changing the 0-vs-3 verdict, which is decided from the tag diff alone.
+upstream_tag: v0.28.6
+checks:
+  - name: cargo-deny
+    command: cargo deny check
+    compiles: false
+    state: reporting
