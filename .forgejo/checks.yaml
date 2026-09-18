@@ -29,7 +29,18 @@ checks:
     tools: [biome]
   - name: helm-lint
     upstream: helm-publish.yaml
-    command: helm lint --strict helm && helm template helm >/dev/null
+    # Mistranslated until 2026-09-19 as `helm lint --strict helm && helm
+    # template helm`. Run 529 -- the first run in which this check ever
+    # actually executed -- returned `stat helm/Chart.yaml: no such file or
+    # directory`. That is not a verdict on our chart; it is this line pointing
+    # at a directory that is not a chart. Upstream's helm-publish.yaml sets
+    # CHART_PATH: helm/warpgate and CHART_NAME: warpgate, and runs
+    # `helm lint ${CHART_PATH} --strict` then
+    # `helm template ${CHART_NAME} ${CHART_PATH} --debug >/dev/null`; ours had
+    # neither the real path nor the release name. Now matched, less `--debug`,
+    # which changes only diagnostic verbosity and not the exit status while
+    # printing the whole rendered manifest to stderr on every green run.
+    command: helm lint helm/warpgate --strict && helm template warpgate helm/warpgate >/dev/null
     compiles: false
     state: reporting
     tools: [helm]
