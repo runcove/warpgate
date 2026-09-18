@@ -1,0 +1,18 @@
+# Synthetic checks.yaml for testing run-check.sh's --forward-env wiring in
+# isolation from the real checks.yaml's commands -- `cargo deny check`,
+# `just clippy` etc. are real, possibly slow, network-touching commands on
+# this host, and this test only needs to know WHICH path (capped/uncapped)
+# run-check.sh takes and what it passes to hardened-run.sh, not whether any
+# actual check tool passes. `command: "true"` is a harmless no-op either way.
+upstream_tag: v0.28.6
+checks:
+  - name: fake-capped
+    upstream: build.yml
+    command: "true"
+    compiles: true
+    state: reporting
+  - name: fake-uncapped
+    upstream: build.yml
+    command: "true"
+    compiles: false
+    state: reporting

@@ -142,5 +142,45 @@ rm -rf "$TIMEOUT_DIR"
 grep -qi "timed out\|timeout" <<<"$out" && ok "names it as a timeout, not a generic failure" \
   || bad "timeout was not named: $out"
 
+# FIX ROUND 1 (Task 5's fix round): a capped check must forward the seven
+# cache/credential variable NAMES to hardened-run.sh via --forward-env; an
+# uncapped check must never invoke hardened-run.sh at all. Proven against a
+# stub hardened-run.sh's own recorded argv -- what run-check.sh actually
+# calls it with -- using the same symlink substitution the timeout case
+# above uses for lookup-check.py, not a claim about run-check.sh's source.
+#
+# Uses a synthetic checks.yaml (fixtures/checks-forward-test.yaml), not the
+# real one: the real checks' commands (`cargo deny check`, `just clippy`, ...)
+# are real, network-touching tools on this host -- an earlier version of
+# this test called the real `cargo-deny` for its "uncapped" case and it
+# spent minutes fetching an advisory-db over git before being killed. This
+# test only needs to know which path run-check.sh takes, not whether a real
+# check tool passes, and "true" as both fixture commands makes the uncapped
+# path's real `bash -lc "true"` instant and harmless either way.
+FORWARD_DIR="${TMPDIR:-/tmp}/run-check-forward-test.$$"
+mkdir -p "$FORWARD_DIR"
+ln -sf "$SCRIPT" "$FORWARD_DIR/run-check.sh"
+ln -sf "$HERE/../lookup-check.py" "$FORWARD_DIR/lookup-check.py"
+ln -sf "$HERE/fixtures/hardened-run-stub.sh" "$FORWARD_DIR/hardened-run.sh"
+FAKE_CHECKS="$HERE/fixtures/checks-forward-test.yaml"
+
+ARGS_FILE="$FORWARD_DIR/hardened-run-args"
+CHECKS_FILE="$FAKE_CHECKS" STUB_HARDENED_RUN_ARGS_FILE="$ARGS_FILE" \
+  "$FORWARD_DIR/run-check.sh" fake-capped >/dev/null 2>&1
+for v in RUSTC_WRAPPER SCCACHE_BUCKET SCCACHE_ENDPOINT SCCACHE_S3_USE_SSL \
+         SCCACHE_S3_NO_CREDENTIALS AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; do
+  grep -qx -- "--forward-env" "$ARGS_FILE" 2>/dev/null && grep -qx "$v" "$ARGS_FILE" 2>/dev/null \
+    && ok "forwards $v to hardened-run.sh on the capped path" \
+    || bad "did not forward $v to hardened-run.sh: $(cat "$ARGS_FILE" 2>/dev/null)"
+done
+
+rm -f "$ARGS_FILE"
+out=$(CHECKS_FILE="$FAKE_CHECKS" STUB_HARDENED_RUN_ARGS_FILE="$ARGS_FILE" \
+  "$FORWARD_DIR/run-check.sh" fake-uncapped 2>&1); rc=$?
+[ "$rc" -eq 0 ] && ok "the uncapped fixture check still passes" || bad "fake-uncapped failed (rc=$rc): $out"
+[ ! -e "$ARGS_FILE" ] && ok "an uncapped check never invokes hardened-run.sh at all" \
+  || bad "fake-uncapped still called hardened-run.sh: $(cat "$ARGS_FILE" 2>/dev/null)"
+rm -rf "$FORWARD_DIR"
+
 echo; [ "$fails" -eq 0 ] && echo "PASS" || echo "FAILURES"
 exit "$fails"

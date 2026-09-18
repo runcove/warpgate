@@ -84,6 +84,20 @@ fi
 CAPPED=yes
 [ "$COMPILES" = "false" ] && CAPPED=no
 
+# The seven variables sccache needs to help a capped/compiling check: the
+# five cache-env.sh (Task 3) prints, plus the two AWS credentials it
+# deliberately does not print itself. Named here, not valued -- passed to
+# hardened-run.sh's --forward-env, which only crosses the cap boundary a
+# name that is actually set and non-empty in THIS process's own
+# environment. A cold run, or a run where cache-env.sh refused, forwards
+# nothing and the check still runs, just uncached (hardened-run.sh reports
+# the count and names so that silence is never how a cache miss looks).
+CACHE_FORWARD_VARS=(RUSTC_WRAPPER SCCACHE_BUCKET SCCACHE_ENDPOINT
+                     SCCACHE_S3_USE_SSL SCCACHE_S3_NO_CREDENTIALS
+                     AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY)
+FORWARD_FLAGS=()
+for v in "${CACHE_FORWARD_VARS[@]}"; do FORWARD_FLAGS+=(--forward-env "$v"); done
+
 if [ "${RUN_CHECK_DRY:-}" = "1" ]; then
   if [ "$CAPPED" = "yes" ]; then
     echo "would run via hardened-run: $COMMAND"
@@ -97,7 +111,7 @@ if [ -n "${RUN_CHECK_FORCE_RC:-}" ]; then
   rc="$RUN_CHECK_FORCE_RC"
 elif [ "$CAPPED" = "yes" ]; then
   "$HERE/hardened-run.sh" --cpus "${CI_CPUS:-4}" --memory "${CI_MEMORY:-7g}" \
-    --label "check-$NAME" -- bash -lc "$COMMAND"
+    --label "check-$NAME" "${FORWARD_FLAGS[@]}" -- bash -lc "$COMMAND"
   rc=$?
 else
   bash -lc "$COMMAND"
