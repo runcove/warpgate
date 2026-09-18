@@ -1,0 +1,20 @@
+# Synthetic checks.yaml for testing run-all-checks.sh's ordering logic in
+# isolation -- the check names are what matter (run-check-stub.sh keys its
+# forced exit codes off them), not the commands, which never run for real.
+upstream_tag: v0.28.6
+checks:
+  - name: check-a
+    upstream: build.yml
+    command: "true"
+    compiles: false
+    state: reporting
+  - name: check-b
+    upstream: build.yml
+    command: "true"
+    compiles: false
+    state: reporting
+  - name: check-c
+    upstream: build.yml
+    command: "true"
+    compiles: false
+    state: reporting
