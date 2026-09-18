@@ -6,12 +6,14 @@ into a run: block. All static. None of it executes a line of the shell, so the
 first real execution of the resolve and replay logic would otherwise be the
 scheduled fire, unattended, on the repository we actually care about.
 
-This runs those two steps' ACTUAL TEXT -- extracted from the workflow file, not
+This runs those steps' ACTUAL TEXT -- extracted from the workflow file, not
 retyped -- against a throwaway git repository built to have the shape the real
 one has. Everything it asserts is a behaviour the static checks cannot see:
 which branch becomes OLD, whether a version sort or a lexical sort decides it,
-what happens when upstream's API hands back the string "null", and whether a
-conflicting rebase leaves the tree clean and names the files it stopped on.
+what happens when upstream's API hands back the string "null", whether the gate
+that decides if anything runs at all can return both of its answers, and
+whether a conflicting rebase leaves the tree clean and names the files it
+stopped on.
 
 Deliberately NOT covered here, because they need credentials or a remote:
 the push step, and the report step's POST. Their guards are what
@@ -19,7 +21,23 @@ upstream-watch-check.py asserts statically. This file is about the half that
 can be proven on this machine, and the point is that it is a much larger half
 than it looks.
 
+The "already current?" step was in neither list when this file was first
+written -- not covered, and not declared uncovered either, which is the worse
+of the two states: a gap nobody had decided to accept. It needs no credentials
+and no remote, and it is the step whose failure is hardest to see from outside
+(a watcher wired to "no" is indistinguishable from a quiet upstream). Counting
+the steps against the coverage, rather than trusting the list, is what found
+it.
+
 Run: python3 .forgejo/scripts/upstream-watch-replay-test.py [PATH-TO-WORKFLOW]
+     python3 .forgejo/scripts/upstream-watch-replay-test.py --selftest
+
+--selftest is the answer to "and how do you know THIS file is not asleep?"
+(trap 43). It breaks the workflow in ways a reader would call obviously wrong
+and requires the assertions above to go red on each, naming the right one. It
+lived as a scratch script in /tmp for a day, which meant the proof that this
+test refuses anything would have vanished at the next reboot along with the
+harness -- so it is here, in git, next to the thing it proves.
 """
 import os
 import pathlib
@@ -154,6 +172,7 @@ def main() -> int:
         return 2
     doc = yaml.safe_load(wf.read_text())
     resolve = step_run(doc, "resolve what is new and what we are on")
+    check = step_run(doc, "already current?")
     replay = step_run(doc, "replay our patches onto the new release")
 
     root = pathlib.Path(tempfile.mkdtemp(prefix="upstream-watch-replay-"))
@@ -194,6 +213,52 @@ def main() -> int:
     rc, log, got = run_step(resolve, repo, {"IN_NEW": "null", "IN_OLD": "", "IN_PREFIX": ""}, out)
     expect('a tag literally named "null" is refused, not rebased onto', rc, 1)
     expect("...and it says why", "refusing to guess" in log, True)
+
+    # --- already current? ------------------------------------------------
+    # The gate that decides whether anything happens at all, and the step with
+    # the quietest failure modes in the file. Stuck on "no" the watcher never
+    # fires and looks exactly like a calm upstream -- a year could pass before
+    # anyone noticed. Stuck on "yes" it replays and pushes every night onto the
+    # release it is already on. Neither surfaces as an error anywhere.
+    #
+    # It is driven from RESOLVE'S OWN OUTPUTS, not from hand-typed values. A
+    # hand-typed pair would prove only that `[ "$a" = "$b" ]` compares strings.
+    # What needs proving is that the two producers agree on SHAPE: NEW comes
+    # from a release tag (`v0.28.10`), OLD from a branch name with
+    # `cove-patches-` stripped off it. If either side ever gains or loses the
+    # leading "v", the two are never equal, and the only symptom is a job that
+    # quietly does a full replay every night forever.
+    answers = []
+    for label, in_new, want in [
+        ("upstream is ahead of us", "v0.29.0", "yes"),
+        ("we are already on upstream's newest", "v0.28.10", "no"),
+    ]:
+        out.write_text("")
+        rc, log, got = run_step(resolve, repo,
+                                {"IN_NEW": in_new, "IN_OLD": "", "IN_PREFIX": ""}, out)
+        expect(f"resolve succeeds when {label}", rc, 0)
+        # OLD must name a tag that actually exists upstream. This is the shape
+        # check with teeth: if the strip ever yields "0.28.10" or leaves
+        # "cove-patches-v0.28.10", it fails HERE, loudly, instead of becoming a
+        # comparison that can never come back equal.
+        expect(f"...and OLD ({got.get('old')!r}) names a real upstream tag",
+               git_ok(repo, "rev-parse", "--verify", "-q",
+                      f"refs/tags/{got.get('old')}"), True)
+        out.write_text("")
+        rc, log, got2 = run_step(check, repo,
+                                 {"NEW": got.get("new", ""),
+                                  "OLD": got.get("old", "")}, out)
+        expect(f"...the gate succeeds when {label}", rc, 0)
+        expect(f"...and answers todo={want} when {label}", got2.get("todo"), want)
+        answers.append(got2.get("todo"))
+
+    # Trap 44, made an assertion rather than a hope. The two cases above are
+    # worth nothing unless the step actually answered them DIFFERENTLY: a gate
+    # hard-wired to one constant still passes every individual case that happens
+    # to expect that constant. This is the assertion that fails if `todo` cannot
+    # vary, and it is the one assertion here that no single-case test can make.
+    expect("the gate is capable of both answers, not wired to one",
+           sorted(a for a in answers if a), ["no", "yes"])
 
     # --- replay, clean --------------------------------------------------
     # UPSTREAM_URL points at the local fixture's own origin, so the step's fetch
@@ -274,5 +339,109 @@ def main() -> int:
     return 0 if passed == total else 1
 
 
+# Each entry breaks the WORKFLOW -- the subject, never the test -- in a way a
+# reader would call obviously wrong, and names the assertion that must catch it.
+# The anchor must match exactly once: a mutation whose anchor has moved silently
+# becomes a no-op and "passes", which is this file's own subject matter turned
+# on itself.
+MUTATIONS = [
+    # A lexical sort picks v0.9.0 as "highest", replaying the wrong branch onto
+    # the new release -- silently, and only once a year.
+    ("version-sort-becomes-lexical", "| sort -V | tail -1)", "| sort | tail -1)",
+     "OLD is the highest patch branch BY VERSION"),
+    # Drop the guard on jq printing the string "null": the job rebases onto a
+    # tag named null.
+    ("null-tag-guard-removed",
+     "''|null) echo \"could not resolve an upstream tag -- refusing to guess\"; exit 1 ;;",
+     "''|nullXX) echo \"could not resolve an upstream tag -- refusing to guess\"; exit 1 ;;",
+     "refused, not rebased onto"),
+    # Capture the conflicting paths AFTER the abort clears them: the report
+    # names nothing.
+    ("conflicts-read-after-abort",
+     '            CONFLICTS=$(git diff --name-only --diff-filter=U | tr \'\\n\' \' \')\n'
+     '            echo "conflicts: $CONFLICTS"\n'
+     '            git rebase --abort || true\n',
+     '            git rebase --abort || true\n'
+     '            CONFLICTS=$(git diff --name-only --diff-filter=U | tr \'\\n\' \' \')\n'
+     '            echo "conflicts: $CONFLICTS"\n',
+     "names the conflicting path"),
+    # Do not abort at all: a half-replayed tree is left behind.
+    ("no-rebase-abort", "            git rebase --abort || true\n", "",
+     "rebase is aborted"),
+    # Put the branch prefix on the SOURCE too, so the replay reads from a branch
+    # that does not exist.
+    ("prefix-leaks-onto-source",
+     'echo "source_branch=cove-patches-$OLD"',
+     'echo "source_branch=${IN_PREFIX}cove-patches-$OLD"',
+     "not on the source branch"),
+    # The gate, wired to one answer each way. Stuck on "no" the watcher never
+    # fires and looks like a calm upstream; stuck on "yes" it replays nightly
+    # onto the release it is already on. Both are invisible in production.
+    ("gate-wired-to-no", 'echo "todo=yes" >> "$GITHUB_OUTPUT"',
+     'echo "todo=no" >> "$GITHUB_OUTPUT"', "capable of both answers"),
+    ("gate-comparison-inverted", 'if [ "$NEW" = "$OLD" ]; then',
+     'if [ "$NEW" != "$OLD" ]; then', "answers todo="),
+    # Strip the leading "v" off OLD, so NEW ("v0.28.10") and OLD ("0.28.10")
+    # can never be equal and the job replays every single night.
+    ("old-loses-its-v-prefix", "| sed 's|.*origin/cove-patches-||' \\",
+     "| sed 's|.*origin/cove-patches-v||' \\", "names a real upstream tag"),
+]
+
+
+def _run_child(wf_text: str, work: pathlib.Path, name: str):
+    p = work / f"{name}.yml"
+    p.write_text(wf_text)
+    r = subprocess.run([sys.executable, str(pathlib.Path(__file__).resolve()), str(p)],
+                       capture_output=True, text=True)
+    out = r.stdout + r.stderr
+    fails = [ln.strip()[6:].strip() for ln in out.splitlines()
+             if ln.strip().startswith("FAIL")]
+    return r.returncode, fails
+
+
+def selftest(wf: pathlib.Path) -> int:
+    src = wf.read_text()
+    work = pathlib.Path(tempfile.mkdtemp(prefix="upstream-watch-selftest-"))
+    print(f"selftest: mutating {wf} and requiring this test to notice\n")
+
+    # A gate that refuses everything is as useless as one that refuses nothing,
+    # and only the pristine case tells them apart.
+    rc, fails = _run_child(src, work, "pristine")
+    if rc != 0:
+        print(f"  PRISTINE WORKFLOW FAILS -- nothing below means anything\n    {fails[:3]}")
+        return 2
+    print("  ok    the unmodified workflow passes")
+
+    missed = []
+    for name, old, new, want in MUTATIONS:
+        n = src.count(old)
+        if n != 1:
+            print(f"  FAIL  {name}: anchor matched {n}x, not once -- "
+                  "this mutation tests nothing")
+            missed.append(name)
+            continue
+        rc, fails = _run_child(src.replace(old, new), work, name)
+        if rc == 0:
+            print(f"  FAIL  {name}: the test did NOT notice")
+            missed.append(name)
+        elif not any(want in f for f in fails):
+            print(f"  FAIL  {name}: went red, but not on {want!r}\n"
+                  f"          first failure was {fails[0][:90] if fails else '(none)'}")
+            missed.append(name)
+        else:
+            print(f"  ok    {name} -> {want}")
+
+    print()
+    if missed:
+        print(f"  BLIND SPOTS: {missed}")
+        return 1
+    print(f"  the test notices every mutation ({len(MUTATIONS)} tried)")
+    return 0
+
+
 if __name__ == "__main__":
+    argv = sys.argv[1:]
+    if argv and argv[0] == "--selftest":
+        rest = argv[1:]
+        sys.exit(selftest(pathlib.Path(rest[0]) if rest else DEFAULT_WF))
     sys.exit(main())
