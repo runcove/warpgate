@@ -562,15 +562,27 @@ MUTATIONS = [
     # Build the report body by string interpolation instead of jq --arg. The
     # workflow's comment says this would lose the report when a conflicting
     # filename contains a quote; this is that comment turned into a test.
+    #
+    # ANCHOR MAINTENANCE (2026-09-18): this anchor previously described the
+    # three-arg report body and stopped matching when the drift detector added
+    # `--arg drift "$DRIFT_SUMMARY"` and turned `message` into a jq expression.
+    # A stale anchor does not fail loudly on its own -- the mutation simply
+    # applies nothing, the test passes, and the pass certifies the opposite of
+    # the truth. It was caught only because --selftest counts its own anchor
+    # hits and refuses an anchor that matched 0 times. If you change the report
+    # body in upstream-watch.yml, this anchor changes with it, in the same
+    # commit; the selftest is what will tell you if you forget.
     ("report-body-interpolated-not-escaped",
      '          jq -n --arg new "$NEW" --arg count "$COUNT" --arg conflicts "$CONFLICTS" \\\n'
+     '                --arg drift "$DRIFT_SUMMARY" \\\n'
      '            \'{source: "warpgate-upstream", severity: "warning",\n'
      '              title: "Warpgate \\($new) needs a hand",\n'
-     '              message: "replaying \\($count) patches onto \\($new) stopped at: \\($conflicts)"}\' \\\n',
+     '              message: ("replaying \\($count) patches onto \\($new) stopped at: \\($conflicts)"\n'
+     '                        + (if $drift == "" then "" else "\\n\\n" + $drift end))}\' \\\n',
      '          printf \'{"source":"warpgate-upstream","severity":"warning",'
      '"title":"Warpgate %s needs a hand",'
-     '"message":"replaying %s patches onto %s stopped at: %s"}\' '
-     '"$NEW" "$COUNT" "$NEW" "$CONFLICTS" \\\n',
+     '"message":"replaying %s patches onto %s stopped at: %s%s"}\' '
+     '"$NEW" "$COUNT" "$NEW" "$CONFLICTS" "$DRIFT_SUMMARY" \\\n',
      "hostile filename"),
 ]
 
