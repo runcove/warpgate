@@ -15,11 +15,18 @@ that decides if anything runs at all can return both of its answers, and
 whether a conflicting rebase leaves the tree clean and names the files it
 stopped on.
 
-Deliberately NOT covered here, because they need credentials or a remote:
-the push step, and the report step's POST. Their guards are what
-upstream-watch-check.py asserts statically. This file is about the half that
-can be proven on this machine, and the point is that it is a much larger half
-than it looks.
+Deliberately NOT covered here: the report step's POST, which needs a real
+credential and a real endpoint. Its guards are what upstream-watch-check.py
+asserts statically.
+
+The push step used to be on that list too, as "needs credentials or a remote".
+Checking the premise rather than the sentence: the fixture's origin is a local
+clone, so it already IS a remote and no credential is involved. It is now
+covered, including the one property that matters most in a job that pushes on a
+schedule with nobody watching -- that a push which would overwrite history on
+the remote is REFUSED rather than resolved. "Needs a remote" was true of the
+words and false of the situation, which is the shape a stale exclusion always
+has.
 
 The "already current?" step was in neither list when this file was first
 written -- not covered, and not declared uncovered either, which is the worse
@@ -174,6 +181,7 @@ def main() -> int:
     resolve = step_run(doc, "resolve what is new and what we are on")
     check = step_run(doc, "already current?")
     replay = step_run(doc, "replay our patches onto the new release")
+    push = step_run(doc, "push the replayed branch")
 
     root = pathlib.Path(tempfile.mkdtemp(prefix="upstream-watch-replay-"))
     repo = build_fixture(root)
@@ -285,6 +293,50 @@ def main() -> int:
            git_ok(repo, "merge-base", "--is-ancestor", "v0.28.6",
                   "cove-patches-v0.28.6"), True)
 
+    # --- push the replayed branch ----------------------------------------
+    # Declared uncovered as "needs credentials or a remote" until the premise
+    # was checked: the fixture's origin is a local clone, so it IS a remote and
+    # no credential is involved. The step is two lines, and one property of it
+    # is worth more than the rest of this file put together -- see below.
+    up = root / "upstream"          # the fixture's 'origin', a plain local repo
+    DST = "rehearsal/cove-patches-v0.28.10"
+    out.write_text("")
+    rc, log, _ = run_step(push, repo, {"DST": DST}, out)
+    expect("the push step succeeds after a clean replay", rc, 0)
+    expect("...and the branch is on the remote", git_ok(up, "rev-parse", "--verify", "-q", DST), True)
+    expect("...at exactly the commit we replayed",
+           git(up, "rev-parse", DST), git(repo, "rev-parse", DST))
+    # The negative: pushing the destination must not drag the source with it.
+    expect("...and the source branch was not pushed anywhere new",
+           git_ok(up, "rev-parse", "--verify", "-q", "rehearsal/cove-patches-v0.28.6"), False)
+
+    # THE safety property of this whole workflow. It runs on a schedule with
+    # nobody watching, and it pushes. If that push can ever overwrite history on
+    # the forge, an unattended job destroys work on a branch someone else moved,
+    # and the first anyone knows is the missing commits. A non-fast-forward must
+    # be REFUSED, not resolved.
+    #
+    # Diverge the remote's copy, then push again. `up` is checked out on main so
+    # the refusal can only be the non-fast-forward, never receive.denyCurrentBranch
+    # -- otherwise this would pass for a reason that has nothing to do with safety.
+    expect("PRECONDITION: the remote is not sitting on the branch under test",
+           git(up, "rev-parse", "--abbrev-ref", "HEAD") != DST, True)
+    git(up, "checkout", "-q", "-B", "diverge", DST)
+    (up / "REMOTE_MOVED").write_text("someone else pushed here\n")
+    git(up, "add", "REMOTE_MOVED")
+    git(up, "commit", "-qm", "a commit only the remote has")
+    git(up, "branch", "-f", DST, "diverge")
+    git(up, "checkout", "-q", "main")
+    remote_tip = git(up, "rev-parse", DST)
+
+    out.write_text("")
+    rc, log, _ = run_step(push, repo, {"DST": DST}, out)
+    expect("a push that would overwrite the remote is REFUSED", rc != 0, True)
+    expect("...for the right reason, not some other failure",
+           ("non-fast-forward" in log) or ("rejected" in log), True)
+    expect("...and the remote still has the commit we did not make",
+           git(up, "rev-parse", DST), remote_tip)
+
     # --- replay, conflicting --------------------------------------------
     # Make upstream's newest tag touch the same file our patch does, so the
     # rebase cannot apply cleanly. This is the path that must NEVER push.
@@ -385,6 +437,15 @@ MUTATIONS = [
     # can never be equal and the job replays every single night.
     ("old-loses-its-v-prefix", "| sed 's|.*origin/cove-patches-||' \\",
      "| sed 's|.*origin/cove-patches-v||' \\", "names a real upstream tag"),
+    # The one that matters most. A scheduled job that force-pushes can destroy
+    # a branch someone else moved, unattended, with the missing commits as the
+    # first symptom. Adding six characters must go red here.
+    ("push-becomes-force", 'git push origin "$DST"', 'git push --force origin "$DST"',
+     "remote still has the commit we did not make"),
+    # Swallowing the push failure: the job goes green having pushed nothing,
+    # which is how a watcher becomes decorative without anyone noticing.
+    ("push-failure-swallowed", 'git push origin "$DST"', 'git push origin "$DST" || true',
+     "overwrite the remote is REFUSED"),
 ]
 
 
