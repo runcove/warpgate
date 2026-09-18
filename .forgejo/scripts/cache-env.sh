@@ -23,7 +23,14 @@ set -uo pipefail
 if [ "${1:-}" = "--verdict" ]; then
   stats="${2:-}"
 
-  # Nothing to read at all.
+  # Nothing to read at all. Deliberately redundant with the missing-fields
+  # guard below -- an empty string also fails every `field` match, so that
+  # guard alone would already catch this case. This early exit exists only
+  # for a clearer message ("no stats given" vs "missing expected fields");
+  # the missing-fields guard is the one actually load-bearing here. Do not
+  # delete either on the assumption the other one covers it by accident --
+  # delete this one and the message gets vaguer, delete that one and the
+  # script breaks.
   if [ -z "$stats" ]; then
     echo "cache-env.sh: no cache stats given -- cannot tell, treating as FAILED" >&2
     echo "FAILED"; exit 1
@@ -32,6 +39,20 @@ if [ "${1:-}" = "--verdict" ]; then
   # sccache's own account of its startup outranks every counter below: a blob
   # that claims healthy numbers alongside this marker is contradicting
   # itself, and the marker is the one sccache actually meant.
+  #
+  # This is NOT corroborated once compile requests are above zero, and must
+  # not be treated as if it were. It catches exactly one shape: the server
+  # crashing before it ever took a request, which is also the shape the
+  # requests==0 fingerprint below catches on its own -- reworded or
+  # localised, this string stops matching and that fingerprint is then the
+  # only thing standing between a dead-at-startup backend and a false COLD.
+  # It says nothing at all about a backend that answered at startup and
+  # degraded or stopped retaining afterwards (compiles keep running, no
+  # error text, no error counter): that failure is invisible to a single
+  # stats read by construction, not by a gap in this pattern, and is a named
+  # Task 9 follow-up (run-to-run evidence, not a better parse). Do not
+  # "simplify" this check and the requests==0 check into one: they cover
+  # different shapes and only overlap in the one case both were built for.
   if grep -qiE 'sccache: error:|server startup failed|cache storage failed to read' <<<"$stats"; then
     echo "cache-env.sh: sccache reported a startup failure -- treating as FAILED" >&2
     echo "FAILED"; exit 1
@@ -40,7 +61,11 @@ if [ "${1:-}" = "--verdict" ]; then
   # Extract the value of an exact stats field, e.g. "Cache hits" -- anchored
   # to the whole line so it can't also match "Cache hits rate" or "Cache
   # hits (C/C++)", which real sccache prints on neighbouring lines sharing
-  # the same prefix.
+  # the same prefix. `[0-9]+` deliberately accepts digits only: a value that
+  # isn't a plain integer (blank, "-", garbled) fails this match and falls
+  # through to the missing-fields guard below as unreadable, which is the
+  # correct outcome. Do not loosen this to be "helpful" to odd input --
+  # that is exactly the guessing this file exists to refuse.
   field() {
     grep -E "^${1}[[:space:]]+[0-9]+[[:space:]]*\$" <<<"$stats" | head -n1 | tr -dc '0-9'
   }
