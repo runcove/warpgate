@@ -135,6 +135,15 @@ checks:
     # class of error either -- the probe reports declared tools that are
     # missing, and can never report a tool that was never declared.
     #
+    # WHERE THE AGREEMENT CHECK ACTUALLY FIRES. The script cross-checks
+    # `upstream_tag` against the tag encoded in a `cove-patches-vX.Y.Z`
+    # branch name. Only release branches encode one, so on `wip/**` -- which
+    # is where our CI runs today -- the cross-check is skipped, and the run
+    # says so rather than looking like a cross-checked green. A green here on
+    # a wip branch is therefore no evidence the two records agree; only a run
+    # on a cove-patches branch tests that. The unit tests exercise both
+    # cases, which is the only place the agreement path runs at all for now.
+    #
     # `just` is gone from this list because the script calls the two npm
     # scripts directly rather than through the justfile recipe (which also
     # generates TypeScript clients via a Java tool, for artefacts this check
