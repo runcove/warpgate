@@ -129,6 +129,53 @@ class TestValidatorAgainstUpstream(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("does-not-exist.yml", r.stdout + r.stderr)
 
+    # --- the command must exist, not only be well-formed ------------------
+    # `reprotest` named .forgejo/scripts/reprotest.sh for as long as the check
+    # list existed, and no such file was ever committed. This validator said
+    # "ok: 11 check(s) valid" the whole time. The check is `state: excepted`,
+    # so nothing ran it and nothing complained; un-excepting it would have
+    # failed with "No such file or directory" in the ORDINARY range, which no
+    # exit code distinguishes from a verdict on our code.
+
+    def test_a_command_naming_a_missing_repo_script_fails(self):
+        bad = GOOD.replace("command: cargo deny check",
+                           "command: .forgejo/scripts/definitely-not-here.sh")
+        r = self.run_validator(write(bad))
+        self.assertNotEqual(r.returncode, 0,
+                            "a command naming a file we do not have was accepted")
+        self.assertIn("definitely-not-here.sh", r.stdout + r.stderr,
+                      "the refusal does not name the missing path")
+
+    def test_a_command_naming_a_non_executable_repo_file_fails(self):
+        # Distinct from missing: present but not runnable fails the same way at
+        # run time and must not be waved through because the path resolves.
+        bad = GOOD.replace("command: cargo deny check",
+                           "command: .forgejo/checks.yaml")
+        r = self.run_validator(write(bad))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("not executable", r.stdout + r.stderr)
+
+    def test_a_real_repo_script_passes(self):
+        # The control. Without it, the two assertions above would also be
+        # satisfied by a validator that refused every command with a slash in
+        # it, which would refuse the whole real check list.
+        ok = GOOD.replace("command: cargo deny check",
+                          "command: .forgejo/scripts/check-lockfile.sh")
+        r = self.run_validator(write(ok))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_a_plain_program_name_is_not_treated_as_a_path(self):
+        # `cargo`, `helm`, `mkdir` are resolved wherever the check runs, which
+        # is a sandbox image, not here. Refusing them would be a confident
+        # false refusal about tools that are present there and absent here.
+        for cmd in ("cargo deny check",
+                    "cd warpgate-web && biome ci .",
+                    "mkdir -p warpgate-web/dist && just clippy"):
+            with self.subTest(cmd=cmd):
+                r = self.run_validator(write(GOOD.replace("command: cargo deny check",
+                                                          f"command: {cmd}")))
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
     def test_the_committed_checks_file_is_valid(self):
         r = self.run_validator(str(REPO / ".forgejo" / "checks.yaml"))
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
