@@ -225,6 +225,72 @@ jobs:
       - name: preflight
         run: .forgejo/scripts/preflight.sh
 
+      # DIAGNOSTIC ONLY, AND IT CHANGES NOTHING. Run 602 named the reason the
+      # build cache has never once started, and it is not credentials, not the
+      # endpoint and not TLS: every capped check emitted the same single line,
+      #
+      #   dns error: failed to lookup address information:
+      #   Name has no usable address
+      #
+      # for https://oga2.tenfourty.site:8010/... -- a host that resolves fine
+      # from the development machine (A record, no AAAA) and that
+      # hardened-run.sh's `docker run` is given no DNS configuration for at
+      # all: its argument array carries --cpus, --memory and --memory-swap and
+      # nothing else.
+      #
+      # Three candidate causes fit that symptom equally well, which is exactly
+      # the position this repo refuses to guess from. So this step takes the
+      # readings that separate them, in the place the fault actually happens,
+      # BEFORE any fix is written:
+      #
+      #   (a) the job container resolves it and a dind container does not
+      #       -> the daemon's own resolver is the cause, and the honest fix is
+      #          --dns with the nameserver READ from this output at run time
+      #   (b) a plain dind container resolves it and a capped one does not
+      #       -> the cap flags are the cause
+      #   (c) nothing resolves it anywhere
+      #       -> the name is unreachable from this network entirely, and only
+      #          then is a pinned --add-host defensible, with a comment saying
+      #          it is pinned and why
+      #
+      # It exits 0 unconditionally. A diagnostic that can fail the run buys a
+      # verdict at the cost of the run that was carrying it.
+      - name: DIAGNOSTIC (non-fatal) -- where does the cache host resolve?
+        run: |
+          set +e -u -o pipefail
+          # Derived from the same variable the checks use, never typed: a
+          # hostname written by hand here could differ from the one that
+          # actually failed and the reading would answer about nothing.
+          HOST=${S3_ENDPOINT#*://}; HOST=${HOST%%:*}; HOST=${HOST%%/*}
+          echo "cache host under test: $HOST   (from S3_ENDPOINT=$S3_ENDPOINT)"
+          echo
+          echo "== (1) the JOB container, where the uncapped checks run =="
+          echo "--- /etc/resolv.conf ---"; cat /etc/resolv.conf
+          echo "--- getent hosts $HOST ---"; getent hosts "$HOST"; echo "getent rc=$?"
+          echo
+          if [ -z "${HARDENED_RUN_IMAGE:-}" ]; then
+            echo "HARDENED_RUN_IMAGE is empty -- skipping the two container readings."
+          else
+            echo "== (2) a PLAIN container on the dind daemon, no cap flags =="
+            docker run --rm "$HARDENED_RUN_IMAGE" sh -c \
+              'echo "--- /etc/resolv.conf ---"; cat /etc/resolv.conf; echo "--- getent ---"; getent hosts '"$HOST"'; echo "getent rc=$?"'
+            echo "docker run rc=$?"
+            echo
+            echo "== (3) the SAME image with the cap flags hardened-run.sh passes =="
+            # Representative caps, not read from checks.yaml: the question here
+            # is only whether --cpus/--memory/--memory-swap change resolution,
+            # and no value of them should. Note this uses `docker run` where
+            # hardened-run.sh uses `docker run -d` + `docker exec`; DNS is
+            # decided at container creation, so the reading carries, but the
+            # difference is stated rather than glossed.
+            docker run --rm --cpus=4 --memory=7g --memory-swap=7g "$HARDENED_RUN_IMAGE" sh -c \
+              'echo "--- /etc/resolv.conf ---"; cat /etc/resolv.conf; echo "--- getent ---"; getent hosts '"$HOST"'; echo "getent rc=$?"'
+            echo "docker run rc=$?"
+          fi
+          echo
+          echo "DIAGNOSTIC COMPLETE -- exiting 0 whatever the above says."
+          exit 0
+
       # Every CI defect this arc has produced lived in the machinery that RUNS
       # the checks, not in the checks themselves: a port stripped from the cache
       # endpoint, a missing region that broke every rustc call, a guard that
