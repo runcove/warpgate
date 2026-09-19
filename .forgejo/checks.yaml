@@ -91,7 +91,17 @@ checks:
     tools: [helm]
   - name: clippy
     upstream: clippy.yml
-    command: just clippy
+    command: mkdir -p warpgate-web/dist && just clippy
+    # THE `mkdir` IS NOT PADDING. warpgate-web/src/lib.rs derives RustEmbed on
+    # `#[folder = "../warpgate-web/dist"]`, and RustEmbed fails to COMPILE when
+    # that folder does not exist. A fresh checkout has no dist/, so without
+    # this the crate — and therefore the whole workspace — fails to build, in
+    # the ORDINARY range, indistinguishable from our code being broken.
+    # Upstream does the same thing and calls it "Stub web assets for
+    # RustEmbed" (clippy.yml). Found 2026-09-19 by reading lib.rs rather than
+    # by a run; a run would have produced exactly the fake verdict described.
+    # The stub is empty, so what is built embeds no UI: these checks assert
+    # that the workspace COMPILES, never that the artefact is shippable.
     compiles: true
     state: reporting
     # cargo-cranky added 2026-09-19: the justfile recipe is `cargo cranky
@@ -101,8 +111,11 @@ checks:
     # missing tool discovered per CI run.
     # LEAVES (traced 2026-09-19): `just clippy` -> justfile recipe `cargo cranky --workspace
     # --all-features` -> the cargo-cranky binary. Upstream also runs
-    # `rustup component add clippy` and `mkdir -p warpgate-web/dist` first;
-    # neither is in our command yet (runcove-xais).
+    # `rustup component add clippy` and `mkdir -p warpgate-web/dist` first.
+    # The mkdir is now in the command above. The clippy component is the
+    # IMAGE's job, not the command's: it is installed into the sandbox image
+    # (.forgejo/images/ci-toolchain/Dockerfile) so every capped check gets it
+    # once rather than each command re-adding it per run.
     tools: [just, cargo, cargo-cranky]
   - name: schema-compat
     upstream: check-schema-compatibility.yml
@@ -164,7 +177,17 @@ checks:
     tools: [git, tar, python3, npm, cargo, oasdiff]
   - name: unit-tests
     upstream: test.yml
-    command: cargo llvm-cov test --workspace
+    command: mkdir -p warpgate-web/dist && cargo llvm-cov test --workspace
+    # THE `mkdir` IS NOT PADDING. warpgate-web/src/lib.rs derives RustEmbed on
+    # `#[folder = "../warpgate-web/dist"]`, and RustEmbed fails to COMPILE when
+    # that folder does not exist. A fresh checkout has no dist/, so without
+    # this the crate — and therefore the whole workspace — fails to build, in
+    # the ORDINARY range, indistinguishable from our code being broken.
+    # Upstream does the same thing and calls it "Stub web assets for
+    # RustEmbed" (clippy.yml). Found 2026-09-19 by reading lib.rs rather than
+    # by a run; a run would have produced exactly the fake verdict described.
+    # The stub is empty, so what is built embeds no UI: these checks assert
+    # that the workspace COMPILES, never that the artefact is shippable.
     compiles: true
     state: reporting
     # cargo-llvm-cov added 2026-09-19 (upstream test.yml pins 0.6.15
@@ -182,7 +205,17 @@ checks:
     tools: [cargo, cargo-llvm-cov]
   - name: release-build
     upstream: build.yml
-    command: cargo build --all-features --release
+    command: mkdir -p warpgate-web/dist && cargo build --all-features --release
+    # THE `mkdir` IS NOT PADDING. warpgate-web/src/lib.rs derives RustEmbed on
+    # `#[folder = "../warpgate-web/dist"]`, and RustEmbed fails to COMPILE when
+    # that folder does not exist. A fresh checkout has no dist/, so without
+    # this the crate — and therefore the whole workspace — fails to build, in
+    # the ORDINARY range, indistinguishable from our code being broken.
+    # Upstream does the same thing and calls it "Stub web assets for
+    # RustEmbed" (clippy.yml). Found 2026-09-19 by reading lib.rs rather than
+    # by a run; a run would have produced exactly the fake verdict described.
+    # The stub is empty, so what is built embeds no UI: these checks assert
+    # that the workspace COMPILES, never that the artefact is shippable.
     compiles: true
     state: reporting
     # LEAVES (traced 2026-09-19): `cargo build --all-features --release`. Leaf, nothing below it --
