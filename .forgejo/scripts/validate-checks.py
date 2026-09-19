@@ -12,6 +12,49 @@ import pathlib
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import checks_lib
+import importlib.util as _ilu
+
+# derive-tools.py has a hyphen, so it cannot be imported by name.
+_spec = _ilu.spec_from_file_location(
+    "derive_tools", str(pathlib.Path(__file__).resolve().parent / "derive-tools.py"))
+derive_tools = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(derive_tools)
+
+
+def _undeclared_tools(checks, root):
+    """Refuse a check that invokes a program it does not declare.
+
+    THE CASE THIS EXISTS FOR. `check-lockfile.sh` piped through `sed` from the
+    day it was written, and the lockfile check declared only `jq` and `find`.
+    sed is not coreutils, so nothing covered it.
+
+    WHY NO CI RUN COULD EVER HAVE FOUND IT. The tools gate in run-check.sh
+    reports the tools a check DECLARES and finds missing. A tool that was never
+    declared is invisible to it — so instead of refusing 97 ("the environment
+    cannot run this check"), a missing one dies with a bare 127 in the ORDINARY
+    range, where nothing separates our missing tool from upstream's verdict on
+    our code. The gate can only be as complete as the list it is handed, and
+    nothing was checking the list.
+
+    Same shape as the sccache case found the same day: a requirement that is
+    real, and invisible to every guard, because each guard reads a list rather
+    than the code.
+
+    Derived mechanically by derive-tools.py, which is fixture-tested against
+    the ways the three hand-rolled sweeps that preceded it went wrong —
+    heredocs and multi-line strings read as code (false positives), and
+    over-eager stripping deleting real code (false negatives).
+    """
+    bad = False
+    for c in checks:
+        for name, where in derive_tools.undeclared_for_check(c, root):
+            print(f"INVALID: check {c['name']!r} invokes {name!r} at {where} but does "
+                  f"not declare it in tools:. An undeclared tool cannot refuse 97 — it "
+                  f"fails with 127 in the ordinary range and reads like a verdict on "
+                  f"the code. Add it to tools:, or, if it is always present, to "
+                  f"ALWAYS_PRESENT in derive-tools.py.", file=sys.stderr)
+            bad = True
+    return bad
 
 
 def _dangling_commands(checks):
@@ -109,6 +152,16 @@ def main(argv):
         return 1
 
     if _dangling_commands(checks):
+        return 1
+
+    root = subprocess.run(["git", "rev-parse", "--show-toplevel"],
+                          capture_output=True, text=True)
+    if root.returncode != 0:
+        print("INVALID: not inside a git checkout, so a check's scripts cannot be "
+              "read to derive what they invoke — refusing rather than skipping",
+              file=sys.stderr)
+        return 1
+    if _undeclared_tools(checks, root.stdout.strip()):
         return 1
 
     print(f"ok: {len(checks)} check(s) valid against {tag}")

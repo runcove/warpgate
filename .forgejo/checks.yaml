@@ -29,12 +29,21 @@ checks:
     #   * Its PASS now states its own scope -- "examined 2 lockfile(s), 331
     #     package entries" -- so a green result can be read without going to
     #     the repository to find out what it covered.
-    # Cheap and deterministic: jq and find only, no network, no compile.
+    # Cheap and deterministic: jq, find and sed only, no network, no compile.
     state: blocking
-    # LEAVES (traced 2026-09-19): `.forgejo/scripts/check-lockfile.sh` -> `find` and `jq`. Ours, so
-    # the leaves are verified by that script's own test suite rather than by
-    # reading an upstream workflow.
-    tools: [jq, find]
+    # LEAVES (traced 2026-09-19): `.forgejo/scripts/check-lockfile.sh` -> `find`, `jq` and `sed`.
+    # Ours, so the leaves are verified by that script's own test suite rather
+    # than by reading an upstream workflow.
+    #   * sed: check-lockfile.sh:101, `echo "$missing" | sed 's/^/  /'`, which
+    #     indents the entries a failure names. Added 2026-09-19 (runcove-tbxh).
+    #     It is NOT coreutils, so the convention that lets coreutils go
+    #     undeclared does not cover it. Undeclared, a missing sed gives a bare
+    #     127 in the ordinary range; declared, the gate refuses 97 and says so.
+    #     No CI run could have found this: the probe reports the tools a check
+    #     DECLARES and finds missing, so a tool that was never declared is
+    #     invisible to it. derive-tools.py now derives this list mechanically
+    #     and validate-checks.py refuses a list that has drifted from it.
+    tools: [jq, find, sed]
   - name: fmt-toml
     upstream: fmt-toml.yml
     command: cargo fmt-toml --check
