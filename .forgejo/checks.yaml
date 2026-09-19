@@ -13,7 +13,22 @@ checks:
     upstream: lockfile.yml
     command: .forgejo/scripts/check-lockfile.sh
     compiles: false
-    state: reporting
+    # PROMOTED 2026-09-19. The bar for blocking is that the FAILING case has
+    # been demonstrated, never a PASS alone -- a check that has only ever
+    # passed may be passing because it looks at nothing, which is exactly what
+    # this one did on 2026-09-18 with jq absent.
+    #   * It fails: a lockfile with an entry missing resolved/integrity exits 1
+    #     and names the entry (tests/test-check-lockfile.sh, proven by
+    #     mutation four ways on disposable copies).
+    #   * It refuses rather than passing when it cannot look: no jq (97), no
+    #     lockfiles (99), a lockfileVersion it cannot read (99), a file with no
+    #     entries (99). A refusal is never downgraded by state, so promoting
+    #     this does not change how those are reported.
+    #   * Its PASS now states its own scope -- "examined 2 lockfile(s), 331
+    #     package entries" -- so a green result can be read without going to
+    #     the repository to find out what it covered.
+    # Cheap and deterministic: jq and find only, no network, no compile.
+    state: blocking
     tools: [jq, find]
   - name: fmt-toml
     upstream: fmt-toml.yml
@@ -42,7 +57,20 @@ checks:
     # printing the whole rendered manifest to stderr on every green run.
     command: helm lint helm/warpgate --strict && helm template warpgate helm/warpgate >/dev/null
     compiles: false
-    state: reporting
+    # PROMOTED 2026-09-19, and this check needed the bar more than any other:
+    # its only previous FAIL (run 529) was OUR mistranslation, not a verdict on
+    # the chart, and an exit code cannot tell those apart. So the failing case
+    # was demonstrated deliberately, on `git archive` copies, against the
+    # corrected command -- three ways, each failing distinctly:
+    #   * `version:` removed from Chart.yaml  -> [ERROR] Chart.yaml: version is required
+    #   * broken template syntax              -> [ERROR] templates/: parse error ... unclosed action
+    #   * `required` on an absent value       -> Error: execution error ... deliberately missing
+    # The third is why both clauses are here and why `helm template` is not
+    # redundant: measured, `helm lint --strict` PASSES that chart ("1 chart(s)
+    # linted, 0 chart(s) failed") and only `helm template` catches it.
+    # Control: the real chart passes both, rc=0.
+    # Cheap and deterministic: helm only, no cluster, no network.
+    state: blocking
     tools: [helm]
   - name: clippy
     upstream: clippy.yml
