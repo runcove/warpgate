@@ -448,7 +448,21 @@ if [ "$CAPPED" = "yes" ]; then
 # names its three variables one at a time, and __ev_show refuses outright any
 # name that looks like a credential: widening it to a secret now takes a
 # deliberate removal of a refusal, not the addition of a name to a list.
+# A denylist alone was not enough, and the gap is worth stating because it is
+# not obvious: it filters on how a NAME LOOKS, and a value can be secret under
+# a name that looks innocent. SCCACHE_ENDPOINT is the live example -- an S3
+# endpoint URL may legitimately carry credentials in its userinfo, and the name
+# matches no pattern above. So the allowlist decides what may be printed, and
+# the denylist stays as a second refusal for anything that is ever added to it
+# carelessly. Adding a variable now takes editing the allowlist, which is a
+# line whose only purpose is to say "this one is safe to print".
 __ev_show() {
+  case "$1" in
+    CARGO_INCREMENTAL|RUSTC_WRAPPER|SCCACHE_BUCKET) ;;
+    *)
+      echo "ENV-IN-CONTAINER @@NAME@@ — refusing to print '$1': not in the allowlist of variables this probe may report" >&2
+      return ;;
+  esac
   case "$1" in
     *KEY*|*SECRET*|*TOKEN*|*PASSWORD*|*CREDENTIAL*)
       echo "ENV-IN-CONTAINER @@NAME@@ — refusing to print '$1': the name looks like a credential" >&2

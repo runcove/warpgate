@@ -1030,7 +1030,8 @@ out=$( cd "$probe_tmp" && PATH="$probe_tmp/bin:$PATH" \
        AWS_SECRET_ACCESS_KEY=not-a-real-secret-0ae3 RUSTC_WRAPPER=sccache \
        bash -c "$cmd
 __ev_show AWS_SECRET_ACCESS_KEY
-__ev_show SCCACHE_S3_KEY_PREFIX" 2>&1 )
+__ev_show SCCACHE_S3_KEY_PREFIX
+__ev_show SCCACHE_ENDPOINT" 2>&1 )
 # The floor for the negative assertion below, and the reason it is here: on the
 # first run of this block `out` was empty (stderr escaped the substitution) and
 # "the secret appears nowhere" passed against nothing at all. `grep -q` on an
@@ -1042,15 +1043,29 @@ __ev_show SCCACHE_S3_KEY_PREFIX" 2>&1 )
 grep -q "refusing to print 'AWS_SECRET_ACCESS_KEY'" <<<"$out" \
   && ok "the probe refuses a credential-shaped variable name outright" \
   || bad "no refusal when asked to print AWS_SECRET_ACCESS_KEY: $out"
+# The allowlist, which catches what the denylist structurally cannot: a secret
+# VALUE under an innocent NAME. SCCACHE_ENDPOINT is the real case -- an S3
+# endpoint URL may carry credentials in its userinfo and matches no
+# credential-shaped pattern. A name-shape filter can never see that.
+grep -q "refusing to print 'SCCACHE_ENDPOINT'" <<<"$out" \
+  && ok "a name that looks innocent is still refused: the allowlist decides, not the name's shape" \
+  || bad "SCCACHE_ENDPOINT was not refused -- only the denylist is doing the work: $out"
+grep -q 'not in the allowlist' <<<"$out" \
+  && ok "the refusal says it was the allowlist, so the reason is legible in the log" \
+  || bad "no allowlist refusal reason in the output: $out"
 grep -q 'not-a-real-secret-0ae3' <<<"$out" \
   && bad "THE PROBE PRINTED A SECRET'S VALUE INTO ITS OUTPUT: $out" \
   || ok "the refused variable's value appears nowhere in the output"
-# A deliberate, documented false positive: SCCACHE_S3_KEY_PREFIX is not a
-# secret, but it matches *KEY* and is refused. Asserted so the behaviour is a
-# decision on record rather than a surprise to whoever adds that variable.
+# Every variable outside the three is refused, credential-shaped or not.
 grep -q "refusing to print 'SCCACHE_S3_KEY_PREFIX'" <<<"$out" \
-  && ok "the guard errs toward refusing (SCCACHE_S3_KEY_PREFIX is refused, by design)" \
+  && ok "a variable outside the allowlist is refused whatever its name suggests" \
   || bad "SCCACHE_S3_KEY_PREFIX was not refused -- the guard is narrower than documented: $out"
+# And the allowlist is not so tight it refuses its own three: a guard that
+# blocked everything would pass every assertion above while reporting nothing,
+# which is this arc's defect wearing a safety jacket.
+grep -q 'ENV-IN-CONTAINER clippy — RUSTC_WRAPPER=sccache' <<<"$out" \
+  && ok "the three allowed variables still print, so the guard did not silence the probe" \
+  || bad "the allowlist refused an allowed variable -- the probe reports nothing: $out"
 
 echo; [ "$fails" -eq 0 ] && echo "PASS" || echo "FAILURES"
 exit "$fails"
