@@ -37,8 +37,8 @@
     import CredentialUsedStateBadge from 'common/CredentialUsedStateBadge.svelte'
     import EmptyState from 'common/EmptyState.svelte'
     import Loadable from 'common/Loadable.svelte'
-    import RelativeDate from 'common/RelativeDate.svelte'
     import { abbreviatePublicKey, possibleCredentials } from 'common/protocols'
+    import RelativeDate from 'common/RelativeDate.svelte'
     import { SvelteSet } from 'svelte/reactivity'
     import Fa from 'svelte-fa'
     import CertificateCredentialModal from '../../CertificateCredentialModal.svelte'
@@ -437,7 +437,9 @@
                         <small class="d-block text-muted">
                             Last step-up SSO:
                             {#if credential.lastSsoAt}
-                                <RelativeDate date={new Date(credential.lastSsoAt)} />
+                                <RelativeDate
+                                    date={new Date(credential.lastSsoAt)}
+                                />
                             {:else}
                                 never
                             {/if}
@@ -458,7 +460,9 @@
                         <small class="d-block text-muted">
                             Last step-up SSO:
                             {#if credential.lastSsoAt}
-                                <RelativeDate date={new Date(credential.lastSsoAt)} />
+                                <RelativeDate
+                                    date={new Date(credential.lastSsoAt)}
+                                />
                             {:else}
                                 never
                             {/if}
