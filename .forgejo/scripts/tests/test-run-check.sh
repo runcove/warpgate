@@ -302,6 +302,105 @@ grep -qx -- "--add-host" "$ARGS_FILE" 2>/dev/null \
   && bad "passed --add-host with no cache configured at all: $(cat "$ARGS_FILE" 2>/dev/null)" \
   || ok "no cache configured means no --add-host -- the flag is conditional, not decorative"
 
+# ---------------------------------------------------------------------------
+# The DERIVED cluster resolver (--dns). Run 608 measured that a container on
+# the inner daemon's default bridge honours --dns and can reach the cluster
+# resolver from there; these assert the derivation that decides WHICH address,
+# which is the half that can go wrong silently.
+#
+# Every case hands the script a FIXTURE resolv.conf. Reading the host's real
+# /etc/resolv.conf here would make the verdict depend on the machine running
+# the suite -- that is run 580's defect, where test-assert-toolchain.sh passed
+# on Fedora and failed on Debian for reasons that had nothing to do with the
+# code under test.
+RESOLV_DIR="${TMPDIR:-/tmp}/run-check-resolv.$$"
+mkdir -p "$RESOLV_DIR"
+mkresolv() { printf '%s\n' 'nameserver 127.0.0.11' "$2" > "$RESOLV_DIR/$1"; }
+mkresolv good     '# ExtServers: [10.96.0.10]'
+mkresolv edge     '# ExtServers: [10.111.255.254]'
+mkresolv public   '# ExtServers: [8.8.8.8]'
+mkresolv two      '# ExtServers: [10.96.0.10,10.96.0.11]'
+mkresolv nearmiss '# ExtServers: [10.95.0.10]'
+mkresolv garbage  '# ExtServers: [host(10.96.0.10)]'
+printf '%s\n' 'nameserver 1.1.1.1' > "$RESOLV_DIR/absent"
+
+dnsrun() {  # $1 = fixture name; leaves the captured args in $ARGS_FILE, output in $out
+  rm -f "$ARGS_FILE"
+  out=$(CHECKS_FILE="$FAKE_CHECKS" STUB_HARDENED_RUN_ARGS_FILE="$ARGS_FILE" \
+        RUN_CHECK_RESOLV_CONF="$RESOLV_DIR/$1" \
+        SCCACHE_ENDPOINT=https://localhost:9000 \
+        "$FORWARD_DIR/run-check.sh" fake-capped 2>&1); rc=$?
+}
+
+dnsrun good
+if grep -qx -- "--dns" "$ARGS_FILE" 2>/dev/null; then
+  ok "a single in-range ExtServers address produces --dns"
+  grep -qx "10.96.0.10" "$ARGS_FILE" 2>/dev/null \
+    && ok "and --dns carries the address DERIVED from the file, not a typed one" \
+    || bad "--dns was passed with the wrong value: $(cat "$ARGS_FILE" 2>/dev/null)"
+else
+  bad "an in-range ExtServers address produced no --dns: $(cat "$ARGS_FILE" 2>/dev/null)"
+fi
+[ "$rc" -eq 0 ] && ok "and the check still runs" || bad "deriving a resolver failed the check (rc=$rc): $out"
+
+# The top of 10.96.0.0/12. A range check written as a prefix match on "10.96."
+# would reject this and nobody would notice until the cluster used it.
+dnsrun edge
+grep -qx "10.111.255.254" "$ARGS_FILE" 2>/dev/null \
+  && ok "the top of 10.96.0.0/12 is accepted, so the range is a range and not a prefix" \
+  || bad "10.111.255.254 was rejected: $out"
+
+# THE SECURITY CASE. A runner reconfigured to forward to a public resolver must
+# not have that address derived into the sandbox as "the cluster resolver" --
+# every lookup in every capped check would quietly go off-site.
+dnsrun public
+grep -qx -- "--dns" "$ARGS_FILE" 2>/dev/null \
+  && bad "a PUBLIC resolver was handed to the sandbox as the cluster resolver: $(cat "$ARGS_FILE" 2>/dev/null)" \
+  || ok "a public resolver in ExtServers is refused, not derived"
+grep -q "CACHE-DNS-FALLBACK.*not an IPv4 address in the cluster service range" <<<"$out" \
+  && ok "and the refusal says so in the marker rather than passing silently" \
+  || bad "a refused resolver was silent: $out"
+[ "$rc" -eq 0 ] && ok "and the check still runs uncached rather than going red" \
+  || bad "a refused resolver turned into a failure (rc=$rc): $out"
+
+# One below the range. Distinct from the public case: this one is private
+# space, so a check that only asked "is it an RFC1918 address" would pass it.
+dnsrun nearmiss
+grep -qx -- "--dns" "$ARGS_FILE" 2>/dev/null \
+  && bad "10.95.0.10 is outside 10.96.0.0/12 and was still derived: $(cat "$ARGS_FILE" 2>/dev/null)" \
+  || ok "a private address just below the service range is refused too"
+
+dnsrun two
+grep -qx -- "--dns" "$ARGS_FILE" 2>/dev/null \
+  && bad "picked one of two ExtServers: $(cat "$ARGS_FILE" 2>/dev/null)" \
+  || ok "two servers in ExtServers means no --dns -- it refuses rather than guessing"
+grep -q "CACHE-DNS-FALLBACK.*lists 2 servers" <<<"$out" \
+  && ok "and the marker names how many it found" || bad "the two-server refusal did not say so: $out"
+
+# Docker has written ExtServers in other shapes in other versions. Anything
+# that is not a bare dotted quad is refused rather than string-mangled into one.
+dnsrun garbage
+grep -qx -- "--dns" "$ARGS_FILE" 2>/dev/null \
+  && bad "a non-address ExtServers entry was turned into a --dns value: $(cat "$ARGS_FILE" 2>/dev/null)" \
+  || ok "an ExtServers entry that is not a bare address is refused"
+
+# THE NEGATIVE CONTROL. Without it every assertion above would still pass if
+# the address were hardcoded in run-check.sh.
+dnsrun absent
+grep -qx -- "--dns" "$ARGS_FILE" 2>/dev/null \
+  && bad "passed --dns with no ExtServers line at all -- the address is hardcoded somewhere: $(cat "$ARGS_FILE" 2>/dev/null)" \
+  || ok "no ExtServers line means no --dns -- the value comes from the file, nowhere else"
+grep -q "CACHE-DNS-FALLBACK.*no '# ExtServers:' line" <<<"$out" \
+  && ok "and the missing line is named in the marker" || bad "a missing ExtServers line was silent: $out"
+
+# Both routes are kept on purpose: they fail independently. The good fixture
+# resolves `localhost`, so this run must carry BOTH.
+dnsrun good
+grep -qx -- "--add-host" "$ARGS_FILE" 2>/dev/null \
+  && ok "--dns does not displace --add-host: both routes are passed together" \
+  || bad "--add-host disappeared once --dns was derived: $(cat "$ARGS_FILE" 2>/dev/null)"
+rm -rf "$RESOLV_DIR"
+
 rm -f "$ARGS_FILE"
 out=$(CHECKS_FILE="$FAKE_CHECKS" STUB_HARDENED_RUN_ARGS_FILE="$ARGS_FILE" \
   "$FORWARD_DIR/run-check.sh" fake-uncapped 2>&1); rc=$?

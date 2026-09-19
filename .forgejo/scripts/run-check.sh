@@ -295,6 +295,66 @@ for v in "${CACHE_FORWARD_VARS[@]}"; do FORWARD_FLAGS+=(--forward-env "$v"); don
 # a dead cache reached one step earlier. The marker is the same greppable one,
 # so run-all-checks.sh collects it into the summary and a resolution failure
 # is exactly as visible as any other cache outage.
+# The general route, measured in run 608: give the capped container the
+# cluster's own resolver and it resolves everything, not just the one name
+# --add-host carries. Same run, same daemon, same image, one flag different:
+# without it, 8.8.8.8/8.8.4.4 and rc=2 for the cache host; with
+# `--dns 10.96.0.10`, `# Overrides: [nameservers]` and rc=0 for both a cluster
+# name and a homelab name.
+#
+# NOTHING IS TYPED, and that is the point. Docker writes the address it
+# forwards to into this job container's own /etc/resolv.conf as
+# `# ExtServers: [...]`, every run. Deriving it there means there is no
+# literal to go stale, and so nothing for a drift guard to police -- a guard
+# for a pinned resolver was written and deleted precisely because the value
+# turned out to be readable.
+#
+# REFUSED RATHER THAN GUESSED. The derivation demands exactly one address and
+# demands it be an IPv4 literal inside 10.96.0.0/12, the cluster service
+# range. A runner reconfigured to forward straight to a public resolver would
+# otherwise be derived into the sandbox as "the cluster resolver", quietly
+# sending every lookup in every capped check off-site. On anything unexpected
+# this says so and falls back to --add-host, which needs only this container's
+# own resolution and so fails independently. Both routes are kept for that
+# reason: --dns needs kube-dns reachable, --add-host does not.
+#
+# THE MARKER IS DELIBERATELY NOT `CACHE-UNAVAILABLE`. Failing to derive a
+# resolver is not a cache outage -- the --add-host route still carries the
+# cache host, so the cache works. Reusing the outage marker here would put a
+# healthy cache in the run summary's outage list, which is the good state
+# reported as the degraded one: the same indistinguishability this arc keeps
+# meeting, pointing the other way. An existing test caught exactly that.
+CACHE_DNS=()
+if [ "$CAPPED" = "yes" ]; then
+  # Overridable ONLY so the tests can hand it a fixture. Run 580's defect was
+  # a suite whose verdict came from the host's own files; a derivation that
+  # reads /etc/resolv.conf unconditionally would reproduce it one script over,
+  # passing on a machine with no ExtServers line for the wrong reason.
+  __rf="${RUN_CHECK_RESOLV_CONF:-/etc/resolv.conf}"
+  __rl=$(grep -m1 '^# ExtServers:' "$__rf" 2>/dev/null || true)
+  if [ -z "$__rl" ]; then
+    echo "CACHE-DNS-FALLBACK $NAME — no '# ExtServers:' line in $__rf, so the cluster resolver could not be derived; falling back to the single --add-host mapping" >&2
+  else
+    __rs=${__rl#*[}; __rs=${__rs%]*}
+    __rn=$(printf '%s\n' "$__rs" | tr ',' '\n' | grep -c '[^[:space:]]' || true)
+    __r1=$(printf '%s\n' "$__rs" | tr ',' '\n' | head -1 | tr -d '[:space:]')
+    if [ "$__rn" -ne 1 ]; then
+      echo "CACHE-DNS-FALLBACK $NAME — '# ExtServers:' lists $__rn servers ('$__rs'); refusing to pick one, falling back to --add-host" >&2
+    else
+      case "$__r1" in
+        *[!0-9.]*) __r1="" ;;
+        *.*.*.*.*) __r1="" ;;
+        *.*.*.*)   : ;;
+        *)         __r1="" ;;
+      esac
+      case "$__r1" in
+        10.9[6-9].*|10.10[0-9].*|10.11[0-1].*) CACHE_DNS=(--dns "$__r1") ;;
+        *) echo "CACHE-DNS-FALLBACK $NAME — '# ExtServers:' names '$__r1', which is not an IPv4 address in the cluster service range 10.96.0.0/12; refusing to hand it to the sandbox as a resolver, falling back to --add-host" >&2 ;;
+      esac
+    fi
+  fi
+fi
+
 CACHE_ADD_HOST=()
 if [ "$CAPPED" = "yes" ] && [ -n "${SCCACHE_ENDPOINT:-}" ]; then
   __ch="${SCCACHE_ENDPOINT#*://}"; __ch="${__ch%%:*}"; __ch="${__ch%%/*}"
@@ -368,6 +428,7 @@ elif [ "$CAPPED" = "yes" ]; then
   # /etc/profile.d entry that a check needs.
   "$HERE/hardened-run.sh" --cpus "${CI_CPUS:-4}" --memory "${CI_MEMORY:-7g}" \
     --label "check-$NAME" --source "$PWD" --workdir /src --verify-file Cargo.toml \
+    ${CACHE_DNS[@]+"${CACHE_DNS[@]}"} \
     ${CACHE_ADD_HOST[@]+"${CACHE_ADD_HOST[@]}"} \
     "${FORWARD_FLAGS[@]}" -- bash -c "${TOOL_PROBE}${CACHE_PROBE}$COMMAND"
   rc=$?

@@ -47,6 +47,7 @@ done
 CPUS="" MEM="" LABEL="hardened" SOURCE="" WORKDIR="" VERIFY_FILE=""
 FORWARD_VARS=()
 ADD_HOSTS=()
+DNS_SERVERS=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --cpus)    CPUS="$2"; shift 2 ;;
@@ -89,6 +90,15 @@ while [ $# -gt 0 ]; do
     # while the job container resolves the same name without trouble.
     # Repeatable.
     --add-host)    ADD_HOSTS+=("$2"); shift 2 ;;
+    # --dns is the general form of the same fault --add-host works around one
+    # name at a time. Run 608 measured that a container the inner daemon
+    # starts on its DEFAULT bridge does honour --dns (`# Overrides:
+    # [nameservers]`), and that the cluster resolver is reachable from there:
+    # a cluster name and a homelab name both came back rc=0, where the same
+    # container without the flag got Google and rc=2. This script does not
+    # decide WHICH resolver -- it takes one and passes it through, exactly as
+    # it takes --add-host without knowing which host matters. Repeatable.
+    --dns)         DNS_SERVERS+=("$2"); shift 2 ;;
     --) shift; break ;;
     *) echo "hardened-run: unknown argument $1" >&2; exit 2 ;;
   esac
@@ -131,6 +141,29 @@ for m in ${ADD_HOSTS[@]+"${ADD_HOSTS[@]}"}; do
   [ -n "${m##*:}" ] || { echo "hardened-run: --add-host '$m' has an empty address" >&2; exit 2; }
 done
 
+# A resolver has to be a literal ADDRESS. A hostname here would have to be
+# resolved to be used, by the very resolver it is trying to configure, and
+# docker would accept it and produce a container whose DNS silently does
+# nothing. Refused at parse time with the value named, like --add-host above.
+# The shape is checked here; WHICH address is a policy question and belongs to
+# the caller (run-check.sh), which is the only side that knows what a
+# plausible resolver is for this environment.
+for d in ${DNS_SERVERS[@]+"${DNS_SERVERS[@]}"}; do
+  case "$d" in
+    *[!0-9.]*|"") echo "hardened-run: --dns '$d' is not an IPv4 address" >&2; exit 2 ;;
+  esac
+  __oc=0
+  __rest="$d"
+  while [ -n "$__rest" ]; do
+    __part="${__rest%%.*}"
+    [ -n "$__part" ] || { echo "hardened-run: --dns '$d' is not an IPv4 address" >&2; exit 2; }
+    [ "$__part" -le 255 ] 2>/dev/null || { echo "hardened-run: --dns '$d' has an octet above 255" >&2; exit 2; }
+    __oc=$((__oc+1))
+    case "$__rest" in *.*) __rest="${__rest#*.}" ;; *) __rest="" ;; esac
+  done
+  [ "$__oc" -eq 4 ] || { echo "hardened-run: --dns '$d' does not have four octets" >&2; exit 2; }
+done
+
 NAME="${LABEL}-${GITHUB_RUN_ID:-local}-$$"
 
 # --memory-swap must equal --memory. If it is left unset the container may swap
@@ -139,6 +172,7 @@ ARGS=(--rm --name "$NAME"
       "--cpus=${CPUS}"
       "--memory=${MEM}" "--memory-swap=${MEM}")
 for m in ${ADD_HOSTS[@]+"${ADD_HOSTS[@]}"}; do ARGS+=(--add-host "$m"); done
+for d in ${DNS_SERVERS[@]+"${DNS_SERVERS[@]}"}; do ARGS+=(--dns "$d"); done
 
 # Only a variable that is actually SET, with a non-empty value, in this
 # script's own environment gets forwarded. `-e VAR` (name-only) tells docker

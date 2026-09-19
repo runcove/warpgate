@@ -778,6 +778,51 @@ for bogus in "nocolon" ":192.0.2.1" "name:"; do
     || bad "--add-host '$bogus' was not refused with 2 naming it (rc=$rc): $out"
 done
 
+# 42-45. --dns: the same passthrough contract as --add-host, and the same
+# three-part shape -- it arrives, it repeats without loss, and it is absent
+# when not asked for. The last is the one that matters: without it, a resolver
+# hardcoded in this script would satisfy every other assertion here.
+out=$(HARDENED_RUN_DRY=1 "$SCRIPT" --cpus 4 --memory 7g \
+      --dns 10.96.0.10 -- true 2>&1)
+grep -q -- "--dns 10.96.0.10" <<<"$out" \
+  && ok "--dns reaches the docker invocation unchanged" \
+  || bad "--dns did not reach the invocation: $out"
+
+out=$(HARDENED_RUN_DRY=1 "$SCRIPT" --cpus 4 --memory 7g \
+      --dns 10.96.0.10 --dns 10.96.0.11 -- true 2>&1)
+if grep -q -- "--dns 10.96.0.10" <<<"$out" && grep -q -- "--dns 10.96.0.11" <<<"$out"; then
+  ok "a repeated --dns keeps both servers (not last-one-wins)"
+else
+  bad "a repeated --dns lost one of its servers: $out"
+fi
+
+out=$(HARDENED_RUN_DRY=1 "$SCRIPT" --cpus 4 --memory 7g -- true 2>&1)
+grep -q -- "--dns" <<<"$out" \
+  && bad "an invocation with no --dns still carried one -- a resolver is hardcoded: $out" \
+  || ok "no --dns given, none in the invocation"
+
+# A resolver must be a literal ADDRESS. A hostname would have to be resolved by
+# the very resolver it is configuring, and docker would accept it and build a
+# container whose DNS silently does nothing -- a failure that looks like a
+# working container. Four shapes, because "is not empty" is not the same check
+# as "has four octets" or "each octet fits in a byte".
+for bogus in "kube-dns.kube-system.svc" "10.96.0" "10.96.0.10.1" "10.96.0.300"; do
+  out=$(HARDENED_RUN_DRY=1 "$SCRIPT" --cpus 4 --memory 7g --dns "$bogus" -- true 2>&1); rc=$?
+  [ "$rc" -eq 2 ] && grep -q -- "$bogus" <<<"$out" \
+    && ok "refuses --dns '$bogus' (exit 2) and quotes the value back" \
+    || bad "--dns '$bogus' was not refused with 2 naming it (rc=$rc): $out"
+done
+
+# The two flags are independent: passing both must yield both. run-check.sh
+# relies on exactly this, because the two routes fail independently.
+out=$(HARDENED_RUN_DRY=1 "$SCRIPT" --cpus 4 --memory 7g \
+      --dns 10.96.0.10 --add-host cache.example:192.0.2.10 -- true 2>&1)
+if grep -q -- "--dns 10.96.0.10" <<<"$out" && grep -q -- "--add-host cache.example:192.0.2.10" <<<"$out"; then
+  ok "--dns and --add-host coexist in one invocation"
+else
+  bad "passing --dns and --add-host together lost one of them: $out"
+fi
+
 # 41. THE REQUIRE-FLAG ITSELF. Ruling (arc rulebook, "Settled"): "The proof
 #     needs a require-flag that turns that skip into a refusal AND a CI step
 #     that sets it. Anyone shortening this to 'we run the tests in CI now' has
