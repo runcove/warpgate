@@ -60,8 +60,40 @@ python_stub() { # python_stub <yaml-ok:0|1>
 WORK="$TMP/src"; mkdir -p "$WORK"
 printf '[toolchain]\nchannel = "%s"\n' "$PIN" > "$WORK/rust-toolchain.toml"
 
+# The assertion asks rustup TWO unrelated questions -- which toolchain is
+# active, and which components it has -- so the stub has to answer them
+# separately. make_stub echoes one string whatever the arguments, which would
+# make a test that changes the active toolchain silently also empty the
+# component list: the failure would then have two causes and the suite could
+# not say which it had proven. Every rustup stub below goes through here.
+#
+# HEALTHY_COMPONENTS is the real output shape, copied from
+# `rustup component list --installed` on the pinned nightly (2026-09-19),
+# triple suffixes and all -- a stub printing bare `clippy` would pass an
+# assertion that matched only bare names and prove nothing about the image.
+HEALTHY_COMPONENTS="cargo-x86_64-unknown-linux-gnu
+clippy-x86_64-unknown-linux-gnu
+llvm-tools-x86_64-unknown-linux-gnu
+rust-std-x86_64-unknown-linux-gnu
+rustc-x86_64-unknown-linux-gnu
+rustfmt-x86_64-unknown-linux-gnu"
+
+# rustup_stub <active-toolchain-line> [component-list-text]
+rustup_stub() {
+  local active="$1"; local comps="${2-$HEALTHY_COMPONENTS}"
+  { echo '#!/usr/bin/env bash'
+    echo 'if [ "${1:-}" = "component" ]; then'
+    printf '  cat <<%s\n%s\n%s\n' "'COMPS_EOF'" "$comps" "COMPS_EOF"
+    echo '  exit 0'
+    echo 'fi'
+    printf 'echo %q\n' "$active"
+    echo 'exit 0'
+  } > "$BIN/rustup"
+  chmod +x "$BIN/rustup"
+}
+
 healthy() {
-  make_stub rustup 0 "${PIN}-x86_64-unknown-linux-gnu (overridden by '$WORK/rust-toolchain.toml')"
+  rustup_stub "${PIN}-x86_64-unknown-linux-gnu (overridden by '$WORK/rust-toolchain.toml')"
   make_stub cargo  0 "cargo 1.92.0-nightly (abcdef012 2099-01-01)"
   # sccache is stubbed separately from $TOOLS on purpose: $TOOLS is the set the
   # capped checks DECLARE, and sccache is precisely the tool that is required
@@ -82,7 +114,11 @@ n=$(grep -c "^  ok    " <<<"$out")
 
 echo "== the case this exists for: a different toolchain =="
 healthy
-make_stub rustup 0 "stable-x86_64-unknown-linux-gnu (default)"
+# Through rustup_stub, so the component list stays healthy and the ONLY
+# difference from the passing case is the active toolchain. A make_stub here
+# would also blank the components, and the rc=1 below would no longer be
+# evidence that a wrong toolchain is caught.
+rustup_stub "stable-x86_64-unknown-linux-gnu (default)"
 run
 [ "$rc" -eq 1 ] && ok "a stable toolchain fails the build (1)" || bad "wrong toolchain should fail, got rc=$rc: $out"
 grep -q "expected: $PIN" <<<"$out" && grep -q "actual:   stable" <<<"$out" \
@@ -95,7 +131,7 @@ grep -q "look like a verdict on our code" <<<"$out" \
 # A near miss, not a different channel: the same nightly one day off. A
 # prefix/substring assertion written loosely would wave this through.
 healthy
-make_stub rustup 0 "nightly-2099-01-03-x86_64-unknown-linux-gnu (overridden)"
+rustup_stub "nightly-2099-01-03-x86_64-unknown-linux-gnu (overridden)"
 run
 [ "$rc" -eq 1 ] && ok "a nightly one day off the pin also fails" \
   || bad "a nightly one day off the pin was accepted as $PIN, got rc=$rc: $out"
@@ -222,6 +258,87 @@ elif grep -v '^[[:space:]]*#' "$RUN_CHECK" | grep -q "RUSTC_WRAPPER"; then
   ok "run-check.sh forwards RUSTC_WRAPPER into the capped container (in code, not a comment)"
 else
   bad "run-check.sh no longer forwards RUSTC_WRAPPER in code; the sccache requirement above may be stale"
+fi
+
+echo "== the requirements that are not programs at all: rustup components =="
+# clippy and llvm-tools are components of the pinned toolchain, not PATH
+# entries. derive-tools.py sees `just` and `cargo` in the commands and can
+# never derive them; no tools: list can name them; TOOLCHAIN_REQUIRED_TOOLS
+# lists binaries, and cargo-cranky/cargo-llvm-cov being present says nothing
+# about the components they drive. The assertion is the only guard that can
+# see them, so prove it does -- by removing each one and requiring a NAMED
+# failure, never by grepping the script for the word.
+for comp in clippy llvm-tools; do
+  healthy
+  rustup_stub "${PIN}-x86_64-unknown-linux-gnu (overridden)" \
+    "$(printf '%s\n' "$HEALTHY_COMPONENTS" | grep -v "^${comp}-")"
+  run
+  [ "$rc" -eq 1 ] && ok "rustup component $comp missing fails the build (1)" \
+    || bad "a missing $comp component was accepted, got rc=$rc: $out"
+  grep -q "rustup component $comp is NOT installed" <<<"$out" \
+    && ok "and names $comp, rather than failing anonymously" \
+    || bad "$comp absence was not named: $out"
+  grep -q "ORDINARY range" <<<"$out" \
+    && ok "and says what would happen instead" \
+    || bad "does not explain the consequence for $comp: $out"
+done
+
+# THE CONTROL for the two cases above. Without it they would also be satisfied
+# by an assertion that refused every component list it was given -- which would
+# refuse the real image.
+healthy; run
+[ "$rc" -eq 0 ] && ok "and a healthy component list still passes (the control)" \
+  || bad "the healthy component list was refused, so the two failures above prove nothing: $out"
+
+# THE ALIAS. Measured 2026-09-19 on the real pinned nightly: the Dockerfile
+# installs `--component llvm-tools-preview` and rustup reports it as
+# `llvm-tools-<triple>`. Both spellings mean the component is there, so an
+# assertion keyed to either literal alone is wrong half the time. This is the
+# direction that would fail on a HEALTHY image, which is the worse of the two.
+healthy
+rustup_stub "${PIN}-x86_64-unknown-linux-gnu (overridden)" \
+  "$(printf '%s\n' "$HEALTHY_COMPONENTS" | sed 's/^llvm-tools-/llvm-tools-preview-/')"
+run
+[ "$rc" -eq 0 ] && ok "the -preview spelling of llvm-tools is accepted too" \
+  || bad "an image reporting llvm-tools-preview was refused; the alias is not handled: $out"
+
+# rustup ANSWERING NOTHING must not read as "no components missing". An empty
+# list is the shape a broken stub, a changed subcommand or a future rustup
+# would produce, and it is exactly the "a sweep that sees less reports less"
+# failure: it would sail through as green.
+healthy
+rustup_stub "${PIN}-x86_64-unknown-linux-gnu (overridden)" ""
+run
+[ "$rc" -eq 1 ] && ok "an EMPTY component list is refused, not read as clean" \
+  || bad "an empty component list passed, so this check can report success without looking: $out"
+
+# THE DRIFT GUARD, derived rather than hand-copied -- the same design as the
+# cache-env.sh derivation above, and for the same reason. The components are
+# DECIDED in the Dockerfile; the assertion only has to agree with it. Two
+# hand-maintained lists with nothing keeping them in step is the defect this
+# whole arc is about, and adding a third copy here would recreate it.
+DOCKERFILE="$HERE/../../images/ci-toolchain/Dockerfile"
+if [ ! -f "$DOCKERFILE" ]; then
+  bad "no Dockerfile at $DOCKERFILE -- the component requirements are unverified"
+else
+  # `-preview` stripped because that is the spelling rustup ACCEPTS on the way
+  # in while reporting the canonical name on the way out (measured above).
+  WANT=$(grep -oE -- '--component[= ][A-Za-z0-9_-]+' "$DOCKERFILE" \
+         | sed -E 's/^--component[= ]//; s/-preview$//' | sort -u)
+  if [ -z "$WANT" ]; then
+    bad "no --component flags found in $DOCKERFILE -- this comparison checked nothing"
+  else
+    ok "Dockerfile installs components: $(echo $WANT)"
+    for comp in $WANT; do
+      healthy
+      rustup_stub "${PIN}-x86_64-unknown-linux-gnu (overridden)" \
+        "$(printf '%s\n' "$HEALTHY_COMPONENTS" | grep -v "^${comp}-")"
+      run
+      [ "$rc" -eq 1 ] && grep -q "$comp" <<<"$out" \
+        && ok "and the assertion refuses an image without $comp, by name" \
+        || bad "the Dockerfile installs $comp but the assertion does not require it: rc=$rc $out"
+    done
+  fi
 fi
 
 echo "== the assertion's tool list against the checks it is protecting =="

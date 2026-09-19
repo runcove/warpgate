@@ -93,7 +93,7 @@ for t in ${TOOLCHAIN_REQUIRED_TOOLS:-just git tar python3 npm oasdiff cargo-cran
   else bad "$t is declared by a capped check and is NOT in this image"; fi
 done
 
-# --- the two requirements no `tools:` list can express -----------------------
+# --- the four requirements no `tools:` list can express ----------------------
 # Both of these are needed by a capped check and named in no check's tools
 # list, for the same underlying reason: the tools gate can only see PATH
 # entries that a check's COMMAND invokes. Anything a check needs by another
@@ -120,6 +120,50 @@ else bad "sccache is NOT in this image. It is named in no tools: list because it
         as RUSTC_WRAPPER, so the run-time tools gate cannot refuse 97 for it: instead every
         compiling capped check would fail in the ORDINARY range the moment the cache is
         configured, and read as a verdict on our code."; fi
+
+# RUSTUP COMPONENTS are not PATH entries and not programs any command names.
+# `just clippy` runs `cargo cranky --workspace --all-features`, which is a
+# clippy wrapper; `cargo llvm-cov test` needs the llvm-tools profiling
+# binaries. Both arrive as components OF THE PINNED TOOLCHAIN, installed on
+# Dockerfile line 106.
+#
+# WHY EVERY EXISTING GUARD IS BLIND TO THEM, which is the whole reason this
+# block exists. derive-tools.py reads a check's command and sees `just` and
+# `cargo`; a component has no command position to be found in. The `tools:`
+# lists therefore cannot name them, so the run-time gate cannot refuse 97 for
+# them. And TOOLCHAIN_REQUIRED_TOOLS above lists BINARIES: cargo-cranky being
+# present does not imply the clippy component, and cargo-llvm-cov being
+# present does not imply llvm-tools. Drop either `--component` from the
+# Dockerfile and this image builds, passes its own assertion, and then fails
+# `clippy` and `unit-tests` in the ORDINARY range — indistinguishable from
+# upstream's verdict on our code. Same shape as sccache above, one layer down.
+#
+# SPELLING, measured 2026-09-19 against the real pinned nightly: the Dockerfile
+# asks for `llvm-tools-preview` and rustup reports it installed as
+# `llvm-tools-<triple>`. `-preview` is a live alias, so BOTH spellings must be
+# accepted here — an assertion demanding the literal string the Dockerfile uses
+# would fail on a healthy image, which is the loudest possible wrong answer.
+comps=$(cd "$WORKDIR" && rustup component list --installed 2>&1); rc=$?
+if [ "$rc" -ne 0 ]; then
+  # Deliberately a different message from "a component is missing": one is
+  # rustup not answering, the other is rustup answering that it has nothing.
+  # Sharing a voice would leave the build log unable to say which happened.
+  bad "rustup could not list installed components (exit $rc): $comps
+        This is rustup failing to answer, NOT a component being absent. Nothing below
+        was checked, so do not read the absence of component failures as their presence."
+else
+  for c in clippy llvm-tools; do
+    if printf '%s\n' "$comps" | grep -Eq "^${c}(-preview)?(-|\$)"; then
+      ok "rustup component $c is installed"
+    else
+      bad "rustup component $c is NOT installed in this image. No check declares it and no
+        \`tools:\` list can: it is a component of the pinned toolchain, not a program a
+        command invokes, so the run-time tools gate cannot refuse 97 for it. Without it
+        $( [ "$c" = clippy ] && echo "\`just clippy\` (cargo cranky)" || echo "\`cargo llvm-cov test\`" ) fails
+        in the ORDINARY range and reads as upstream's verdict on our code."
+    fi
+  done
+fi
 
 echo
 [ "$fails" -eq 0 ] && { echo "assert-toolchain: PASS"; exit 0; }
