@@ -12,6 +12,30 @@ ok()   { echo "  ok    $1"; }
 bad()  { echo "  FAIL  $1"; fails=1; }
 skip() { echo "  SKIP  $1"; skips=$((skips + 1)); }
 
+# HARDENED_RUN_TESTS_REQUIRE_REAL_ENGINE -- the half of "prove it in CI" that
+# is easy to lose. Removing the podman fallback makes cases 24-29b SKIP on this
+# development host, which is correct; it also makes them skip in CI, where they
+# are the only reason the ruling "prove the container path in CI instead" has
+# an answer at all. A skip that CI accepts is a skip that proves nothing, and a
+# green run would then mean exactly what it meant before the cases existed.
+#
+# Set to any non-empty value, an absent real-engine run is a FAILURE. The CI
+# selftest step sets it; nothing else does, so running the suite by hand here
+# still skips and still exits 0.
+#
+# The assertion at the foot of this file is POSITIVE -- it requires that the
+# real-engine block RAN, rather than that no skip fired. Those are not the same
+# reading: a future refactor that drops the block entirely emits no skip at all,
+# and only the positive form catches it.
+#
+# The skip reason is carried in a variable rather than left to the SKIP line:
+# the CI step prints only the last 25 lines of a failing suite's log, and that
+# SKIP is ~300 lines earlier. A failure message that says "see the line above"
+# is a message whose cause has been trimmed off.
+REQUIRE_REAL_ENGINE="${HARDENED_RUN_TESTS_REQUIRE_REAL_ENGINE:-}"
+REAL_ENGINE_CASES_RAN=0
+REAL_ENGINE_SKIP_REASON="the real-engine block did not run and recorded no reason -- it was probably removed or short-circuited"
+
 # Cases 1-11 drive hardened-run.sh's own test hooks (HARDENED_RUN_DRY,
 # HARDENED_RUN_FAKE_INSPECT*), which fix round 1 makes fatal to use inside a
 # real CI run (see cases 12-14). Clear any ambient CI markers so this suite
@@ -337,6 +361,7 @@ if command -v docker >/dev/null 2>&1; then
 fi
 
 if [ -z "$REAL_ENGINE" ]; then
+  REAL_ENGINE_SKIP_REASON="no docker on PATH"
   skip "no docker on PATH -- cases 24-29 (real --source delivery) are NOT proven here. This is deliberate: podman is not an accepted substitute (Ruling 45), so these run in CI, where a real docker daemon exists, and nowhere else."
 else
   TEST_IMAGE="${HARDENED_RUN_TEST_IMAGE:-docker.io/library/alpine:latest}"
@@ -537,7 +562,15 @@ else
     grep -qi "weaker check" <<<"$weak_out" \
       && ok "the weak branch's own distinguishing message fired, not just a bare rc" \
       || bad "weak-branch message did not appear: $weak_out"
+
+    # Last statement in the block, deliberately: this records that the
+    # real-engine cases ran to completion, which is what the require-flag's
+    # assertion at the foot of this file reads. Individual failures inside the
+    # block have already set fails=1 through bad(); this flag answers a
+    # different question -- did this block execute at all.
+    REAL_ENGINE_CASES_RAN=1
   else
+    REAL_ENGINE_SKIP_REASON="docker is present but \`docker pull $TEST_IMAGE\` failed or timed out (90 s)"
     skip "could not pull $TEST_IMAGE (no network?) -- cases 24-29 (real --source delivery) skipped"
   fi
 fi
@@ -681,6 +714,25 @@ grep -qi "docker cp itself failed" <<<"$out" && ok "names docker cp as the faili
   || bad "did not name docker cp as the failing step: $out"
 [ ! -e "$marker36" ] && ok "the real command never ran after a failed docker cp" \
   || bad "the real command ran despite a failed docker cp"
+
+# 37. THE REQUIRE-FLAG ITSELF. Ruling (arc rulebook, "Settled"): "The proof
+#     needs a require-flag that turns that skip into a refusal AND a CI step
+#     that sets it. Anyone shortening this to 'we run the tests in CI now' has
+#     lost the half that matters."
+#
+#     Where the environment is entitled to decide -- this host, a hand run --
+#     the flag is unset and the skip above stands. Where the environment was
+#     chosen precisely because it can run containers, the flag is set and an
+#     absent real-engine run is a failed run, not a quiet one.
+if [ -n "$REQUIRE_REAL_ENGINE" ]; then
+  [ "$REAL_ENGINE_CASES_RAN" -eq 1 ] \
+    && ok "HARDENED_RUN_TESTS_REQUIRE_REAL_ENGINE is set and the real --source delivery cases ran" \
+    || bad "HARDENED_RUN_TESTS_REQUIRE_REAL_ENGINE is set, so a skip of cases 24-29b is a REFUSAL, not a skip.
+        Why they did not run: $REAL_ENGINE_SKIP_REASON.
+        This flag is set only where the container path is supposed to be provable -- if it
+        cannot be proven there, no run anywhere is proving it, which is the state this
+        assertion exists to make visible rather than green."
+fi
 
 echo
 echo "skipped: $skips"

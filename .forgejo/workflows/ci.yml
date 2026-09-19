@@ -269,6 +269,15 @@ jobs:
           A count that drifts down silently means tests stopped being discovered, which looks identical to them passing."; exit 1; }
           echo "python selftests: $py_n tests, all passed (expected $EXPECTED_PY)"
 
+          # The other half of "prove the container path in CI instead".
+          # test-hardened-run.sh's real --source delivery cases need a real
+          # docker daemon; where there is none they SKIP and say so, which is
+          # right on a development host and worthless here -- this job IS the
+          # environment those cases were moved to. With this set, that skip is
+          # a failed step, so the container path is either proven in this run
+          # or the run is red. Without it (a hand run on baba) the skip stands.
+          export HARDENED_RUN_TESTS_REQUIRE_REAL_ENGINE=1
+
           shopt -s nullglob
           suites=(test-*.sh)
           [ "${#suites[@]}" -eq "$EXPECTED_SH" ] || { echo "FAILING ON PURPOSE: found ${#suites[@]} shell suite(s), expected exactly $EXPECTED_SH."; exit 1; }
