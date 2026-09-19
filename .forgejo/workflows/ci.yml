@@ -225,6 +225,69 @@ jobs:
       - name: preflight
         run: .forgejo/scripts/preflight.sh
 
+      # Every CI defect this arc has produced lived in the machinery that RUNS
+      # the checks, not in the checks themselves: a port stripped from the cache
+      # endpoint, a missing region that broke every rustc call, a guard that
+      # certified an environment nobody runs in. Those scripts have 11 shell
+      # suites and 59 python tests, and until now nothing ran them except a
+      # human remembering to. This step makes the check runner prove itself
+      # before it is trusted to report on the product.
+      #
+      # It runs AFTER preflight (which proves python3, yaml and docker are
+      # usable at all -- 115 s of selftests against a container that cannot run
+      # them is 115 s of noise) and BEFORE the check list is validated, counted
+      # or used, because a broken runner's verdict on checks.yaml is worthless.
+      #
+      # Cost, decided rather than assumed: test-hardened-run.sh alone is 92 s of
+      # the ~115 s total, and it is the suite guarding hardened-run.sh, which is
+      # where every one of today's defects lived. Against a run that takes 27
+      # minutes uncached that is under six percent, for the coverage that matters
+      # most. If the cost ever needs cutting the lever is caching or a separate
+      # job, not dropping the suite.
+      #
+      # Both counts are hardcoded for the same reason EXPECTED=11 is below: a
+      # floor absorbs a suite that stops being discovered, and a suite that
+      # vanishes is exactly the failure this step exists to catch. They change in
+      # the same commit that adds or removes a test.
+      #
+      # The shell loop runs ALL suites and reports every failure. Stopping at the
+      # first one turns this step into a light bulb when what a CI log needs is
+      # an instrument -- this arc has already paid four CI runs for that mistake,
+      # one per defect discovered in sequence.
+      - name: prove the check machinery itself (selftests)
+        run: |
+          set +e -u -o pipefail
+          cd .forgejo/scripts/tests
+          EXPECTED_PY=59
+          EXPECTED_SH=11
+
+          py_out=$(python3 -m unittest discover -p 'test_*.py' 2>&1); py_rc=$?
+          printf '%s\n' "$py_out" | tail -3
+          py_n=$(printf '%s\n' "$py_out" | sed -n 's/^Ran \([0-9]\{1,\}\) tests\{0,1\} in .*/\1/p' | tail -n1)
+          [ "$py_rc" -eq 0 ] || { printf '%s\n' "$py_out"; echo "FAILING ON PURPOSE: python selftests failed (exit $py_rc)."; exit 1; }
+          [ "${py_n:-0}" -eq "$EXPECTED_PY" ] || { echo "FAILING ON PURPOSE: expected exactly $EXPECTED_PY python tests, the run reported '${py_n:-<none>}'.
+          A count that drifts down silently means tests stopped being discovered, which looks identical to them passing."; exit 1; }
+          echo "python selftests: $py_n tests, all passed (expected $EXPECTED_PY)"
+
+          shopt -s nullglob
+          suites=(test-*.sh)
+          [ "${#suites[@]}" -eq "$EXPECTED_SH" ] || { echo "FAILING ON PURPOSE: found ${#suites[@]} shell suite(s), expected exactly $EXPECTED_SH."; exit 1; }
+
+          logdir=$(mktemp -d)
+          failed=()
+          for t in "${suites[@]}"; do
+            bash "$t" > "$logdir/$t.log" 2>&1; t_rc=$?
+            if [ "$t_rc" -eq 0 ]; then
+              echo "  ok    $t"
+            else
+              echo "  FAIL  $t (exit $t_rc)"
+              sed 's/^/        /' "$logdir/$t.log" | tail -25
+              failed+=("$t")
+            fi
+          done
+          [ "${#failed[@]}" -eq 0 ] || { echo "FAILING ON PURPOSE: ${#failed[@]} of ${#suites[@]} selftest suite(s) failed: ${failed[*]}"; exit 1; }
+          echo "shell selftests: ${#suites[@]} suites, all passed (expected $EXPECTED_SH)"
+
       # The check list must be valid before anything runs from it. A malformed
       # list that silently ran zero checks would look exactly like a green build.
       - name: validate the check list
