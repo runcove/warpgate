@@ -44,6 +44,36 @@ ARG CARGO_CYCLONEDX_VERSION=0.5.9
 # on either side. We pin, and verify the download.
 ARG OASDIFF_VERSION=1.32.1
 ARG OASDIFF_SHA256=7c8939fc49b75ee11fec66a5b83b37a2fca6aee109fed85013b1ba2ac2a1ee7f
+# sccache, and the reason it is here is a blind spot rather than a tool list.
+# THE CASE THIS EXISTS FOR. cache-env.sh sets RUSTC_WRAPPER=sccache, and
+# run-check.sh forwards RUSTC_WRAPPER across the cap boundary into this image.
+# sccache therefore becomes a hard requirement of every compiling capped check
+# the moment the cache is configured -- but it is named in no `tools:` list,
+# because it is not something a check's command invokes. It arrives by
+# ENVIRONMENT.
+#
+# That made it invisible to all three guards at once, and the agreement of the
+# three is what made it look safe: the run-time tools gate reads `tools:`
+# lists; the assertion reads TOOLCHAIN_REQUIRED_TOOLS; and the drift test
+# compares those two lists TO EACH OTHER. sccache is absent from both, so they
+# agree, and agreement reads as green. Three guards sharing one blind spot
+# prove nothing between them.
+#
+# Measured 2026-09-19: S3_ENDPOINT is unset on the forge, cache-env.sh refuses
+# 93 every run, and hardened-run reports "forwarded 0 variable(s)" for every
+# capped check -- so this is LATENT, not live. It becomes live on the day
+# someone sets S3_ENDPOINT, which is a goal of this arc, and it would then
+# fail five capped checks at once in the ordinary range. Installing it now
+# costs one layer in a build that already compiles six cargo tools; finding
+# out later costs a full rebuild and a new content tag.
+#
+# Pinned and checksummed for the same reason as oasdiff, and taken as the
+# upstream prebuilt rather than `cargo install` because sccache is a long
+# build and the musl asset is static-pie (verified: no interpreter, so
+# bookworm-slim needs nothing for it). 0.17.0 is the version test-cache-env.sh
+# measured its fixtures against, so the image and the fixtures agree.
+ARG SCCACHE_VERSION=0.17.0
+ARG SCCACHE_SHA256=67c4a96dd237c1f518f6b36083f270f9976d516f1e57fce891755ea782e50006
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV CARGO_HOME=/usr/local/cargo RUSTUP_HOME=/usr/local/rustup
@@ -108,6 +138,20 @@ RUN curl -fsSL -o /tmp/oasdiff.tgz \
  && tar -xzf /tmp/oasdiff.tgz -C /usr/local/bin oasdiff \
  && rm -f /tmp/oasdiff.tgz \
  && oasdiff --version
+
+# sccache, verified the same way. NOTE the layout differs from oasdiff's: the
+# binary sits inside a versioned directory rather than at the archive root, so
+# this needs --strip-components and the full member path. Extracting the wrong
+# member would leave no sccache on PATH and the assertion below would catch
+# it, but getting it right here means the build says so immediately.
+RUN curl -fsSL -o /tmp/sccache.tgz \
+      "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+ && echo "${SCCACHE_SHA256}  /tmp/sccache.tgz" | sha256sum -c - \
+ && tar -xzf /tmp/sccache.tgz -C /usr/local/bin --strip-components=1 \
+      "sccache-v${SCCACHE_VERSION}-x86_64-unknown-linux-musl/sccache" \
+ && chmod +x /usr/local/bin/sccache \
+ && rm -f /tmp/sccache.tgz \
+ && sccache --version
 
 # ---------------------------------------------------------------------------
 # The download block, and why RUSTUP_TOOLCHAIN is deliberately NOT set here.

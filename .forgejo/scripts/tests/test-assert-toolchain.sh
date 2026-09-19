@@ -63,7 +63,11 @@ printf '[toolchain]\nchannel = "%s"\n' "$PIN" > "$WORK/rust-toolchain.toml"
 healthy() {
   make_stub rustup 0 "${PIN}-x86_64-unknown-linux-gnu (overridden by '$WORK/rust-toolchain.toml')"
   make_stub cargo  0 "cargo 1.92.0-nightly (abcdef012 2099-01-01)"
-  present $TOOLS; python_stub 0
+  # sccache is stubbed separately from $TOOLS on purpose: $TOOLS is the set the
+  # capped checks DECLARE, and sccache is precisely the tool that is required
+  # without being declared. Folding it in would erase the distinction the test
+  # below exists to hold open.
+  present $TOOLS sccache; python_stub 0
 }
 run() { out=$(PATH="$BIN" bash "$SCRIPT" "$PIN" "$WORK" 2>&1); rc=$?; }
 
@@ -161,6 +165,64 @@ healthy; python_stub 1; run
 [ "$rc" -eq 1 ] && grep -q "cannot import yaml" <<<"$out" \
   && ok "PyYAML missing fails, though python3 itself is present" \
   || bad "PyYAML absence was not caught, or was confused with python3 itself: rc=$rc $out"
+
+echo "== the tool that is required without being declared: sccache =="
+# sccache reaches a capped check as RUSTC_WRAPPER, never as a command, so no
+# `tools:` list names it and the run-time gate cannot refuse 97 for it. If the
+# image lacks it, every compiling capped check fails in the ORDINARY range the
+# moment the cache is configured. The assertion is the only place that can
+# catch it, so prove the assertion actually does.
+healthy; absent sccache; run
+[ "$rc" -eq 1 ] && ok "sccache missing fails the build (1)" \
+  || bad "a missing sccache was accepted, got rc=$rc: $out"
+grep -q "sccache is NOT in this image" <<<"$out" \
+  && ok "and names it, rather than failing anonymously" \
+  || bad "sccache absence was not named: $out"
+grep -q "ORDINARY range" <<<"$out" \
+  && ok "and says what would happen instead, in the build log" \
+  || bad "does not explain the consequence: $out"
+
+# THE DRIFT GUARD, and the reason it reads cache-env.sh rather than asserting
+# the string "sccache". The wrapper's name is DECIDED in cache-env.sh; the
+# assertion only has to agree with it. Hard-coding "sccache" in both places
+# would recreate exactly the defect this whole block is about — two
+# hand-maintained copies with nothing keeping them in step — and a switch to
+# some other wrapper would leave the assertion cheerfully requiring a program
+# nothing sets any more.
+CACHE_ENV="$HERE/../cache-env.sh"
+if [ ! -f "$CACHE_ENV" ]; then
+  bad "no cache-env.sh at $CACHE_ENV -- the wrapper requirement is unverified"
+else
+  WRAPPER=$(sed -n 's/.*RUSTC_WRAPPER=\([A-Za-z0-9_-]*\).*/\1/p' "$CACHE_ENV" | head -1)
+  if [ -z "$WRAPPER" ]; then
+    bad "could not find what cache-env.sh sets RUSTC_WRAPPER to -- this comparison checked nothing"
+  else
+    ok "cache-env.sh sets RUSTC_WRAPPER=$WRAPPER"
+    # Derived, not assumed: whatever that program is, the assertion must
+    # require it. Proven by REMOVING it and requiring a named failure -- a
+    # grep for the name in the script would pass on a script that merely
+    # mentioned it in a comment.
+    healthy; absent "$WRAPPER"; run
+    [ "$rc" -eq 1 ] && grep -q "$WRAPPER" <<<"$out" \
+      && ok "and the assertion refuses an image without $WRAPPER, by name" \
+      || bad "cache-env.sh forwards $WRAPPER but the assertion does not require it: rc=$rc $out"
+  fi
+fi
+
+# And the forwarding half of the claim: run-check.sh must actually carry
+# RUSTC_WRAPPER across the cap boundary, or none of the above matters.
+RUN_CHECK="$HERE/../run-check.sh"
+if [ ! -f "$RUN_CHECK" ]; then
+  bad "no run-check.sh at $RUN_CHECK -- cannot confirm the variable crosses the cap"
+elif grep -v '^[[:space:]]*#' "$RUN_CHECK" | grep -q "RUSTC_WRAPPER"; then
+  # Comments stripped first: run-check.sh DISCUSSES the cap boundary at length
+  # around this code, so a plain grep would pass on a file that had kept the
+  # prose and dropped the variable -- the same "matched the explanation, not
+  # the behaviour" defect this suite keeps finding elsewhere.
+  ok "run-check.sh forwards RUSTC_WRAPPER into the capped container (in code, not a comment)"
+else
+  bad "run-check.sh no longer forwards RUSTC_WRAPPER in code; the sccache requirement above may be stale"
+fi
 
 echo "== the assertion's tool list against the checks it is protecting =="
 # The default list inside assert-toolchain.sh is a hand-copied duplicate of

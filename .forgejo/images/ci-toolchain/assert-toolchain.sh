@@ -93,10 +93,33 @@ for t in ${TOOLCHAIN_REQUIRED_TOOLS:-just git tar python3 npm oasdiff cargo-cran
   else bad "$t is declared by a capped check and is NOT in this image"; fi
 done
 
-# PyYAML is not a PATH entry, so the tools gate in run-check.sh structurally
-# cannot see it. check-schema-compat.sh imports checks_lib, which imports yaml.
+# --- the two requirements no `tools:` list can express -----------------------
+# Both of these are needed by a capped check and named in no check's tools
+# list, for the same underlying reason: the tools gate can only see PATH
+# entries that a check's COMMAND invokes. Anything a check needs by another
+# route is structurally invisible to it, so it has to be asserted here by
+# hand — and said out loud, because a hand-maintained requirement with nothing
+# keeping it honest is how the sccache case below went unnoticed in the first
+# place.
+
+# PyYAML is not a PATH entry at all.
+# check-schema-compat.sh imports checks_lib, which imports yaml.
 if python3 -c "import yaml" >/dev/null 2>&1; then ok "python3 can import yaml (PyYAML)"
 else bad "python3 cannot import yaml; check-schema-compat.sh would refuse 93 reading its own baseline"; fi
+
+# sccache IS a PATH entry, but it arrives by ENVIRONMENT, not by a command.
+# cache-env.sh sets RUSTC_WRAPPER=sccache and run-check.sh forwards
+# RUSTC_WRAPPER across the cap boundary, so from the moment the cache is
+# configured every compiling capped check invokes it — via cargo, never by
+# name. No `tools:` list mentions it, this list did not either, and the drift
+# test compares those two lists to EACH OTHER, so all three agreed and the
+# agreement read as green. tests/test-assert-toolchain.sh now derives the
+# wrapper's name from cache-env.sh rather than trusting the spelling here.
+if command -v sccache >/dev/null 2>&1; then ok "sccache present (RUSTC_WRAPPER's program, forwarded into this image by run-check.sh)"
+else bad "sccache is NOT in this image. It is named in no tools: list because it arrives
+        as RUSTC_WRAPPER, so the run-time tools gate cannot refuse 97 for it: instead every
+        compiling capped check would fail in the ORDINARY range the moment the cache is
+        configured, and read as a verdict on our code."; fi
 
 echo
 [ "$fails" -eq 0 ] && { echo "assert-toolchain: PASS"; exit 0; }
