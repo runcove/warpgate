@@ -81,6 +81,7 @@ count=0
 CACHE_NOTES=()
 CACHE_CHECKS=()
 CACHE_READINGS=()
+ENV_READINGS=()
 tmp_out="$(mktemp)"
 trap 'rm -f "$tmp_out"' EXIT
 
@@ -100,6 +101,9 @@ while IFS= read -r name; do
   while IFS= read -r reading; do
     [ -n "$reading" ] && CACHE_READINGS+=("$reading")
   done < <(grep -hE '^CACHE-STATS( |-UNAVAILABLE )' "$tmp_out" || true)
+  while IFS= read -r envline; do
+    [ -n "$envline" ] && ENV_READINGS+=("$envline")
+  done < <(grep -h '^ENV-IN-CONTAINER ' "$tmp_out" || true)
   echo "::endgroup::"
   if [ "$check_rc" -ne 0 ]; then
     if [ "$check_rc" -ge 89 ] && [ "$check_rc" -le 99 ]; then
@@ -152,5 +156,33 @@ if [ "${#CACHE_READINGS[@]}" -gt 0 ]; then
   echo "  time. These lines are what tell those two apart, and avg-read-hit is"
   echo "  what a fetch cost — the number that decides whether the cache earns its"
   echo "  place, rather than merely working."
+fi
+
+# What the capped containers were actually RUN WITH, read from inside them.
+#
+# This block answers a different question from the one above, and the
+# difference is the point. A cache reading says what a check GOT; this says
+# what it was CONFIGURED with. The two come apart in exactly the case that cost
+# this arc the most time: run 2840's checks showed 99.7 % hit rates with
+# CARGO_INCREMENTAL never set by us at all, so the hit rate -- the consequence
+# -- looked like proof of a cause that was not there. A high rate can be
+# produced by something we did not do and do not control. These lines cannot.
+#
+# Counted as well as listed, because "is it set in every capped check" is the
+# actual question and eyeballing five lines for one that differs is how a
+# single odd check gets missed.
+if [ "${#ENV_READINGS[@]}" -gt 0 ]; then
+  ci_zero=$(printf '%s\n' "${ENV_READINGS[@]}" | grep -c 'CARGO_INCREMENTAL=0$' || true)
+  ci_other=$(printf '%s\n' "${ENV_READINGS[@]}" | grep -c 'CARGO_INCREMENTAL=' || true)
+  ci_other=$((ci_other - ci_zero))
+  echo "environment readings — what each capped check was actually run with, read from inside the container:"
+  printf '  %s\n' "${ENV_READINGS[@]}"
+  echo "  CARGO_INCREMENTAL=0 in $ci_zero capped check(s); anything else in $ci_other."
+  if [ "$ci_other" -gt 0 ]; then
+    echo "  A check that did NOT get CARGO_INCREMENTAL=0 can still report a high hit"
+    echo "  rate, because something outside our control has been turning incremental"
+    echo "  off anyway. Do not read the rate as proof the setting arrived — that is"
+    echo "  the substitution these lines exist to prevent."
+  fi
 fi
 exit "$rc"

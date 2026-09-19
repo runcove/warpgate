@@ -120,6 +120,47 @@ grep -q "cache readings" <<<"$out" \
   && bad "summary printed a cache-readings block for a run that produced none: $out" \
   || ok "a run with no readings prints no readings block"
 
+# 1d. The ENVIRONMENT readings — what the capped checks were RUN WITH.
+#     A separate block from 1c on purpose: a cache reading is a consequence, an
+#     environment reading is a cause, and run 2840 proved they can disagree
+#     (99.7 % hit rates with CARGO_INCREMENTAL unset by us at all). The count is
+#     the part under test — listing five lines and letting a reader spot the odd
+#     one is how the odd one gets missed.
+out=$(RUN_CHECK_STUB_ENV="check-a check-b" RUN_CHECK_STUB_ENV_OTHER="check-c" \
+      run_with_map "check-a=0 check-b=0 check-c=0" 2>&1)
+env_block=$(sed -n '/^environment readings — /,$p' <<<"$out")
+[ -n "$env_block" ] \
+  && ok "a run whose checks reported their environment prints an environment block" \
+  || bad "no environment-readings block despite three checks reporting one: $out"
+grep -q 'CARGO_INCREMENTAL=0 in 2 capped check(s); anything else in 1\.' <<<"$env_block" \
+  && ok "the summary COUNTS agreement and disagreement rather than only listing" \
+  || bad "wrong or missing environment counts: ${env_block:-<no env block>}"
+grep -q 'ENV-IN-CONTAINER check-b — RUSTC_WRAPPER=sccache' <<<"$env_block" \
+  && ok "every environment line is collected, not just the first per check" \
+  || bad "a check's second environment line was dropped: ${env_block:-<no env block>}"
+grep -q 'Do not read the rate as proof the setting arrived' <<<"$env_block" \
+  && ok "a disagreeing check triggers the warning against reading the rate instead" \
+  || bad "a check without CARGO_INCREMENTAL=0 drew no warning: ${env_block:-<no env block>}"
+
+#     And the case that must NOT warn: total agreement. A caveat printed
+#     unconditionally is a caveat nobody reads, and it would make the assertion
+#     above pass on a run that had nothing to warn about.
+out=$(RUN_CHECK_STUB_ENV="check-a check-b check-c" \
+      run_with_map "check-a=0 check-b=0 check-c=0" 2>&1)
+env_block=$(sed -n '/^environment readings — /,$p' <<<"$out")
+grep -q 'CARGO_INCREMENTAL=0 in 3 capped check(s); anything else in 0\.' <<<"$env_block" \
+  && ok "unanimous agreement is counted as such" \
+  || bad "wrong counts when every check agreed: ${env_block:-<no env block>}"
+grep -q 'Do not read the rate as proof' <<<"$env_block" \
+  && bad "warned about a disagreement on a run where every check agreed: $env_block" \
+  || ok "no disagreement warning when every capped check got the setting"
+
+#     Negative control, same as 1b and 1c: no readings, no block.
+out=$(run_with_map "check-a=0 check-b=0 check-c=0" 2>&1)
+grep -q "environment readings" <<<"$out" \
+  && bad "summary printed an environment block for a run that produced none: $out" \
+  || ok "a run with no environment readings prints no environment block"
+
 # 2. A lone ordinary failure (not a refusal) sets the job's exit code.
 out=$(run_with_map "check-a=0 check-b=1 check-c=0" 2>&1); rc=$?
 [ "$rc" -eq 1 ] && ok "a lone ordinary failure sets the job's exit code" \

@@ -424,6 +424,47 @@ if [ "$CAPPED" = "yes" ]; then
   # simple, and this block is the only thing standing between a dead cache and
   # a run nobody can diagnose.
   CACHE_PROBE=$(cat <<'PROBE'
+# Read the cache-shaping variables from INSIDE the capped container, which is
+# the only place that can answer what this check actually ran with.
+# hardened-run.sh prints a "forwarded N variable(s)" line, but it prints it
+# BEFORE `docker exec` and from its OWN environment: it is the host's statement
+# of intent, not a reading. A variable that is set on the host, named in
+# CACHE_FORWARD_VARS and listed on that line can still fail to arrive -- an
+# entrypoint or a profile inside the image may unset or overwrite it, and
+# `-e VAR` name-only forwarding is silently a no-op for a variable that went
+# empty between the two. This echo is the reading.
+#
+# Three states, deliberately distinguished: <unset>, <set-empty> and a value.
+# CARGO_INCREMENTAL=0 and CARGO_INCREMENTAL= behave DIFFERENTLY in cargo (the
+# empty string is not "0"), and an unset variable is the pre-39afc096 state we
+# are trying to leave -- collapsing any two of those into one word would make
+# this line unable to answer the question it exists to answer.
+#
+# The guard below is not decoration. CACHE_FORWARD_VARS -- the list this probe
+# reports on -- ends with AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, three
+# lines away in this same file. A probe that prints "the forwarded variables"
+# by iterating that list would print the S3 secret into a CI log on its first
+# run, and the obvious future edit ("report them all") is exactly that. So this
+# names its three variables one at a time, and __ev_show refuses outright any
+# name that looks like a credential: widening it to a secret now takes a
+# deliberate removal of a refusal, not the addition of a name to a list.
+__ev_show() {
+  case "$1" in
+    *KEY*|*SECRET*|*TOKEN*|*PASSWORD*|*CREDENTIAL*)
+      echo "ENV-IN-CONTAINER @@NAME@@ — refusing to print '$1': the name looks like a credential" >&2
+      return ;;
+  esac
+  if [ -z "${!1+x}" ]; then
+    echo "ENV-IN-CONTAINER @@NAME@@ — $1=<unset>" >&2
+  elif [ -z "${!1}" ]; then
+    echo "ENV-IN-CONTAINER @@NAME@@ — $1=<set-empty>" >&2
+  else
+    echo "ENV-IN-CONTAINER @@NAME@@ — $1=${!1}" >&2
+  fi
+}
+__ev_show CARGO_INCREMENTAL
+__ev_show RUSTC_WRAPPER
+__ev_show SCCACHE_BUCKET
 if [ -n "${RUSTC_WRAPPER:-}" ]; then
   if __ce=$(sccache --start-server 2>&1); then
     sccache --zero-stats >/dev/null 2>&1 || true

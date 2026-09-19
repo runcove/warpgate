@@ -959,5 +959,98 @@ for promoted in lockfile helm-lint; do
     || bad "$promoted is '$st' in the real checks.yaml, expected blocking"
 done
 
+# --- the container-side environment reading -------------------------------
+#
+# 39afc096 makes cache-env.sh emit CARGO_INCREMENTAL=0, and the pinned-key test
+# in test-cache-env.sh proves it is EMITTED while the forwarded-vars assertion
+# above proves it is NAMED for forwarding. Neither proves it ARRIVED. The whole
+# arc's standing failure is a reading that cannot tell two cases apart being
+# reported as the case we expected, and "hardened-run said it forwarded 8
+# variables" is that reading: it is printed before `docker exec`, from
+# hardened-run's own environment, and an entrypoint or profile inside the image
+# can still unset the variable afterwards with nothing to say so.
+#
+# These cases run the composed command under a controlled environment and
+# assert on what the probe -- which executes INSIDE the capped container in
+# production -- actually reports.
+# The probe writes every line to STDERR, so each capture below puts `2>&1`
+# INSIDE the command substitution. Outside it, stderr escapes to the terminal
+# and the capture comes back EMPTY -- which made the negative assertion "the
+# secret's value appears nowhere in the output" pass against an empty string
+# on the first run of these cases. A negative control that passes because the
+# reading is missing is the failure this whole arc keeps producing, reproduced
+# here in a test that exists to catch it.
+env_probe_run() {
+  # Same `sed '1s/...//'` as probe_run, and for the same reason: an `s///p`
+  # here would print only the prefix line and hand bash a truncated script.
+  # `env -u` cannot be used to clear a variable for these: it is an external
+  # binary and cannot call a shell function. Unset in the subshell instead.
+  local cmd unset_var="${1:-}"
+  cmd=$(RUN_CHECK_DRY=1 "$SCRIPT" clippy 2>/dev/null | sed '1s/^would run via hardened-run: //')
+  ( cd "$probe_tmp" && PATH="$probe_tmp/bin:$PATH" \
+    && { [ -n "$unset_var" ] && unset "$unset_var"; :; } \
+    && bash -c "$cmd" ) 2>&1
+}
+
+probe_fakes "$probe_tmp/bin" ok 0
+
+# The three states must be DISTINGUISHABLE, because they mean different things:
+# <unset> is the pre-39afc096 state we are leaving, <set-empty> is a forwarding
+# bug (docker's name-only `-e VAR` carries an empty value silently), and "0" is
+# the fix having landed. cargo itself treats "" and "0" differently, so a probe
+# that printed both as "empty" would report the bug as the fix.
+out=$(CARGO_INCREMENTAL=0 RUSTC_WRAPPER=sccache SCCACHE_BUCKET=b env_probe_run)
+grep -q 'ENV-IN-CONTAINER clippy — CARGO_INCREMENTAL=0' <<<"$out" \
+  && ok "a set CARGO_INCREMENTAL is read back from inside the container by value" \
+  || bad "no container-side reading of CARGO_INCREMENTAL=0: $out"
+
+out=$(RUSTC_WRAPPER=sccache SCCACHE_BUCKET=b env_probe_run CARGO_INCREMENTAL)
+grep -q 'ENV-IN-CONTAINER clippy — CARGO_INCREMENTAL=<unset>' <<<"$out" \
+  && ok "an unset CARGO_INCREMENTAL reports <unset>, not a blank" \
+  || bad "an unset CARGO_INCREMENTAL was not reported as <unset>: $out"
+
+out=$(CARGO_INCREMENTAL= RUSTC_WRAPPER=sccache SCCACHE_BUCKET=b env_probe_run)
+grep -q 'ENV-IN-CONTAINER clippy — CARGO_INCREMENTAL=<set-empty>' <<<"$out" \
+  && ok "a set-but-empty CARGO_INCREMENTAL is distinguished from an unset one" \
+  || bad "set-empty and unset CARGO_INCREMENTAL are indistinguishable: $out"
+
+# The probe must not depend on the wrapper being on: the case worth catching is
+# precisely the one where caching did NOT engage, and a reading that disappears
+# exactly when the run goes wrong is no reading at all.
+out=$(CARGO_INCREMENTAL=0 env_probe_run RUSTC_WRAPPER)
+grep -q 'ENV-IN-CONTAINER clippy — RUSTC_WRAPPER=<unset>' <<<"$out" \
+  && ok "the reading still reports when the wrapper is off, which is when it matters" \
+  || bad "no container-side reading with RUSTC_WRAPPER unset: $out"
+
+# The credential guard. CACHE_FORWARD_VARS ends with AWS_SECRET_ACCESS_KEY, so
+# the tempting future edit -- iterate the forwarded list -- leaks the S3 secret
+# into a CI log. Assert the refusal fires AND that the value never appears.
+cmd=$(RUN_CHECK_DRY=1 "$SCRIPT" clippy 2>/dev/null | sed '1s/^would run via hardened-run: //')
+out=$( cd "$probe_tmp" && PATH="$probe_tmp/bin:$PATH" \
+       AWS_SECRET_ACCESS_KEY=not-a-real-secret-0ae3 RUSTC_WRAPPER=sccache \
+       bash -c "$cmd
+__ev_show AWS_SECRET_ACCESS_KEY
+__ev_show SCCACHE_S3_KEY_PREFIX" 2>&1 )
+# The floor for the negative assertion below, and the reason it is here: on the
+# first run of this block `out` was empty (stderr escaped the substitution) and
+# "the secret appears nowhere" passed against nothing at all. `grep -q` on an
+# empty string is indistinguishable from `grep -q` on a clean one, so a
+# negative control needs a positive statement that the reading exists.
+[ -n "$out" ] \
+  && ok "the credential-guard capture is non-empty, so the check below reads something" \
+  || bad "the credential-guard capture came back EMPTY -- every assertion on it is vacuous"
+grep -q "refusing to print 'AWS_SECRET_ACCESS_KEY'" <<<"$out" \
+  && ok "the probe refuses a credential-shaped variable name outright" \
+  || bad "no refusal when asked to print AWS_SECRET_ACCESS_KEY: $out"
+grep -q 'not-a-real-secret-0ae3' <<<"$out" \
+  && bad "THE PROBE PRINTED A SECRET'S VALUE INTO ITS OUTPUT: $out" \
+  || ok "the refused variable's value appears nowhere in the output"
+# A deliberate, documented false positive: SCCACHE_S3_KEY_PREFIX is not a
+# secret, but it matches *KEY* and is refused. Asserted so the behaviour is a
+# decision on record rather than a surprise to whoever adds that variable.
+grep -q "refusing to print 'SCCACHE_S3_KEY_PREFIX'" <<<"$out" \
+  && ok "the guard errs toward refusing (SCCACHE_S3_KEY_PREFIX is refused, by design)" \
+  || bad "SCCACHE_S3_KEY_PREFIX was not refused -- the guard is narrower than documented: $out"
+
 echo; [ "$fails" -eq 0 ] && echo "PASS" || echo "FAILURES"
 exit "$fails"

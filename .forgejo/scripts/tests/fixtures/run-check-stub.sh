@@ -42,6 +42,24 @@ for n in ${RUN_CHECK_STUB_CACHE_STATS:-}; do
   fi
 done
 
+# The container-side environment reading. Named checks report
+# CARGO_INCREMENTAL=0; RUN_CHECK_STUB_ENV_OTHER names the checks that report
+# something ELSE, which is the case the summary's counter has to separate out.
+# Two variables rather than one value, because the summary's whole job here is
+# to say how many capped checks agreed and how many did not -- a fixture that
+# could only make them all agree could not exercise the count that matters.
+for n in ${RUN_CHECK_STUB_ENV:-}; do
+  if [ "$n" = "$name" ]; then
+    echo "ENV-IN-CONTAINER $name — CARGO_INCREMENTAL=0" >&2
+    echo "ENV-IN-CONTAINER $name — RUSTC_WRAPPER=sccache" >&2
+  fi
+done
+for n in ${RUN_CHECK_STUB_ENV_OTHER:-}; do
+  if [ "$n" = "$name" ]; then
+    echo "ENV-IN-CONTAINER $name — CARGO_INCREMENTAL=<unset>" >&2
+  fi
+done
+
 # The no-reading case, which must NOT be filed as a reading.
 for n in ${RUN_CHECK_STUB_CACHE_STATS_GONE:-}; do
   if [ "$n" = "$name" ]; then
