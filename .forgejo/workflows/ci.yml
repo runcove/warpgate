@@ -317,6 +317,35 @@ jobs:
             docker run --rm --cpus=4 --memory=7g --memory-swap=7g "$HARDENED_RUN_IMAGE" sh -c \
               'echo "--- /etc/resolv.conf ---"; cat /etc/resolv.conf; echo "--- getent ---"; getent hosts '"$HOST"'; echo "getent rc=$?"'
             echo "docker run rc=$?"
+            echo
+            echo "== (3b) the dind SERVICE container's OWN /etc/resolv.conf =="
+            # (2) and (3) show what the dind daemon HANDS OUT. This shows what
+            # it READS, and the two answer different questions.
+            #
+            # The question it exists for: forgejo-runner 13.1.0 is documented
+            # in this homelab's own forge changelog (2026-09-02) as DROPPING
+            # unknown service options -- naming `--dns` on a dind service
+            # specifically -- with `--privileged` only working once a GLOBAL
+            # runner flag was added. So the `--dns` in `options:` above may
+            # never reach this container at all. That is not the same fault as
+            # the daemon receiving it and ignoring it, and the two have
+            # different owners: the first is the runner config, the second is
+            # docker. A reading that cannot tell them apart sends someone to
+            # the wrong file.
+            #
+            # A bind mount, deliberately, NOT `--network host`: the mount is
+            # resolved by the DAEMON, so this is the dind container's real
+            # file, read with no Docker DNS logic anywhere in the path. Host
+            # networking would hand back a file Docker itself had already had
+            # an opinion about, which is the ambiguity being avoided.
+            docker run --rm -v /etc/resolv.conf:/dind-resolv.conf:ro \
+              "$HARDENED_RUN_IMAGE" cat /dind-resolv.conf
+            echo "docker run rc=$?"
+            echo "  If the line above says 'nameserver 10.96.0.10', the --dns"
+            echo "  in this workflow's options: reached the service container."
+            echo "  If it says 'nameserver 127.0.0.11', the runner dropped the"
+            echo "  option and the fix is the runner's global container"
+            echo "  options, not this file."
           fi
           echo
           echo "== (4) is the --dns pin in this file still what the cluster hands us? =="
