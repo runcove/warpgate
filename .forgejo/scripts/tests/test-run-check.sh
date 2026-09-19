@@ -48,6 +48,32 @@ out=$(RUN_CHECK_DRY=1 "$SCRIPT" schema-compat 2>&1)
 grep -q "hardened-run" <<<"$out" && ok "'unverified' is treated as compiling" \
   || bad "'unverified' ran uncapped -- unsafe default: $out"
 
+# THE CACHE PROBE (added after run 573). A capped command must carry the probe
+# that degrades to an uncached build when sccache cannot start, because
+# RUSTC_WRAPPER fronts every rustc call and a dead sccache otherwise breaks
+# checks that never wanted a cache. Asserted through the dry run because, as
+# with the tools gate, this is the only place the composed command can be
+# observed without a container engine, and baba has none.
+out=$(RUN_CHECK_DRY=1 "$SCRIPT" clippy 2>&1)
+grep -q 'RUSTC_WRAPPER' <<<"$out" \
+  && ok "capped command carries the cache probe" \
+  || bad "capped command has no cache probe -- a dead cache would break the check instead of slowing it: $out"
+grep -q 'unset RUSTC_WRAPPER' <<<"$out" \
+  && ok "the probe DEGRADES (unsets the wrapper) rather than refusing" \
+  || bad "probe does not unset RUSTC_WRAPPER -- a cache outage would turn the run red: $out"
+grep -q 'CACHE-UNAVAILABLE' <<<"$out" \
+  && ok "the probe emits a greppable CACHE-UNAVAILABLE marker for the run summary" \
+  || bad "probe is silent -- a cache dead for a week would become the new normal: $out"
+
+# The uncapped path must NOT carry it: those checks never enter the sandbox,
+# so sccache is neither present nor relevant there. Without this, the probe
+# could be pasted onto every command and both assertions above would still
+# pass, proving only that the string exists somewhere.
+out=$(RUN_CHECK_DRY=1 "$SCRIPT" cargo-deny 2>&1)
+grep -q 'CACHE-UNAVAILABLE' <<<"$out" \
+  && bad "uncapped check carries the cache probe, which runs in a container it never enters: $out" \
+  || ok "uncapped check carries no cache probe"
+
 # An unknown check name must fail loudly, not silently pass.
 "$SCRIPT" no-such-check >/dev/null 2>&1
 [ $? -ne 0 ] && ok "unknown check name is refused" || bad "unknown check passed"
@@ -167,12 +193,43 @@ FAKE_CHECKS="$HERE/fixtures/checks-forward-test.yaml"
 ARGS_FILE="$FORWARD_DIR/hardened-run-args"
 CHECKS_FILE="$FAKE_CHECKS" STUB_HARDENED_RUN_ARGS_FILE="$ARGS_FILE" \
   "$FORWARD_DIR/run-check.sh" fake-capped >/dev/null 2>&1
-for v in RUSTC_WRAPPER SCCACHE_BUCKET SCCACHE_ENDPOINT SCCACHE_S3_USE_SSL \
-         SCCACHE_S3_NO_CREDENTIALS AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; do
+# DERIVED FROM cache-env.sh, not typed out again. Until 2026-09-19 this loop
+# held a hand-written list of seven names -- a THIRD copy of a set already
+# written twice (cache-env.sh's echoes, run-check.sh's CACHE_FORWARD_VARS).
+# Three copies cannot disagree usefully: when SCCACHE_REGION was added to the
+# first two, this test kept passing, because a membership check over its own
+# stale list is satisfied by any superset. It asserted that seven names it
+# already knew about were present, which was never the question.
+#
+# So the expected set is now COMPUTED: whatever cache-env.sh actually prints,
+# plus the two AWS credentials it deliberately does not print (they hold
+# secrets and are supplied by the caller's environment). Both directions are
+# checked -- a name emitted but not forwarded is silently ignored by the
+# process that needs it, and a name forwarded but never emitted is a stale
+# entry nobody will remove.
+EXPECTED_FWD="$(S3_ENDPOINT=https://fixture.example:9000 \
+  "$HERE/../cache-env.sh" fixture-bucket | cut -d= -f1)
+AWS_ACCESS_KEY_ID
+AWS_SECRET_ACCESS_KEY"
+
+n_expected=$(grep -c . <<<"$EXPECTED_FWD")
+[ "$n_expected" -ge 8 ] \
+  && ok "derived $n_expected expected forward names from cache-env.sh itself" \
+  || bad "cache-env.sh yielded only $n_expected names -- the derivation failed, so every assertion below would pass vacuously"
+
+while IFS= read -r v; do
+  [ -z "$v" ] && continue
   grep -qx -- "--forward-env" "$ARGS_FILE" 2>/dev/null && grep -qx "$v" "$ARGS_FILE" 2>/dev/null \
     && ok "forwards $v to hardened-run.sh on the capped path" \
     || bad "did not forward $v to hardened-run.sh: $(cat "$ARGS_FILE" 2>/dev/null)"
-done
+done <<<"$EXPECTED_FWD"
+
+# The other direction: nothing is forwarded that cache-env.sh never emits.
+ACTUAL_FWD="$(grep -A1 -x -- "--forward-env" "$ARGS_FILE" 2>/dev/null | grep -vx -e '--forward-env' -e '--' | sort -u)"
+EXTRA="$(comm -13 <(sort -u <<<"$EXPECTED_FWD") <(printf '%s\n' "$ACTUAL_FWD"))"
+[ -z "$EXTRA" ] \
+  && ok "forwards nothing cache-env.sh does not emit (no stale entries)" \
+  || bad "forwards name(s) cache-env.sh never emits: $(tr '\n' ' ' <<<"$EXTRA")"
 
 # TASK 7B: the capped container starts empty -- hardened-run.sh puts nothing
 # in it on its own -- so every capped check must be given --source/--workdir,

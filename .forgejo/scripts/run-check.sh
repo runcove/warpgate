@@ -191,19 +191,72 @@ if [ "$CAPPED" = "yes" ]; then
   TOOL_PROBE="__miss=\"\"; for __t in${probe_list}; do command -v \"\$__t\" >/dev/null 2>&1 || __miss=\"\$__miss \$__t\"; done; if [ -n \"\$__miss\" ]; then echo \"REFUSE $(printf '%q' "$NAME") — required tool(s) not installed inside the sandbox, where this capped check runs:\$__miss (exit 97). The environment cannot run this check; it never ran.\" >&2; exit 97; fi; "
 fi
 
-# The seven variables sccache needs to help a capped/compiling check: the
-# five cache-env.sh (Task 3) prints, plus the two AWS credentials it
+# The eight variables sccache needs to help a capped/compiling check: the
+# six cache-env.sh (Task 3) prints, plus the two AWS credentials it
 # deliberately does not print itself. Named here, not valued -- passed to
 # hardened-run.sh's --forward-env, which only crosses the cap boundary a
 # name that is actually set and non-empty in THIS process's own
 # environment. A cold run, or a run where cache-env.sh refused, forwards
 # nothing and the check still runs, just uncached (hardened-run.sh reports
 # the count and names so that silence is never how a cache miss looks).
+#
+# THIS LIST AND cache-env.sh's OUTPUT MUST AGREE. They are two hand-written
+# lists in different files describing one set, so they can drift silently:
+# a variable printed there but missing here is emitted, ignored, and never
+# reaches the process that needs it. test-run-check.sh pins them to each
+# other for exactly that reason -- SCCACHE_REGION was added on 2026-09-19
+# and had to be added in both places.
 CACHE_FORWARD_VARS=(RUSTC_WRAPPER SCCACHE_BUCKET SCCACHE_ENDPOINT
-                     SCCACHE_S3_USE_SSL SCCACHE_S3_NO_CREDENTIALS
+                     SCCACHE_REGION SCCACHE_S3_USE_SSL SCCACHE_S3_NO_CREDENTIALS
                      AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY)
 FORWARD_FLAGS=()
 for v in "${CACHE_FORWARD_VARS[@]}"; do FORWARD_FLAGS+=(--forward-env "$v"); done
+
+# A DEAD CACHE MUST COST SPEED, NEVER CORRECTNESS. Run 573 is why this exists.
+#
+# `RUSTC_WRAPPER=sccache` is not scoped to caching: it sits in front of every
+# rustc invocation, so an sccache that cannot start takes down work that never
+# wanted a cache at all. Measured, same branch, one commit apart: with no cache
+# (run 569) unit-tests PASSED 436 tests and sbom PASSED; with a cache that
+# could not start (run 573) unit-tests FAILED, sbom FAILED on `cargo metadata`,
+# and schema-compat went from a known FAIL 1 to REFUSE 96. A broken cache was
+# strictly worse than no cache.
+#
+# THE PROBE HAS TO BE HERE, INSIDE THE SANDBOX. configure-cache.sh is the
+# obvious home for it and is the wrong one: it runs in the JOB container, which
+# has no sccache at all (sccache is installed by the ci-toolchain image, and
+# only there). A probe there would prove a property of an environment that
+# never runs the compiler -- the same mistake as run 567, where a prover and a
+# consumer resolved the same names against different PATHs and disagreed
+# forever, both correct.
+#
+# On failure it DEGRADES rather than refuses: `unset RUSTC_WRAPPER` and carry
+# on. The check then runs exactly as it did before any of this was wired —
+# capped, uncached, honest. A refusal would convert a cache outage into a red
+# run, which is the same over-reaction in the other direction.
+#
+# The marker line is deliberately greppable and carries sccache's OWN first
+# error line rather than a paraphrase. run-all-checks.sh collects it into the
+# run summary, so a cache that has been dead for a week says so in every run
+# instead of quietly becoming the new normal — the failure mode this arc keeps
+# meeting, where the degraded state is indistinguishable from the good one.
+#
+# `--start-server` is the right call and `--show-stats` is not: cache-env.sh's
+# own notes record that --show-stats never contacts the backend, so it reports
+# a healthy all-zero blob against a dead bucket. Startup is the step that
+# actually builds the S3 client, which is why run 573's failure surfaced there.
+#
+# NOT HANDLED, and said plainly rather than left to be discovered: if a server
+# were already running, --start-server's exit status for that case is untested
+# here, and a non-zero would make this degrade unnecessarily. It cannot arise
+# today — hardened-run.sh starts a fresh container per check, so the probe
+# always meets a cold sccache — and the consequence if that ever changes is a
+# needlessly uncached build, i.e. slower, which is the direction this whole
+# block is built to fail in.
+CACHE_PROBE=""
+if [ "$CAPPED" = "yes" ]; then
+  CACHE_PROBE="if [ -n \"\${RUSTC_WRAPPER:-}\" ]; then if __ce=\$(sccache --start-server 2>&1); then :; else __cf=\$(printf '%s\n' \"\$__ce\" | grep -m1 '[^[:space:]]' || true); echo \"CACHE-UNAVAILABLE $(printf '%q' "$NAME") — \${__cf:-sccache could not start and printed nothing}\" >&2; unset RUSTC_WRAPPER; fi; fi; "
+fi
 
 if [ "${RUN_CHECK_DRY:-}" = "1" ]; then
   if [ "$CAPPED" = "yes" ]; then
@@ -211,7 +264,7 @@ if [ "${RUN_CHECK_DRY:-}" = "1" ]; then
     # command -- this is the only place the capped tools gate can be observed
     # without a container engine, and baba has none (podman is off-limits,
     # Ruling 45). tests/test-run-check.sh asserts on it here.
-    echo "would run via hardened-run: ${TOOL_PROBE}$COMMAND"
+    echo "would run via hardened-run: ${TOOL_PROBE}${CACHE_PROBE}$COMMAND"
   else
     echo "would run directly: $COMMAND"
   fi
@@ -256,7 +309,7 @@ elif [ "$CAPPED" = "yes" ]; then
   # /etc/profile.d entry that a check needs.
   "$HERE/hardened-run.sh" --cpus "${CI_CPUS:-4}" --memory "${CI_MEMORY:-7g}" \
     --label "check-$NAME" --source "$PWD" --workdir /src --verify-file Cargo.toml \
-    "${FORWARD_FLAGS[@]}" -- bash -c "${TOOL_PROBE}$COMMAND"
+    "${FORWARD_FLAGS[@]}" -- bash -c "${TOOL_PROBE}${CACHE_PROBE}$COMMAND"
   rc=$?
 else
   # Same change, same reason. This path runs in the JOB container, where the

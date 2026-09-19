@@ -33,6 +33,37 @@ out=$(run_with_map "check-a=0 check-b=0 check-c=0" 2>&1); rc=$?
 grep -q "checks refused: 0, checks failed: 0" <<<"$out" \
   && ok "reports zero refused and zero failed" || bad "counters wrong: $out"
 
+# 1b. A DEGRADED CACHE IS REPORTED IN THE SUMMARY AND CHANGES NOTHING ELSE.
+#     Run 573's lesson, from the other side: a dead cache must cost speed,
+#     never correctness, and must never quietly become the new normal. So the
+#     run stays green, the counters stay at zero, and the summary names it.
+out=$(RUN_CHECK_STUB_CACHE_DEAD="check-b" run_with_map "check-a=0 check-b=0 check-c=0" 2>&1); rc=$?
+[ "$rc" -eq 0 ] && ok "a degraded cache does not turn a green run red" \
+  || bad "cache degradation changed the exit code (rc=$rc): $out"
+grep -q "checks refused: 0, checks failed: 0" <<<"$out" \
+  && ok "a degraded cache is counted as neither a refusal nor a failure" \
+  || bad "cache degradation moved a counter: $out"
+grep -q "cache unavailable on 1 check(s)" <<<"$out" \
+  && ok "the run summary names the degradation" \
+  || bad "summary is silent about the degraded cache -- it would become invisible: $out"
+# Scoped to the SUMMARY BLOCK, not to the whole output. The raw
+# CACHE-UNAVAILABLE line is already in the log because the check printed it,
+# so a bare `grep "region is missing" <<<"$out"` passes whether or not the
+# summary exists -- measured: it survived deleting the summary block outright.
+# An assertion that cannot fail for the reason it was written is not a test.
+summary_block=$(sed -n '/^cache unavailable on /,$p' <<<"$out")
+grep -q "region is missing" <<<"$summary_block" \
+  && ok "the summary block itself carries sccache's OWN error, not a paraphrase" \
+  || bad "summary block dropped the underlying cause: ${summary_block:-<no summary block>}"
+
+#     The negative control. Every assertion above would also pass if the
+#     summary block printed unconditionally, so a clean run must NOT mention
+#     the cache at all.
+out=$(run_with_map "check-a=0 check-b=0 check-c=0" 2>&1)
+grep -q "cache unavailable" <<<"$out" \
+  && bad "summary claims a cache problem on a run that had none: $out" \
+  || ok "a healthy run says nothing about the cache"
+
 # 2. A lone ordinary failure (not a refusal) sets the job's exit code.
 out=$(run_with_map "check-a=0 check-b=1 check-c=0" 2>&1); rc=$?
 [ "$rc" -eq 1 ] && ok "a lone ordinary failure sets the job's exit code" \

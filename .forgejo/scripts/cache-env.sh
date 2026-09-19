@@ -171,5 +171,25 @@ HOST="${S3_ENDPOINT#*://}"; HOST="${HOST%%/*}"
 echo "RUSTC_WRAPPER=sccache"
 echo "SCCACHE_BUCKET=${BUCKET}"
 echo "SCCACHE_ENDPOINT=${HOST}"
+# REQUIRED, not optional, and its absence cost run 573. sccache v0.17.0's
+# docs/S3.md lists exactly two required variables for this backend --
+# SCCACHE_BUCKET and SCCACHE_REGION -- and without the region sccache refuses
+# to start at all:
+#
+#   sccache: error: Server startup failed: create s3 cache failed:
+#   ConfigInvalid (permanent) at Builder::build, context: { service: s3 }
+#   => region is missing. Please find it by S3::detect_region() or set them in env.
+#
+# `auto` is the documented value for a custom endpoint ("can be set to `auto`
+# if using a custom endpoint"), which is what QuObjects is. It is NOT a guess
+# at a plausible AWS region name: region detection is meaningless against a
+# non-AWS store, and `auto` is how the docs say to tell sccache so.
+#
+# The lesson this line records is not "we forgot a variable". Both cache bugs
+# in this file came from checking what ONE variable wanted and never asking
+# what else was mandatory -- first SCCACHE_ENDPOINT's host:port form, then
+# this. When adding a backend variable, read the backend's REQUIRED list, not
+# just the entry for the value you happen to be holding.
+echo "SCCACHE_REGION=auto"
 echo "SCCACHE_S3_USE_SSL=true"
 echo "SCCACHE_S3_NO_CREDENTIALS=0"

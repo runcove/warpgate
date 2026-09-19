@@ -49,6 +49,33 @@ out=$(unset S3_ENDPOINT; "$SCRIPT" warpgate-sccache 2>/dev/null)
 
 out=$(S3_ENDPOINT=https://oga2.example:9000 "$SCRIPT" warpgate-sccache 2>&1)
 grep -q "RUSTC_WRAPPER=sccache"            <<<"$out" && ok "sets the compiler wrapper" || bad "no RUSTC_WRAPPER: $out"
+
+# SCCACHE_REGION is REQUIRED by sccache's S3 backend, and its absence cost
+# run 573: sccache refused to start with "region is missing", which — because
+# RUSTC_WRAPPER fronts every rustc call — turned unit-tests and sbom from PASS
+# into FAIL and schema-compat from a known FAIL into REFUSE 96. A broken cache
+# was strictly worse than no cache.
+#
+# `auto` rather than an AWS region name, per sccache v0.17.0 docs/S3.md: the
+# region "can be set to `auto` if using a custom endpoint", and region
+# detection means nothing against a non-AWS store like QuObjects. Pinned to
+# the exact line so substituting a plausible-looking region such as us-east-1
+# is caught — it might even work, and "might work" is not what this file is
+# for.
+region_line=$(grep '^SCCACHE_REGION=' <<<"$out")
+[ "$region_line" = "SCCACHE_REGION=auto" ] \
+  && ok "sets SCCACHE_REGION=auto (required; sccache will not start without it)" \
+  || bad "expected SCCACHE_REGION=auto, got '${region_line:-<absent>}': $out"
+
+# The whole emitted set, pinned as a set. Each line above checks one variable
+# it already knows to look for, so a newly-required variable going missing is
+# invisible to all of them — which is exactly how the region was lost. This
+# fails when a variable is dropped AND when one is added without a decision.
+got_keys=$(cut -d= -f1 <<<"$out" | sort | tr '\n' ' ')
+want_keys="RUSTC_WRAPPER SCCACHE_BUCKET SCCACHE_ENDPOINT SCCACHE_REGION SCCACHE_S3_NO_CREDENTIALS SCCACHE_S3_USE_SSL "
+[ "$got_keys" = "$want_keys" ] \
+  && ok "emits exactly the six expected variables, no more and no fewer" \
+  || bad "emitted set changed: got [$got_keys] want [$want_keys]"
 grep -q "SCCACHE_BUCKET=warpgate-sccache"  <<<"$out" && ok "bucket is the one passed"  || bad "wrong bucket: $out"
 
 # THE FIXTURE IS THE TEST HERE, and it used to be the bug.

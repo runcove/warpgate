@@ -38,11 +38,35 @@ refused=0
 failed=0
 saw_refusal=0
 count=0
+
+# Collected so a degraded cache is reported once, at the end, where the run's
+# verdict is read -- not only as a line buried in one check's group.
+#
+# run-check.sh degrades to an uncached build when sccache cannot start
+# (see its CACHE_PROBE), which is the right call: a cache outage must cost
+# speed, not correctness. But a silent degradation is how "the cache is dead"
+# becomes "the cache was never on", and the run gets slower and slower with
+# nobody able to name when it changed. So the probe emits a greppable
+# CACHE-UNAVAILABLE line carrying sccache's own first error, and this collects
+# them.
+#
+# The tee is what makes that possible: this script previously let run-check.sh
+# write straight through, so there was no point at which its output could be
+# examined. PIPESTATUS[0] preserves the check's own exit code, which is
+# load-bearing for the refusal-band logic below -- `pipefail` alone would give
+# tee's status for a passing check that wrote a marker.
+CACHE_NOTES=()
+tmp_out="$(mktemp)"
+trap 'rm -f "$tmp_out"' EXIT
+
 while IFS= read -r name; do
   [ -z "$name" ] && continue
   count=$((count + 1))
   echo "::group::$name"
-  "$HERE/run-check.sh" "$name"; check_rc=$?
+  "$HERE/run-check.sh" "$name" 2>&1 | tee "$tmp_out"; check_rc=${PIPESTATUS[0]}
+  while IFS= read -r note; do
+    [ -n "$note" ] && CACHE_NOTES+=("$note")
+  done < <(grep -h '^CACHE-UNAVAILABLE ' "$tmp_out" || true)
   echo "::endgroup::"
   if [ "$check_rc" -ne 0 ]; then
     if [ "$check_rc" -ge 89 ] && [ "$check_rc" -le 99 ]; then
@@ -70,4 +94,17 @@ if [ "$count" -eq 0 ]; then
 fi
 
 echo "checks refused: $refused, checks failed: $failed"
+
+# Named in the summary, with sccache's own words, every run it happens.
+# Deliberately NOT folded into `refused` or `failed`: nothing refused and
+# nothing failed because of this -- the checks ran and their verdicts stand.
+# What changed is that they ran uncached, and that is a fact about the run's
+# COST, reported next to its verdict rather than in place of one. It does not
+# touch $rc: a dead cache must never turn a green run red.
+if [ "${#CACHE_NOTES[@]}" -gt 0 ]; then
+  echo "cache unavailable on ${#CACHE_NOTES[@]} check(s) — they ran UNCACHED (slower, not wrong):"
+  printf '  %s\n' "${CACHE_NOTES[@]}"
+  echo "  A cache that is down stays visible here on every run; if this line has"
+  echo "  been present for days it is the finding, not the weather."
+fi
 exit "$rc"
