@@ -156,7 +156,7 @@ grep -qi "timed out\|timeout" <<<"$out" && ok "names it as a timeout, not a gene
 # spent minutes fetching an advisory-db over git before being killed. This
 # test only needs to know which path run-check.sh takes, not whether a real
 # check tool passes, and "true" as both fixture commands makes the uncapped
-# path's real `bash -lc "true"` instant and harmless either way.
+# path's real `bash -c "true"` instant and harmless either way.
 FORWARD_DIR="${TMPDIR:-/tmp}/run-check-forward-test.$$"
 mkdir -p "$FORWARD_DIR"
 ln -sf "$SCRIPT" "$FORWARD_DIR/run-check.sh"
@@ -293,9 +293,13 @@ grep -q "command -v" <<<"$out" \
 # machine running the tests.
 #
 # No PATH restriction here, deliberately. "made-up-tool-zzz" is absent from
-# every PATH by construction, and the probe runs under `bash -lc`, which
-# sources login profiles -- under a crippled PATH those fail for reasons of
-# their own and return an exit code that has nothing to do with the probe.
+# every PATH by construction, and under a crippled PATH the shell fails for
+# reasons of its own and returns an exit code that has nothing to do with the
+# probe. (This said "runs under `bash -lc`, which sources login profiles"
+# until later the same day: the `-l` is gone, because /etc/profile ASSIGNS
+# PATH and that cost run 567 a full CI cycle. The observation that login
+# profiles mess with PATH was right here in the file the whole time, one
+# question short of the bug.)
 # Measured 2026-09-19: a first version of this test returned 101 for BOTH the
 # missing-tool and present-tool cases, from /usr/libexec/grepconf.sh, and could
 # not distinguish them at all.

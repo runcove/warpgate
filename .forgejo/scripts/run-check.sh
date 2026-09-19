@@ -228,12 +228,43 @@ elif [ "$CAPPED" = "yes" ]; then
   # optional for other callers. --verify-file names Cargo.toml because THIS
   # repo is a cargo workspace -- hardened-run.sh itself names no project, so
   # that fact belongs here, not there.
+  #
+  # `bash -c`, NOT `bash -lc`. This was `-lc` until run 567, and the `-l` is
+  # what that run actually died of. A login shell sources /etc/profile, and
+  # Debian's /etc/profile (base-files 12.4+deb12u15, read from the package the
+  # image installs) does not EXTEND PATH, it ASSIGNS it:
+  #
+  #   if [ "$(id -u)" -eq 0 ]; then
+  #     PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  #
+  # so the toolchain image's own `ENV PATH=/usr/local/cargo/bin:$PATH` is
+  # discarded before the probe below runs a single `command -v`. Run 567
+  # measured exactly that split: git, tar, python3, npm (/usr/bin) and oasdiff
+  # (/usr/local/bin) were found, while just, cargo, cargo-cranky,
+  # cargo-llvm-cov and cargo-cyclonedx -- every resident of
+  # /usr/local/cargo/bin, and only those -- refused 97 as "not installed",
+  # inside the very image whose own assertion had just proved all nine present.
+  #
+  # Both readings were true. assert-toolchain.sh proves reachability via
+  # `docker run IMAGE assert-toolchain.sh`, which is not a login shell; the
+  # check asked through one. A prover and a consumer that resolve the same
+  # name against different PATHs will disagree for as long as nobody makes
+  # them use the same shell. `docker exec` already hands us the image's
+  # environment (hardened-run.sh forwards PATH for nobody -- run 567 logged
+  # "forwarded 0 variable(s)"), so -c inherits exactly what the image declared
+  # and -l was never buying anything: nothing in these images ships a
+  # /etc/profile.d entry that a check needs.
   "$HERE/hardened-run.sh" --cpus "${CI_CPUS:-4}" --memory "${CI_MEMORY:-7g}" \
     --label "check-$NAME" --source "$PWD" --workdir /src --verify-file Cargo.toml \
-    "${FORWARD_FLAGS[@]}" -- bash -lc "${TOOL_PROBE}$COMMAND"
+    "${FORWARD_FLAGS[@]}" -- bash -c "${TOOL_PROBE}$COMMAND"
   rc=$?
 else
-  bash -lc "$COMMAND"
+  # Same change, same reason. This path runs in the JOB container, where the
+  # uncapped checks' tools (jq, helm, biome, find, sed) all live in /usr/local/bin
+  # or /usr/bin and so survive /etc/profile's assignment -- which is precisely
+  # why the trap sat here unsprung and only fired once an image put tools
+  # somewhere else. Fixed in both places rather than only where it bit.
+  bash -c "$COMMAND"
   rc=$?
 fi
 

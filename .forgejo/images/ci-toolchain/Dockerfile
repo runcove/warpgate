@@ -177,6 +177,30 @@ ENV RUSTUP_DIST_SERVER=http://127.0.0.1:9
 ENV RUSTUP_UPDATE_ROOT=http://127.0.0.1:9
 
 # ---------------------------------------------------------------------------
+# Make the PATH above survive a login shell.
+# ---------------------------------------------------------------------------
+# `ENV PATH=/usr/local/cargo/bin:$PATH` at the top of this file is honoured by
+# `docker run`, by `docker exec`, and by any non-login shell they start. It is
+# NOT honoured by a LOGIN shell: Debian's /etc/profile (base-files
+# 12.4+deb12u15) assigns PATH outright rather than extending it --
+#
+#   if [ "$(id -u)" -eq 0 ]; then
+#     PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+#
+# -- so /usr/local/cargo/bin vanishes and every cargo tool in this image
+# becomes invisible while git, npm, python3 and oasdiff stay visible. Run 567
+# cost a full CI cycle to that split, because run-check.sh invoked capped
+# checks through `bash -lc`. That call site is fixed (it now uses `bash -c`,
+# which is the actual cause), and this file is fixed too, because an image
+# whose toolchain disappears the moment someone types `docker exec -it … bash
+# -l` to debug it is a trap that will be sprung again by a human rather than a
+# script. /etc/profile.d runs AFTER the assignment above, so an entry here is
+# the supported way to put a directory back.
+RUN printf '%s\n' 'PATH="/usr/local/cargo/bin:$PATH"' 'export PATH' \
+      > /etc/profile.d/10-cargo-path.sh \
+ && chmod 0644 /etc/profile.d/10-cargo-path.sh
+
+# ---------------------------------------------------------------------------
 # Prove the image is what it claims, before it is ever tagged.
 # ---------------------------------------------------------------------------
 # Runs AFTER the block above on purpose: it therefore also proves the block

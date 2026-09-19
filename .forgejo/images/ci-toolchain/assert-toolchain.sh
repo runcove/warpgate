@@ -93,7 +93,7 @@ for t in ${TOOLCHAIN_REQUIRED_TOOLS:-just git tar python3 npm oasdiff cargo-cran
   else bad "$t is declared by a capped check and is NOT in this image"; fi
 done
 
-# --- the four requirements no `tools:` list can express ----------------------
+# --- the five requirements no `tools:` list can express ----------------------
 # Both of these are needed by a capped check and named in no check's tools
 # list, for the same underlying reason: the tools gate can only see PATH
 # entries that a check's COMMAND invokes. Anything a check needs by another
@@ -163,6 +163,58 @@ else
         in the ORDINARY range and reads as upstream's verdict on our code."
     fi
   done
+fi
+
+# THE SHELL ITSELF is the fifth thing no `tools:` list can express, and the one
+# this assertion was blind to until run 567 spent a CI cycle proving it.
+#
+# Everything above resolves names with the PATH this process inherited. The
+# checks did not: run-check.sh invoked them through `bash -lc`, a LOGIN shell,
+# and Debian's /etc/profile ASSIGNS PATH rather than extending it, dropping
+# /usr/local/cargo/bin. So this script proved nine tools present while the
+# consumer, in the same image, seconds later, could not find five of them --
+# and the two answers were both correct, because they were answers about
+# different environments. A prover that does not resolve names the way its
+# consumer does is not proving the consumer's property.
+#
+# run-check.sh now uses `bash -c`, and the Dockerfile installs
+# /etc/profile.d/10-cargo-path.sh so a login shell is correct too. This
+# assertion is what keeps the second of those honest: delete that file and the
+# image build FAILS here, instead of tagging cleanly and refusing 97 in CI
+# forty minutes later.
+#
+# One ok line, not one per tool, because the property is "the shell keeps the
+# PATH", not "each tool exists" -- that question is already answered above, and
+# answering it twice would make the count say the image has twice the tools.
+login_missing=""
+for t in ${TOOLCHAIN_REQUIRED_TOOLS:-just git tar python3 npm oasdiff cargo-cranky cargo-llvm-cov cargo-cyclonedx} cargo sccache; do
+  # HOME is neutralised so the login shell reads /etc/profile and nothing else.
+  # In the image that changes nothing (root has no ~/.bash_profile); on the host
+  # where tests/test-assert-toolchain.sh runs this against stubs, it stops a
+  # developer's own rc files from deciding the verdict. This suite has already
+  # been bitten once by a login shell answering for reasons of its own -- see
+  # the /usr/libexec/grepconf.sh note in tests/test-run-check.sh.
+  #
+  # Overridable for ONE reason: a guard with no way to make it fire is the
+  # failure this repo keeps finding (sccache, undeclared tools, rustup
+  # components, the registry login -- each a correct guard that nothing
+  # triggered). Debian's /etc/profile cannot be edited from a test, so the
+  # test points this at a HOME whose .bash_profile breaks PATH and asserts
+  # this block FAILS and names the tools. Nothing in the image sets it.
+  env HOME="${ASSERT_TOOLCHAIN_LOGIN_HOME:-/nonexistent}" \
+    bash -lc "command -v $(printf '%q' "$t") >/dev/null 2>&1" \
+    || login_missing="$login_missing $t"
+done
+if [ -z "$login_missing" ]; then
+  ok "every declared tool is still found under \`bash -lc\` (a login shell re-assigns PATH from /etc/profile)"
+else
+  bad "a LOGIN shell cannot find:$login_missing
+        These exist in this image -- the loop above found them -- but \`bash -lc\` re-reads
+        PATH from /etc/profile, which ASSIGNS it rather than extending it, so anything
+        outside /usr/local/bin and /usr/bin disappears. /etc/profile.d/10-cargo-path.sh in
+        the Dockerfile is what puts /usr/local/cargo/bin back; if it is gone, this is what
+        run 567 looked like from CI: five capped checks refusing 97 for tools this very
+        script had just certified present."
 fi
 
 echo

@@ -108,9 +108,21 @@ healthy; run
 [ "$rc" -eq 0 ] && ok "a correct image passes (0)" || bad "healthy image should pass, got rc=$rc: $out"
 grep -q "active toolchain in .* is $PIN" <<<"$out" && ok "and names the toolchain it found" \
   || bad "does not report the active toolchain: $out"
+# EXACT, not a floor. `-ge 12` was here until 2026-09-19 and it is the shape
+# this repo already argues against for the check count (ci.yml: "a floor lets
+# exactly one check vanish and still pass"). The same reasoning applies harder
+# here, because the failure it would absorb is an assertion quietly checking
+# LESS than it claims to -- and an image that asserts less still tags clean.
+#
+# 17 = 1 pin file + 1 active toolchain + 1 cargo runs + 9 declared tools
+#      + 1 PyYAML + 1 sccache + 2 rustup components + 1 login-shell PATH.
+# This number must change in the SAME commit that adds or removes an
+# assertion. Going stale loudly and forcing someone to count is the point.
+EXPECTED_OK=17
 n=$(grep -c "^  ok    " <<<"$out")
-[ "$n" -ge 12 ] && ok "and reports $n individual checks, not one summary verdict" \
-  || bad "expected at least 12 ok lines, got $n: $out"
+[ "$n" -eq "$EXPECTED_OK" ] && ok "and reports exactly $n individual checks, not one summary verdict" \
+  || bad "expected exactly $EXPECTED_OK ok lines, got $n. An assertion was added or removed
+        without updating this count, or one silently stopped running: $out"
 
 echo "== the case this exists for: a different toolchain =="
 healthy
@@ -378,6 +390,39 @@ PY
     *)        bad "assertion tool list and checks.yaml disagree:$cmp_out" ;;
   esac
 fi
+
+echo "== the login-shell PATH guard, and PROOF it can fail =="
+# The guard this block controls was added after run 567, where five capped
+# checks refused 97 for tools that were present in the image. The cause was
+# that the checks ran under `bash -lc` and Debian's /etc/profile ASSIGNS PATH
+# instead of extending it, so /usr/local/cargo/bin was gone by the time
+# `command -v` ran -- while assert-toolchain.sh, not being a login shell, saw
+# all nine tools and certified the image.
+#
+# A positive control is mandatory here rather than nice to have: this guard's
+# healthy answer is "nothing is missing", and an ABSENCE is exactly the verdict
+# a broken check produces for free. Without the failing case below, a typo in
+# the loop would read as a clean image forever.
+#
+# /etc/profile cannot be edited from a test, so the break is injected through
+# ASSERT_TOOLCHAIN_LOGIN_HOME: a HOME whose .bash_profile strips the stub
+# directory, which is what Debian's /etc/profile does to /usr/local/cargo/bin.
+healthy
+LOGIN_HOME="$WORK/fake-login-home"
+mkdir -p "$LOGIN_HOME"
+printf '%s\n' 'PATH=/usr/bin:/bin' 'export PATH' > "$LOGIN_HOME/.bash_profile"
+out=$(PATH="$BIN" ASSERT_TOOLCHAIN_LOGIN_HOME="$LOGIN_HOME" bash "$SCRIPT" "$PIN" "$WORK" 2>&1); rc=$?
+if [ "$rc" -ne 0 ] && grep -q "a LOGIN shell cannot find:" <<<"$out"; then
+  ok "CONTROL FIRED: a login shell that loses the tool directory fails the assertion"
+else
+  bad "CONTROL DID NOT FIRE. A login shell was given a PATH with none of the stubbed tools
+        and the assertion still passed (rc=$rc). The guard cannot detect the condition it
+        exists for, which is precisely how run 567 happened: $out"
+fi
+# and it must name them, not just fail somewhere
+grep -qE "a LOGIN shell cannot find:.*\bjust\b" <<<"$out" \
+  && ok "and names the tools the login shell lost" \
+  || bad "the control fired but did not name \`just\` among the lost tools: $out"
 
 [ "$fails" -eq 0 ] && echo "PASS" || echo "FAILURES"
 exit "$fails"

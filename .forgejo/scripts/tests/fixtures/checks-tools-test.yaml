@@ -28,9 +28,15 @@ checks:
   # command runs inside hardened-run.sh's container, so its tools must be
   # checked THERE, not in the job container. "made-up-tool-zzz" is absent from
   # every PATH by construction, so the missing-tool case needs no PATH
-  # restriction -- which matters here because the probe is executed through
-  # `bash -lc`, and a crippled PATH makes the login shell itself fail for
-  # reasons unrelated to the thing under test (measured, 2026-09-19).
+  # restriction -- which matters here because a crippled PATH makes the shell
+  # itself fail for reasons unrelated to the thing under test (2026-09-19).
+  #
+  # This said "the probe is executed through `bash -lc`" until later the same
+  # day. It is `bash -c` now: a login shell re-reads PATH from /etc/profile,
+  # which ASSIGNS rather than extends it, and that is what made run 567 refuse
+  # 97 for five tools the image demonstrably contained. Note what this comment
+  # did -- it observed the login shell being fragile about PATH and routed
+  # around the symptom instead of asking what it did to PATH.
   - name: fake-capped-missing-tool
     upstream: build.yml
     command: "echo SHOULD_NOT_RUN_CAPPED"
