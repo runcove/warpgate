@@ -161,6 +161,42 @@ pub(crate) fn find_http_target_by_external_host(
         .map(|(t, o)| (t.clone(), o.clone()))
 }
 
+/// What the caller should actually do, with the target it needs already in
+/// hand.
+///
+/// This exists because the obvious return type — `(Option<(Target,
+/// TargetHTTPOptions)>, PublicTargetDecision)` — lets the two halves
+/// disagree. `Bypass` alongside `None` is nonsense, but the type permits it,
+/// so the caller had to assert the invariant at runtime with
+/// `.expect("Bypass decision implies a resolved target")`. That assertion was
+/// true, but only because two functions in this file happened to agree;
+/// nothing made them keep agreeing, and `clippy::expect_used` (upstream's own
+/// bar, via a `Cranky.toml` byte-identical to v0.28.6's) was right to reject
+/// it.
+///
+/// Here the target rides inside the `Bypass` variant, so a `Bypass` without a
+/// target cannot be constructed at all. There is no unwrap to get wrong and
+/// no unreachable branch standing in for one. The compiler, rather than a
+/// test, is what keeps this true — which is the whole reason to prefer this
+/// over returning an error on a branch that cannot be taken.
+///
+/// `#[allow(clippy::large_enum_variant)]` because `Target` is far bigger than
+/// the two unit variants. This is upstream's own idiom for the same
+/// situation, not a local invention — `warpgate-admin/src/api/targets.rs`,
+/// `users.rs`, `sessions_detail.rs` and `ldap_servers.rs` all carry it on
+/// enums holding config structs. Boxing would silence the lint too, but it
+/// would depart from how this codebase already answers the question.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PublicTargetResolution {
+    /// Bypass the auth path and proxy to this target.
+    Bypass { target: Target },
+    /// Public target reached with a non-session token class — 401.
+    Reject401,
+    /// Existing auth path runs unchanged.
+    NotApplicable,
+}
+
 /// Async wrapper around the host→target lookup + `decide_public_target_access`
 /// helpers. Used by `page_auth` (in `common.rs`) to skip the redirect-to-login
 /// when a request resolves to a public target.
@@ -168,17 +204,20 @@ pub(crate) fn find_http_target_by_external_host(
 /// `host` is the trusted Host header (already resolved by the caller via
 /// `UnauthenticatedRequestContext::trusted_host_header`, port-aware per T1)
 /// so this helper stays a thin async glue and the pure logic lives in the
-/// two helpers above. Returns the resolved target+options together with
-/// the bypass decision so the caller can either short-circuit (Bypass),
-/// reject (Reject401), or fall through to the existing auth path
-/// (NotApplicable).
+/// two helpers above.
+///
+/// The target is destructured out of the lookup BEFORE the decision is taken,
+/// so every path that can still reach `Bypass` already owns it. That ordering
+/// is what removes the unwrap: the no-target case returns early, exactly as
+/// `decide_public_target_access(None, _)` would have, and the decision call
+/// below is then only ever made with real options.
 pub(crate) async fn resolve_public_target_decision(
     services: &warpgate_core::Services,
     host: Option<&str>,
     auth: Option<&RequestAuthorization>,
-) -> poem::Result<(Option<(Target, TargetHTTPOptions)>, PublicTargetDecision)> {
+) -> poem::Result<PublicTargetResolution> {
     let Some(host) = host else {
-        return Ok((None, PublicTargetDecision::NotApplicable));
+        return Ok(PublicTargetResolution::NotApplicable);
     };
     let candidates: Vec<Target> = services
         .config_provider
@@ -186,10 +225,14 @@ pub(crate) async fn resolve_public_target_decision(
         .await?
         .into_iter()
         .collect();
-    let resolved = find_http_target_by_external_host(&candidates, host);
-    let opts = resolved.as_ref().map(|(_, o)| o);
-    let decision = decide_public_target_access(opts, auth);
-    Ok((resolved, decision))
+    let Some((target, opts)) = find_http_target_by_external_host(&candidates, host) else {
+        return Ok(PublicTargetResolution::NotApplicable);
+    };
+    Ok(match decide_public_target_access(Some(&opts), auth) {
+        PublicTargetDecision::Bypass => PublicTargetResolution::Bypass { target },
+        PublicTargetDecision::Reject401 => PublicTargetResolution::Reject401,
+        PublicTargetDecision::NotApplicable => PublicTargetResolution::NotApplicable,
+    })
 }
 
 /// Pairs a target with its HTTP options, discarding targets of other protocols.

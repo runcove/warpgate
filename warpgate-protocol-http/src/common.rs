@@ -30,7 +30,7 @@ use warpgate_db_entities::User;
 use warpgate_sso::WarpgateIdToken;
 
 use crate::catchall::{
-    PublicTargetDecision, is_warpgate_management_path, resolve_public_target_decision,
+    PublicTargetResolution, is_warpgate_management_path, resolve_public_target_decision,
 };
 use crate::session::SessionStore;
 use crate::step_up::{StepUpSessionExt, is_session_step_up_stale};
@@ -394,12 +394,13 @@ async fn try_public_target_bypass(req: &Request) -> poem::Result<PublicBypassOut
         .flatten();
     let auth_ref = auth_ctx.as_deref().map(|c| &c.auth);
 
-    let (resolved, decision) =
+    let resolution =
         resolve_public_target_decision(unauth_ctx.services(), host.as_deref(), auth_ref).await?;
 
-    match decision {
-        PublicTargetDecision::Bypass => {
-            let (target, _opts) = resolved.expect("Bypass decision implies a resolved target");
+    match resolution {
+        // The target arrives inside the variant, so there is nothing to
+        // unwrap and no invariant to assert at runtime.
+        PublicTargetResolution::Bypass { target } => {
             let synthetic_auth = RequestAuthorization::Session(SessionAuthorization::Ticket {
                 user_id: Uuid::nil(),
                 username: "<public>".into(),
@@ -409,8 +410,8 @@ async fn try_public_target_bypass(req: &Request) -> poem::Result<PublicBypassOut
                 unauth_ctx.to_authenticated(synthetic_auth),
             ))
         }
-        PublicTargetDecision::Reject401 => Ok(PublicBypassOutcome::Reject401),
-        PublicTargetDecision::NotApplicable => Ok(PublicBypassOutcome::NotApplicable),
+        PublicTargetResolution::Reject401 => Ok(PublicBypassOutcome::Reject401),
+        PublicTargetResolution::NotApplicable => Ok(PublicBypassOutcome::NotApplicable),
     }
 }
 
