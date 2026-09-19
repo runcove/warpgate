@@ -342,6 +342,13 @@ else
   bad "an in-range ExtServers address produced no --dns: $(cat "$ARGS_FILE" 2>/dev/null)"
 fi
 [ "$rc" -eq 0 ] && ok "and the check still runs" || bad "deriving a resolver failed the check (rc=$rc): $out"
+# The POSITIVE reading. Without this line, a successful derivation is silent,
+# and the only evidence it happened is the absence of a fallback marker --
+# which a deleted or short-circuited block also produces. Success has to
+# announce itself or the log cannot tell the two apart.
+grep -q "CACHE-DNS-DERIVED.*10\.96\.0\.10" <<<"$out" \
+  && ok "a successful derivation SAYS so, naming the address it derived" \
+  || bad "the derivation succeeded silently -- a deleted block would look identical: $out"
 
 # The top of 10.96.0.0/12. A range check written as a prefix match on "10.96."
 # would reject this and nobody would notice until the cluster used it.
@@ -390,6 +397,9 @@ dnsrun absent
 grep -qx -- "--dns" "$ARGS_FILE" 2>/dev/null \
   && bad "passed --dns with no ExtServers line at all -- the address is hardcoded somewhere: $(cat "$ARGS_FILE" 2>/dev/null)" \
   || ok "no ExtServers line means no --dns -- the value comes from the file, nowhere else"
+grep -q "CACHE-DNS-DERIVED" <<<"$out" \
+  && bad "announced a derived resolver when there was no ExtServers line at all: $out" \
+  || ok "and claims no derivation it did not make"
 grep -q "CACHE-DNS-FALLBACK.*no '# ExtServers:' line" <<<"$out" \
   && ok "and the missing line is named in the marker" || bad "a missing ExtServers line was silent: $out"
 

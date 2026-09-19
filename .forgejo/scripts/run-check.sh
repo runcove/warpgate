@@ -348,7 +348,17 @@ if [ "$CAPPED" = "yes" ]; then
         *)         __r1="" ;;
       esac
       case "$__r1" in
-        10.9[6-9].*|10.10[0-9].*|10.11[0-1].*) CACHE_DNS=(--dns "$__r1") ;;
+        10.9[6-9].*|10.10[0-9].*|10.11[0-1].*)
+          CACHE_DNS=(--dns "$__r1")
+          # SAY SO WHEN IT WORKS. Every other outcome of this block prints a
+          # line; success printed nothing, so the only evidence the derivation
+          # had run correctly was the ABSENCE of a fallback marker -- and a
+          # block that was deleted, short-circuited or never reached emits no
+          # absence to notice. A run could not distinguish "derived 10.96.0.10"
+          # from "this code is gone". One line per capped check is the price of
+          # being able to tell those apart from the log.
+          echo "CACHE-DNS-DERIVED $NAME — capped container gets resolver $__r1, derived from the '# ExtServers:' line in $__rf" >&2
+          ;;
         *) echo "CACHE-DNS-FALLBACK $NAME — '# ExtServers:' names '$__r1', which is not an IPv4 address in the cluster service range 10.96.0.0/12; refusing to hand it to the sandbox as a resolver, falling back to --add-host" >&2 ;;
       esac
     fi
