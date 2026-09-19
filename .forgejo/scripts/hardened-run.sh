@@ -420,6 +420,40 @@ else
   [ -n "$peak_bytes" ] || peak_why="neither memory.peak (cgroup v2) nor memory.max_usage_in_bytes (v1) was readable"
 fi
 
+# THE PEAK SATURATES AT THE CAP, SO IT CANNOT ANSWER THE QUESTION ALONE.
+# memory.current is held under memory.max by reclaim, so memory.peak can never
+# exceed the cap by construction. Run 2836 showed what that costs: three of five
+# capped checks read exactly "7168 MiB of 7168 MiB cap (100%)" -- unit-tests which
+# PASSED, schema-compat which failed on its own merits, and release-build which was
+# OOM-killed. Three different outcomes, one identical string. A peak at the ceiling
+# says "it pressed against the limit" and can never say whether the check wanted
+# 7.1 GiB or 40, which is the distinction runcove-ljvj.2 was filed to make because
+# the two argue for opposite decisions (nudge the cap, or move the build).
+#
+# memory.events is the half that decides it. cgroup v2 maintains counters for THIS
+# cgroup: `max` counts how many times allocation hit the limit, `oom` how many times
+# it could not be reclaimed, and `oom_kill` how many processes the kernel killed
+# INSIDE THIS CGROUP. That last one is the direct answer to "was it our cap or the
+# host", which no exit code can give -- we have now watched one OOM arrive as 137
+# and the same event arrive as 101 once sccache was in the way, because an exit code
+# is a downstream report and oom_kill is the kernel's own count of what happened.
+oom_kill=""
+mem_max_events=""
+oom_events=""
+events_why=""
+if [ "${HARDENED_RUN_DRY:-}" = "1" ]; then
+  events_why="dry run"
+else
+  ev=$(docker exec "$NAME" cat /sys/fs/cgroup/memory.events 2>/dev/null) || ev=""
+  if [ -n "$ev" ]; then
+    oom_kill=$(printf '%s\n' "$ev" | awk '$1=="oom_kill"{print $2; exit}')
+    oom_events=$(printf '%s\n' "$ev" | awk '$1=="oom"{print $2; exit}')
+    mem_max_events=$(printf '%s\n' "$ev" | awk '$1=="max"{print $2; exit}')
+  else
+    events_why="memory.events was not readable (cgroup v1 does not provide it)"
+  fi
+fi
+
 if [ -n "$peak_bytes" ]; then
   peak_mib=$(( peak_bytes / 1048576 ))
   if [ -n "${EXPECT_MEM:-}" ] && [ "${EXPECT_MEM:-0}" -gt 0 ] 2>/dev/null; then
@@ -429,14 +463,25 @@ if [ -n "$peak_bytes" ]; then
   else
     echo "MEM-PEAK ${peak_mib} MiB, from ${peak_src} (cap not parsed, so no percentage)"
   fi
-  # 137 is SIGKILL+128. Say what it means in the same breath as the number, so
-  # nobody has to remember the encoding to read the line that matters most.
-  if [ "$EXEC_RC" -eq 137 ]; then
-    echo "MEM-PEAK the check was KILLED (exit 137 = SIGKILL). The peak above is at or near the cap, which is what a cap kill looks like; it is a FLOOR on what the check wanted, not the amount it needed to finish."
-  fi
 else
   # Absence must never read as health. See trap 60 and this arc generally.
   echo "MEM-PEAK-UNAVAILABLE no peak-memory reading: ${peak_why:-unknown}. Exit was ${EXEC_RC}; if that is 137 the diagnosis this line exists for is NOT available."
+fi
+
+# The FLOOR caveat is keyed on oom_kill, NOT on an exit code. It used to fire only
+# on 137, and run 2836 proved that wrong in the worst way: release-build's OOM came
+# back as 101 because sccache caught the SIGKILL and reported it as an ordinary
+# compile failure, so the one check that most needed this caveat was the only one
+# that did not get it. oom_kill is the event; an exit code is a rumour about it.
+if [ -n "$oom_kill" ]; then
+  echo "MEM-EVENTS oom_kill=${oom_kill} oom=${oom_events:-?} limit-hits=${mem_max_events:-?} (cgroup v2 memory.events, this container only). Exit was ${EXEC_RC}."
+  if [ "$oom_kill" -gt 0 ] 2>/dev/null; then
+    echo "MEM-EVENTS THE KERNEL KILLED ${oom_kill} PROCESS(ES) IN THIS CGROUP: the cap did this, not the host. Any MEM-PEAK above is a FLOOR on what the check wanted, not the amount it needed to finish -- it stops at the cap by construction, so it cannot tell you how much more it would have used."
+  elif [ "$EXEC_RC" -ne 0 ]; then
+    echo "MEM-EVENTS no OOM kill in this cgroup, so exit ${EXEC_RC} is NOT this cap. If something was killed, it was killed by the host and this container was not the cgroup it was charged to."
+  fi
+else
+  echo "MEM-EVENTS-UNAVAILABLE ${events_why:-unknown}. Without it, a MEM-PEAK at 100% of cap cannot be told apart from one that merely brushed the limit and recovered, and exit ${EXEC_RC} cannot be attributed to the cap or the host."
 fi
 
 exit "$EXEC_RC"

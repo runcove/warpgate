@@ -138,6 +138,13 @@ grep -q 'CACHE-STATS clippy — requests=772 .*hits=765 misses=7' <<<"$out" \
 grep -q 'avg-read-hit=0.167 s' <<<"$out" \
   && ok "the reading carries what a read COST, which is the NAS question" \
   || bad "CACHE-STATS omits the average read-hit time: $out"
+# A cost is only meaningful beside the cost of the alternative. Run 2840 printed
+# avg-read-hit=0.008 s and answered nothing on its own -- it took a second source
+# to know that the compile it replaced takes seconds, which is the whole argument
+# for the cache. Both numbers on one line make it self-pricing.
+grep -q 'avg-compile=1.842 s' <<<"$out" \
+  && ok "the reading also carries what COMPILING costs, so the line prices itself" \
+  || bad "CACHE-STATS gives a fetch's cost with nothing to compare it against: $out"
 grep -q 'CACHE-STATS-UNAVAILABLE' <<<"$out" \
   && bad "a healthy cache reported its reading as unavailable: $out" \
   || ok "a healthy cache does not also claim the reading is unavailable"

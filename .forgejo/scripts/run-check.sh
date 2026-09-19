@@ -436,6 +436,7 @@ if [ -n "${RUSTC_WRAPPER:-}" ]; then
       __c_wre=$(__cg 'Cache write errors')
       __c_err=$(__cg 'Cache errors')
       __c_avg=$(__cg 'Average cache read hit')
+      __c_cmpt=$(__cg 'Average compiler')
       __c_gone=""
       [ -n "$__c_req" ] || __c_gone="$__c_gone 'Compile requests'"
       [ -n "$__c_hit" ] || __c_gone="$__c_gone 'Cache hits'"
@@ -444,7 +445,7 @@ if [ -n "${RUSTC_WRAPPER:-}" ]; then
         echo "CACHE-STATS-UNAVAILABLE @@NAME@@ — sccache --show-stats ran, but these labels were not in its output:$__c_gone. The output format has changed from the one this parser was written against (sccache 0.17.0, pinned in the ci-toolchain Dockerfile); no cache reading is available for this check until the parser is updated." >&2
         return
       fi
-      echo "CACHE-STATS @@NAME@@ — requests=$__c_req executed=$__c_exe hits=$__c_hit misses=$__c_mis rate=$__c_rat compilations=$__c_cmp read-errors=$__c_rde write-errors=$__c_wre errors=$__c_err avg-read-hit=$__c_avg" >&2
+      echo "CACHE-STATS @@NAME@@ — requests=$__c_req executed=$__c_exe hits=$__c_hit misses=$__c_mis rate=$__c_rat compilations=$__c_cmp read-errors=$__c_rde write-errors=$__c_wre errors=$__c_err avg-read-hit=$__c_avg avg-compile=$__c_cmpt" >&2
       case "$__c_hit" in
         0|'') echo "CACHE-STATS @@NAME@@ — zero hits: everything this check compiled, it compiled itself. That is what a cold store looks like AND what a store it cannot read from looks like; read-errors and errors above are what separate them." >&2 ;;
       esac

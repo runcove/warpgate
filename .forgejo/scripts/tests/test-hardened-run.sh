@@ -846,21 +846,81 @@ grep -q "MEM-PEAK" <<<"$out" \
   && ok "...on a SUCCEEDING check, so healthy runs establish the normal band" \
   || bad "MEM-PEAK absent from a successful run: $out"
 
-#     The 137 case says what 137 means, and is honest that a cap kill gives a
-#     FLOOR rather than the requirement.
+#     THE KILL CASE, KEYED ON oom_kill AND NOT ON AN EXIT CODE. This caveat used
+#     to fire only on 137, and run 2836 proved that wrong in the worst possible
+#     way: release-build's OOM came back as exit 101, because sccache caught the
+#     SIGKILL and reported it as an ordinary compile failure. The one check that
+#     most needed the caveat was the only one that did not get it. oom_kill is
+#     the kernel's own count of the event; an exit code is a rumour about it.
 out=$(PATH="$FIXTURES:$PATH" HARDENED_RUN_IMAGE=stub-image \
       STUB_DOCKER_MEM=7516192768 STUB_DOCKER_NANOCPUS=4000000000 \
       STUB_DOCKER_EXEC_CAT_OUTPUT=7516192768 STUB_DOCKER_EXEC_RC=137 \
+      STUB_DOCKER_EXEC_EVENTS_OUTPUT="low 0
+high 0
+max 12
+oom 3
+oom_kill 1" \
       "$SCRIPT" --cpus 4 --memory 7g -- true 2>&1); rc=$?
 [ "$rc" -eq 137 ] \
   && ok "the check's own exit status survives the diagnostic (137 in, 137 out)" \
   || bad "the peak-memory read changed the exit status: got $rc, want 137"
-grep -q "KILLED (exit 137 = SIGKILL)" <<<"$out" \
-  && ok "...and a 137 is explained in the same breath as the number" \
-  || bad "137 not explained alongside the peak: $out"
+grep -q "MEM-EVENTS oom_kill=1 oom=3 limit-hits=12" <<<"$out" \
+  && ok "the kernel's own OOM counters are reported for this cgroup" \
+  || bad "no MEM-EVENTS counters: $out"
+grep -q "the cap did this, not the host" <<<"$out" \
+  && ok "...attributing the kill to the cap rather than to the host" \
+  || bad "an oom_kill was not attributed to the cap: $out"
 grep -q "FLOOR on what the check wanted" <<<"$out" \
   && ok "...saying the peak is a floor, not the amount needed to finish" \
   || bad "the floor caveat is missing, so the number reads as a requirement: $out"
+
+#     THE CASE THE 137 KEYING MISSED, asserted directly: the same OOM arriving
+#     as an ordinary exit code because a wrapper swallowed the signal. Exit 101,
+#     oom_kill=1. The caveat must still fire. Without this assertion the fix is
+#     indistinguishable from the bug it replaces.
+out=$(PATH="$FIXTURES:$PATH" HARDENED_RUN_IMAGE=stub-image \
+      STUB_DOCKER_MEM=7516192768 STUB_DOCKER_NANOCPUS=4000000000 \
+      STUB_DOCKER_EXEC_CAT_OUTPUT=7516192768 STUB_DOCKER_EXEC_RC=101 \
+      STUB_DOCKER_EXEC_EVENTS_OUTPUT="max 9
+oom 2
+oom_kill 1" \
+      "$SCRIPT" --cpus 4 --memory 7g -- true 2>&1); rc=$?
+[ "$rc" -eq 101 ] && ok "an sccache-converted OOM keeps its own exit status (101)" \
+  || bad "exit status changed: got $rc, want 101"
+grep -q "the cap did this, not the host" <<<"$out" \
+  && ok "an OOM that arrives as exit 101 is STILL attributed to the cap" \
+  || bad "the 101-shaped OOM was not recognised -- this is run 2836's defect intact: $out"
+
+#     And the complement, which is the half that makes it a discriminator rather
+#     than a label: a failure with NO oom_kill must be said NOT to be the cap.
+#     Without this, every failure at a high peak would read as a cap problem.
+out=$(PATH="$FIXTURES:$PATH" HARDENED_RUN_IMAGE=stub-image \
+      STUB_DOCKER_MEM=7516192768 STUB_DOCKER_NANOCPUS=4000000000 \
+      STUB_DOCKER_EXEC_CAT_OUTPUT=7516192768 STUB_DOCKER_EXEC_RC=1 \
+      STUB_DOCKER_EXEC_EVENTS_OUTPUT="max 4
+oom 0
+oom_kill 0" \
+      "$SCRIPT" --cpus 4 --memory 7g -- true 2>&1)
+grep -q "is NOT this cap" <<<"$out" \
+  && ok "a failure with no OOM kill is explicitly cleared of the cap" \
+  || bad "a non-OOM failure at a 100% peak was left ambiguous: $out"
+grep -q "the cap did this, not the host" <<<"$out" \
+  && bad "a run with oom_kill=0 was blamed on the cap anyway: $out" \
+  || ok "...and is not blamed on the cap"
+
+#     memory.events absent (cgroup v1) must be LOUD, exactly as the peak's
+#     absence is. A peak of 100% with no events line is the ambiguity this
+#     whole follow-up exists to remove, so it must say so itself.
+out=$(PATH="$FIXTURES:$PATH" HARDENED_RUN_IMAGE=stub-image \
+      STUB_DOCKER_MEM=7516192768 STUB_DOCKER_NANOCPUS=4000000000 \
+      STUB_DOCKER_EXEC_CAT_OUTPUT=7516192768 STUB_DOCKER_EXEC_RC=137 \
+      "$SCRIPT" --cpus 4 --memory 7g -- true 2>&1)
+grep -q "MEM-EVENTS-UNAVAILABLE" <<<"$out" \
+  && ok "an unreadable memory.events is REPORTED, never silent" \
+  || bad "memory.events could not be read and nothing said so: $out"
+grep -q "cannot be told apart from one that merely brushed the limit" <<<"$out" \
+  && ok "...and names the ambiguity that leaves behind" \
+  || bad "the unavailable line does not say what is lost: $out"
 
 #     ABSENCE MUST BE LOUD. If neither cgroup file can be read, silence would
 #     look exactly like a healthy run that simply did not print. This is the

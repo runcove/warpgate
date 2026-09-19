@@ -87,6 +87,23 @@ case "$cmd" in
       esac
     done
     if [ "$is_cat" -eq 1 ]; then
+      # TWO cgroup files are read now, and they must be answerable SEPARATELY.
+      # A stub that returned one blob for any `cat` could not express the case
+      # that matters most -- a peak that is readable while memory.events is not
+      # (cgroup v1) -- and a test suite that cannot express a case cannot
+      # assert on it. Dispatch on the path, which is what the real cgroup does.
+      is_events=0
+      for a in "$@"; do
+        case "$a" in */memory.events) is_events=1 ;; esac
+      done
+      if [ "$is_events" -eq 1 ]; then
+        # Empty by default: memory.events unreadable, which hardened-run.sh must
+        # report as MEM-EVENTS-UNAVAILABLE rather than pass over in silence.
+        if [ -n "${STUB_DOCKER_EXEC_EVENTS_OUTPUT:-}" ]; then
+          printf '%s\n' "$STUB_DOCKER_EXEC_EVENTS_OUTPUT"
+        fi
+        exit "${STUB_DOCKER_EXEC_EVENTS_RC:-0}"
+      fi
       # Empty by default: no peak reading available, which is the path
       # hardened-run.sh must report as MEM-PEAK-UNAVAILABLE rather than pass
       # over in silence. Set STUB_DOCKER_EXEC_CAT_OUTPUT to supply a value.
