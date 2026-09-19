@@ -114,17 +114,18 @@ fi
 # Every declared tool is checked, not just the first -- reporting only one
 # missing tool per run is how a four-tool gap takes four CI runs to
 # discover, and each of those runs costs a human a read.
-if [ -z "${RUN_CHECK_DRY:-}" ] && [ -z "${RUN_CHECK_FORCE_RC:-}" ] && [ -z "${RUN_CHECK_FORCE_STATE:-}" ]; then
-  missing_tools=()
-  IFS=',' read -r -a TOOL_LIST <<<"$TOOLS"
-  for t in "${TOOL_LIST[@]}"; do
-    command -v "$t" >/dev/null 2>&1 || missing_tools+=("$t")
-  done
-  if [ "${#missing_tools[@]}" -gt 0 ]; then
-    echo "REFUSE $NAME — required tool(s) not installed: ${missing_tools[*]} (exit 97). The environment cannot run this check; it never ran." >&2
-    exit 97
-  fi
-fi
+#
+# WHERE the question is asked is the whole of it (2026-09-19). Until today this
+# gate ran `command -v` in the JOB container for every check, and then the
+# capped ones went and ran their command INSIDE hardened-run.sh's container --
+# a different image. So for every capped check the gate interrogated a
+# filesystem the command would never touch: `cargo` was demanded where it is
+# never used, while HARDENED_RUN_IMAGE, where it actually has to exist, was
+# never asked. That is why the fork briefly grew a bespoke Rust job image
+# (runs 518/523/525, withdrawn in d6c3a20a) -- an image built to satisfy a
+# question being put to the wrong machine.
+#
+# So the gate splits on CAPPED, which is computed just above for this reason.
 
 # Whether a check is capped is a safety decision, not a convenience one: an
 # uncapped Rust build on this cluster has already taken the control plane
@@ -135,8 +136,51 @@ fi
 # stale "True"/"False" from before compiles_token() existed, or a lookup that
 # partially failed. An unrecognised value never gets to mean "safe to run
 # uncapped" by accident.
+#
+# Moved above the tools gate on 2026-09-19: the gate cannot split on CAPPED
+# while CAPPED is computed twenty lines below it. Nothing between the old and
+# new position reads it, so this is a move, not a change.
 CAPPED=yes
 [ "$COMPILES" = "false" ] && CAPPED=no
+
+IFS=',' read -r -a TOOL_LIST <<<"$TOOLS"
+
+# UNCAPPED checks run their command right here, in the job container, so the
+# job container is the right place to ask. Unchanged from the original gate.
+if [ "$CAPPED" = "no" ] \
+   && [ -z "${RUN_CHECK_DRY:-}" ] && [ -z "${RUN_CHECK_FORCE_RC:-}" ] && [ -z "${RUN_CHECK_FORCE_STATE:-}" ]; then
+  missing_tools=()
+  for t in "${TOOL_LIST[@]}"; do
+    command -v "$t" >/dev/null 2>&1 || missing_tools+=("$t")
+  done
+  if [ "${#missing_tools[@]}" -gt 0 ]; then
+    echo "REFUSE $NAME — required tool(s) not installed in the job container, where this uncapped check runs: ${missing_tools[*]} (exit 97). The environment cannot run this check; it never ran." >&2
+    exit 97
+  fi
+fi
+
+# CAPPED checks are asked the same question INSIDE the sandbox, by prefixing
+# the probe to the command hardened-run.sh is handed. One container, not two:
+# hardened-run.sh's last line is `docker exec ... "$@"`, so the inner exit
+# status IS its exit status, and an inner 97 arrives at the 89-99 band handler
+# below exactly as the job-container gate's 97 would have. A separate probe
+# container would cost a second container start per capped check and prove the
+# same thing.
+#
+# The message names WHICH filesystem was missing the tool. "required tool(s)
+# not installed", with no location, is one sentence for two different
+# environments -- and telling those apart is the entire point of this split.
+TOOL_PROBE=""
+if [ "$CAPPED" = "yes" ]; then
+  probe_list=""
+  for t in "${TOOL_LIST[@]}"; do
+    # Quoted when composed. These names come from checks.yaml, which is ours
+    # and validated, but building a shell string out of a data file unquoted
+    # is a habit worth not having.
+    probe_list+=" $(printf '%q' "$t")"
+  done
+  TOOL_PROBE="for __t in${probe_list}; do command -v \"\$__t\" >/dev/null 2>&1 || { echo \"REFUSE $(printf '%q' "$NAME") — required tool not installed inside the sandbox, where this capped check runs: \$__t (exit 97). The environment cannot run this check; it never ran.\" >&2; exit 97; }; done; "
+fi
 
 # The seven variables sccache needs to help a capped/compiling check: the
 # five cache-env.sh (Task 3) prints, plus the two AWS credentials it
@@ -154,7 +198,11 @@ for v in "${CACHE_FORWARD_VARS[@]}"; do FORWARD_FLAGS+=(--forward-env "$v"); don
 
 if [ "${RUN_CHECK_DRY:-}" = "1" ]; then
   if [ "$CAPPED" = "yes" ]; then
-    echo "would run via hardened-run: $COMMAND"
+    # The probe is printed as part of the command because it IS part of the
+    # command -- this is the only place the capped tools gate can be observed
+    # without a container engine, and baba has none (podman is off-limits,
+    # Ruling 45). tests/test-run-check.sh asserts on it here.
+    echo "would run via hardened-run: ${TOOL_PROBE}$COMMAND"
   else
     echo "would run directly: $COMMAND"
   fi
@@ -173,7 +221,7 @@ elif [ "$CAPPED" = "yes" ]; then
   # that fact belongs here, not there.
   "$HERE/hardened-run.sh" --cpus "${CI_CPUS:-4}" --memory "${CI_MEMORY:-7g}" \
     --label "check-$NAME" --source "$PWD" --workdir /src --verify-file Cargo.toml \
-    "${FORWARD_FLAGS[@]}" -- bash -lc "$COMMAND"
+    "${FORWARD_FLAGS[@]}" -- bash -lc "${TOOL_PROBE}$COMMAND"
   rc=$?
 else
   bash -lc "$COMMAND"

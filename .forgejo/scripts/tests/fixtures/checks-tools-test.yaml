@@ -24,3 +24,22 @@ checks:
     compiles: false
     state: reporting
     tools: [bash]
+  # Capped entries, added 2026-09-19 for the split tools gate. A capped check's
+  # command runs inside hardened-run.sh's container, so its tools must be
+  # checked THERE, not in the job container. "made-up-tool-zzz" is absent from
+  # every PATH by construction, so the missing-tool case needs no PATH
+  # restriction -- which matters here because the probe is executed through
+  # `bash -lc`, and a crippled PATH makes the login shell itself fail for
+  # reasons unrelated to the thing under test (measured, 2026-09-19).
+  - name: fake-capped-missing-tool
+    upstream: build.yml
+    command: "echo SHOULD_NOT_RUN_CAPPED"
+    compiles: true
+    state: reporting
+    tools: [made-up-tool-zzz]
+  - name: fake-capped-present-tool
+    upstream: build.yml
+    command: "echo CAPPED_COMMAND_RAN"
+    compiles: true
+    state: reporting
+    tools: [bash]

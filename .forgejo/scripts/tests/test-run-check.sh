@@ -259,6 +259,92 @@ grep -qi "report-only" <<<"$out" \
 
 rm -rf "$TOOLS_BIN"
 
+# ---------------------------------------------------------------------------
+# The tools gate asks WHERE THE COMMAND RUNS (2026-09-19, homelab-br5.16).
+#
+# Until today the gate ran `command -v` in the job container for every check,
+# while capped checks went on to run their command inside hardened-run.sh's
+# container -- a different image. So a capped check's tools were demanded on a
+# filesystem the command would never touch. The gate now splits: uncapped
+# checks are asked here (every assertion above still passes unchanged, which is
+# how we know the uncapped half did not move), capped checks are asked inside
+# the sandbox by a probe prefixed to the command.
+#
+# The three cases below are the composition; the two after them EXECUTE the
+# composed string, because a probe that is composed correctly is not a probe
+# that refuses correctly.
+# ---------------------------------------------------------------------------
+out=$(CHECKS_FILE="$TOOLS_FIXTURE" RUN_CHECK_DRY=1 "$SCRIPT" fake-capped-missing-tool 2>&1)
+grep -q "made-up-tool-zzz" <<<"$out" \
+  && ok "capped: the probe names the declared tool" \
+  || bad "capped: dry run does not carry a probe for the declared tool: $out"
+grep -q "inside the sandbox" <<<"$out" \
+  && ok "capped: the probe says WHICH environment it is asking about" \
+  || bad "capped: the probe does not name the environment: $out"
+out=$(CHECKS_FILE="$TOOLS_FIXTURE" RUN_CHECK_DRY=1 "$SCRIPT" fake-present-tool 2>&1)
+grep -q "command -v" <<<"$out" \
+  && bad "uncapped: a sandbox probe was prefixed to a check that runs in the job container: $out" \
+  || ok "uncapped: no sandbox probe — it is gated here, where it runs"
+
+# Executed, not just composed. hardened-run-exec-stub.sh runs the string
+# run-check.sh hands the sandbox, so the probe's own shell decides the exit
+# code. Safe because this fixture's commands are `echo`s: pointing this at the
+# real checks.yaml would hand it `just clippy` and start a Rust build on the
+# machine running the tests.
+#
+# No PATH restriction here, deliberately. "made-up-tool-zzz" is absent from
+# every PATH by construction, and the probe runs under `bash -lc`, which
+# sources login profiles -- under a crippled PATH those fail for reasons of
+# their own and return an exit code that has nothing to do with the probe.
+# Measured 2026-09-19: a first version of this test returned 101 for BOTH the
+# missing-tool and present-tool cases, from /usr/libexec/grepconf.sh, and could
+# not distinguish them at all.
+#
+# The directory is built from $SCRIPT's OWN directory, not from "$HERE/..".
+# First version of this block symlinked "$HERE/../run-check.sh" -- the real
+# script -- so it ignored $SCRIPT entirely and every assertion below tested the
+# unmutated original no matter what was under test. Found 2026-09-19 by
+# mutation: removing the split and disarming the probe both left this suite
+# green. A test that cannot be pointed at the code under test is not a test of
+# it, which is this suite's own subject matter turned on itself.
+EXEC_DIR="${TMPDIR:-/tmp}/run-check-capped-exec.$$"
+mkdir -p "$EXEC_DIR"
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT")" && pwd)"
+for f in "$SCRIPT_DIR"/*; do ln -sf "$f" "$EXEC_DIR/$(basename "$f")"; done
+# Overrides the hardened-run.sh just linked in: last write wins, and this one
+# executes what it is handed instead of starting a container.
+ln -sf "$HERE/fixtures/hardened-run-exec-stub.sh" "$EXEC_DIR/hardened-run.sh"
+
+# Guard against the failure above ever returning silently: the script this
+# block is about to run must be the one under test.
+if [ "$(readlink -f "$EXEC_DIR/run-check.sh")" = "$(readlink -f "$SCRIPT")" ]; then
+  ok "capped exec harness points at the script under test"
+else
+  bad "capped exec harness points at $(readlink -f "$EXEC_DIR/run-check.sh"), not $(readlink -f "$SCRIPT") — every capped assertion below would be void"
+fi
+
+out=$(CHECKS_FILE="$TOOLS_FIXTURE" "$EXEC_DIR/run-check.sh" fake-capped-missing-tool 2>&1); rc=$?
+[ "$rc" -eq 97 ] && ok "capped, tool missing in the sandbox: exits 97" \
+  || bad "capped, tool missing: expected rc=97, got rc=$rc: $out"
+grep -q "SHOULD_NOT_RUN_CAPPED" <<<"$out" \
+  && bad "capped, tool missing: the check's command ran anyway: $out" \
+  || ok "capped, tool missing: the command never ran"
+grep -q "inside the sandbox" <<<"$out" \
+  && ok "capped, tool missing: says which environment lacked it" \
+  || bad "capped, tool missing: does not say where it looked: $out"
+
+# The control. Without it, a probe hardwired to refuse would pass everything
+# above -- and a gate that refuses everything is as useless as one that refuses
+# nothing.
+out=$(CHECKS_FILE="$TOOLS_FIXTURE" "$EXEC_DIR/run-check.sh" fake-capped-present-tool 2>&1); rc=$?
+[ "$rc" -eq 0 ] && ok "capped, tool present: the probe lets the command through" \
+  || bad "capped, tool present: expected rc=0, got rc=$rc: $out"
+grep -q "CAPPED_COMMAND_RAN" <<<"$out" \
+  && ok "capped, tool present: the command actually ran" \
+  || bad "capped, tool present: the command did not run: $out"
+
+rm -rf "$EXEC_DIR"
+
 # Step 4(b): a check whose command exits 127 with its declared tools present
 # still exits 97 -- the backstop (Step 2), independent of Step 1. No PATH
 # restriction needed: RUN_CHECK_FORCE_RC bypasses running the command
