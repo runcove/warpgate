@@ -10,8 +10,10 @@
 # "our image is subtly wrong". That is the single largest risk in this arc, and
 # the only cheap place to cut it is here, before the image is ever tagged.
 #
-# THE CASE THIS EXISTS FOR, specifically. The workspace pins
-# `nightly-2026-07-09` in rust-toolchain.toml. An image carrying any other
+# THE CASE THIS EXISTS FOR, specifically. The workspace pins a dated nightly in
+# rust-toolchain.toml — that file is the source of truth, and the expected
+# value is passed in rather than written here so this script holds no second
+# copy to go stale. An image carrying any other
 # toolchain does not fail loudly: rustup will happily DOWNLOAD the pinned one
 # on first use if it can reach the network, so the image would work, slowly,
 # once per container, and an image carrying a stable toolchain would instead

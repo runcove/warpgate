@@ -19,7 +19,12 @@ bad() { echo "  FAIL  $1"; fails=1; }
 
 [ -f "$SCRIPT" ] || { echo "  FAIL  $SCRIPT not found"; exit 1; }
 
-PIN="nightly-2026-07-09"
+# A DELIBERATELY FICTIONAL pin, not the repo's real one. Two reasons: nothing
+# here should read like a third copy of a value whose source of truth is
+# rust-toolchain.toml, and using a date the script could not possibly know
+# proves it hard-codes the real pin nowhere — a suite written with the real
+# string would pass just as happily on a script that ignored its argument.
+PIN="nightly-2099-01-02"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 BIN="$TMP/bin"; mkdir -p "$BIN"
 # Real bash/grep/command etc. still need to work: this is a PATH built from
@@ -57,7 +62,7 @@ printf '[toolchain]\nchannel = "%s"\n' "$PIN" > "$WORK/rust-toolchain.toml"
 
 healthy() {
   make_stub rustup 0 "${PIN}-x86_64-unknown-linux-gnu (overridden by '$WORK/rust-toolchain.toml')"
-  make_stub cargo  0 "cargo 1.92.0-nightly (abcdef012 2026-07-08)"
+  make_stub cargo  0 "cargo 1.92.0-nightly (abcdef012 2099-01-01)"
   present $TOOLS; python_stub 0
 }
 run() { out=$(PATH="$BIN" bash "$SCRIPT" "$PIN" "$WORK" 2>&1); rc=$?; }
@@ -86,10 +91,10 @@ grep -q "look like a verdict on our code" <<<"$out" \
 # A near miss, not a different channel: the same nightly one day off. A
 # prefix/substring assertion written loosely would wave this through.
 healthy
-make_stub rustup 0 "nightly-2026-07-10-x86_64-unknown-linux-gnu (overridden)"
+make_stub rustup 0 "nightly-2099-01-03-x86_64-unknown-linux-gnu (overridden)"
 run
 [ "$rc" -eq 1 ] && ok "a nightly one day off the pin also fails" \
-  || bad "nightly-2026-07-10 was accepted as $PIN, got rc=$rc: $out"
+  || bad "a nightly one day off the pin was accepted as $PIN, got rc=$rc: $out"
 
 echo "== rustup failing is not the same as rustup disagreeing =="
 healthy
@@ -119,7 +124,7 @@ grep -q "Nothing was checked" <<<"$out" \
 # the assertions would then be testing a pin nobody asked for.
 healthy
 STALE="$TMP/stale"; mkdir -p "$STALE"
-printf '[toolchain]\nchannel = "nightly-2025-01-01"\n' > "$STALE/rust-toolchain.toml"
+printf '[toolchain]\nchannel = "nightly-2099-06-06"\n' > "$STALE/rust-toolchain.toml"
 out=$(PATH="$BIN" bash "$SCRIPT" "$PIN" "$STALE" 2>&1); rc=$?
 [ "$rc" -eq 2 ] && ok "pin file naming another toolchain: REFUSES (2)" \
   || bad "a stale expectation should refuse with 2, got rc=$rc: $out"

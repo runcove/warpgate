@@ -6,14 +6,25 @@
 # nothing distinguishes "upstream's verdict on our code" from "our image is
 # subtly wrong". Everything unusual in this file is aimed at that one risk.
 #
-# WHY NOT THE OFFICIAL `rust:` IMAGE. The workspace pins `nightly-2026-07-09`
-# in rust-toolchain.toml. The official images carry stable, so every cargo
-# command would fail in the ordinary range — five checks going red with nothing
-# in the log to say they went red for our reason rather than upstream's. A
-# stock image is not the cautious option here; it is the dangerous one.
+# WHY NOT THE OFFICIAL `rust:` IMAGE. The workspace pins a dated nightly in
+# rust-toolchain.toml. The official images carry stable, so every cargo command
+# would fail in the ordinary range — five checks going red with nothing in the
+# log to say they went red for our reason rather than upstream's. A stock image
+# is not the cautious option here; it is the dangerous one.
+#
+# WHICH COPY OF THE PIN IS THE SOURCE OF TRUTH. `rust-toolchain.toml` is, and
+# RUST_TOOLCHAIN below exists only because `rustup toolchain install` needs a
+# literal to install. The two cannot drift apart silently: assert-toolchain.sh
+# refuses the build unless rust-toolchain.toml NAMES the value passed to it, so
+# a repo that bumps its pin fails this image's BUILD rather than every later
+# run. Prose elsewhere in this file and in the assertion deliberately says "the
+# pinned toolchain" instead of repeating the string, so a bump leaves no stale
+# copies behind to mislead a reader.
 
 FROM debian:bookworm-slim
 
+# The one literal. Bump this together with rust-toolchain.toml; the assertion
+# below fails the build if you bump one and not the other.
 ARG RUST_TOOLCHAIN=nightly-2026-07-09
 # Upstream's own pins, copied from .github/workflows/. Where upstream is loose
 # we are not, and each of those is called out below.
