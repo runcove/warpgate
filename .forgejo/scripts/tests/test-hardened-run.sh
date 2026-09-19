@@ -304,32 +304,40 @@ out=$(HARDENED_RUN_DRY=1 "$SCRIPT" --cpus 4 --memory 7g --workdir /src -- true 2
 # `docker cp`'s contents-vs-directory distinction (the actual bug class this
 # task exists to close) cannot be proven by a stub that just returns
 # whatever exit code a test tells it to; only a genuine copy into a genuine
-# container proves the trailing "/." landed the files unnested. Prefers a
-# real `docker` binary when present (real CI: docker:28-dind); this
-# development host has no docker at all, so this falls back to a `docker`
-# shim over `podman` -- verified by hand against `alpine` beforehand
-# (run/exec/cp/inspect/rm all match docker's documented behaviour, including
-# the cp contents-vs-directory distinction) before being relied on here.
-# With neither available, these cases are SKIPPED and say so loudly -- never
-# silently counted as passing.
+# container proves the trailing "/." landed the files unnested. Where no real
+# engine exists these cases are SKIPPED and say so loudly -- never silently
+# counted as passing.
+#
+# DOCKER ONLY, AND THE ABSENCE OF A PODMAN FALLBACK IS THE POINT.
+# This block used to fall back to a `docker` shim over `podman`, with a
+# comment explaining that the development host has no docker. It works --
+# that is precisely the problem. baba has /usr/bin/podman, so every run of
+# this suite on this machine pulled alpine and ran real containers under
+# podman, and the four real-engine assertions below passed by doing it.
+#
+# Ruling 45 (Jeremy, 2026-09-18) says podman is not to be run by this session
+# or any worker it dispatches. He ruled it while holding the open choice
+# "prove the container path in CI, or allow podman here", and he chose CI. A
+# fallback buried in a test file quietly took the other option on his behalf
+# for a week, and nobody typed a podman command to do it.
+#
+# So the engine is docker or nothing, which makes the ruling operate rather
+# than merely be recorded:
+#   - on baba: the skip fires, cases 24-29 are visibly not proven here, and
+#     nothing reaches for a container engine at all;
+#   - in CI: the job container has a real docker daemon (preflight.sh asserts
+#     it), so these cases run for real against docker -- which IS what "prove
+#     it in CI instead" asked for.
+# That also removes a silent asymmetry: coverage here was better than
+# coverage there, and the run that mattered was the one getting less.
 REAL_ENGINE=""
 ENGINE_PATH_PREFIX=""
 if command -v docker >/dev/null 2>&1; then
   REAL_ENGINE=docker
-elif command -v podman >/dev/null 2>&1; then
-  REAL_ENGINE=podman
-  ENGINE_BIN_DIR="$MARKER_DIR/engine-bin"
-  mkdir -p "$ENGINE_BIN_DIR"
-  cat > "$ENGINE_BIN_DIR/docker" <<'SHIM'
-#!/usr/bin/env bash
-exec podman "$@"
-SHIM
-  chmod +x "$ENGINE_BIN_DIR/docker"
-  ENGINE_PATH_PREFIX="$ENGINE_BIN_DIR:"
 fi
 
 if [ -z "$REAL_ENGINE" ]; then
-  skip "no real container runtime (docker or podman) on PATH -- cases 24-29 (real --source delivery) cannot be proven here"
+  skip "no docker on PATH -- cases 24-29 (real --source delivery) are NOT proven here. This is deliberate: podman is not an accepted substitute (Ruling 45), so these run in CI, where a real docker daemon exists, and nowhere else."
 else
   TEST_IMAGE="${HARDENED_RUN_TEST_IMAGE:-docker.io/library/alpine:latest}"
   if PATH="${ENGINE_PATH_PREFIX}$PATH" timeout 90 docker pull "$TEST_IMAGE" >/dev/null 2>&1; then
