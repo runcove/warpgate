@@ -87,8 +87,39 @@ jobs:
     # run 514 measured. Honest refusals beat a job that cannot start.
     services:
       dind:
+        # --dns is the root-cause fix for the build cache never starting.
+        # Run 604 measured it: this job container's resolver is Docker's
+        # embedded one at 127.0.0.11, the dind daemon inherits that file,
+        # refuses to hand a LOOPBACK nameserver to the containers it starts,
+        # and substitutes its own built-in defaults -- Google's 8.8.8.8 and
+        # 8.8.4.4 -- which cannot answer for a homelab name. Giving dind a
+        # real address instead of a loopback one removes the substitution at
+        # its cause, where --add-host (run-check.sh) works around it one
+        # container further in. Both are kept: the mapping still covers the
+        # cache host if this resolver is ever unreachable.
+        #
+        # 10.96.0.10 is the kube-dns ClusterIP. It is READ, not remembered,
+        # and it rests on TWO independent readings taken on 2026-09-19:
+        #   (a) the `# ExtServers: [10.96.0.10]` line Docker itself wrote into
+        #       this job container's /etc/resolv.conf in run 604 -- i.e. the
+        #       address this very container's DNS already forwards to, and
+        #       which resolved the cache host there with rc=0;
+        #   (b) `kubectl get svc -n kube-system kube-dns`, run against the
+        #       cluster by the homelab operator session. The session that
+        #       wrote this line has no kubeconfig on baba and could not take
+        #       (b) itself; it is named here as someone else's reading rather
+        #       than folded in as if it were one.
+        # Reading (4) of the diagnostic step below re-takes (a) on every run
+        # and says loudly if this pin and the live value ever diverge.
+        #
+        # --dns-search is deliberately NOT set, against the suggestion that it
+        # should be. Run 604 lines 340 and 359 measured the dind-started
+        # containers as already carrying `search ci.svc.cluster.local
+        # svc.cluster.local cluster.local`: the substitution replaces the
+        # nameservers and KEEPS the search list. Naming one domain here would
+        # narrow a correct list of three to one, which is a change, not a fix.
         image: docker:28-dind
-        options: --privileged
+        options: --privileged --dns 10.96.0.10
         env: {DOCKER_TLS_CERTDIR: ""}
     env:
       DOCKER_HOST: tcp://dind:2375
@@ -286,6 +317,44 @@ jobs:
             docker run --rm --cpus=4 --memory=7g --memory-swap=7g "$HARDENED_RUN_IMAGE" sh -c \
               'echo "--- /etc/resolv.conf ---"; cat /etc/resolv.conf; echo "--- getent ---"; getent hosts '"$HOST"'; echo "getent rc=$?"'
             echo "docker run rc=$?"
+          fi
+          echo
+          echo "== (4) is the --dns pin in this file still what the cluster hands us? =="
+          # The services: block has to name the resolver as a literal -- YAML
+          # has no shell to resolve one. So the literal is CHECKED instead of
+          # trusted: the left side is read back out of the workflow file in
+          # the checkout, the right side out of the line Docker writes into
+          # this container's own /etc/resolv.conf. Nothing here is typed.
+          #
+          # Honest limit: this guard lives in a workflow step, so unlike
+          # run-check.sh's assertions nothing refuses its DELETION -- only its
+          # failure. Promoting it to a tested script is runcove-p4mu's shape,
+          # not this commit's.
+          # Anchored on the `options:` line, not on the first `--dns` in the
+          # file: the comments around it also say `--dns`, and a guard that
+          # can read its own prose instead of the live setting is the kind of
+          # reading that cannot tell two cases apart.
+          PINNED=$(grep -m1 -E '^[[:space:]]*options:.*--dns[[:space:]]' \
+                     .forgejo/workflows/ci.yml \
+                   | grep -oE -- '--dns[[:space:]]+[0-9]+(\.[0-9]+){3}' \
+                   | grep -oE '[0-9]+(\.[0-9]+){3}')
+          LIVE=$(grep -m1 '^# ExtServers:' /etc/resolv.conf \
+                 | grep -oE '[0-9]+(\.[0-9]+){3}' | head -1)
+          if [ -z "$PINNED" ] || [ -z "$LIVE" ]; then
+            # Stated, never silent: a missing reading is not a passing one.
+            echo "DNS-PIN UNCHECKED -- pinned='$PINNED' live='$LIVE'. One of the"
+            echo "  two readings did not come back, so this run says NOTHING about"
+            echo "  whether the pin is still right. Look at (1) above for why."
+          elif [ "$PINNED" = "$LIVE" ]; then
+            echo "DNS-PIN OK -- ci.yml pins $PINNED and this job container's"
+            echo "  resolver forwards to $PINNED. Two readings, same answer."
+          else
+            echo "DNS-PIN DRIFT -- ci.yml pins --dns $PINNED but this job"
+            echo "  container's resolver forwards to $LIVE. The dind containers"
+            echo "  are being pointed at an address the cluster no longer uses,"
+            echo "  so every capped check has lost DNS and is running uncached."
+            echo "  Fix: set --dns $LIVE in the services: dind: options of"
+            echo "  .forgejo/workflows/ci.yml."
           fi
           echo
           echo "DIAGNOSTIC COMPLETE -- exiting 0 whatever the above says."
