@@ -66,14 +66,35 @@ case "$cmd" in
     exit "${STUB_DOCKER_CP_RC:-0}"
     ;;
   exec)
-    is_mkdir=0 is_test=0 is_find=0
+    # The script runs several execs of its OWN before and after the caller's
+    # command -- mkdir/test/find to prepare and verify the workdir, and `cat` to
+    # read the cgroup's peak-memory file afterwards. None of them is the
+    # caller's real argv, and STUB_DOCKER_EXEC_ARGS_FILE is written with `>`, so
+    # letting one through means the LAST internal exec overwrites the recording
+    # and every assertion about the real command inspects the wrong invocation.
+    #
+    # `cat` was added 2026-09-19 with the peak-memory read, and it broke the
+    # forwarded-env assertions exactly that way: they reported that docker exec
+    # never received -e FORWARD_ME, which was a true statement about a probe and
+    # a false one about the command under test.
+    is_mkdir=0 is_test=0 is_find=0 is_cat=0
     for a in "$@"; do
       case "$a" in
         mkdir) is_mkdir=1 ;;
         test)  is_test=1 ;;
         find)  is_find=1 ;;
+        cat)   is_cat=1 ;;
       esac
     done
+    if [ "$is_cat" -eq 1 ]; then
+      # Empty by default: no peak reading available, which is the path
+      # hardened-run.sh must report as MEM-PEAK-UNAVAILABLE rather than pass
+      # over in silence. Set STUB_DOCKER_EXEC_CAT_OUTPUT to supply a value.
+      if [ -n "${STUB_DOCKER_EXEC_CAT_OUTPUT:-}" ]; then
+        printf '%s\n' "$STUB_DOCKER_EXEC_CAT_OUTPUT"
+      fi
+      exit "${STUB_DOCKER_EXEC_CAT_RC:-0}"
+    fi
     if [ "$is_mkdir" -eq 1 ]; then
       exit "${STUB_DOCKER_EXEC_MKDIR_RC:-0}"
     fi

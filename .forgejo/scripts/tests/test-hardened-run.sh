@@ -823,6 +823,69 @@ else
   bad "passing --dns and --add-host together lost one of them: $out"
 fi
 
+# 42. PEAK MEMORY (runcove-ljvj.2). A capped check killed at its cap left no
+#     memory reading at all, so a 137 could not distinguish "needed 7.1 GB"
+#     from "needed 40 GB" -- readings that argue for opposite decisions.
+#
+#     Read from the cgroup via `docker exec` AFTER the command returns, which
+#     works only because the container is started detached running `sleep` and
+#     the check runs inside it: an OOM kill takes the exec'd process, not the
+#     container, so the evidence outlives the event.
+out=$(PATH="$FIXTURES:$PATH" HARDENED_RUN_IMAGE=stub-image \
+      STUB_DOCKER_MEM=7516192768 STUB_DOCKER_NANOCPUS=4000000000 \
+      STUB_DOCKER_EXEC_CAT_OUTPUT=3221225472 \
+      "$SCRIPT" --cpus 4 --memory 7g -- true 2>&1)
+grep -q "MEM-PEAK 3072 MiB of 7168 MiB cap (42%)" <<<"$out" \
+  && ok "reports the peak against the cap, as bytes converted and a percentage" \
+  || bad "no usable MEM-PEAK line: $out"
+
+#     Unconditionally, not only on failure: one number with nothing to compare
+#     it against is the position ljvj.2 was filed from. A healthy run has to
+#     establish the band, so this must appear on a PASSING check too.
+grep -q "MEM-PEAK" <<<"$out" \
+  && ok "...on a SUCCEEDING check, so healthy runs establish the normal band" \
+  || bad "MEM-PEAK absent from a successful run: $out"
+
+#     The 137 case says what 137 means, and is honest that a cap kill gives a
+#     FLOOR rather than the requirement.
+out=$(PATH="$FIXTURES:$PATH" HARDENED_RUN_IMAGE=stub-image \
+      STUB_DOCKER_MEM=7516192768 STUB_DOCKER_NANOCPUS=4000000000 \
+      STUB_DOCKER_EXEC_CAT_OUTPUT=7516192768 STUB_DOCKER_EXEC_RC=137 \
+      "$SCRIPT" --cpus 4 --memory 7g -- true 2>&1); rc=$?
+[ "$rc" -eq 137 ] \
+  && ok "the check's own exit status survives the diagnostic (137 in, 137 out)" \
+  || bad "the peak-memory read changed the exit status: got $rc, want 137"
+grep -q "KILLED (exit 137 = SIGKILL)" <<<"$out" \
+  && ok "...and a 137 is explained in the same breath as the number" \
+  || bad "137 not explained alongside the peak: $out"
+grep -q "FLOOR on what the check wanted" <<<"$out" \
+  && ok "...saying the peak is a floor, not the amount needed to finish" \
+  || bad "the floor caveat is missing, so the number reads as a requirement: $out"
+
+#     ABSENCE MUST BE LOUD. If neither cgroup file can be read, silence would
+#     look exactly like a healthy run that simply did not print. This is the
+#     same shape as trap 60 and it is the failure this whole feature exists to
+#     remove, so it gets its own assertion rather than being assumed.
+out=$(PATH="$FIXTURES:$PATH" HARDENED_RUN_IMAGE=stub-image \
+      STUB_DOCKER_MEM=7516192768 STUB_DOCKER_NANOCPUS=4000000000 \
+      STUB_DOCKER_EXEC_CAT_OUTPUT= STUB_DOCKER_EXEC_RC=137 \
+      "$SCRIPT" --cpus 4 --memory 7g -- true 2>&1)
+grep -q "MEM-PEAK-UNAVAILABLE" <<<"$out" \
+  && ok "an unreadable cgroup is REPORTED, never silent" \
+  || bad "no peak was read and nothing said so: $out"
+grep -q "the diagnosis this line exists for is NOT available" <<<"$out" \
+  && ok "...and says plainly that a 137 is undiagnosable without it" \
+  || bad "the unavailable line does not connect itself to the 137: $out"
+
+#     A diagnostic that can fail a build is worse than the missing diagnostic
+#     it replaces. Prove the success path is unaffected too, not just the 137.
+out=$(PATH="$FIXTURES:$PATH" HARDENED_RUN_IMAGE=stub-image \
+      STUB_DOCKER_MEM=7516192768 STUB_DOCKER_NANOCPUS=4000000000 \
+      STUB_DOCKER_EXEC_CAT_OUTPUT= "$SCRIPT" --cpus 4 --memory 7g -- true 2>&1); rc=$?
+[ "$rc" -eq 0 ] \
+  && ok "a failed peak read cannot fail a passing check" \
+  || bad "an unreadable cgroup changed a passing check to $rc: $out"
+
 # 41. THE REQUIRE-FLAG ITSELF. Ruling (arc rulebook, "Settled"): "The proof
 #     needs a require-flag that turns that skip into a refusal AND a CI step
 #     that sets it. Anyone shortening this to 'we run the tests in CI now' has

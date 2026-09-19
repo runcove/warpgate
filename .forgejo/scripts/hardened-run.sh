@@ -385,3 +385,58 @@ fi
 EXEC_ARGS=("${FORWARD_ARGS[@]}")
 [ -n "$SOURCE" ] && EXEC_ARGS+=(--workdir "$WORKDIR")
 docker exec "${EXEC_ARGS[@]}" "$NAME" "$@"
+EXEC_RC=$?
+
+# PEAK MEMORY, read before the EXIT trap removes the container.
+#
+# Why this can work at all: the container is started DETACHED running `sleep
+# 86400` and the check runs inside it via `docker exec`. So when a check is
+# OOM-killed the container itself survives -- only the exec'd process dies --
+# and its cgroup is still there to be read. A `docker run <cmd>` design would
+# have destroyed the evidence at the moment it was created.
+#
+# Why unconditionally and not just on 137: a number is only diagnostic against a
+# band, and the band comes from healthy runs. Printed only on failure, the first
+# 137 would give one figure with nothing to compare it to -- which is the
+# position runcove-ljvj.2 was filed from. A 137 alone cannot distinguish "needed
+# 7.1 GB" from "needed 40 GB", and those argue for opposite decisions.
+#
+# NOTHING HERE MAY CHANGE THE CHECK'S RESULT. Every command is guarded and the
+# script exits with EXEC_RC regardless. A diagnostic that can fail a build is a
+# worse defect than the missing diagnostic it replaces.
+peak_bytes=""
+peak_src=""
+peak_why=""
+if [ "${HARDENED_RUN_DRY:-}" = "1" ]; then
+  peak_why="dry run"
+else
+  # cgroup v2 first (memory.peak), then v1 (memory.max_usage_in_bytes). Both are
+  # kernel-maintained high-water marks, so a single read after the fact is the
+  # true peak -- no sampling, nothing to miss between polls.
+  for probe in "/sys/fs/cgroup/memory.peak" "/sys/fs/cgroup/memory/memory.max_usage_in_bytes"; do
+    v=$(docker exec "$NAME" cat "$probe" 2>/dev/null | tr -dc '0-9') || v=""
+    if [ -n "$v" ]; then peak_bytes="$v"; peak_src="${probe##*/}"; break; fi
+  done
+  [ -n "$peak_bytes" ] || peak_why="neither memory.peak (cgroup v2) nor memory.max_usage_in_bytes (v1) was readable"
+fi
+
+if [ -n "$peak_bytes" ]; then
+  peak_mib=$(( peak_bytes / 1048576 ))
+  if [ -n "${EXPECT_MEM:-}" ] && [ "${EXPECT_MEM:-0}" -gt 0 ] 2>/dev/null; then
+    cap_mib=$(( EXPECT_MEM / 1048576 ))
+    pct=$(( peak_bytes * 100 / EXPECT_MEM ))
+    echo "MEM-PEAK ${peak_mib} MiB of ${cap_mib} MiB cap (${pct}%), from ${peak_src}"
+  else
+    echo "MEM-PEAK ${peak_mib} MiB, from ${peak_src} (cap not parsed, so no percentage)"
+  fi
+  # 137 is SIGKILL+128. Say what it means in the same breath as the number, so
+  # nobody has to remember the encoding to read the line that matters most.
+  if [ "$EXEC_RC" -eq 137 ]; then
+    echo "MEM-PEAK the check was KILLED (exit 137 = SIGKILL). The peak above is at or near the cap, which is what a cap kill looks like; it is a FLOOR on what the check wanted, not the amount it needed to finish."
+  fi
+else
+  # Absence must never read as health. See trap 60 and this arc generally.
+  echo "MEM-PEAK-UNAVAILABLE no peak-memory reading: ${peak_why:-unknown}. Exit was ${EXEC_RC}; if that is 137 the diagnosis this line exists for is NOT available."
+fi
+
+exit "$EXEC_RC"
