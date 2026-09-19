@@ -18,8 +18,13 @@ done
 # The real marker is written inside the capped container by run-check.sh's
 # CACHE_PROBE; what run-all-checks.sh sees either way is a line on the check's
 # output, which is exactly what this reproduces.
+# TWO lines, banner first, because that is the shape the real probe emits and
+# the shape that defeated the old single-line version in run 576. A one-line
+# fixture cannot tell "collects every marker" from "collects the first marker",
+# so the summary could drop the cause and this suite would stay green.
 for n in ${RUN_CHECK_STUB_CACHE_DEAD:-}; do
   if [ "$n" = "$name" ]; then
+    echo "CACHE-UNAVAILABLE $name — sccache: Starting the server..." >&2
     echo "CACHE-UNAVAILABLE $name — sccache: error: Server startup failed: region is missing" >&2
   fi
 done

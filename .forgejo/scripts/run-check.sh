@@ -235,11 +235,26 @@ for v in "${CACHE_FORWARD_VARS[@]}"; do FORWARD_FLAGS+=(--forward-env "$v"); don
 # capped, uncached, honest. A refusal would convert a cache outage into a red
 # run, which is the same over-reaction in the other direction.
 #
-# The marker line is deliberately greppable and carries sccache's OWN first
-# error line rather than a paraphrase. run-all-checks.sh collects it into the
-# run summary, so a cache that has been dead for a week says so in every run
-# instead of quietly becoming the new normal — the failure mode this arc keeps
-# meeting, where the degraded state is indistinguishable from the good one.
+# The marker line is deliberately greppable and carries sccache's OWN words
+# rather than a paraphrase. run-all-checks.sh collects it into the run summary,
+# so a cache that has been dead for a week says so in every run instead of
+# quietly becoming the new normal — the failure mode this arc keeps meeting,
+# where the degraded state is indistinguishable from the good one.
+#
+# EVERY non-blank line is emitted, each separately prefixed, and no line is
+# selected as "the" error. That is not tidiness, it is the fix for run 576.
+# This block used to take the FIRST non-blank line, and sccache prints a status
+# banner before it prints a cause, so all five markers in run 576 read
+# `CACHE-UNAVAILABLE clippy — sccache: Starting the server...` and the actual
+# reason was discarded with the rest of the captured text. A marker that cannot
+# distinguish one cache failure from another is the exact defect this arc exists
+# to catch, committed inside the guard built to catch it.
+#
+# Any rule for picking the interesting line is a guess about a format we do not
+# control, and the cost of guessing wrong is a run that reports a cache outage
+# without saying why — precisely what happened. Printing all of them cannot be
+# wrong; at worst it is three lines instead of one, in a block that only appears
+# when something is already broken.
 #
 # `--start-server` is the right call and `--show-stats` is not: cache-env.sh's
 # own notes record that --show-stats never contacts the backend, so it reports
@@ -255,7 +270,7 @@ for v in "${CACHE_FORWARD_VARS[@]}"; do FORWARD_FLAGS+=(--forward-env "$v"); don
 # block is built to fail in.
 CACHE_PROBE=""
 if [ "$CAPPED" = "yes" ]; then
-  CACHE_PROBE="if [ -n \"\${RUSTC_WRAPPER:-}\" ]; then if __ce=\$(sccache --start-server 2>&1); then :; else __cf=\$(printf '%s\n' \"\$__ce\" | grep -m1 '[^[:space:]]' || true); echo \"CACHE-UNAVAILABLE $(printf '%q' "$NAME") — \${__cf:-sccache could not start and printed nothing}\" >&2; unset RUSTC_WRAPPER; fi; fi; "
+  CACHE_PROBE="if [ -n \"\${RUSTC_WRAPPER:-}\" ]; then if __ce=\$(sccache --start-server 2>&1); then :; else __cf=\$(printf '%s\n' \"\$__ce\" | grep '[^[:space:]]' || true); if [ -n \"\$__cf\" ]; then printf '%s\n' \"\$__cf\" | while IFS= read -r __cl; do echo \"CACHE-UNAVAILABLE $(printf '%q' "$NAME") — \$__cl\" >&2; done; else echo \"CACHE-UNAVAILABLE $(printf '%q' "$NAME") — sccache could not start and printed nothing\" >&2; fi; unset RUSTC_WRAPPER; fi; fi; "
 fi
 
 if [ "${RUN_CHECK_DRY:-}" = "1" ]; then

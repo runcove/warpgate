@@ -55,6 +55,17 @@ summary_block=$(sed -n '/^cache unavailable on /,$p' <<<"$out")
 grep -q "region is missing" <<<"$summary_block" \
   && ok "the summary block itself carries sccache's OWN error, not a paraphrase" \
   || bad "summary block dropped the underlying cause: ${summary_block:-<no summary block>}"
+# The count is CHECKS, not marker lines. The fixture emits two lines for one
+# check precisely so these can disagree: with a single-line fixture "1 check"
+# and "1 line" are the same number and the counter cannot be wrong. It WAS
+# wrong -- until 19 Sep this counted lines, so run 576's "5 check(s)" was
+# correct only because each check happened to print exactly one line.
+[ "$(grep -c '^  CACHE-UNAVAILABLE ' <<<"$summary_block")" -eq 2 ] \
+  && ok "the summary block carries every marker line, banner and cause both" \
+  || bad "summary block did not carry both lines: ${summary_block:-<no summary block>}"
+grep -q "cache unavailable on 1 check(s)" <<<"$summary_block" \
+  && ok "the count is checks, not marker lines -- two lines from one check still reads 1" \
+  || bad "the summary counted lines and called them checks: ${summary_block:-<no summary block>}"
 
 #     The negative control. Every assertion above would also pass if the
 #     summary block printed unconditionally, so a clean run must NOT mention

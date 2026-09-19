@@ -423,6 +423,64 @@ grep -q "SHOULD_NOT_RUN_CAPPED_MULTI" <<<"$out" \
   && bad "capped, two tools missing: the check's command ran anyway: $out" \
   || ok "capped, two tools missing: the command never ran"
 
+# THE CACHE PROBE, EXECUTED AGAINST THE SHAPE THAT DEFEATED IT (run 576).
+#
+# Everything above about the probe asserts that a STRING is present in the
+# composed command. Presence was never the question. Run 576 carried the probe,
+# ran it, emitted the marker on all five capped checks -- and every marker read
+# `CACHE-UNAVAILABLE clippy — sccache: Starting the server...`, because the
+# probe took the FIRST non-blank line and sccache prints a status banner before
+# it prints a cause. The cache's actual reason for failing was discarded, so the
+# run could not be diagnosed at all. Five green assertions above, and the guard
+# was useless.
+#
+# So this runs the real probe with a real sccache on PATH that reproduces the
+# banner-then-error shape, and requires the CAUSE line specifically. A fixture
+# that emits its error on line 1 cannot fail for this bug, which is exactly why
+# the old one never did.
+SCC_DIR="${TMPDIR:-/tmp}/run-check-sccache.$$"
+mkdir -p "$SCC_DIR"
+cat > "$SCC_DIR/sccache" <<'FAKE'
+#!/usr/bin/env bash
+# The two-line shape sccache really produces: status first, cause second.
+echo "sccache: Starting the server..."
+echo "sccache: error: Server startup failed: create s3 cache failed: ConfigInvalid"
+exit 1
+FAKE
+chmod +x "$SCC_DIR/sccache"
+
+out=$(CHECKS_FILE="$TOOLS_FIXTURE" PATH="$SCC_DIR:$PATH" RUSTC_WRAPPER=sccache \
+        "$EXEC_DIR/run-check.sh" fake-capped-present-tool 2>&1); rc=$?
+grep -q "CACHE-UNAVAILABLE.*ConfigInvalid" <<<"$out" \
+  && ok "dead cache: the marker carries sccache's CAUSE, not just its banner" \
+  || bad "dead cache: no marker names the cause -- this is run 576's defect, the cache cannot be diagnosed from the log: $out"
+[ "$(grep -c 'CACHE-UNAVAILABLE' <<<"$out")" -ge 2 ] \
+  && ok "dead cache: every line of sccache's output is emitted, none selected away" \
+  || bad "dead cache: only one line survived, so a cause printed below a banner would be lost again: $out"
+[ "$rc" -eq 0 ] && ok "dead cache: the check still succeeds -- an outage costs speed, not correctness" \
+  || bad "dead cache: expected rc=0 (degrade), got rc=$rc -- a cache outage turned the run red: $out"
+grep -q "CAPPED_COMMAND_RAN" <<<"$out" \
+  && ok "dead cache: the command ran anyway, uncached" \
+  || bad "dead cache: the command did not run: $out"
+
+# The control. Without it every assertion above is satisfied by a probe wired to
+# report a dead cache unconditionally, which would make the marker meaningless
+# in the other direction -- a cache outage reported on every run, forever.
+cat > "$SCC_DIR/sccache" <<'FAKE'
+#!/usr/bin/env bash
+echo "sccache: Starting the server..."
+exit 0
+FAKE
+chmod +x "$SCC_DIR/sccache"
+out=$(CHECKS_FILE="$TOOLS_FIXTURE" PATH="$SCC_DIR:$PATH" RUSTC_WRAPPER=sccache \
+        "$EXEC_DIR/run-check.sh" fake-capped-present-tool 2>&1); rc=$?
+grep -q 'CACHE-UNAVAILABLE' <<<"$out" \
+  && bad "live cache: a working sccache was still reported unavailable: $out" \
+  || ok "live cache: no marker -- the probe distinguishes a dead cache from a live one"
+[ "$rc" -eq 0 ] && ok "live cache: the check succeeds" \
+  || bad "live cache: expected rc=0, got rc=$rc: $out"
+
+rm -rf "$SCC_DIR"
 rm -rf "$EXEC_DIR"
 
 # Step 4(b): a check whose command exits 127 with its declared tools present

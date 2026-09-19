@@ -46,9 +46,18 @@ count=0
 # (see its CACHE_PROBE), which is the right call: a cache outage must cost
 # speed, not correctness. But a silent degradation is how "the cache is dead"
 # becomes "the cache was never on", and the run gets slower and slower with
-# nobody able to name when it changed. So the probe emits a greppable
-# CACHE-UNAVAILABLE line carrying sccache's own first error, and this collects
-# them.
+# nobody able to name when it changed. So the probe emits greppable
+# CACHE-UNAVAILABLE lines carrying sccache's own output, and this collects them.
+#
+# TWO accumulators, not one, and the distinction is the whole point. The probe
+# emits one line per line sccache printed -- it deliberately selects none of
+# them, because run 576 proved that picking "the" error line picks the banner.
+# So the LINES are the detail and the CHECKS are the count. Collapsing them,
+# as this did until 19 Sep, makes "cache unavailable on N check(s)" report the
+# number of lines: one check printing three lines read as three checks. That is
+# this arc's own recurring fault in a counter -- a reading that cannot tell
+# "three checks with one problem" from "one check with three lines", printed as
+# the first.
 #
 # The tee is what makes that possible: this script previously let run-check.sh
 # write straight through, so there was no point at which its output could be
@@ -56,6 +65,7 @@ count=0
 # load-bearing for the refusal-band logic below -- `pipefail` alone would give
 # tee's status for a passing check that wrote a marker.
 CACHE_NOTES=()
+CACHE_CHECKS=()
 tmp_out="$(mktemp)"
 trap 'rm -f "$tmp_out"' EXIT
 
@@ -64,9 +74,14 @@ while IFS= read -r name; do
   count=$((count + 1))
   echo "::group::$name"
   "$HERE/run-check.sh" "$name" 2>&1 | tee "$tmp_out"; check_rc=${PIPESTATUS[0]}
+  check_notes=()
   while IFS= read -r note; do
-    [ -n "$note" ] && CACHE_NOTES+=("$note")
+    [ -n "$note" ] && check_notes+=("$note")
   done < <(grep -h '^CACHE-UNAVAILABLE ' "$tmp_out" || true)
+  if [ "${#check_notes[@]}" -gt 0 ]; then
+    CACHE_CHECKS+=("$name")
+    CACHE_NOTES+=("${check_notes[@]}")
+  fi
   echo "::endgroup::"
   if [ "$check_rc" -ne 0 ]; then
     if [ "$check_rc" -ge 89 ] && [ "$check_rc" -le 99 ]; then
@@ -101,8 +116,8 @@ echo "checks refused: $refused, checks failed: $failed"
 # What changed is that they ran uncached, and that is a fact about the run's
 # COST, reported next to its verdict rather than in place of one. It does not
 # touch $rc: a dead cache must never turn a green run red.
-if [ "${#CACHE_NOTES[@]}" -gt 0 ]; then
-  echo "cache unavailable on ${#CACHE_NOTES[@]} check(s) — they ran UNCACHED (slower, not wrong):"
+if [ "${#CACHE_CHECKS[@]}" -gt 0 ]; then
+  echo "cache unavailable on ${#CACHE_CHECKS[@]} check(s) — they ran UNCACHED (slower, not wrong):"
   printf '  %s\n' "${CACHE_NOTES[@]}"
   echo "  A cache that is down stays visible here on every run; if this line has"
   echo "  been present for days it is the finding, not the weather."
