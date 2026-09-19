@@ -1,0 +1,128 @@
+name: build-ci-toolchain
+# Builds and publishes the sandbox image the capped checks run inside
+# (HARDENED_RUN_IMAGE). Separate from build-image.yml on purpose: that one
+# builds the PRODUCT, this one builds the thing that tests it, and tangling
+# their triggers would mean a toolchain change waiting on a product build or
+# the other way round.
+
+on:
+  # MANUAL ONLY, and the reason matters more than the choice. This build
+  # compiles five cargo tools from source on a runner shared with the homelab
+  # repo — tens of minutes of a queue somebody else may be watching. A path
+  # filter on push would fire it on every comment edit in the Dockerfile.
+  #
+  # The cost of manual-only is that the published image can drift from the
+  # committed Dockerfile with nothing noticing. That is not left hanging: the
+  # tag below is a CONTENT HASH of the three files that define the image, so a
+  # drifted Dockerfile means HARDENED_RUN_IMAGE points at a tag no committed
+  # source produces, which is detectable rather than invisible (runcove: a
+  # check for exactly that is worth adding once this has run once).
+  workflow_dispatch:
+
+concurrency: {group: warpgate-ci-toolchain, cancel-in-progress: false}
+
+jobs:
+  build:
+    runs-on: docker
+    timeout-minutes: 120
+    services:
+      dind:
+        image: docker:28-dind
+        options: --privileged
+        env: {DOCKER_TLS_CERTDIR: ""}
+    env:
+      DOCKER_HOST: tcp://dind:2375
+      REGISTRY: git.tenfourty.site
+      IMAGE: git.tenfourty.site/runcove/warpgate-ci-toolchain
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: docker cli
+        run: |
+          curl -fsSL https://download.docker.com/linux/static/stable/x86_64/docker-28.3.3.tgz | tar xz -C /tmp
+          install /tmp/docker/docker /usr/local/bin/docker
+          for i in $(seq 1 30); do docker info >/dev/null 2>&1 && break; sleep 2; done
+          docker info >/dev/null
+
+      - name: derive the content tag
+        # The tag is a hash of exactly the three files that decide what this
+        # image contains. Not the commit sha: two commits that leave these
+        # three files untouched must not produce two "different" images, or
+        # HARDENED_RUN_IMAGE would need updating for changes that cannot
+        # affect it. Not `latest` either — an unpinned image is the same drift
+        # we refused for oasdiff, one level up.
+        #
+        # The file list is explicit and sorted by hand, never a glob: a glob
+        # that silently matched nothing would hash an empty string and produce
+        # a stable, meaningless tag that looked fine.
+        run: |
+          set -euo pipefail
+          for f in rust-toolchain.toml \
+                   .forgejo/images/ci-toolchain/Dockerfile \
+                   .forgejo/images/ci-toolchain/assert-toolchain.sh; do
+            [ -f "$f" ] || { echo "::error::$f is missing; the content tag would not describe this image"; exit 1; }
+          done
+          TAG=$(cat rust-toolchain.toml \
+                    .forgejo/images/ci-toolchain/Dockerfile \
+                    .forgejo/images/ci-toolchain/assert-toolchain.sh \
+                | sha256sum | cut -c1-12)
+          [ "${#TAG}" -eq 12 ] || { echo "::error::content hash came out as '$TAG'"; exit 1; }
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          echo "content tag: $TAG"
+
+      - name: registry login
+        # The token travels in env:, never spliced into the script text, and
+        # --password-stdin keeps it off argv. Same reasoning as build-image.yml:
+        # an expression inside `run:` is substituted before any shell sees it,
+        # so the secret would become part of the rendered source.
+        run: docker login "$REGISTRY" -u jeremy --password-stdin <<< "$REGISTRY_TOKEN"
+        env:
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+
+      - name: build
+        # Plain `docker build`: this Dockerfile uses no --mount=type=cache, so
+        # buildx would add a builder bootstrap and a Docker Hub pull for no
+        # gain. The build-time assertion inside the Dockerfile is what decides
+        # whether this step succeeds — a wrong toolchain fails HERE, before the
+        # image is ever tagged or pushed.
+        run: |
+          set -euo pipefail
+          docker build -f .forgejo/images/ci-toolchain/Dockerfile -t "$IMAGE:$TAG" .
+
+      - name: prove the assertion ran, and would have failed
+        # The Dockerfile's RUN layer could be served from cache, in which case
+        # a green build says nothing about this image. Re-running the assertion
+        # in the finished image costs seconds and answers the question
+        # directly. The second half is the part that matters: the same
+        # assertion pointed at a directory with no rust-toolchain.toml must
+        # REFUSE, which is what separates "the assertion passed" from "the
+        # assertion cannot fail".
+        run: |
+          set -euo pipefail
+          PIN=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
+          [ -n "$PIN" ] || { echo "::error::could not read the channel from rust-toolchain.toml"; exit 1; }
+          echo "--- assertion, against the pin file"
+          docker run --rm "$IMAGE:$TAG" assert-toolchain.sh "$PIN" /opt/toolchain-check
+          echo "--- the same assertion with nothing to check: must refuse"
+          if docker run --rm "$IMAGE:$TAG" assert-toolchain.sh "$PIN" /tmp; then
+            echo "::error::the assertion PASSED with no rust-toolchain.toml present, so it proves nothing"
+            exit 1
+          fi
+          echo "it refused, as it must"
+
+      - name: push
+        run: docker push "$IMAGE:$TAG"
+
+      - name: say what to point HARDENED_RUN_IMAGE at
+        # Deliberately NOT self-applied. Changing which image every capped
+        # check runs inside is a decision someone takes, and a workflow that
+        # quietly repointed it would make "what were these checks running
+        # against last Tuesday" unanswerable.
+        run: |
+          echo "::notice::built and pushed ${IMAGE}:${TAG}"
+          echo
+          echo "To adopt it, set the repo action variable:"
+          echo "    HARDENED_RUN_IMAGE = ${IMAGE}:${TAG}"
+          echo
+          echo "Nothing changes until that variable is set; the capped checks"
+          echo "keep running against whatever it names today."

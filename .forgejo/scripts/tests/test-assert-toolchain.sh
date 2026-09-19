@@ -162,5 +162,43 @@ healthy; python_stub 1; run
   && ok "PyYAML missing fails, though python3 itself is present" \
   || bad "PyYAML absence was not caught, or was confused with python3 itself: rc=$rc $out"
 
+echo "== the assertion's tool list against the checks it is protecting =="
+# The default list inside assert-toolchain.sh is a hand-copied duplicate of
+# what the capped checks declare in checks.yaml, and a duplicate with nothing
+# keeping it in step is the defect this whole arc is about. Adding a tool to a
+# capped check without adding it here would produce an image that passes its
+# own assertion and then refuses 97 in CI — a full queue cycle and a human read
+# to discover something this comparison finds for free.
+#
+# `cargo` is excluded on both sides: it comes from the toolchain itself and is
+# asserted separately, by actually running it.
+CHECKS="$HERE/../../checks.yaml"
+if [ ! -f "$CHECKS" ]; then
+  bad "no checks.yaml at $CHECKS -- the list below is unverified"
+else
+  cmp_out=$(python3 - "$CHECKS" "$SCRIPT" <<'PY'
+import sys, re, yaml
+checks, script = sys.argv[1], sys.argv[2]
+need = set()
+for c in yaml.safe_load(open(checks))["checks"]:
+    if c.get("compiles") is True:
+        need.update(c.get("tools", []))
+need.discard("cargo")
+m = re.search(r"TOOLCHAIN_REQUIRED_TOOLS:-([^}]*)\}", open(script).read())
+if not m:
+    print("NOANCHOR"); raise SystemExit(0)
+have = set(m.group(1).split())
+print("MISSING " + " ".join(sorted(need - have)) if need - have else "", end="")
+print(" EXTRA " + " ".join(sorted(have - need)) if have - need else "", end="")
+print(" OK" if need == have else "")
+PY
+)
+  case "$cmp_out" in
+    NOANCHOR) bad "could not find TOOLCHAIN_REQUIRED_TOOLS in $SCRIPT -- this comparison silently checked nothing" ;;
+    *OK*)     ok "every tool the capped checks declare is required by the assertion, and no others" ;;
+    *)        bad "assertion tool list and checks.yaml disagree:$cmp_out" ;;
+  esac
+fi
+
 [ "$fails" -eq 0 ] && echo "PASS" || echo "FAILURES"
 exit "$fails"
