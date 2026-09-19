@@ -1,0 +1,30 @@
+# Synthetic checks.yaml for proving that run-check.sh takes a check's state
+# from THIS FILE, rather than only from RUN_CHECK_FORCE_STATE.
+#
+# Every other blocking assertion in test-run-check.sh sets
+# RUN_CHECK_FORCE_STATE, which is applied at run-check.sh:77 AFTER the YAML
+# lookup at :54 -- so those cases prove run-check.sh honours a state it is
+# handed, and say nothing about whether it reads the one written here. That
+# left the chain checks.yaml -> lookup -> behaviour untested end to end,
+# which is the link Task 8's promotions actually depend on.
+#
+# The two checks below are byte-identical apart from `state:`. That is the
+# whole design: if the exit codes differ, the only thing that can have
+# produced the difference is the state read from this file. Both are
+# `compiles: false` so they run uncapped, in-process, with no container; the
+# commands are `exit 1` rather than anything real, so nothing is built and
+# no tool beyond bash is needed.
+upstream_tag: v0.28.6
+checks:
+  - name: fake-blocking-fail
+    upstream: build.yml
+    command: exit 1
+    compiles: false
+    state: blocking
+    tools: [bash]
+  - name: fake-reporting-fail
+    upstream: build.yml
+    command: exit 1
+    compiles: false
+    state: reporting
+    tools: [bash]

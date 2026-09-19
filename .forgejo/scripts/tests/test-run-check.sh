@@ -395,5 +395,45 @@ grep -qi "report-only" <<<"$out" \
   || ok "a 'nothing examined' refusal is not printed as report-only"
 rm -f "$LOCKFILE_INT_FIXTURE"
 
+# TASK 8's MISSING LINK: does run-check.sh take a state from checks.yaml at
+# all? Every blocking assertion above sets RUN_CHECK_FORCE_STATE, which is
+# applied at run-check.sh:77 -- AFTER the lookup at :54 -- so all of them
+# prove run-check.sh honours a state it is handed and none of them touch the
+# YAML. Run 537 could not close the gap either: `lockfile` and `helm-lint`
+# PASSED there, and a passing check prints the same line whether it is
+# blocking or reporting. So until this case existed, nothing in the system
+# demonstrated that promoting a check in checks.yaml changed anything.
+#
+# The fixture's two checks differ in exactly one line, `state:`. No forced
+# state is set anywhere below. If the exit codes differ, the state read from
+# the file is the only thing that can have made them differ.
+STATE_FIXTURE="$HERE/fixtures/checks-state-test.yaml"
+
+out=$(CHECKS_FILE="$STATE_FIXTURE" "$SCRIPT" fake-blocking-fail 2>&1); rc=$?
+[ "$rc" -ne 0 ] \
+  && ok "state: blocking read from checks.yaml fails the job (no forced state)" \
+  || bad "a blocking check from the FILE passed while failing -- the promotion is inert: $out"
+
+out=$(CHECKS_FILE="$STATE_FIXTURE" "$SCRIPT" fake-reporting-fail 2>&1); rc=$?
+[ "$rc" -eq 0 ] \
+  && ok "state: reporting read from checks.yaml does not fail the job (no forced state)" \
+  || bad "a reporting check from the FILE failed the job (rc=$rc): $out"
+grep -q "report-only" <<<"$out" \
+  && ok "the reporting check says so in its own output" \
+  || bad "reporting check did not identify itself as report-only: $out"
+
+# The production fact Task 8 rests on, asserted rather than eyeballed. This
+# READS the real checks.yaml; it never composes or runs a command from it --
+# lookup-check.py only prints fields, so no check of ours can be triggered
+# from here by a future edit to that file.
+REAL_CHECKS="$HERE/../../checks.yaml"
+[ -f "$REAL_CHECKS" ] || bad "the real checks.yaml is not at $REAL_CHECKS -- the two assertions below prove nothing"
+for promoted in lockfile helm-lint; do
+  st=$(python3 "$HERE/../lookup-check.py" "$REAL_CHECKS" "$promoted" 2>/dev/null | cut -d'|' -f1)
+  [ "$st" = "blocking" ] \
+    && ok "$promoted is blocking in the real checks.yaml" \
+    || bad "$promoted is '$st' in the real checks.yaml, expected blocking"
+done
+
 echo; [ "$fails" -eq 0 ] && echo "PASS" || echo "FAILURES"
 exit "$fails"
