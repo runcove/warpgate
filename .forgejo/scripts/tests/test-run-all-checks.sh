@@ -75,6 +75,51 @@ grep -q "cache unavailable" <<<"$out" \
   && bad "summary claims a cache problem on a run that had none: $out" \
   || ok "a healthy run says nothing about the cache"
 
+# 1c. THE POSITIVE READING IS IN THE SUMMARY TOO (runcove-vhkg). Everything in
+#     1b is about a cache that is DOWN; a cache that is up and reading well
+#     emitted nothing at all, which in a summary is indistinguishable from a
+#     probe nobody wired in. On 19 Sep 2026 answering "did the cache read
+#     anything" took a bucket-object counter bound to check boundaries and
+#     three converging non-timing arguments, none of them from the run.
+out=$(RUN_CHECK_STUB_CACHE_STATS="check-a check-c" run_with_map "check-a=0 check-b=0 check-c=0" 2>&1); rc=$?
+[ "$rc" -eq 0 ] && ok "a cache reading does not change the exit code" \
+  || bad "collecting cache readings changed the run's exit code (rc=$rc): $out"
+grep -q "checks refused: 0, checks failed: 0" <<<"$out" \
+  && ok "a cache reading moves neither counter" || bad "a cache reading moved a counter: $out"
+readings_block=$(sed -n '/^cache readings — /,$p' <<<"$out")
+[ -n "$readings_block" ] \
+  && ok "the run summary carries the positive cache reading" \
+  || bad "summary is silent about what the cache actually returned: $out"
+grep -q 'hits=765 misses=7' <<<"$readings_block" \
+  && ok "the readings block names hits and misses" \
+  || bad "readings block dropped the counts: ${readings_block:-<no readings block>}"
+grep -q 'avg-read-hit=0.167 s' <<<"$readings_block" \
+  && ok "the readings block carries what a fetch COST" \
+  || bad "readings block dropped avg-read-hit, the figure that prices the store: ${readings_block:-<no readings block>}"
+[ "$(grep -c '^  CACHE-STATS ' <<<"$readings_block")" -eq 4 ] \
+  && ok "every reading line from every check is collected, not just the first of each" \
+  || bad "readings block did not carry all four lines from two checks: ${readings_block:-<no readings block>}"
+
+#     The discrimination that the collecting pattern is easiest to get wrong.
+#     `grep '^CACHE-STATS '` -- the obvious pattern, with the trailing space --
+#     silently DROPS CACHE-STATS-UNAVAILABLE, so a check that could produce no
+#     reading at all would vanish from the summary and read exactly like a check
+#     that was never capped. That is this arc's signature defect committed
+#     inside the fix for it.
+out=$(RUN_CHECK_STUB_CACHE_STATS="check-a" RUN_CHECK_STUB_CACHE_STATS_GONE="check-c" run_with_map "check-a=0 check-b=0 check-c=0" 2>&1)
+readings_block=$(sed -n '/^cache readings — /,$p' <<<"$out")
+grep -q 'CACHE-STATS-UNAVAILABLE check-c' <<<"$readings_block" \
+  && ok "a check that could produce no reading says so IN the summary" \
+  || bad "a missing reading was dropped from the summary, so it reads as an uncapped check: ${readings_block:-<no readings block>}"
+
+#     The negative control, same as 1b's: a run where nothing reported a
+#     reading must not print the block at all, or every assertion above passes
+#     against a block that is printed unconditionally.
+out=$(run_with_map "check-a=0 check-b=0 check-c=0" 2>&1)
+grep -q "cache readings" <<<"$out" \
+  && bad "summary printed a cache-readings block for a run that produced none: $out" \
+  || ok "a run with no readings prints no readings block"
+
 # 2. A lone ordinary failure (not a refusal) sets the job's exit code.
 out=$(run_with_map "check-a=0 check-b=1 check-c=0" 2>&1); rc=$?
 [ "$rc" -eq 1 ] && ok "a lone ordinary failure sets the job's exit code" \

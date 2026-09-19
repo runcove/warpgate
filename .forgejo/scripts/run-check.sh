@@ -417,7 +417,40 @@ if [ "$CAPPED" = "yes" ]; then
   # a run nobody can diagnose.
   CACHE_PROBE=$(cat <<'PROBE'
 if [ -n "${RUSTC_WRAPPER:-}" ]; then
-  if __ce=$(sccache --start-server 2>&1); then :; else
+  if __ce=$(sccache --start-server 2>&1); then
+    sccache --zero-stats >/dev/null 2>&1 || true
+    __cache_stats() {
+      __cst=$(sccache --show-stats 2>/dev/null)
+      if [ -z "$__cst" ]; then
+        echo "CACHE-STATS-UNAVAILABLE @@NAME@@ — sccache started, but --show-stats produced nothing at the end of the check, so this run carries NO cache reading. Absence of a CACHE-STATS line is not a statement about hits." >&2
+        return
+      fi
+      __cg() { printf '%s\n' "$__cst" | sed -n "s/^$1 \{2,\}\(.*[^ ]\) *\$/\1/p" | head -n 1; }
+      __c_req=$(__cg 'Compile requests')
+      __c_exe=$(__cg 'Compile requests executed')
+      __c_hit=$(__cg 'Cache hits')
+      __c_mis=$(__cg 'Cache misses')
+      __c_rat=$(__cg 'Cache hits rate')
+      __c_cmp=$(__cg 'Compilations')
+      __c_rde=$(__cg 'Cache read errors')
+      __c_wre=$(__cg 'Cache write errors')
+      __c_err=$(__cg 'Cache errors')
+      __c_avg=$(__cg 'Average cache read hit')
+      __c_gone=""
+      [ -n "$__c_req" ] || __c_gone="$__c_gone 'Compile requests'"
+      [ -n "$__c_hit" ] || __c_gone="$__c_gone 'Cache hits'"
+      [ -n "$__c_mis" ] || __c_gone="$__c_gone 'Cache misses'"
+      if [ -n "$__c_gone" ]; then
+        echo "CACHE-STATS-UNAVAILABLE @@NAME@@ — sccache --show-stats ran, but these labels were not in its output:$__c_gone. The output format has changed from the one this parser was written against (sccache 0.17.0, pinned in the ci-toolchain Dockerfile); no cache reading is available for this check until the parser is updated." >&2
+        return
+      fi
+      echo "CACHE-STATS @@NAME@@ — requests=$__c_req executed=$__c_exe hits=$__c_hit misses=$__c_mis rate=$__c_rat compilations=$__c_cmp read-errors=$__c_rde write-errors=$__c_wre errors=$__c_err avg-read-hit=$__c_avg" >&2
+      case "$__c_hit" in
+        0|'') echo "CACHE-STATS @@NAME@@ — zero hits: everything this check compiled, it compiled itself. That is what a cold store looks like AND what a store it cannot read from looks like; read-errors and errors above are what separate them." >&2 ;;
+      esac
+    }
+    trap __cache_stats EXIT
+  else
     __cf=$(printf '%s\n' "$__ce" | grep '[^[:space:]]' || true)
     if [ -n "$__cf" ]; then
       __cs=$(printf '%s\n' "$__cf" | sed -n '/^[[:space:]]*Source:[[:space:]]*$/{n;s/^[[:space:]]*//;p;q;}')

@@ -64,8 +64,23 @@ count=0
 # examined. PIPESTATUS[0] preserves the check's own exit code, which is
 # load-bearing for the refusal-band logic below -- `pipefail` alone would give
 # tee's status for a passing check that wrote a marker.
+#
+# AND THE POSITIVE SIDE, added 19 Sep 2026 (runcove-vhkg). Everything above is
+# about a cache that is DOWN. A cache that is up and reading well emits nothing
+# at all here -- which is indistinguishable, in a run summary, from a probe
+# nobody wired in. Proving the read path on 19 Sep took a bucket-object counter
+# bound to check boundaries plus three converging non-timing arguments, and not
+# one of those readings came from the run. run-check.sh now ends every capped
+# check with a CACHE-STATS line, and these collect it so the answer is in the
+# summary instead of in an afternoon's forensics.
+#
+# `'^CACHE-STATS '` WITH THE TRAILING SPACE, and the pattern below is anchored
+# so `CACHE-STATS-UNAVAILABLE` cannot satisfy it: a prefix match would file
+# "there is no reading" under "here is the reading", which is the same fault in
+# a grep that the marker exists to remove from the run.
 CACHE_NOTES=()
 CACHE_CHECKS=()
+CACHE_READINGS=()
 tmp_out="$(mktemp)"
 trap 'rm -f "$tmp_out"' EXIT
 
@@ -82,6 +97,9 @@ while IFS= read -r name; do
     CACHE_CHECKS+=("$name")
     CACHE_NOTES+=("${check_notes[@]}")
   fi
+  while IFS= read -r reading; do
+    [ -n "$reading" ] && CACHE_READINGS+=("$reading")
+  done < <(grep -hE '^CACHE-STATS( |-UNAVAILABLE )' "$tmp_out" || true)
   echo "::endgroup::"
   if [ "$check_rc" -ne 0 ]; then
     if [ "$check_rc" -ge 89 ] && [ "$check_rc" -le 99 ]; then
@@ -121,5 +139,18 @@ if [ "${#CACHE_CHECKS[@]}" -gt 0 ]; then
   printf '  %s\n' "${CACHE_NOTES[@]}"
   echo "  A cache that is down stays visible here on every run; if this line has"
   echo "  been present for days it is the finding, not the weather."
+fi
+
+# The positive reading, printed whether it is good news or not. Like the block
+# above it never touches $rc: how much a run got from the store is a fact about
+# its cost, never a verdict on the code.
+if [ "${#CACHE_READINGS[@]}" -gt 0 ]; then
+  echo "cache readings — what each capped check actually got from the store:"
+  printf '  %s\n' "${CACHE_READINGS[@]}"
+  echo "  An absent reading proves nothing either way: a check running with no"
+  echo "  wrapper at all also fetches nothing and also finishes in about uncached"
+  echo "  time. These lines are what tell those two apart, and avg-read-hit is"
+  echo "  what a fetch cost — the number that decides whether the cache earns its"
+  echo "  place, rather than merely working."
 fi
 exit "$rc"

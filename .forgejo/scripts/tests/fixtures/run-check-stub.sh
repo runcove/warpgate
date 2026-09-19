@@ -29,6 +29,26 @@ for n in ${RUN_CHECK_STUB_CACHE_DEAD:-}; do
   fi
 done
 
+# And the POSITIVE reading, same reasoning in the other direction. The real
+# CACHE-STATS line is written by an EXIT trap inside the capped container; what
+# run-all-checks.sh sees is a line on the check's output, reproduced here.
+# TWO lines again, because the real marker emits an explanatory second line
+# when hits are zero -- a one-line fixture could not tell "collects every
+# reading" from "collects the first".
+for n in ${RUN_CHECK_STUB_CACHE_STATS:-}; do
+  if [ "$n" = "$name" ]; then
+    echo "CACHE-STATS $name — requests=772 executed=765 hits=765 misses=7 rate=99.09 % compilations=7 read-errors=0 write-errors=0 errors=0 avg-read-hit=0.167 s" >&2
+    echo "CACHE-STATS $name — second line, to prove every reading is collected rather than the first" >&2
+  fi
+done
+
+# The no-reading case, which must NOT be filed as a reading.
+for n in ${RUN_CHECK_STUB_CACHE_STATS_GONE:-}; do
+  if [ "$n" = "$name" ]; then
+    echo "CACHE-STATS-UNAVAILABLE $name — sccache --show-stats produced nothing at the end of the check" >&2
+  fi
+done
+
 if [ "$code" -ge 89 ] && [ "$code" -le 99 ]; then
   echo "REFUSE $name — did not run safely (exit $code, reserved band 89-99)." >&2
 elif [ "$code" -eq 0 ]; then

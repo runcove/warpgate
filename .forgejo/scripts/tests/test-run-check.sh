@@ -74,6 +74,121 @@ grep -q 'CACHE-UNAVAILABLE' <<<"$out" \
   && bad "uncapped check carries the cache probe, which runs in a container it never enters: $out" \
   || ok "uncapped check carries no cache probe"
 
+# THE POSITIVE READING (runcove-vhkg). CACHE-UNAVAILABLE above is a NEGATIVE
+# marker: its absence is consistent both with a cache that read everything and
+# with a cache nobody ever switched on. Proving the read path on 19 Sep 2026
+# took a bucket-object counter bound to check boundaries plus three converging
+# non-timing arguments, none of which came from the run. These cases assert the
+# run now says it itself.
+out=$(RUN_CHECK_DRY=1 "$SCRIPT" clippy 2>&1)
+grep -q 'CACHE-STATS' <<<"$out" \
+  && ok "capped command carries a positive cache reading" \
+  || bad "capped command emits no CACHE-STATS -- a working cache and a skipped probe stay identical: $out"
+grep -q 'trap __cache_stats EXIT' <<<"$out" \
+  && ok "the reading is on an EXIT trap, so it survives a failing or exiting check" \
+  || bad "CACHE-STATS is not on an EXIT trap -- the reading would be lost exactly when a check dies, which is when it is wanted: $out"
+out=$(RUN_CHECK_DRY=1 "$SCRIPT" cargo-deny 2>&1)
+grep -q 'CACHE-STATS' <<<"$out" \
+  && bad "uncapped check carries the stats epilogue, which reads an sccache that is not in its container: $out" \
+  || ok "uncapped check carries no stats epilogue"
+
+# Behavioural, not textual. Everything above proves a string was composed; the
+# cases below RUN the composed command with fakes for the three tools clippy
+# declares (just, cargo, cargo-cranky) and for sccache, so the probe's actual
+# behaviour is observed rather than inferred. This is the same gap that let a
+# 291-green selftest suite stay silent about the only path that mattered.
+probe_fakes() {
+  # $1 = dir, $2 = sccache mode, $3 = rc for the fake `just`
+  mkdir -p "$1"
+  printf '#!/bin/sh\nexit %s\n' "$3" > "$1/just"
+  printf '#!/bin/sh\nexit 0\n' > "$1/cargo"
+  printf '#!/bin/sh\nexit 0\n' > "$1/cargo-cranky"
+  case "$2" in
+    ok)       printf '#!/bin/sh\ncase "$1" in --start-server|--zero-stats) exit 0;; --show-stats) cat %s; exit 0;; esac\nexit 0\n' "$HERE/fixtures/sccache-show-stats-0.17.0.txt" > "$1/sccache" ;;
+    drifted)  printf '#!/bin/sh\ncase "$1" in --start-server|--zero-stats) exit 0;; --show-stats) echo "Requests          772"; echo "Hits              765"; exit 0;; esac\nexit 0\n' > "$1/sccache" ;;
+    silent)   printf '#!/bin/sh\ncase "$1" in --start-server|--zero-stats) exit 0;; --show-stats) exit 0;; esac\nexit 0\n' > "$1/sccache" ;;
+    deadstart) printf '#!/bin/sh\ncase "$1" in --start-server) echo "sccache: error: Failed to create S3 cache"; echo "Source:"; echo "  dispatch failure"; exit 1;; esac\nexit 0\n' > "$1/sccache" ;;
+  esac
+  chmod +x "$1"/*
+}
+probe_run() {
+  # Compose exactly what CI runs, then run it with the fakes. stderr is dropped
+  # because run-check.sh also writes CACHE-DNS-* markers there, and folding
+  # those into the command would test a string nobody executes.
+  #
+  # The prefix is stripped from the FIRST LINE ONLY, and every other line is
+  # kept. The composed command is ~58 lines; an `s/.../p` here matched just the
+  # one line carrying the prefix and silently handed bash a truncated `if`,
+  # which failed as a syntax error with exit 2 -- and the exit-status assertions
+  # below then read that 2 as "the epilogue rewrote the status". A truncated
+  # reading dressed as the failure it was looking for, caught only because the
+  # cases assert on the marker text as well as the code.
+  local dir="$1" cmd
+  cmd=$(RUN_CHECK_DRY=1 "$SCRIPT" clippy 2>/dev/null | sed '1s/^would run via hardened-run: //')
+  ( cd "$dir" && PATH="$dir/bin:$PATH" RUSTC_WRAPPER=sccache bash -c "$cmd" ) 2>&1
+}
+
+probe_tmp=$(mktemp -d); trap 'rm -rf "$probe_tmp"' EXIT
+
+probe_fakes "$probe_tmp/bin" ok 0
+out=$(probe_run "$probe_tmp"); rc=$?
+grep -q 'CACHE-STATS clippy — requests=772 .*hits=765 misses=7' <<<"$out" \
+  && ok "a healthy cache reports its hits and misses by name" \
+  || bad "no usable CACHE-STATS line from a healthy cache: $out"
+grep -q 'avg-read-hit=0.167 s' <<<"$out" \
+  && ok "the reading carries what a read COST, which is the NAS question" \
+  || bad "CACHE-STATS omits the average read-hit time: $out"
+grep -q 'CACHE-STATS-UNAVAILABLE' <<<"$out" \
+  && bad "a healthy cache reported its reading as unavailable: $out" \
+  || ok "a healthy cache does not also claim the reading is unavailable"
+[ "$rc" -eq 0 ] && ok "the epilogue leaves a passing check's exit status alone" \
+  || bad "the stats epilogue changed a passing check's exit status to $rc"
+
+# The one that matters most: a check that FAILS must still report its cache
+# reading, and must still report its own failure. An epilogue that swallowed
+# either would be worse than no epilogue.
+probe_fakes "$probe_tmp/bin" ok 1
+out=$(probe_run "$probe_tmp"); rc=$?
+[ "$rc" -eq 1 ] && ok "a failing check keeps its exit status through the epilogue" \
+  || bad "the stats epilogue rewrote a failing check's exit status to $rc -- a FAIL would read as a PASS"
+grep -q 'CACHE-STATS clippy' <<<"$out" \
+  && ok "a failing check still reports its cache reading" \
+  || bad "the reading is lost exactly when a check fails: $out"
+
+# Format drift must be LOUD. sccache 0.17.0 is pinned in the ci-toolchain
+# Dockerfile, but a pin is a fact about today; a bump that renames a label
+# must not turn this reading silently into nothing, which is the defect the
+# whole marker exists to remove.
+probe_fakes "$probe_tmp/bin" drifted 0
+out=$(probe_run "$probe_tmp")
+grep -q 'CACHE-STATS-UNAVAILABLE' <<<"$out" \
+  && ok "a renamed label is reported, not swallowed" \
+  || bad "drifted stats output produced no marker at all -- silence reads as 'no cache reading needed': $out"
+grep -q "'Cache hits'" <<<"$out" \
+  && ok "the drift marker NAMES the labels it could not find" \
+  || bad "drift marker does not say which labels went missing, so nobody can fix it: $out"
+
+probe_fakes "$probe_tmp/bin" silent 0
+out=$(probe_run "$probe_tmp")
+grep -q 'CACHE-STATS-UNAVAILABLE' <<<"$out" \
+  && ok "stats output that is empty is reported as unavailable" \
+  || bad "empty stats output produced no marker: $out"
+
+# And the complement: when sccache cannot START, there is no server to ask, so
+# the run must carry CACHE-UNAVAILABLE and NOT a stats line. A CACHE-STATS of
+# all zeros here would be the arc's signature defect committed inside the fix
+# for it -- a reading that cannot tell "read nothing" from "never ran".
+probe_fakes "$probe_tmp/bin" deadstart 0
+out=$(probe_run "$probe_tmp")
+grep -q 'CACHE-UNAVAILABLE clippy' <<<"$out" \
+  && ok "a cache that cannot start still says so" \
+  || bad "dead sccache produced no CACHE-UNAVAILABLE marker: $out"
+grep -q 'CACHE-STATS' <<<"$out" \
+  && bad "a cache that never started reported cache statistics -- 'read nothing' and 'never ran' are indistinguishable again: $out" \
+  || ok "no stats are claimed for a cache that never started"
+
+rm -rf "$probe_tmp"; trap - EXIT
+
 # An unknown check name must fail loudly, not silently pass.
 "$SCRIPT" no-such-check >/dev/null 2>&1
 [ $? -ne 0 ] && ok "unknown check name is refused" || bad "unknown check passed"
