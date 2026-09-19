@@ -47,18 +47,46 @@ out=$(unset S3_ENDPOINT; "$SCRIPT" warpgate-sccache 2>/dev/null)
 [ -z "$out" ] && ok "no partial KEY=VALUE output leaks out on refusal" \
   || bad "refusal still printed output an eval would pick up: $out"
 
-out=$(S3_ENDPOINT=https://oga2.example:443 "$SCRIPT" warpgate-sccache 2>&1)
+out=$(S3_ENDPOINT=https://oga2.example:9000 "$SCRIPT" warpgate-sccache 2>&1)
 grep -q "RUSTC_WRAPPER=sccache"            <<<"$out" && ok "sets the compiler wrapper" || bad "no RUSTC_WRAPPER: $out"
 grep -q "SCCACHE_BUCKET=warpgate-sccache"  <<<"$out" && ok "bucket is the one passed"  || bad "wrong bucket: $out"
 
-# Pinned to the exact line, not a substring: "SCCACHE_ENDPOINT=oga2.example" is
-# also a substring of "SCCACHE_ENDPOINT=oga2.example:443", so a `grep -q`
-# would still pass even if the port were never stripped. This is the
-# vacuous-test bug fix round 1's review named.
+# THE FIXTURE IS THE TEST HERE, and it used to be the bug.
+#
+# This case drove `:443` until 2026-09-19 and asserted the port was STRIPPED.
+# The assertion was pinned to the exact line rather than a substring, with a
+# comment explaining why — all of which was correct and none of which helped,
+# because :443 is the ONE port at which stripping and keeping produce the same
+# WORKING result. A precisely-argued assertion built on the single input value
+# where the behaviour under test cannot do any harm. Our real endpoint is
+# QuObjects on :8010, where the two differ completely: measured that day,
+# oga2.tenfourty.site:8010 is open and :443 is closed.
+#
+# So the fixture now uses a NON-DEFAULT port, and the expectation is inverted
+# to match sccache 0.17.0's documented form (`SCCACHE_ENDPOINT=<ip>:<port>`).
+# With :9000, "stripped" and "kept" are different observable strings, so this
+# assertion can now fail for the reason it exists.
 endpoint_line=$(grep '^SCCACHE_ENDPOINT=' <<<"$out")
-[ "$endpoint_line" = "SCCACHE_ENDPOINT=oga2.example" ] \
-  && ok "endpoint is the bare host, port stripped" \
-  || bad "endpoint line wrong: '$endpoint_line'"
+[ "$endpoint_line" = "SCCACHE_ENDPOINT=oga2.example:9000" ] \
+  && ok "a non-default port is PRESERVED, as sccache documents" \
+  || bad "endpoint line wrong: '$endpoint_line' (expected the port to survive)"
+
+# The scheme must still go, and a trailing path with it — sccache takes the
+# protocol from SCCACHE_S3_USE_SSL, and the endpoint is a host, not a URL.
+for e in "https://oga2.example:9000" "http://oga2.example:9000" "oga2.example:9000" "https://oga2.example:9000/"; do
+  line=$(S3_ENDPOINT="$e" "$SCRIPT" warpgate-sccache 2>&1 | grep '^SCCACHE_ENDPOINT=')
+  [ "$line" = "SCCACHE_ENDPOINT=oga2.example:9000" ] \
+    && ok "scheme/path stripped, port kept: $e" \
+    || bad "from '$e' got '$line'"
+done
+
+# :443 kept as a REGRESSION case, but only now that a discriminating one sits
+# above it. On its own it proved nothing; beside :9000 it confirms the default
+# port is not special-cased into disappearing.
+line=$(S3_ENDPOINT=https://oga2.example:443 "$SCRIPT" warpgate-sccache 2>&1 | grep '^SCCACHE_ENDPOINT=')
+[ "$line" = "SCCACHE_ENDPOINT=oga2.example:443" ] \
+  && ok "the default port is kept too, not special-cased away" \
+  || bad "443 case: got '$line'"
 
 # A credential must never appear, even if one is in the environment.
 out=$(S3_ENDPOINT=https://oga2.example:443 AWS_SECRET_ACCESS_KEY=shouldnotappear \

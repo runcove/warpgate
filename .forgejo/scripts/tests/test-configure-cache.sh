@@ -32,11 +32,11 @@ grep -qi "S3_ENDPOINT" <<<"$out" && ok "names the actual missing configuration" 
 # 2. Success: GITHUB_ENV gets all five KEY=VALUE lines, exactly once, and
 #    nothing is silently dropped.
 GENV="$SCRATCH/success.env"
-out=$(S3_ENDPOINT=https://oga2.example:443 GITHUB_ENV="$GENV" "$SCRIPT" warpgate-sccache 2>&1); rc=$?
+out=$(S3_ENDPOINT=https://oga2.example:9000 GITHUB_ENV="$GENV" "$SCRIPT" warpgate-sccache 2>&1); rc=$?
 [ "$rc" -eq 0 ] && ok "success exits 0" || bad "success path failed (rc=$rc): $out"
 grep -q "compiler cache configured" <<<"$out" && ok "says it configured the cache" \
   || bad "silent about success: $out"
-for kv in RUSTC_WRAPPER=sccache SCCACHE_BUCKET=warpgate-sccache SCCACHE_ENDPOINT=oga2.example \
+for kv in RUSTC_WRAPPER=sccache SCCACHE_BUCKET=warpgate-sccache SCCACHE_ENDPOINT=oga2.example:9000 \
           SCCACHE_S3_USE_SSL=true SCCACHE_S3_NO_CREDENTIALS=0; do
   grep -qx "$kv" "$GENV" && ok "GITHUB_ENV carries $kv" || bad "GITHUB_ENV missing $kv: $(cat "$GENV" 2>/dev/null)"
 done
@@ -44,7 +44,7 @@ done
 # 3. GITHUB_ENV entirely unset (not just pointed at a scratch file) must not
 #    crash -- that is a real state outside CI (running this by hand), not a
 #    refusal.
-out=$(unset GITHUB_ENV; S3_ENDPOINT=https://oga2.example:443 "$SCRIPT" warpgate-sccache 2>&1); rc=$?
+out=$(unset GITHUB_ENV; S3_ENDPOINT=https://oga2.example:9000 "$SCRIPT" warpgate-sccache 2>&1); rc=$?
 [ "$rc" -eq 0 ] && ok "runs fine with GITHUB_ENV entirely unset" \
   || bad "crashed or failed with GITHUB_ENV unset (rc=$rc): $out"
 

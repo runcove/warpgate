@@ -146,8 +146,25 @@ case "$BUCKET" in
     ;;
 esac
 
-# Strip scheme and port: sccache wants a bare host.
-HOST="${S3_ENDPOINT#*://}"; HOST="${HOST%%:*}"
+# Strip the scheme and any trailing path, and KEEP THE PORT.
+#
+# This line used to also strip the port, on the stated premise that "sccache
+# wants a bare host". That premise is false, and it would have cost a CI run to
+# learn. sccache 0.17.0's own S3 docs — the version this image installs —
+# document the variable as:
+#
+#     SCCACHE_ENDPOINT=<ip>:<port>   ... such as MinIO or DigitalOcean storage
+#
+# and our endpoint is QuObjects on a NON-default port. Measured 2026-09-19:
+# oga2.tenfourty.site:8010 is OPEN and :443 is CLOSED, so a bare host sends
+# sccache to a closed port. The failure that produces is a connection error
+# arriving immediately after the credentials are installed, which is read as a
+# credentials problem by everyone who looks at it.
+#
+# The scheme still goes, because sccache takes the protocol from
+# SCCACHE_S3_USE_SSL (emitted below) rather than from the endpoint string; a
+# trailing path goes too, since the endpoint is a host, not a URL to an object.
+HOST="${S3_ENDPOINT#*://}"; HOST="${HOST%%/*}"
 
 # Credentials are supplied to the process through the environment by the caller
 # and are deliberately NOT printed here.
