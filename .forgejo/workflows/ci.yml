@@ -9,6 +9,34 @@ on:
 jobs:
   checks:
     runs-on: docker
+    # UNBOUNDED UNTIL 2026-09-19, and latent for exactly as long. Until
+    # 1e9c1d6b the five capped checks refused 97 within seconds, so nothing
+    # here could hang; from run 569 onward they compile for real, and a hung
+    # or pathologically slow check now yields a run that never reaches a
+    # terminal state while holding a slot on a shared forge. "Still running"
+    # and "wedged" look identical in the run list, which is the actual harm:
+    # not the lost time, the unreadable state.
+    #
+    # 120 rather than a number picked to feel safe. The only completed run in
+    # the new regime is 569 at 1630 s (27.2 min) -- the earlier 675-717 s
+    # cluster is useless as a baseline because every one of those runs was
+    # refusing the compiling checks, i.e. timing an environment rather than a
+    # build. So the sample is n=1, and a bound drawn tightly around n=1 would
+    # kill honest runs; 120 is 4.4x it, and is the figure
+    # build-ci-toolchain.yml already uses for compiling work in this same arc.
+    # ci.yml was the ONLY one of our four workflows with no bound at all
+    # (build-image 170, build-ci-toolchain 120, upstream-watch 20), which is
+    # what marks this an oversight rather than a decision.
+    #
+    # A JOB-LEVEL KILL REPORTS NOTHING ABOUT WHICH CHECK HUNG. Per-check
+    # bounds refusing in the 89-99 band would say, and are wanted (runcove-kzer)
+    # -- but picking per-check numbers needs per-check duration data, and today
+    # that is also n=1 (clippy 324 s, schema-compat 444 s, unit-tests 433 s,
+    # release-build 390 s, sbom 14 s, cargo-deny 22 s, all from run 569).
+    # Setting per-check bounds from one observation would repeat precisely the
+    # mistake the 675-717 s cluster records. Job bound now; per-check bounds
+    # once three completed runs give a band.
+    timeout-minutes: 120
     # Task 7C part (a). The runner's own default for `runs-on: docker` is
     # `node:22-bookworm` (mapped in the homelab repo's k8s/platform/ci/
     # runner.yaml for every repository on the forge) -- never a Rust
