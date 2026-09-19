@@ -8,6 +8,8 @@ checks:
     command: cargo deny check
     compiles: false
     state: reporting
+    # LEAVES (traced 2026-09-19): `cargo deny check` -> the cargo-deny subcommand binary.
+    # Upstream pins cargo-deny@0.18.9. Leaf, nothing below it.
     tools: [cargo, cargo-deny]
   - name: lockfile
     upstream: lockfile.yml
@@ -29,18 +31,30 @@ checks:
     #     the repository to find out what it covered.
     # Cheap and deterministic: jq and find only, no network, no compile.
     state: blocking
+    # LEAVES (traced 2026-09-19): `.forgejo/scripts/check-lockfile.sh` -> `find` and `jq`. Ours, so
+    # the leaves are verified by that script's own test suite rather than by
+    # reading an upstream workflow.
     tools: [jq, find]
   - name: fmt-toml
     upstream: fmt-toml.yml
     command: cargo fmt-toml --check
     compiles: false
     state: reporting
-    tools: [cargo, taplo]
+    # LEAVES (traced 2026-09-19): `cargo fmt-toml --check` -> the
+    # cargo-fmt-toml subcommand binary. NOT taplo, which is what this
+    # line said until today and is a different TOML formatter --
+    # installing it would never have made this check run. Upstream's
+    # fmt-toml.yml installs cargo-fmt-toml@0.0.16 explicitly, and there
+    # is no `fmt-toml` alias in .cargo/config.toml.
+    tools: [cargo, cargo-fmt-toml]
   - name: biome
     upstream: biome.yml
     command: cd warpgate-web && biome ci .
     compiles: false
     state: reporting
+    # LEAVES (traced 2026-09-19): `cd warpgate-web && biome ci .` -> the biome binary. Upstream uses
+    # biomejs/setup-biome@v2 with no version in the file, so ours stays where
+    # Task 7C(a) put it: a DIVERGENCE, not a pin copied from upstream.
     tools: [biome]
   - name: helm-lint
     upstream: helm-publish.yaml
@@ -71,6 +85,9 @@ checks:
     # Control: the real chart passes both, rc=0.
     # Cheap and deterministic: helm only, no cluster, no network.
     state: blocking
+    # LEAVES (traced 2026-09-19): `helm lint … --strict && helm template …` -> the helm binary.
+    # Both clauses are load-bearing: measured, --strict PASSES a chart whose
+    # `required` value is absent and only `helm template` catches it.
     tools: [helm]
   - name: clippy
     upstream: clippy.yml
@@ -82,18 +99,37 @@ checks:
     # cargo-cranky@0.3.0 explicitly. Undeclared, the probe passes and the
     # failure lands a layer deeper on the 127 backstop -- honest, but one
     # missing tool discovered per CI run.
+    # LEAVES (traced 2026-09-19): `just clippy` -> justfile recipe `cargo cranky --workspace
+    # --all-features` -> the cargo-cranky binary. Upstream also runs
+    # `rustup component add clippy` and `mkdir -p warpgate-web/dist` first;
+    # neither is in our command yet (runcove-xais).
     tools: [just, cargo, cargo-cranky]
   - name: schema-compat
     upstream: check-schema-compatibility.yml
     command: just openapi-all
-    compiles: unverified
+    # Measured, no longer a hedge: it compiles two crates (above).
+    compiles: true
     state: reporting
     # 2026-09-19: npm, not cargo. `just openapi-all` is
     # `cd warpgate-web && npm run ...` four times over -- it invokes no
     # cargo at all, so `cargo` was declared here and never used while the
     # tool it actually needs was missing. See runcove-xais: this check is
     # also only HALF of upstream's, which compares schemas with oasdiff.
-    tools: [just, npm]
+    # LEAVES (traced 2026-09-19, after I got this wrong once): `just
+    # openapi-all` -> `cd warpgate-web && npm run openapi:schema:admin`
+    # -> `cargo run -p warpgate-admin > src/admin/lib/openapi-schema.json`,
+    # and the same for the gateway via warpgate-protocol-http. So it DOES
+    # need cargo -- through npm, not directly. Reading only the justfile
+    # recipe says otherwise, and a run cannot correct it: the probe
+    # reports declared tools that are missing and can never report a tool
+    # that was never declared.
+    #
+    # git is here for the coming baseline comparison, which extracts the
+    # upstream tag with `git archive` INSIDE the sandbox. That works
+    # because hardened-run.sh copies the working tree rather than an
+    # archive, so .git is delivered -- a deliberate choice recorded in
+    # that script, relied on here.
+    tools: [just, npm, cargo, git]
   - name: unit-tests
     upstream: test.yml
     command: cargo llvm-cov test --workspace
@@ -108,12 +144,17 @@ checks:
     # plan. Declaring them would make this check refuse for tools its
     # command never invokes -- a refusal that should not happen is as
     # misleading as a pass that should not.
+    # LEAVES (traced 2026-09-19): `cargo llvm-cov test --workspace` -> the cargo-llvm-cov binary.
+    # Upstream pins 0.6.15 deliberately (0.6.16+ pulls ruzstd 0.8.x) and runs
+    # three npm prep steps first that ours omits (runcove-xais).
     tools: [cargo, cargo-llvm-cov]
   - name: release-build
     upstream: build.yml
     command: cargo build --all-features --release
     compiles: true
     state: reporting
+    # LEAVES (traced 2026-09-19): `cargo build --all-features --release`. Leaf, nothing below it --
+    # the one capped check whose declared list was right all along.
     tools: [cargo]
   - name: sbom
     upstream: build.yml
@@ -122,6 +163,8 @@ checks:
     state: reporting
     # cargo-cyclonedx added 2026-09-19: the command is `cargo cyclonedx`,
     # which is a separate binary, not a builtin subcommand.
+    # LEAVES (traced 2026-09-19): `cargo cyclonedx --all-features` -> the cargo-cyclonedx binary,
+    # which is a separate binary and not a builtin subcommand.
     tools: [cargo, cargo-cyclonedx]
   - name: reprotest
     upstream: reprotest.yml
@@ -133,6 +176,21 @@ checks:
     # measured against a real run's log. cargo is a guess based on the
     # "capped Rust checks" bucket, not a confirmed fact. Re-check this the
     # day reprotest stops being excepted, before trusting it.
+    # LEAVES (traced 2026-09-19): NONE -- and that is the finding.
+    # `.forgejo/scripts/reprotest.sh` DOES NOT EXIST in this repo. The
+    # command names a path that has never been written, and nobody
+    # noticed because `excepted` means it never runs. Un-except it and it
+    # fails with "No such file or directory" -- an ORDINARY-range failure
+    # that no exit code distinguishes from upstream's verdict on our
+    # code, which is this arc's fourth kind of FAIL sitting pre-armed in
+    # the check list.
+    #
+    # Note what did NOT catch it: validate-checks.py reports
+    # "ok: 11 check(s) valid" because it validates the SHAPE of an entry
+    # -- fields present, types right, tag known -- and never asks whether
+    # a command exists. A validator that cannot tell a real command from
+    # a dangling one is the same defect as a check that cannot tell a
+    # pass from not having looked. Tracked as runcove-uw2t.
     tools: [cargo]
     reason: >-
       Manual-only upstream (workflow_dispatch) and stays manual here; it re-runs a
