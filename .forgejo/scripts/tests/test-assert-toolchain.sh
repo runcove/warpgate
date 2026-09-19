@@ -300,16 +300,35 @@ fi
 # And the forwarding half of the claim: run-check.sh must actually carry
 # RUSTC_WRAPPER across the cap boundary, or none of the above matters.
 RUN_CHECK="$HERE/../run-check.sh"
+RUN_CHECK_CODE=$(grep -v '^[[:space:]]*#' "$RUN_CHECK" 2>/dev/null || true)
 if [ ! -f "$RUN_CHECK" ]; then
   bad "no run-check.sh at $RUN_CHECK -- cannot confirm the variable crosses the cap"
-elif grep -v '^[[:space:]]*#' "$RUN_CHECK" | grep -q "RUSTC_WRAPPER"; then
+elif grep -q "RUSTC_WRAPPER" <<<"$RUN_CHECK_CODE"; then
   # Comments stripped first: run-check.sh DISCUSSES the cap boundary at length
   # around this code, so a plain grep would pass on a file that had kept the
   # prose and dropped the variable -- the same "matched the explanation, not
   # the behaviour" defect this suite keeps finding elsewhere.
+  #
+  # The stripping happens in a COMMAND SUBSTITUTION above, not in a pipe into
+  # this grep, and that is load-bearing rather than style. This was
+  #
+  #   elif grep -v '^[[:space:]]*#' "$RUN_CHECK" | grep -q "RUSTC_WRAPPER"
+  #
+  # which is a RACE this file runs under `set -o pipefail`. `grep -q` exits the
+  # instant it matches; if the upstream `grep -v` still has output buffered it
+  # takes SIGPIPE and exits 141, pipefail promotes that to the pipeline's
+  # status, the `elif` reads false, and the suite reports that run-check.sh
+  # "no longer forwards RUSTC_WRAPPER" -- about a file that does, five times
+  # over. Whether it fires depends on how much output remains after the first
+  # match, so it sat latent until run-check.sh grew by 41 lines and then failed
+  # CI run 2858 while passing locally minutes earlier.
+  #
+  # Same family as `| head -N` swallowing the answering line: an early-exiting
+  # consumer truncates the producer AND replaces the exit status. Never put one
+  # at the end of a pipeline whose status you are about to branch on.
   ok "run-check.sh forwards RUSTC_WRAPPER into the capped container (in code, not a comment)"
 else
-  bad "run-check.sh no longer forwards RUSTC_WRAPPER in code; the sccache requirement above may be stale"
+  bad "run-check.sh no longer forwards RUSTC_WRAPPER in code; the sccache requirement above may be stale (if run-check.sh plainly DOES contain it, suspect the pipefail/SIGPIPE race described above rather than the script)"
 fi
 
 echo "== the requirements that are not programs at all: rustup components =="
@@ -463,6 +482,55 @@ fi
 grep -qE "a LOGIN shell cannot find:.*\bjust\b" <<<"$out" \
   && ok "and names the tools the login shell lost" \
   || bad "the control fired but did not name \`just\` among the lost tools: $out"
+
+# --- the pattern guard -----------------------------------------------------
+#
+# A timing race cannot be caught by an ordinary assertion: the bug above
+# PASSED locally minutes before it failed CI, and passed again under `bash -x`
+# because tracing changed the timing. A test that runs the racy code and checks
+# the answer is exactly as unreliable as the code it is testing.
+#
+# So guard the PATTERN instead, across the whole suite. Any pipeline that ends
+# in an early-exiting consumer (`grep -q`, `grep -m N`, `head`) and whose
+# status is then branched on is the same bug waiting for a file to grow: the
+# consumer exits, the producer takes SIGPIPE, and under `set -o pipefail` the
+# pipeline reports the producer's death rather than the match. Assign to a
+# variable first, or use `<<<`.
+echo "== no early-exiting consumer at the end of a pipeline used as a condition =="
+# The pattern is built in a variable rather than written inline, and that is
+# not tidiness. Written inline it fired on ITS OWN negative control: the regex
+# text contains `|` as alternation, so a line holding the pattern looks exactly
+# like a line holding a pipeline. The guard reported the file it lives in.
+# A checker whose own source is indistinguishable from what it searches for
+# cannot be trusted either way.
+RACY_RE='^[[:space:]]*(el)?if[[:space:]].*[|][[:space:]]*(grep -q|grep -m|head)[[:space:]]'
+# `<<<` excluded: a herestring is not a pipe and cannot SIGPIPE its producer.
+racy=$(grep -nE "$RACY_RE" "$HERE"/*.sh 2>/dev/null | grep -v '<<<' || true)
+if [ -z "$racy" ]; then
+  ok "no test branches on the status of a pipeline that truncates itself"
+else
+  bad "a pipeline ending in an early-exiting consumer is branched on -- this is the run-2858 race:
+$racy"
+fi
+# The guard's own negative control: it must actually match the shape it claims
+# to, or a clean result means it looked at nothing. Fed the exact line that
+# broke CI run 2858, through a file so the match runs the same way it does
+# above rather than through a herestring the real scan excludes.
+probe_f=$(mktemp); printf 'elif grep -v "^#" "$F" | grep -q "X"; then\n' > "$probe_f"
+if [ -n "$(grep -nE "$RACY_RE" "$probe_f")" ]; then
+  ok "and the guard recognises the real offending line, so a clean result means something"
+else
+  bad "the pattern guard does not match the line that actually broke CI -- it proves nothing"
+fi
+# The other half of a working control: it must NOT match the safe form, or it
+# would condemn the very fix it is meant to protect.
+printf 'elif grep -q "X" <<<"$CODE"; then\n' > "$probe_f"
+if [ -z "$(grep -nE "$RACY_RE" "$probe_f" | grep -v '<<<')" ]; then
+  ok "and it clears the safe herestring form, so the fix is not flagged as the bug"
+else
+  bad "the pattern guard flags the SAFE form -- it would force the code back to the racy one"
+fi
+rm -f "$probe_f"
 
 [ "$fails" -eq 0 ] && echo "PASS" || echo "FAILURES"
 exit "$fails"
