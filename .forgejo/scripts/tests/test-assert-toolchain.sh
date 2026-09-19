@@ -101,7 +101,47 @@ healthy() {
   # below exists to hold open.
   present $TOOLS sccache; python_stub 0
 }
-run() { out=$(PATH="$BIN" bash "$SCRIPT" "$PIN" "$WORK" 2>&1); rc=$?; }
+# FOUND BY CI RUN 580, THE SELFTEST STEP'S FIRST FULL RUN. Every ordinary case
+# here calls the script with PATH set to the stub directory ALONE, and the
+# script then re-checks the same tools through `bash -lc`. What a login shell
+# does to PATH is a property of the HOST, not of this suite: Fedora's
+# /etc/profile leaves an inherited PATH alone, so every case passed on baba,
+# while Debian's ASSIGNS it -- and the CI job image is node:22-bookworm. There
+# the stub directory vanished inside the login shell and the healthy image
+# failed its own health check, with /etc/profile additionally printing
+# `id: command not found` because PATH held nothing but the stubs.
+#
+# A suite whose verdict depends on which distribution ran it is not testing the
+# script. The fixture now models what the REAL toolchain image does about
+# exactly this: our Dockerfile ships /etc/profile.d/10-cargo-path.sh to put
+# /usr/local/cargo/bin back after /etc/profile has assigned PATH. The stub
+# equivalent is a login HOME whose .bash_profile prepends $BIN, delivered
+# through the script's existing ASSERT_TOOLCHAIN_LOGIN_HOME hook.
+#
+# This does NOT weaken the control at the foot of this file: that case passes
+# its own LOGIN_HOME, one that strips the directory, and still has to fire. The
+# pair now discriminates on any host rather than only on Debian.
+#
+# The fixture ASSIGNS PATH before restoring it, deliberately. Simply prepending
+# $BIN would leave this suite passing on Fedora for the old reason -- because
+# nothing had taken the directory away -- and the fix would be unproven exactly
+# where it was needed. Assign-then-restore reproduces Debian's behaviour on any
+# host, so every ordinary case below now exercises the condition that broke run
+# 580 rather than merely surviving it.
+LOGIN_HOME_OK="$WORK/login-home-ok"
+mkdir -p "$LOGIN_HOME_OK"
+printf '%s\n' \
+  '# stands in for Debian /etc/profile assigning PATH ...' \
+  'PATH=/usr/bin:/bin' \
+  'export PATH' \
+  "# ... and for the image's own /etc/profile.d/10-cargo-path.sh putting the" \
+  '# tool directory back afterwards.' \
+  "PATH=\"$BIN:\$PATH\"" \
+  'export PATH' > "$LOGIN_HOME_OK/.bash_profile"
+run() {
+  out=$(PATH="$BIN" ASSERT_TOOLCHAIN_LOGIN_HOME="$LOGIN_HOME_OK" \
+        bash "$SCRIPT" "$PIN" "$WORK" 2>&1); rc=$?
+}
 
 echo "== the healthy image passes, and says what it checked =="
 healthy; run

@@ -287,7 +287,14 @@ jobs:
           for t in "${suites[@]}"; do
             bash "$t" > "$logdir/$t.log" 2>&1; t_rc=$?
             if [ "$t_rc" -eq 0 ]; then
-              echo "  ok    $t"
+              # A passing suite printed one line and nothing else, so a reader
+              # could not tell a suite that proved its cases from one that
+              # skipped them and exited 0 anyway. Any suite reporting skips
+              # says so here. In this job the count must be 0: the
+              # require-flag above turns a skip into a failure, so a non-zero
+              # count reaching this line would itself be a finding.
+              skipline=$(grep -m1 '^skipped: ' "$logdir/$t.log" || true)
+              echo "  ok    $t${skipline:+  ($skipline)}"
             else
               echo "  FAIL  $t (exit $t_rc)"
               sed 's/^/        /' "$logdir/$t.log" | tail -25

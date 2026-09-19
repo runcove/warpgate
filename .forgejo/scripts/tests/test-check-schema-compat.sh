@@ -21,6 +21,22 @@
 # The verdict comes from the DIFFERENCE between the two runs, never from one
 # run looking right.
 set -uo pipefail
+
+# FOUND BY CI RUN 580, THE SELFTEST STEP'S FIRST FULL RUN. Every test below
+# drives check-schema-compat.sh through its own hooks, and that script refuses
+# 93 outright when a hook is set while CI/GITHUB_ACTIONS/FORGEJO_ACTIONS is
+# present -- correctly, since inside a real run a hook would stand in for the
+# comparison being measured. So this suite could pass only where no CI marker
+# was set, i.e. everywhere except the one place it now runs. Six assertions
+# failed in CI while passing on a development host.
+#
+# Clearing the markers here is the same fix test-hardened-run.sh already
+# carries for the same reason. It does not weaken the leak check below: that
+# loop sets each marker EXPLICITLY on the command it is testing, which is the
+# only honest way to test a guard about them anyway -- an ambient variable
+# that happens to satisfy a precondition is not a test of that precondition.
+unset CI GITHUB_ACTIONS FORGEJO_ACTIONS
+
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT="${CHECK_SCHEMA_COMPAT:-$HERE/../check-schema-compat.sh}"
 fails=0
