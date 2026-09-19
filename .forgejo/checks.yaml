@@ -205,7 +205,29 @@ checks:
     tools: [cargo, cargo-llvm-cov]
   - name: release-build
     upstream: build.yml
-    command: mkdir -p warpgate-web/dist && cargo build --all-features --release
+    command: mkdir -p warpgate-web/dist && SOURCE_DATE_EPOCH=0 cargo build --all-features --release
+    # SOURCE_DATE_EPOCH=0 is upstream's, and their build.yml says why in one
+    # word: "for rust-embed determinism". It is the one piece of upstream's
+    # build environment genuinely missing from ours.
+    #
+    # The RUSTFLAGS half of upstream's env is deliberately NOT copied, and the
+    # reason is measured rather than argued (nightly-2026-07-09, throwaway
+    # crate, reading the rustc invocation out of `cargo build -v`):
+    #
+    #   * `.cargo/config.toml` already sets `--cfg tokio_unstable`,
+    #     `-Zthreads=8` and `-Zremap-cwd-prefix=/reproducible-cwd` for
+    #     `cfg(all())`, so they are in force on every cargo command here.
+    #   * Setting plain `RUSTFLAGS` REPLACES those rather than adding to them.
+    #     "Adding" upstream's flags that way would silently REMOVE
+    #     `-Zthreads=8` and `-Zremap-cwd-prefix` — less reproducible, while
+    #     looking like the opposite. Only the `CARGO_TARGET_<triple>_RUSTFLAGS`
+    #     form combines, which is why upstream uses it.
+    #
+    # The remap flags are owed and are coming as a script (runcove-xais), not
+    # as a one-liner: the env var name embeds the host triple, so on any other
+    # architecture the flags are silently ignored — an absence, which is this
+    # arc's whole failure mode. The script will derive the triple and assert
+    # from `cargo build -v` that the flags reached rustc, refusing if not.
     # THE `mkdir` IS NOT PADDING. warpgate-web/src/lib.rs derives RustEmbed on
     # `#[folder = "../warpgate-web/dist"]`, and RustEmbed fails to COMPILE when
     # that folder does not exist. A fresh checkout has no dist/, so without
@@ -228,6 +250,17 @@ checks:
     state: reporting
     # cargo-cyclonedx added 2026-09-19: the command is `cargo cyclonedx`,
     # which is a separate binary, not a builtin subcommand.
+    # DIVERGENCE, deliberate and deferred: RUST BOM ONLY; THE NPM BOM IS NOT
+    # MERGED. Upstream's build.yml builds the product's SBOM by merging this
+    # Rust BOM with the admin-UI npm BOM (cyclonedx-npm@4.1.2 plus the
+    # CycloneDX CLI v0.27.2, after a full `just npm ci` and `npm run build`).
+    # An SBOM missing every npm dependency is not an SBOM of this product —
+    # the same shape schema-compat had before it learned to compare. Deferred
+    # on 2026-09-19 because nothing consumes the fork's SBOM yet and the merge
+    # drags a full npm install and two more tools into the sandbox image.
+    # Tracked as runcove-f1b9, to be taken only after the Rust path has
+    # produced a real verdict on the image. This note is the interim answer
+    # and is not a substitute for that bead.
     # LEAVES (traced 2026-09-19): `cargo cyclonedx --all-features` -> the cargo-cyclonedx binary,
     # which is a separate binary and not a builtin subcommand.
     tools: [cargo, cargo-cyclonedx]
