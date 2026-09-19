@@ -169,6 +169,29 @@ HOST="${S3_ENDPOINT#*://}"; HOST="${HOST%%/*}"
 # Credentials are supplied to the process through the environment by the caller
 # and are deliberately NOT printed here.
 echo "RUSTC_WRAPPER=sccache"
+# PAIRED WITH THE WRAPPER ON PURPOSE, because that is what it is coupled to.
+# sccache does not degrade when incremental compilation is on, it REFUSES --
+# "incremental compilation is prohibited: Unset CARGO_INCREMENTAL to continue" --
+# and forwards every compile uncached. Measured elsewhere on the same tool: 1,173
+# Rust compilations, 0 hits, against a cache that was installed, correctly wired
+# and completely inert. Cargo leaves incremental ON for the dev profile by
+# default, and the dev-profile checks here (clippy, unit-tests, schema-compat) are
+# exactly the ones that would land in that case.
+#
+# WHY THIS LINE EXISTS WHEN THE CACHE ALREADY WORKS. Run 2840 measured 99.65-99.75 %
+# hit rates on those dev-profile checks with zero occurrences of the refusal string,
+# so incremental is already off in the capped container -- and NOTHING WE CONTROL
+# TURNS IT OFF. It is not in this file, not in ci.yml, not in the fork's
+# .cargo/config.toml, and not in the ci-toolchain Dockerfile, whose only cargo ENV
+# is CARGO_HOME/RUSTUP_HOME. Something in the environment is doing it and this
+# comment deliberately does not guess which: an explanation nobody has read in
+# cargo's own docs or source is not an explanation.
+#
+# Correct behaviour from an unidentified mechanism is a latent failure, and this
+# one fails SILENTLY -- no error, just a hit rate that goes to zero while every
+# part of the setup still looks right. One line removes the dependency on
+# something we cannot name. It is a no-op today by construction; that is the point.
+echo "CARGO_INCREMENTAL=0"
 echo "SCCACHE_BUCKET=${BUCKET}"
 echo "SCCACHE_ENDPOINT=${HOST}"
 # REQUIRED, not optional, and its absence cost run 573. sccache v0.17.0's

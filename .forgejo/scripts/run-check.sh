@@ -214,7 +214,15 @@ fi
 # the bucket root. That is the exact keyspace the prefix exists to protect, so
 # the failure would have destroyed the thing the feature was built to preserve
 # while every step still reported success.
-CACHE_FORWARD_VARS=(RUSTC_WRAPPER SCCACHE_BUCKET SCCACHE_ENDPOINT
+#
+# CARGO_INCREMENTAL (2026-09-19) makes the same point a third time, and the pin
+# caught it within a minute of the variable being added to cache-env.sh: emitting
+# it and not forwarding it would have left the sandbox exactly as it is today --
+# relying on whatever unidentified thing currently turns incremental off -- while
+# the commit, the tests for cache-env.sh, and the comment all said the dependency
+# had been removed. A fix that reports itself as applied and is not is worse than
+# no fix, because it stops anyone looking again.
+CACHE_FORWARD_VARS=(RUSTC_WRAPPER CARGO_INCREMENTAL SCCACHE_BUCKET SCCACHE_ENDPOINT
                      SCCACHE_REGION SCCACHE_S3_USE_SSL SCCACHE_S3_NO_CREDENTIALS
                      SCCACHE_S3_KEY_PREFIX
                      AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY)

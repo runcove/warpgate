@@ -72,10 +72,24 @@ region_line=$(grep '^SCCACHE_REGION=' <<<"$out")
 # invisible to all of them — which is exactly how the region was lost. This
 # fails when a variable is dropped AND when one is added without a decision.
 got_keys=$(cut -d= -f1 <<<"$out" | sort | tr '\n' ' ')
-want_keys="RUSTC_WRAPPER SCCACHE_BUCKET SCCACHE_ENDPOINT SCCACHE_REGION SCCACHE_S3_NO_CREDENTIALS SCCACHE_S3_USE_SSL "
+want_keys="CARGO_INCREMENTAL RUSTC_WRAPPER SCCACHE_BUCKET SCCACHE_ENDPOINT SCCACHE_REGION SCCACHE_S3_NO_CREDENTIALS SCCACHE_S3_USE_SSL "
 [ "$got_keys" = "$want_keys" ] \
-  && ok "emits exactly the six expected variables, no more and no fewer" \
+  && ok "emits exactly the seven expected variables, no more and no fewer" \
   || bad "emitted set changed: got [$got_keys] want [$want_keys]"
+# CARGO_INCREMENTAL joined the set on 19 Sep 2026 and this assertion is what
+# made that a decision rather than a drift -- it failed on the addition, as
+# designed. sccache REFUSES when incremental is on rather than degrading, so
+# this variable is coupled to RUSTC_WRAPPER and is emitted beside it.
+#
+# It is a no-op today: run 2840 measured 99.65-99.75 % hits on the dev-profile
+# checks with no refusal in the log, so something already turns incremental off
+# -- and nothing we control does it. Not this file, not ci.yml, not the fork's
+# .cargo/config.toml, not the toolchain Dockerfile. Correct behaviour from an
+# unidentified mechanism is a latent failure whose symptom is silence, so the
+# line exists to remove the dependency, not to change today's behaviour.
+grep -q "CARGO_INCREMENTAL=0" <<<"$out" \
+  && ok "incremental compilation is turned off beside the wrapper that refuses without it" \
+  || bad "CARGO_INCREMENTAL is not emitted; a cargo change could silently zero the hit rate: $out"
 grep -q "SCCACHE_BUCKET=warpgate-sccache"  <<<"$out" && ok "bucket is the one passed"  || bad "wrong bucket: $out"
 
 # THE FIXTURE IS THE TEST HERE, and it used to be the bug.
