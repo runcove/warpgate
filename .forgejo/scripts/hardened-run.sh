@@ -46,6 +46,7 @@ done
 
 CPUS="" MEM="" LABEL="hardened" SOURCE="" WORKDIR="" VERIFY_FILE=""
 FORWARD_VARS=()
+ADD_HOSTS=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --cpus)    CPUS="$2"; shift 2 ;;
@@ -73,6 +74,21 @@ while [ $# -gt 0 ]; do
     # decides what crosses the boundary); repeatable so a caller can forward
     # as many names as it needs.
     --forward-env) FORWARD_VARS+=("$2"); shift 2 ;;
+    # A NAME:ADDRESS mapping placed in the container's /etc/hosts. Pure
+    # passthrough: this script does no name resolution of its own and knows
+    # nothing about which host matters or why. That is the caller's knowledge,
+    # exactly as with --verify-file, and for the same reason -- a caller that
+    # decides a lookup failure is survivable (run-check.sh, for the build
+    # cache) must not have that decision taken for it in here.
+    #
+    # Why a caller needs this at all, measured in run 604: the inner dind
+    # daemon inherits the job container's loopback resolver (127.0.0.11),
+    # treats it as unusable, and falls back to Docker's built-in defaults --
+    # Google's public servers -- which cannot resolve a homelab name. A
+    # container it creates therefore cannot reach anything on the LAN by name,
+    # while the job container resolves the same name without trouble.
+    # Repeatable.
+    --add-host)    ADD_HOSTS+=("$2"); shift 2 ;;
     --) shift; break ;;
     *) echo "hardened-run: unknown argument $1" >&2; exit 2 ;;
   esac
@@ -101,6 +117,20 @@ if [ -n "$SOURCE" ] && [ -z "$WORKDIR" ]; then
   exit 2
 fi
 
+# A malformed mapping is a usage error, not something to pass to docker and
+# let it complain in its own words halfway through a run. Refused at parse
+# time, like --source without --workdir, and the message names the value that
+# was wrong rather than saying one of them was: a caller passing several gets
+# told which.
+for m in ${ADD_HOSTS[@]+"${ADD_HOSTS[@]}"}; do
+  case "$m" in
+    *:*) : ;;
+    *) echo "hardened-run: --add-host '$m' is not NAME:ADDRESS" >&2; exit 2 ;;
+  esac
+  [ -n "${m%%:*}" ] || { echo "hardened-run: --add-host '$m' has an empty name" >&2; exit 2; }
+  [ -n "${m##*:}" ] || { echo "hardened-run: --add-host '$m' has an empty address" >&2; exit 2; }
+done
+
 NAME="${LABEL}-${GITHUB_RUN_ID:-local}-$$"
 
 # --memory-swap must equal --memory. If it is left unset the container may swap
@@ -108,6 +138,7 @@ NAME="${LABEL}-${GITHUB_RUN_ID:-local}-$$"
 ARGS=(--rm --name "$NAME"
       "--cpus=${CPUS}"
       "--memory=${MEM}" "--memory-swap=${MEM}")
+for m in ${ADD_HOSTS[@]+"${ADD_HOSTS[@]}"}; do ARGS+=(--add-host "$m"); done
 
 # Only a variable that is actually SET, with a non-empty value, in this
 # script's own environment gets forwarded. `-e VAR` (name-only) tells docker

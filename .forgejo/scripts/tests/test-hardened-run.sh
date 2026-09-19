@@ -563,6 +563,32 @@ else
       && ok "the weak branch's own distinguishing message fired, not just a bare rc" \
       || bad "weak-branch message did not appear: $weak_out"
 
+    # 29c. --add-host ACTUALLY WORKS, against a real container. Everything
+    #     above proves the flag reaches the invocation; this proves the
+    #     invocation does something. The name is under `.invalid`, which
+    #     RFC 2606 reserves so that it can never resolve -- so a successful
+    #     lookup inside the container cannot have come from DNS and can only
+    #     have come from the mapping. A real hostname here would pass whether
+    #     or not --add-host did anything.
+    out=$(
+      PATH="${ENGINE_PATH_PREFIX}$PATH" HARDENED_RUN_IMAGE="$TEST_IMAGE" \
+      "$SCRIPT" --cpus 1 --memory 256m --add-host probe.invalid:192.0.2.77 \
+        -- getent hosts probe.invalid 2>&1
+    ); rc=$?
+    [ "$rc" -eq 0 ] && grep -q "192.0.2.77" <<<"$out" \
+      && ok "--add-host is honoured inside the real container (a name DNS cannot answer resolves)" \
+      || bad "--add-host did not take effect in a real container (rc=$rc): $out"
+
+    # And its control: the same unresolvable name WITHOUT the mapping must
+    # fail, or the case above proves nothing about --add-host.
+    out=$(
+      PATH="${ENGINE_PATH_PREFIX}$PATH" HARDENED_RUN_IMAGE="$TEST_IMAGE" \
+      "$SCRIPT" --cpus 1 --memory 256m -- getent hosts probe.invalid 2>&1
+    ); rc=$?
+    [ "$rc" -ne 0 ] \
+      && ok "CONTROL: without the mapping the same name does not resolve" \
+      || bad "probe.invalid resolved with no --add-host (rc=$rc) -- the case above is not testing the mapping: $out"
+
     # Last statement in the block, deliberately: this records that the
     # real-engine cases ran to completion, which is what the require-flag's
     # assertion at the foot of this file reads. Individual failures inside the
@@ -715,7 +741,44 @@ grep -qi "docker cp itself failed" <<<"$out" && ok "names docker cp as the faili
 [ ! -e "$marker36" ] && ok "the real command never ran after a failed docker cp" \
   || bad "the real command ran despite a failed docker cp"
 
-# 37. THE REQUIRE-FLAG ITSELF. Ruling (arc rulebook, "Settled"): "The proof
+# 37-40. --add-host: pure passthrough, refused when malformed, and repeatable.
+#     This script does no resolution of its own -- run-check.sh does the lookup
+#     in the job container, where run 604 proved it works, and hands the answer
+#     over. The same division as --verify-file: mechanism here, knowledge there.
+out=$(HARDENED_RUN_DRY=1 "$SCRIPT" --cpus 4 --memory 7g \
+      --add-host cache.example:192.0.2.10 -- true 2>&1)
+grep -q -- "--add-host cache.example:192.0.2.10" <<<"$out" \
+  && ok "a NAME:ADDRESS mapping reaches the docker invocation" \
+  || bad "--add-host did not reach the invocation: $out"
+
+out=$(HARDENED_RUN_DRY=1 "$SCRIPT" --cpus 4 --memory 7g \
+      --add-host a.example:192.0.2.1 --add-host b.example:192.0.2.2 -- true 2>&1)
+if grep -q -- "--add-host a.example:192.0.2.1" <<<"$out" \
+   && grep -q -- "--add-host b.example:192.0.2.2" <<<"$out"; then
+  ok "two mappings both reach the invocation (repeatable, not last-one-wins)"
+else
+  bad "a repeated --add-host lost one of its mappings: $out"
+fi
+
+# The negative that makes the two above mean something: with no --add-host, no
+# mapping appears at all. Without this, a script that hardcoded one would pass
+# both assertions above.
+out=$(HARDENED_RUN_DRY=1 "$SCRIPT" --cpus 4 --memory 7g -- true 2>&1)
+grep -q -- "--add-host" <<<"$out" \
+  && bad "an invocation with no --add-host still carried one: $out" \
+  || ok "no --add-host given, none in the invocation"
+
+# Malformed values are a usage error, refused at parse time rather than handed
+# to docker to complain about halfway through a run. Three shapes, because
+# "contains a colon" is not the same check as "has both halves".
+for bogus in "nocolon" ":192.0.2.1" "name:"; do
+  out=$(HARDENED_RUN_DRY=1 "$SCRIPT" --cpus 4 --memory 7g --add-host "$bogus" -- true 2>&1); rc=$?
+  [ "$rc" -eq 2 ] && grep -q "$bogus" <<<"$out" \
+    && ok "refuses --add-host '$bogus' (exit 2) and quotes the value back" \
+    || bad "--add-host '$bogus' was not refused with 2 naming it (rc=$rc): $out"
+done
+
+# 41. THE REQUIRE-FLAG ITSELF. Ruling (arc rulebook, "Settled"): "The proof
 #     needs a require-flag that turns that skip into a refusal AND a CI step
 #     that sets it. Anyone shortening this to 'we run the tests in CI now' has
 #     lost the half that matters."

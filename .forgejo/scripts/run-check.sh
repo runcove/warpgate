@@ -268,6 +268,50 @@ for v in "${CACHE_FORWARD_VARS[@]}"; do FORWARD_FLAGS+=(--forward-env "$v"); don
 # always meets a cold sccache — and the consequence if that ever changes is a
 # needlessly uncached build, i.e. slower, which is the direction this whole
 # block is built to fail in.
+# THE CAPPED CONTAINER CANNOT RESOLVE THE CACHE HOST, AND THE JOB CONTAINER CAN.
+# Measured in run 604, three readings taken in the place the fault happens:
+#
+#   job container      nameserver 127.0.0.11 (upstream 10.96.0.10)   getent rc=0
+#   plain dind container   nameserver 8.8.8.8 / 8.8.4.4             getent rc=2
+#   same + cap flags       nameserver 8.8.8.8 / 8.8.4.4             getent rc=2
+#
+# The inner dind daemon inherits the job container's loopback resolver, treats
+# a loopback nameserver as unusable, and falls back to Docker's built-in
+# defaults -- Google's public servers, which cannot resolve a homelab name.
+# That, and nothing else, is the `dns error: ... Name has no usable address`
+# that has made every capped check run uncached since the cache was wired.
+# The cap flags are provably irrelevant: readings 2 and 3 are byte-identical.
+#
+# So the lookup happens HERE, where it works, and the answer is carried across
+# as a plain /etc/hosts entry. NOTHING IS TYPED: the host comes out of
+# SCCACHE_ENDPOINT, the address out of getent. A hand-written address would be
+# a second copy of a fact the DNS already holds -- the same pinned-value smell
+# this repo refuses one level down, and it would go stale in silence.
+#
+# ON FAILURE THIS DEGRADES, IT DOES NOT REFUSE, and that is deliberate rather
+# than lazy. The block below already settles the question for a dead cache --
+# "a refusal would convert a cache outage into a red run, which is the same
+# over-reaction in the other direction" -- and a name that will not resolve is
+# a dead cache reached one step earlier. The marker is the same greppable one,
+# so run-all-checks.sh collects it into the summary and a resolution failure
+# is exactly as visible as any other cache outage.
+CACHE_ADD_HOST=()
+if [ "$CAPPED" = "yes" ] && [ -n "${SCCACHE_ENDPOINT:-}" ]; then
+  __ch="${SCCACHE_ENDPOINT#*://}"; __ch="${__ch%%:*}"; __ch="${__ch%%/*}"
+  if [ -z "$__ch" ]; then
+    echo "CACHE-UNAVAILABLE $NAME — SCCACHE_ENDPOINT is set to '${SCCACHE_ENDPOINT}', which yields no hostname" >&2
+  else
+    # ahostsv4, not `hosts`: --add-host takes one address and docker wants an
+    # IPv4 here; `getent hosts` would happily hand back an IPv6 first.
+    __cip=$(getent ahostsv4 "$__ch" 2>/dev/null | awk 'NR==1{print $1}')
+    if [ -n "$__cip" ]; then
+      CACHE_ADD_HOST=(--add-host "$__ch:$__cip")
+    else
+      echo "CACHE-UNAVAILABLE $NAME — could not resolve '$__ch' in the job container, so the capped container was given no route to the cache. The check runs uncached." >&2
+    fi
+  fi
+fi
+
 CACHE_PROBE=""
 if [ "$CAPPED" = "yes" ]; then
   CACHE_PROBE="if [ -n \"\${RUSTC_WRAPPER:-}\" ]; then if __ce=\$(sccache --start-server 2>&1); then :; else __cf=\$(printf '%s\n' \"\$__ce\" | grep '[^[:space:]]' || true); if [ -n \"\$__cf\" ]; then printf '%s\n' \"\$__cf\" | while IFS= read -r __cl; do echo \"CACHE-UNAVAILABLE $(printf '%q' "$NAME") — \$__cl\" >&2; done; else echo \"CACHE-UNAVAILABLE $(printf '%q' "$NAME") — sccache could not start and printed nothing\" >&2; fi; unset RUSTC_WRAPPER; fi; fi; "
@@ -324,6 +368,7 @@ elif [ "$CAPPED" = "yes" ]; then
   # /etc/profile.d entry that a check needs.
   "$HERE/hardened-run.sh" --cpus "${CI_CPUS:-4}" --memory "${CI_MEMORY:-7g}" \
     --label "check-$NAME" --source "$PWD" --workdir /src --verify-file Cargo.toml \
+    ${CACHE_ADD_HOST[@]+"${CACHE_ADD_HOST[@]}"} \
     "${FORWARD_FLAGS[@]}" -- bash -c "${TOOL_PROBE}${CACHE_PROBE}$COMMAND"
   rc=$?
 else

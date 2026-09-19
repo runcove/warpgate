@@ -249,6 +249,59 @@ grep -qx -- "--verify-file" "$ARGS_FILE" 2>/dev/null && grep -qx "Cargo.toml" "$
   && ok "passes --verify-file Cargo.toml to hardened-run.sh on the capped path" \
   || bad "did not pass --verify-file Cargo.toml to hardened-run.sh: $(cat "$ARGS_FILE" 2>/dev/null)"
 
+# --- the cache host is resolved HERE and carried across as /etc/hosts -------
+# Run 604 measured that the capped container cannot resolve a homelab name
+# (its daemon falls back to Google's resolvers) while the job container can.
+# So run-check.sh looks the host up where the lookup works and passes the
+# answer as --add-host. Three cases, because the interesting property is not
+# "a flag appears" but "it appears exactly when it should".
+#
+# `localhost` and `.invalid` are chosen so these assertions mean the same
+# thing on any machine: localhost always resolves to 127.0.0.1, and RFC 2606
+# guarantees .invalid never resolves at all. A real hostname here would make
+# the suite's verdict depend on the DNS of whoever ran it -- which is the
+# defect run 580 found in test-assert-toolchain.sh, one file over.
+rm -f "$ARGS_FILE"
+CHECKS_FILE="$FAKE_CHECKS" STUB_HARDENED_RUN_ARGS_FILE="$ARGS_FILE" \
+  SCCACHE_ENDPOINT=https://localhost:9000 \
+  "$FORWARD_DIR/run-check.sh" fake-capped >/dev/null 2>&1
+if grep -qx -- "--add-host" "$ARGS_FILE" 2>/dev/null; then
+  ok "a resolvable cache host produces --add-host"
+  grep -qx "localhost:127.0.0.1" "$ARGS_FILE" 2>/dev/null \
+    && ok "and the mapping carries the address the job container resolved, not a typed one" \
+    || bad "--add-host was passed with the wrong value: $(grep -A1 -x -- '--add-host' "$ARGS_FILE" 2>/dev/null)"
+else
+  bad "a resolvable cache host did not produce --add-host: $(cat "$ARGS_FILE" 2>/dev/null)"
+fi
+
+# A host that cannot resolve must DEGRADE, not refuse: the check still runs,
+# uncached, and says so in the same greppable marker every other cache outage
+# uses. Refusing here would convert a cache problem into a red check, which
+# run-check.sh's own CACHE_PROBE block already settles in the other direction.
+rm -f "$ARGS_FILE"
+out=$(CHECKS_FILE="$FAKE_CHECKS" STUB_HARDENED_RUN_ARGS_FILE="$ARGS_FILE" \
+  SCCACHE_ENDPOINT=https://no-such-host.invalid:9000 \
+  "$FORWARD_DIR/run-check.sh" fake-capped 2>&1); rc=$?
+[ "$rc" -eq 0 ] && ok "an unresolvable cache host still lets the check run (degrade, not refuse)" \
+  || bad "an unresolvable cache host turned into a failure (rc=$rc): $out"
+grep -qx -- "--add-host" "$ARGS_FILE" 2>/dev/null \
+  && bad "passed --add-host for a host that does not resolve: $(cat "$ARGS_FILE" 2>/dev/null)" \
+  || ok "and passes no --add-host rather than a mapping to nothing"
+grep -q "CACHE-UNAVAILABLE.*could not resolve" <<<"$out" \
+  && ok "and names the resolution failure in the marker run-all-checks.sh collects" \
+  || bad "a resolution failure was silent -- the one thing this must not be: $out"
+
+# THE NEGATIVE CONTROL, and it needs `env -u`: SCCACHE_ENDPOINT is exactly the
+# kind of variable a developer has exported in their own shell, and an ambient
+# value would make this case pass while testing nothing. That happened on this
+# machine with RUSTC_WRAPPER on 2026-09-19 and cost a real control.
+rm -f "$ARGS_FILE"
+env -u SCCACHE_ENDPOINT CHECKS_FILE="$FAKE_CHECKS" STUB_HARDENED_RUN_ARGS_FILE="$ARGS_FILE" \
+  "$FORWARD_DIR/run-check.sh" fake-capped >/dev/null 2>&1
+grep -qx -- "--add-host" "$ARGS_FILE" 2>/dev/null \
+  && bad "passed --add-host with no cache configured at all: $(cat "$ARGS_FILE" 2>/dev/null)" \
+  || ok "no cache configured means no --add-host -- the flag is conditional, not decorative"
+
 rm -f "$ARGS_FILE"
 out=$(CHECKS_FILE="$FAKE_CHECKS" STUB_HARDENED_RUN_ARGS_FILE="$ARGS_FILE" \
   "$FORWARD_DIR/run-check.sh" fake-uncapped 2>&1); rc=$?
