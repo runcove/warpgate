@@ -5,6 +5,11 @@ on:
   push:
     branches: ['**']
   workflow_dispatch:
+    inputs:
+      cache_key_prefix:
+        description: 'Measurement only: write the build cache under this key prefix instead of the bucket root. Leave empty for normal runs.'
+        required: false
+        default: ''
 
 jobs:
   checks:
@@ -130,6 +135,14 @@ jobs:
       # exit 93 rather than a crash (Task 2).
       HARDENED_RUN_IMAGE: ${{ vars.HARDENED_RUN_IMAGE }}
       S3_ENDPOINT: ${{ vars.OGA2_S3_ENDPOINT }}
+      # Measurement seam, empty on every path but a deliberate dispatch. `|| ''`
+      # because `push` supplies no inputs context at all, and cache-env.sh treats
+      # empty as ABSENT -- so pushes and scheduled runs keep using the bucket
+      # root, which is the keyspace run 616 proved warm. cache-env.sh validates
+      # the value and REFUSES 93 on anything outside [A-Za-z0-9._-]; it is not
+      # sanitised, because a silently rewritten prefix would produce a
+      # measurement attributed to a keyspace nobody named.
+      CACHE_KEY_PREFIX: ${{ inputs.cache_key_prefix || '' }}
       AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_ACCESS_KEY }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_SECRET_KEY }}
     steps:

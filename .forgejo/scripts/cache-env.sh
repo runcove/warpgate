@@ -193,3 +193,50 @@ echo "SCCACHE_ENDPOINT=${HOST}"
 echo "SCCACHE_REGION=auto"
 echo "SCCACHE_S3_USE_SSL=true"
 echo "SCCACHE_S3_NO_CREDENTIALS=0"
+
+# OPTIONAL key prefix, for pricing a COLD build without destroying a warm one.
+#
+# Why this exists: on 2026-09-19 the write path measured ~4.1 s per compilation
+# and the read path measured free, but every reading that day was taken while the
+# NAS ran its weekly Saturday clamscan (cron `0 10 * * 6`) over a RAID5 of
+# spinning disks. Re-pricing the write path needs a cold cache. Purging the
+# bucket would do it and would also destroy a warm cache that has been PROVEN to
+# work (run 616: +7 objects across a check that wrote ~772 cold). A prefix gives
+# a fresh keyspace, leaves the proven one intact, is reversible by simply not
+# passing it, and makes the cold-growth number cleaner to read because the new
+# objects can be counted under the prefix alone.
+#
+# EMPTY MEANS ABSENT, not empty-string: with no prefix set sccache uses the
+# bucket root, which is today's proven keyspace. So pushes and scheduled runs are
+# unaffected by the existence of this feature, which is the point.
+PREFIX="${CACHE_KEY_PREFIX:-}"
+if [ -n "$PREFIX" ]; then
+  # Validated, and REFUSED rather than sanitised. This value is chosen by whoever
+  # dispatches the workflow, and the two failure modes differ in kind: a rejected
+  # prefix costs one re-dispatch, while a quietly rewritten one produces a
+  # measurement of a keyspace nobody named -- and the whole purpose of the prefix
+  # is to make a measurement attributable. Sanitising would defeat the feature in
+  # the exact case it exists for.
+  #
+  # No slashes: sccache would accept them (S3 keys are flat and `/` is just a
+  # character), but a prefix is meant to be one short label, and allowing
+  # separators invites `..`, doubled slashes and empty segments that read
+  # differently in a listing than they do here. One label, one meaning.
+  case "$PREFIX" in
+    *[!A-Za-z0-9._-]*)
+      echo "cache-env.sh: FATAL -- CACHE_KEY_PREFIX may contain only A-Z a-z 0-9 . _ -" >&2
+      echo "cache-env.sh: got: $PREFIX" >&2
+      exit 93 ;;
+    [!A-Za-z0-9]*)
+      # A leading dot or dash makes an object that hides in listings or parses as
+      # a flag in whatever reads the bucket next.
+      echo "cache-env.sh: FATAL -- CACHE_KEY_PREFIX must start with a letter or digit" >&2
+      echo "cache-env.sh: got: $PREFIX" >&2
+      exit 93 ;;
+  esac
+  if [ ${#PREFIX} -gt 64 ]; then
+    echo "cache-env.sh: FATAL -- CACHE_KEY_PREFIX is ${#PREFIX} chars, limit 64" >&2
+    exit 93
+  fi
+  echo "SCCACHE_S3_KEY_PREFIX=${PREFIX}"
+fi

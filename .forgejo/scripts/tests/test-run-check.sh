@@ -207,13 +207,32 @@ CHECKS_FILE="$FAKE_CHECKS" STUB_HARDENED_RUN_ARGS_FILE="$ARGS_FILE" \
 # checked -- a name emitted but not forwarded is silently ignored by the
 # process that needs it, and a name forwarded but never emitted is a stale
 # entry nobody will remove.
+#
+# CACHE_KEY_PREFIX is set for the derivation (2026-09-19) so the computed set
+# covers cache-env.sh's FULL emit surface. It prints SCCACHE_S3_KEY_PREFIX only
+# when a prefix is given, so deriving from a default invocation would miss that
+# name entirely -- and then the stale-entry direction below would report the
+# correctly-forwarded variable as an error, while the missing-forward direction
+# would never think to ask for it. A derivation is only as good as the inputs it
+# exercises: driving the source with its default arguments computes a set that
+# happens to match what the default produces, which is not the same as the set
+# the code can produce.
 EXPECTED_FWD="$(S3_ENDPOINT=https://fixture.example:9000 \
+  CACHE_KEY_PREFIX=fixtureprefix \
   "$HERE/../cache-env.sh" fixture-bucket | cut -d= -f1)
 AWS_ACCESS_KEY_ID
 AWS_SECRET_ACCESS_KEY"
 
+# Positive control on the derivation itself: the prefix name must actually be in
+# there. Without this line, a cache-env.sh that silently stopped emitting the
+# prefix would shrink the expected set and every assertion below would keep
+# passing over the smaller one.
+grep -qx SCCACHE_S3_KEY_PREFIX <<<"$EXPECTED_FWD" \
+  && ok "the derivation exercised the prefix path (SCCACHE_S3_KEY_PREFIX present)" \
+  || bad "CACHE_KEY_PREFIX was set but cache-env.sh emitted no SCCACHE_S3_KEY_PREFIX -- the derivation is not covering the full emit surface"
+
 n_expected=$(grep -c . <<<"$EXPECTED_FWD")
-[ "$n_expected" -ge 8 ] \
+[ "$n_expected" -ge 9 ] \
   && ok "derived $n_expected expected forward names from cache-env.sh itself" \
   || bad "cache-env.sh yielded only $n_expected names -- the derivation failed, so every assertion below would pass vacuously"
 

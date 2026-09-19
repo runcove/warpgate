@@ -206,8 +206,17 @@ fi
 # reaches the process that needs it. test-run-check.sh pins them to each
 # other for exactly that reason -- SCCACHE_REGION was added on 2026-09-19
 # and had to be added in both places.
+#
+# SCCACHE_S3_KEY_PREFIX (2026-09-19) is the sharpest case yet for why this list
+# is pinned. It is emitted only when a dispatch sets a prefix, and forgetting it
+# here would not have produced a missing cache -- it would have produced a
+# capped check compiling WITHOUT the prefix, writing a cold build straight into
+# the bucket root. That is the exact keyspace the prefix exists to protect, so
+# the failure would have destroyed the thing the feature was built to preserve
+# while every step still reported success.
 CACHE_FORWARD_VARS=(RUSTC_WRAPPER SCCACHE_BUCKET SCCACHE_ENDPOINT
                      SCCACHE_REGION SCCACHE_S3_USE_SSL SCCACHE_S3_NO_CREDENTIALS
+                     SCCACHE_S3_KEY_PREFIX
                      AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY)
 FORWARD_FLAGS=()
 for v in "${CACHE_FORWARD_VARS[@]}"; do FORWARD_FLAGS+=(--forward-env "$v"); done
