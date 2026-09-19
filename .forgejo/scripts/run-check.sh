@@ -179,7 +179,16 @@ if [ "$CAPPED" = "yes" ]; then
     # is a habit worth not having.
     probe_list+=" $(printf '%q' "$t")"
   done
-  TOOL_PROBE="for __t in${probe_list}; do command -v \"\$__t\" >/dev/null 2>&1 || { echo \"REFUSE $(printf '%q' "$NAME") — required tool not installed inside the sandbox, where this capped check runs: \$__t (exit 97). The environment cannot run this check; it never ran.\" >&2; exit 97; }; done; "
+  # Collects every missing tool before refusing, rather than exiting on the
+  # first. The uncapped gate above has always done this; the capped probe
+  # short-circuited, so a check missing four tools named one per run and a
+  # four-tool gap cost four CI runs to discover -- each one a queue cycle and
+  # a human read. Measured in run 539, the first run in which this probe ever
+  # executed: `clippy` reported `just` and said nothing about `cargo`, which
+  # it also needs. Both halves of the split now answer the same question with
+  # the same completeness; the only difference left is WHERE they looked,
+  # which is the difference that was the point.
+  TOOL_PROBE="__miss=\"\"; for __t in${probe_list}; do command -v \"\$__t\" >/dev/null 2>&1 || __miss=\"\$__miss \$__t\"; done; if [ -n \"\$__miss\" ]; then echo \"REFUSE $(printf '%q' "$NAME") — required tool(s) not installed inside the sandbox, where this capped check runs:\$__miss (exit 97). The environment cannot run this check; it never ran.\" >&2; exit 97; fi; "
 fi
 
 # The seven variables sccache needs to help a capped/compiling check: the

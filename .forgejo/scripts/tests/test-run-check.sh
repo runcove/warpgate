@@ -343,6 +343,25 @@ grep -q "CAPPED_COMMAND_RAN" <<<"$out" \
   && ok "capped, tool present: the command actually ran" \
   || bad "capped, tool present: the command did not run: $out"
 
+# EVERY missing tool, not just the first. The uncapped gate has always done
+# this; the capped probe short-circuited until run 539 showed what that costs
+# -- one missing tool discovered per CI run, each a queue cycle. The fixture
+# declares a PRESENT tool first and two absent ones after it, so "names both"
+# is distinguishable from "names the first miss" AND from "stops at the first
+# entry" -- a single-missing-tool fixture can tell none of those apart, which
+# is how the short-circuit survived this suite in the first place.
+out=$(CHECKS_FILE="$TOOLS_FIXTURE" "$EXEC_DIR/run-check.sh" fake-capped-missing-multi 2>&1); rc=$?
+[ "$rc" -eq 97 ] && ok "capped, two tools missing: exits 97" \
+  || bad "capped, two tools missing: expected rc=97, got rc=$rc: $out"
+if grep -q "made-up-tool-zzz" <<<"$out" && grep -q "made-up-tool-yyy" <<<"$out"; then
+  ok "capped, two tools missing: names BOTH, not just the first"
+else
+  bad "capped, two tools missing: named only some of them — the probe is still short-circuiting: $out"
+fi
+grep -q "SHOULD_NOT_RUN_CAPPED_MULTI" <<<"$out" \
+  && bad "capped, two tools missing: the check's command ran anyway: $out" \
+  || ok "capped, two tools missing: the command never ran"
+
 rm -rf "$EXEC_DIR"
 
 # Step 4(b): a check whose command exits 127 with its declared tools present

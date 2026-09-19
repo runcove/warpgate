@@ -43,3 +43,16 @@ checks:
     compiles: true
     state: reporting
     tools: [bash]
+  # TWO absent tools, so "names both" is distinguishable from "names the
+  # first". A fixture with one missing tool cannot tell those apart, which is
+  # exactly how the short-circuit survived until a real run exposed it. Both
+  # names are absent from every PATH by construction, and `bash` is declared
+  # FIRST and is present -- so a probe that stopped at the first MISS still
+  # has to walk past a hit to reach them, and a probe that stopped at the
+  # first entry of any kind would name nothing and fail loudly.
+  - name: fake-capped-missing-multi
+    upstream: build.yml
+    command: "echo SHOULD_NOT_RUN_CAPPED_MULTI"
+    compiles: true
+    state: reporting
+    tools: [bash, made-up-tool-zzz, made-up-tool-yyy]
