@@ -106,30 +106,53 @@ checks:
     tools: [just, cargo, cargo-cranky]
   - name: schema-compat
     upstream: check-schema-compatibility.yml
-    command: just openapi-all
-    # Measured, no longer a hedge: it compiles two crates (above).
+    command: .forgejo/scripts/check-schema-compat.sh
+    # Measured, no longer a hedge: it compiles two crates (below).
     compiles: true
     state: reporting
-    # 2026-09-19: npm, not cargo. `just openapi-all` is
-    # `cd warpgate-web && npm run ...` four times over -- it invokes no
-    # cargo at all, so `cargo` was declared here and never used while the
-    # tool it actually needs was missing. See runcove-xais: this check is
-    # also only HALF of upstream's, which compares schemas with oasdiff.
-    # LEAVES (traced 2026-09-19, after I got this wrong once): `just
-    # openapi-all` -> `cd warpgate-web && npm run openapi:schema:admin`
-    # -> `cargo run -p warpgate-admin > src/admin/lib/openapi-schema.json`,
-    # and the same for the gateway via warpgate-protocol-http. So it DOES
-    # need cargo -- through npm, not directly. Reading only the justfile
-    # recipe says otherwise, and a run cannot correct it: the probe
-    # reports declared tools that are missing and can never report a tool
-    # that was never declared.
+    # 2026-09-19: this was HALF of upstream's check. The command was
+    # `just openapi-all`, which GENERATES a schema and stops; upstream
+    # generates one and then compares it with `oasdiff breaking`. Generation
+    # succeeding was being read as "no breaking changes", so the check could
+    # not fail for the reason it exists. Our script does the comparison.
     #
-    # git is here for the coming baseline comparison, which extracts the
-    # upstream tag with `git archive` INSIDE the sandbox. That works
-    # because hardened-run.sh copies the working tree rather than an
-    # archive, so .git is delivered -- a deliberate choice recorded in
-    # that script, relied on here.
-    tools: [just, npm, cargo, git]
+    # LEAVES (traced 2026-09-19):
+    #   check-schema-compat.sh
+    #     -> python3 (+ PyYAML) for checks_lib.upstream_tag, which reads the
+    #        baseline out of this file and RAISES rather than defaulting
+    #     -> git rev-parse, git archive (the tag's committed schemas)
+    #     -> tar (extracts that archive)
+    #     -> npm run openapi:schema:{admin,gateway}
+    #          -> cargo run -p warpgate-admin
+    #          -> cargo run -p warpgate-protocol-http
+    #     -> oasdiff breaking
+    #
+    # The cargo line is the one I got wrong once, and it is worth leaving
+    # here as a warning rather than quietly correcting: reading only the
+    # justfile recipe says `just openapi-all` is npm and no cargo at all, and
+    # I reported exactly that. It is `npm run` dispatching two `cargo run`s,
+    # visible only in warpgate-web/package.json. A CI run cannot catch that
+    # class of error either -- the probe reports declared tools that are
+    # missing, and can never report a tool that was never declared.
+    #
+    # `just` is gone from this list because the script calls the two npm
+    # scripts directly rather than through the justfile recipe (which also
+    # generates TypeScript clients via a Java tool, for artefacts this check
+    # never opens). That and two other divergences from upstream are argued
+    # in the script's own header, not hidden here.
+    #
+    # python3 and tar are declared because this is a capped check: it runs
+    # inside the sandbox image, where nothing is present unless we put it
+    # there. PyYAML is a python package rather than a PATH entry, so the
+    # tools gate cannot see it -- the sandbox image owes it (runcove-npoc).
+    #
+    # The script also uses basename, dirname, mkdir, mktemp, pwd, readlink
+    # and rm. None is declared, following what every other check here does:
+    # coreutils is assumed present in any base image we would build on. That
+    # is an assumption, written down so it is a decision rather than an
+    # oversight -- and if it is ever wrong the failure is loud (127, which
+    # run-check.sh converts to 97), not a false pass.
+    tools: [git, tar, python3, npm, cargo, oasdiff]
   - name: unit-tests
     upstream: test.yml
     command: cargo llvm-cov test --workspace
