@@ -64,11 +64,16 @@ jobs:
         env: {DOCKER_TLS_CERTDIR: ""}
     env:
       DOCKER_HOST: tcp://dind:2375
-      # Not yet provisioned by any task in this plan -- referencing it now
-      # means the compiling checks below pick it up the moment it exists,
-      # with no further ci.yml edit. Until then this is empty, and
-      # hardened-run.sh's own guard turns that into a clean exit 93, not a
-      # crash (Task 2).
+      # PROVISIONED 2026-09-19: the forge repo variable now holds
+      # git.tenfourty.site/runcove/warpgate-ci-toolchain:a831121e5d40, built and
+      # published by run 564 and named by its own output rather than composed by
+      # hand. It previously held `debian:bookworm-slim`, which is why the five
+      # capped checks refused 97 -- that image has no cargo. The tag is a
+      # CONTENT HASH of rust-toolchain.toml, the Dockerfile and
+      # assert-toolchain.sh, so changing any of those three and not rebuilding
+      # leaves this pointing at a tag no committed source produces.
+      # If this is ever empty, hardened-run.sh's guard turns that into a clean
+      # exit 93 rather than a crash (Task 2).
       HARDENED_RUN_IMAGE: ${{ vars.HARDENED_RUN_IMAGE }}
       S3_ENDPOINT: ${{ vars.OGA2_S3_ENDPOINT }}
       AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_ACCESS_KEY }}
@@ -127,6 +132,42 @@ jobs:
           install /tmp/docker/docker /usr/local/bin/docker
           for i in $(seq 1 30); do docker info >/dev/null 2>&1 && break; sleep 2; done
           docker info >/dev/null
+
+      # WHAT RUN 565 COST, stated here because the gap was invisible for a
+      # reason that will recur. The capped checks pull HARDENED_RUN_IMAGE from
+      # our own registry, which requires auth -- and this workflow had no
+      # `docker login` at all. Nothing caught it, because until 2026-09-19 the
+      # variable pointed at `debian:bookworm-slim`, which is public on Docker
+      # Hub and needs no credentials. The login was missing the whole time and
+      # the requirement was being met BY ACCIDENT; pointing the variable at a
+      # private image is what stopped the accident.
+      #
+      # A dependency satisfied by accident looks exactly like one satisfied by
+      # design, right up until it isn't.
+      #
+      # Run 565: all five capped checks REFUSED 91 ("could not start the capped
+      # container") on `unauthorized: reqPackageAccess`, in 25 s -- SHORTER than
+      # the 33 s of the runs where every check refused 97. A run that gets
+      # faster after you give it real work has not started doing the work.
+      #
+      # Token handling copied from build-ci-toolchain.yml's push login, and the
+      # shape is the point: the secret travels in `env:` and reaches `docker`
+      # on stdin, never on argv and never spliced into the script text, because
+      # a `${{ }}` inside `run:` is substituted before any shell sees it and
+      # would become part of the rendered source.
+      #
+      # LEAST PRIVILEGE, deliberately not fixed here: REGISTRY_TOKEN was minted
+      # to PUSH and is reused here to PULL. The right end state is a separate
+      # read-only package token for this workflow, which needs Jeremy at the
+      # forge UI -- tracked, not silently accepted. This workflow triggers only
+      # on `push` to our own branches and `workflow_dispatch`; it has NO
+      # `pull_request` trigger, so the token is not reachable from a pull
+      # request opened against this repository. Re-check that before adding one.
+      - name: registry login (to PULL the hardened image)
+        run: docker login "$REGISTRY" -u jeremy --password-stdin <<< "$REGISTRY_TOKEN"
+        env:
+          REGISTRY: git.tenfourty.site
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
 
       # PyYAML missing is what actually killed the first real run, 3 seconds
       # after checkout: `ModuleNotFoundError: No module named 'yaml'` in
