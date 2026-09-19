@@ -642,6 +642,89 @@ grep -q 'CACHE-UNAVAILABLE' <<<"$out" \
 [ "$rc" -eq 0 ] && ok "live cache: the check succeeds" \
   || bad "live cache: expected rc=0, got rc=$rc: $out"
 
+# Run 606's REAL shape: a banner, an error, a Context block, the cause under
+# `Source:`, then fifteen backtrace frames that say `<unknown>`. The cause sat
+# TENTH in a 26-line block and the CI step tails 25 lines, so the one line that
+# explains the outage is the one that gets trimmed. A fixture whose cause is on
+# line 2 cannot catch that -- which is why this one reproduces the depth.
+cat > "$SCC_DIR/sccache" <<'FAKE'
+#!/usr/bin/env bash
+echo "sccache: Starting the server..."
+echo "sccache: error: Server startup failed: cache storage failed to read: Unexpected (temporary) at read => send http request"
+echo "Context:"
+echo "   url: https://oga2.tenfourty.site:8010/warpgate-sccache/.sccache_check"
+echo "   called: http_util::Client::send"
+echo "   service: s3"
+echo "   path: .sccache_check"
+echo "   range: 0-"
+echo "Source:"
+echo "   error sending request: certificate verify failed (self-signed certificate)"
+echo "Backtrace:"
+for i in $(seq 0 14); do printf '   %d: <unknown>\n' "$i"; done
+exit 1
+FAKE
+chmod +x "$SCC_DIR/sccache"
+out=$(CHECKS_FILE="$TOOLS_FIXTURE" PATH="$SCC_DIR:$PATH" RUSTC_WRAPPER=sccache \
+        "$EXEC_DIR/run-check.sh" fake-capped-present-tool 2>&1); rc=$?
+
+first=$(grep -m1 'CACHE-UNAVAILABLE' <<<"$out")
+grep -q 'CAUSE: .*certificate verify failed' <<<"$first" \
+  && ok "deep cause: the FIRST marker line carries the cause, so a tailed log still says why" \
+  || bad "deep cause: the first marker line was not the cause -- a 25-line tail loses it: $first"
+
+# Match an emitted FRAME, not the substring: the suppression notice below
+# quotes '<unknown>' itself, so a bare substring test matches the very line
+# that proves the frames were dropped. It did, on first run.
+grep -qE 'CACHE-UNAVAILABLE.*[0-9]+: <unknown>' <<<"$out" \
+  && bad "deep cause: contentless '<unknown>' frames were emitted, pushing the cause out of a tail: $out" \
+  || ok "deep cause: the '<unknown>' backtrace frames are not emitted"
+grep -q '15 backtrace frames suppressed' <<<"$out" \
+  && ok "deep cause: and the suppression is COUNTED, not silent" \
+  || bad "deep cause: frames vanished without the log saying any had been dropped: $out"
+
+# Nothing with content is discarded: the Context url and the banner are both
+# still there. This is the assertion that keeps (a) a duplication and not a
+# selection -- run 576's defect was selecting one line and losing the rest.
+grep -q 'url: https://oga2' <<<"$out" \
+  && ok "deep cause: every line with content is still emitted below the summary" \
+  || bad "deep cause: the Context block was discarded -- this is run 576's defect again: $out"
+[ "$rc" -eq 0 ] && ok "deep cause: the check still degrades rather than failing" \
+  || bad "deep cause: rc=$rc"
+
+# A backtrace with a REAL symbol must survive: the rule drops frames with no
+# content, not backtraces.
+cat > "$SCC_DIR/sccache" <<'FAKE'
+#!/usr/bin/env bash
+echo "sccache: error: Server startup failed: something"
+echo "Backtrace:"
+echo "   0: <unknown>"
+echo "   1: sccache::server::start_server"
+exit 1
+FAKE
+chmod +x "$SCC_DIR/sccache"
+out=$(CHECKS_FILE="$TOOLS_FIXTURE" PATH="$SCC_DIR:$PATH" RUSTC_WRAPPER=sccache \
+        "$EXEC_DIR/run-check.sh" fake-capped-present-tool 2>&1)
+grep -q 'sccache::server::start_server' <<<"$out" \
+  && ok "a backtrace frame that names a real symbol is kept" \
+  || bad "a symbolised frame was suppressed along with the empty ones: $out"
+
+# No `Source:` section at all: the summary must SAY so rather than be absent,
+# or a format change would silently remove the one line added for the reader.
+cat > "$SCC_DIR/sccache" <<'FAKE'
+#!/usr/bin/env bash
+echo "sccache: error: Server startup failed: no source section here"
+exit 1
+FAKE
+chmod +x "$SCC_DIR/sccache"
+out=$(CHECKS_FILE="$TOOLS_FIXTURE" PATH="$SCC_DIR:$PATH" RUSTC_WRAPPER=sccache \
+        "$EXEC_DIR/run-check.sh" fake-capped-present-tool 2>&1)
+grep -q "CAUSE: sccache printed no 'Source:' section" <<<"$out" \
+  && ok "with no Source: section the summary says so instead of going missing" \
+  || bad "the summary line vanished when the format did not match: $out"
+grep -q 'no source section here' <<<"$out" \
+  && ok "and the output is still emitted in full" || bad "output lost: $out"
+
+
 rm -rf "$SCC_DIR"
 rm -rf "$EXEC_DIR"
 

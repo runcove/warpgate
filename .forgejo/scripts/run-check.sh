@@ -256,6 +256,24 @@ for v in "${CACHE_FORWARD_VARS[@]}"; do FORWARD_FLAGS+=(--forward-env "$v"); don
 # wrong; at worst it is three lines instead of one, in a block that only appears
 # when something is already broken.
 #
+# AMENDED after run 606, and NOT a return to selecting a line. Run 606's block
+# was 26 lines, of which 15 were `N: <unknown>` backtrace frames, and the line
+# naming the cause sat TENTH. The CI step tails 25 lines, so the cause is
+# exactly what gets trimmed. Two changes, both of which keep "print everything"
+# intact:
+#
+#   (a) a CAUSE line is printed FIRST, duplicating the line below `Source:`.
+#       Duplicating, not selecting -- every line is still emitted below it, so
+#       a wrong guess about the format costs one redundant line and discards
+#       nothing. If there is no `Source:` section the CAUSE line says so
+#       explicitly rather than being omitted, because an absent summary would
+#       be indistinguishable from a summary nobody noticed.
+#
+#   (b) `N: <unknown>` frames are dropped and COUNTED. That is suppression of
+#       lines with no content at all, not selection among lines with content:
+#       a frame that resolves to a real symbol is kept, and the count is
+#       printed so the suppression is visible rather than silent.
+#
 # `--start-server` is the right call and `--show-stats` is not: cache-env.sh's
 # own notes record that --show-stats never contacts the backend, so it reports
 # a healthy all-zero blob against a dead bucket. Startup is the step that
@@ -384,7 +402,37 @@ fi
 
 CACHE_PROBE=""
 if [ "$CAPPED" = "yes" ]; then
-  CACHE_PROBE="if [ -n \"\${RUSTC_WRAPPER:-}\" ]; then if __ce=\$(sccache --start-server 2>&1); then :; else __cf=\$(printf '%s\n' \"\$__ce\" | grep '[^[:space:]]' || true); if [ -n \"\$__cf\" ]; then printf '%s\n' \"\$__cf\" | while IFS= read -r __cl; do echo \"CACHE-UNAVAILABLE $(printf '%q' "$NAME") — \$__cl\" >&2; done; else echo \"CACHE-UNAVAILABLE $(printf '%q' "$NAME") — sccache could not start and printed nothing\" >&2; fi; unset RUSTC_WRAPPER; fi; fi; "
+  # Built with a quoted heredoc and one placeholder, rather than as an escaped
+  # one-liner: the previous form needed four levels of quoting to say something
+  # simple, and this block is the only thing standing between a dead cache and
+  # a run nobody can diagnose.
+  CACHE_PROBE=$(cat <<'PROBE'
+if [ -n "${RUSTC_WRAPPER:-}" ]; then
+  if __ce=$(sccache --start-server 2>&1); then :; else
+    __cf=$(printf '%s\n' "$__ce" | grep '[^[:space:]]' || true)
+    if [ -n "$__cf" ]; then
+      __cs=$(printf '%s\n' "$__cf" | sed -n '/^[[:space:]]*Source:[[:space:]]*$/{n;s/^[[:space:]]*//;p;q;}')
+      if [ -n "$__cs" ]; then
+        echo "CACHE-UNAVAILABLE @@NAME@@ — CAUSE: $__cs" >&2
+      else
+        echo "CACHE-UNAVAILABLE @@NAME@@ — CAUSE: sccache printed no 'Source:' section; its full output follows" >&2
+      fi
+      __cn=$(printf '%s\n' "$__cf" | grep -c '^[[:space:]]*[0-9][0-9]*:[[:space:]]*<unknown>[[:space:]]*$' || true)
+      printf '%s\n' "$__cf" | grep -v '^[[:space:]]*[0-9][0-9]*:[[:space:]]*<unknown>[[:space:]]*$' | while IFS= read -r __cl; do
+        echo "CACHE-UNAVAILABLE @@NAME@@ — $__cl" >&2
+      done
+      if [ "$__cn" -gt 0 ]; then
+        echo "CACHE-UNAVAILABLE @@NAME@@ — ($__cn backtrace frames suppressed, every one of them '<unknown>')" >&2
+      fi
+    else
+      echo "CACHE-UNAVAILABLE @@NAME@@ — sccache could not start and printed nothing" >&2
+    fi
+    unset RUSTC_WRAPPER
+  fi
+fi
+PROBE
+)
+  CACHE_PROBE="${CACHE_PROBE//@@NAME@@/$(printf '%q' "$NAME")}"$'\n'
 fi
 
 if [ "${RUN_CHECK_DRY:-}" = "1" ]; then
