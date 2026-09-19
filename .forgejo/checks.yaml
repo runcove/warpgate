@@ -77,19 +77,38 @@ checks:
     command: just clippy
     compiles: true
     state: reporting
-    tools: [just, cargo]
+    # cargo-cranky added 2026-09-19: the justfile recipe is `cargo cranky
+    # --workspace --all-features`, and upstream's clippy.yml installs
+    # cargo-cranky@0.3.0 explicitly. Undeclared, the probe passes and the
+    # failure lands a layer deeper on the 127 backstop -- honest, but one
+    # missing tool discovered per CI run.
+    tools: [just, cargo, cargo-cranky]
   - name: schema-compat
     upstream: check-schema-compatibility.yml
     command: just openapi-all
     compiles: unverified
     state: reporting
-    tools: [just, cargo]
+    # 2026-09-19: npm, not cargo. `just openapi-all` is
+    # `cd warpgate-web && npm run ...` four times over -- it invokes no
+    # cargo at all, so `cargo` was declared here and never used while the
+    # tool it actually needs was missing. See runcove-xais: this check is
+    # also only HALF of upstream's, which compares schemas with oasdiff.
+    tools: [just, npm]
   - name: unit-tests
     upstream: test.yml
     command: cargo llvm-cov test --workspace
     compiles: true
     state: reporting
-    tools: [cargo]
+    # cargo-llvm-cov added 2026-09-19 (upstream test.yml pins 0.6.15
+    # deliberately: 0.6.16+ pulls ruzstd 0.8.x). openssh-client and expect
+    # are NOT declared, though upstream installs them: measured, `tests/`
+    # is a PYTHON harness (conftest.py, api_client.py) and is not a
+    # workspace member, so `cargo llvm-cov test --workspace` cannot reach
+    # the code that needs them. The integration suite is out of scope by
+    # plan. Declaring them would make this check refuse for tools its
+    # command never invokes -- a refusal that should not happen is as
+    # misleading as a pass that should not.
+    tools: [cargo, cargo-llvm-cov]
   - name: release-build
     upstream: build.yml
     command: cargo build --all-features --release
@@ -101,7 +120,9 @@ checks:
     command: cargo cyclonedx --all-features
     compiles: true
     state: reporting
-    tools: [cargo]
+    # cargo-cyclonedx added 2026-09-19: the command is `cargo cyclonedx`,
+    # which is a separate binary, not a builtin subcommand.
+    tools: [cargo, cargo-cyclonedx]
   - name: reprotest
     upstream: reprotest.yml
     command: .forgejo/scripts/reprotest.sh
