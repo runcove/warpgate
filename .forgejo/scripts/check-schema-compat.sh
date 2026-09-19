@@ -182,6 +182,46 @@ generate "$REPO_ROOT" \
 # 3. Compare, and say what was compared.
 # ---------------------------------------------------------------------------
 rc=0
+# ---------------------------------------------------------------------------
+# A WARNING YOU WILL SEE HERE THAT IS CORRECT AND IS NOT A DEFECT
+# ---------------------------------------------------------------------------
+# If this check reports two `new-required-request-property` warnings on the
+# ADMIN API -- POST /targets and PUT /targets/{id}, on
+# TargetOptions_TargetHTTPOptions, for the property `public` -- that is a true
+# statement about an intentional change of ours, and the decision (2026-09-19,
+# runcove-3s0o) is to leave it standing and visible. It is written here rather
+# than only in the tracker because here is where someone debugging the warning
+# is standing.
+#
+# The facts, each verified from the files rather than inferred:
+#   upstream v0.28.6  TargetHTTPOptions.required = [url, tls]
+#   ours                                         = [url, tls, public]
+# and warpgate-common/src/config/target.rs carries #[serde(default)] on
+# `pub public: bool`, so DESERIALIZATION accepts its absence -- a client that
+# omits `public` still works.
+#
+# The schema is therefore stricter than the runtime. That inaccuracy is
+# poem-openapi's, and it is ALREADY IN UPSTREAM: of the four upstream fields,
+# all four carry a serde default, yet `url` (String) and `tls` (Tls) are
+# required while `headers` and `external_host` (both Option<..>) are not.
+# poem-openapi marks a field required iff its type is not Option<T>; serde
+# defaults do not enter into it. Our `public: bool` follows exactly the rule
+# upstream's own `tls: Tls` follows, so this adds one more instance of an
+# existing upstream pattern rather than a new kind of divergence.
+#
+# WHAT NOT TO DO, because it is the obvious move and it is wrong. Adding
+# `new-required-request-property info` to oasdiff-severity.txt turns this
+# green. Do not. That file is byte-identical to upstream's at v0.28.6 and is
+# one of the likeliest files to be compared during an upstream merge; and it
+# is a GLOBAL severity map, not a per-path exception, so downgrading the rule
+# would also silence a genuinely breaking required-property addition anywhere
+# else in either API, permanently, with nothing recording that it had been
+# silenced. That is this arc's signature defect -- a check that can no longer
+# fail for the reason it exists -- introduced deliberately.
+#
+# THE COST, stated rather than left to be discovered: schema-compat cannot be
+# promoted to `state: blocking` while this stands, because it would block on a
+# warning we have decided is correct.
 examined=0
 for pair in "admin:$ADMIN_REL" "gateway:$GATEWAY_REL"; do
   name="${pair%%:*}"; rel="${pair#*:}"

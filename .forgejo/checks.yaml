@@ -60,7 +60,16 @@ checks:
     upstream: biome.yml
     command: cd warpgate-web && biome ci .
     compiles: false
-    state: reporting
+    # PROMOTED to blocking 2026-09-19, on evidence rather than on confidence:
+    # run 563 is the first run in which this check ever produced a real verdict
+    # (PASS), and 564 repeated it. Before that it refused 97 for a missing
+    # binary, so promoting it would have been promoting a check that could not
+    # run -- which fails the job for a reason that says nothing about our code.
+    # It is promoted now because the fork's own patches are clean under it:
+    # 468e6cf0 applied biome's verdict on our two patched Svelte files, and
+    # `git diff -w` across that commit shows no semantic change, so a future
+    # red here is a real new finding and not a backlog we chose to ignore.
+    state: blocking
     # LEAVES (traced 2026-09-19): `cd warpgate-web && biome ci .` -> the biome binary. Upstream uses
     # biomejs/setup-biome@v2 with no version in the file, so ours stays where
     # Task 7C(a) put it: a DIVERGENCE, not a pin copied from upstream.
