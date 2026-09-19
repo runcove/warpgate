@@ -87,39 +87,34 @@ jobs:
     # run 514 measured. Honest refusals beat a job that cannot start.
     services:
       dind:
-        # --dns is the root-cause fix for the build cache never starting.
-        # Run 604 measured it: this job container's resolver is Docker's
-        # embedded one at 127.0.0.11, the dind daemon inherits that file,
-        # refuses to hand a LOOPBACK nameserver to the containers it starts,
-        # and substitutes its own built-in defaults -- Google's 8.8.8.8 and
-        # 8.8.4.4 -- which cannot answer for a homelab name. Giving dind a
-        # real address instead of a loopback one removes the substitution at
-        # its cause, where --add-host (run-check.sh) works around it one
-        # container further in. Both are kept: the mapping still covers the
-        # cache host if this resolver is ever unreachable.
+        # NO --dns HERE, AND THAT IS A MEASURED DECISION, NOT AN OMISSION.
+        # A `--dns` on this service was written and then removed on
+        # 2026-09-19, because the operator session measured what it actually
+        # does on the runner's own docker (kubectl exec into the runner,
+        # throwaway network, one container each way):
         #
-        # 10.96.0.10 is the kube-dns ClusterIP. It is READ, not remembered,
-        # and it rests on TWO independent readings taken on 2026-09-19:
-        #   (a) the `# ExtServers: [10.96.0.10]` line Docker itself wrote into
-        #       this job container's /etc/resolv.conf in run 604 -- i.e. the
-        #       address this very container's DNS already forwards to, and
-        #       which resolved the cache host there with rc=0;
-        #   (b) `kubectl get svc -n kube-system kube-dns`, run against the
-        #       cluster by the homelab operator session. The session that
-        #       wrote this line has no kubeconfig on baba and could not take
-        #       (b) itself; it is named here as someone else's reading rather
-        #       than folded in as if it were one.
-        # Reading (4) of the diagnostic step below re-takes (a) on every run
-        # and says loudly if this pin and the live value ever diverge.
+        #   on a USER-DEFINED network -- which is where act puts every
+        #   service and job container (WORKFLOW-<hash>) -- a container given
+        #   `--dns 10.96.0.10` STILL gets `nameserver 127.0.0.11`, with
+        #   `# ExtServers: [10.96.0.10]` and `# Overrides: [nameservers]`.
+        #   Docker's embedded resolver stays in front; --dns only changes
+        #   what that resolver forwards to.
         #
-        # --dns-search is deliberately NOT set, against the suggestion that it
-        # should be. Run 604 lines 340 and 359 measured the dind-started
-        # containers as already carrying `search ci.svc.cluster.local
-        # svc.cluster.local cluster.local`: the substitution replaces the
-        # nameservers and KEEPS the search list. Naming one domain here would
-        # narrow a correct list of three to one, which is a change, not a fix.
+        # So this container's /etc/resolv.conf is 127.0.0.11 either way, the
+        # inner dockerd filters the loopback entry exactly as before, and its
+        # containers still fall back to Google. The flag was inert BY
+        # CONSTRUCTION -- not because this runner drops unknown options,
+        # which was the other candidate and is not the answer. No global
+        # runner option would change it either: the substitution happens on
+        # the INNER daemon.
+        #
+        # The fix therefore belongs on the inner side, on the containers this
+        # daemon starts. Readings (4) and (5) of the diagnostic step below
+        # measure the two candidates for it in one run, before anyone writes
+        # one. Do not re-add a --dns here on the strength of it looking like
+        # the obvious place; it has been tried and measured.
         image: docker:28-dind
-        options: --privileged --dns 10.96.0.10
+        options: --privileged
         env: {DOCKER_TLS_CERTDIR: ""}
     env:
       DOCKER_HOST: tcp://dind:2375
@@ -318,73 +313,61 @@ jobs:
               'echo "--- /etc/resolv.conf ---"; cat /etc/resolv.conf; echo "--- getent ---"; getent hosts '"$HOST"'; echo "getent rc=$?"'
             echo "docker run rc=$?"
             echo
-            echo "== (3b) the dind SERVICE container's OWN /etc/resolv.conf =="
-            # (2) and (3) show what the dind daemon HANDS OUT. This shows what
-            # it READS, and the two answer different questions.
+            # ---- the two candidate fixes, measured before either is written ----
+            # (2) and (3) already answer "what does the inner daemon hand out
+            # by default": Google, because it filters the loopback nameserver
+            # it inherited. These two ask whether either candidate changes
+            # that, in one run, so that whichever gets written afterwards is
+            # written against a reading instead of an expectation.
             #
-            # The question it exists for: forgejo-runner 13.1.0 is documented
-            # in this homelab's own forge changelog (2026-09-02) as DROPPING
-            # unknown service options -- naming `--dns` on a dind service
-            # specifically -- with `--privileged` only working once a GLOBAL
-            # runner flag was added. So the `--dns` in `options:` above may
-            # never reach this container at all. That is not the same fault as
-            # the daemon receiving it and ignoring it, and the two have
-            # different owners: the first is the runner config, the second is
-            # docker. A reading that cannot tell them apart sends someone to
-            # the wrong file.
+            # Both probe TWO names deliberately. A cluster-internal name shows
+            # whether the query reached kube-dns at all; the cache host shows
+            # whether kube-dns's forward path to homelab DNS also works. Only
+            # the second is what the build cache needs, and a candidate that
+            # resolves the first but not the second has not solved this.
             #
-            # A bind mount, deliberately, NOT `--network host`: the mount is
-            # resolved by the DAEMON, so this is the dind container's real
-            # file, read with no Docker DNS logic anywhere in the path. Host
-            # networking would hand back a file Docker itself had already had
-            # an opinion about, which is the ambiguity being avoided.
-            docker run --rm -v /etc/resolv.conf:/dind-resolv.conf:ro \
-              "$HARDENED_RUN_IMAGE" cat /dind-resolv.conf
-            echo "docker run rc=$?"
-            echo "  If the line above says 'nameserver 10.96.0.10', the --dns"
-            echo "  in this workflow's options: reached the service container."
-            echo "  If it says 'nameserver 127.0.0.11', the runner dropped the"
-            echo "  option and the fix is the runner's global container"
-            echo "  options, not this file."
+            # Names are passed as ARGUMENTS to sh, never interpolated into the
+            # script text: the probe cannot be changed by what it is asked to
+            # look up.
+            CLUSTER_NAME=forgejo-http.forgejo.svc
+            probe() {
+              docker run --rm "$@" "$HARDENED_RUN_IMAGE" sh -c '
+                echo "--- /etc/resolv.conf ---"; cat /etc/resolv.conf
+                for n in "$1" "$2"; do
+                  echo "--- getent hosts $n ---"; getent hosts "$n"; echo "getent rc=$?"
+                done' _ "$CLUSTER_NAME" "$HOST"
+              echo "docker run rc=$?"
+            }
+            echo "== (4) candidate A: --network host on the inner daemon =="
+            # Shares the dind container's own netns, so it uses that
+            # container's 127.0.0.11 -- the OUTER embedded resolver, which
+            # already works (the daemon itself pulls LAN images through it).
+            # This is the same finding as the homelab forge changelog's
+            # 2026-09-02 note, reached from the other side.
+            probe --network host
+            echo "  Candidate A is for BUILDS (buildx accepts --network host)."
+            echo "  It is NOT a candidate for the capped checks: host mode"
+            echo "  dissolves the network isolation that is the whole point of"
+            echo "  hardened-run.sh, and trading that for a cache would be"
+            echo "  paying the wrong price."
+            echo
+            echo "== (5) candidate B: --dns 10.96.0.10 on the inner default bridge =="
+            # The operator session measured, on the runner's own docker, that
+            # --dns is overridden on a USER-DEFINED network (the embedded
+            # resolver stays in front) but takes effect on the DEFAULT bridge,
+            # which is where these containers sit. What is NOT yet known, and
+            # is the point of this reading, is whether a ClusterIP is even
+            # REACHABLE from a bridge nested two levels deep -- container to
+            # docker0 inside dind, to the pod, to the node's kube-proxy.
+            probe --dns 10.96.0.10
+            echo "  Candidate B keeps the capped containers isolated, so it is"
+            echo "  the candidate for run-check.sh IF the getent lines above"
+            echo "  came back rc=0. If the resolv.conf says 10.96.0.10 but the"
+            echo "  lookups still fail, the flag arrived and the ClusterIP is"
+            echo "  unreachable from there -- a different answer, and the one"
+            echo "  that would send us back to --add-host as the only route."
           fi
           echo
-          echo "== (4) is the --dns pin in this file still what the cluster hands us? =="
-          # The services: block has to name the resolver as a literal -- YAML
-          # has no shell to resolve one. So the literal is CHECKED instead of
-          # trusted: the left side is read back out of the workflow file in
-          # the checkout, the right side out of the line Docker writes into
-          # this container's own /etc/resolv.conf. Nothing here is typed.
-          #
-          # Honest limit: this guard lives in a workflow step, so unlike
-          # run-check.sh's assertions nothing refuses its DELETION -- only its
-          # failure. Promoting it to a tested script is runcove-p4mu's shape,
-          # not this commit's.
-          # Anchored on the `options:` line, not on the first `--dns` in the
-          # file: the comments around it also say `--dns`, and a guard that
-          # can read its own prose instead of the live setting is the kind of
-          # reading that cannot tell two cases apart.
-          PINNED=$(grep -m1 -E '^[[:space:]]*options:.*--dns[[:space:]]' \
-                     .forgejo/workflows/ci.yml \
-                   | grep -oE -- '--dns[[:space:]]+[0-9]+(\.[0-9]+){3}' \
-                   | grep -oE '[0-9]+(\.[0-9]+){3}')
-          LIVE=$(grep -m1 '^# ExtServers:' /etc/resolv.conf \
-                 | grep -oE '[0-9]+(\.[0-9]+){3}' | head -1)
-          if [ -z "$PINNED" ] || [ -z "$LIVE" ]; then
-            # Stated, never silent: a missing reading is not a passing one.
-            echo "DNS-PIN UNCHECKED -- pinned='$PINNED' live='$LIVE'. One of the"
-            echo "  two readings did not come back, so this run says NOTHING about"
-            echo "  whether the pin is still right. Look at (1) above for why."
-          elif [ "$PINNED" = "$LIVE" ]; then
-            echo "DNS-PIN OK -- ci.yml pins $PINNED and this job container's"
-            echo "  resolver forwards to $PINNED. Two readings, same answer."
-          else
-            echo "DNS-PIN DRIFT -- ci.yml pins --dns $PINNED but this job"
-            echo "  container's resolver forwards to $LIVE. The dind containers"
-            echo "  are being pointed at an address the cluster no longer uses,"
-            echo "  so every capped check has lost DNS and is running uncached."
-            echo "  Fix: set --dns $LIVE in the services: dind: options of"
-            echo "  .forgejo/workflows/ci.yml."
-          fi
           echo
           echo "DIAGNOSTIC COMPLETE -- exiting 0 whatever the above says."
           exit 0
