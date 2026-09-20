@@ -22,7 +22,6 @@ use warpgate_core::ConfigProvider;
 use warpgate_core::auth::submit_credential;
 use warpgate_sso::{SsoClient, SsoInternalProviderConfig};
 
-use super::sso_provider_detail::SsoContext;
 use crate::SsoLoginState;
 use crate::api::auth_scheme::AuthedSession;
 use crate::api::common::{emit_unknown_authentication_failed_event, logout};

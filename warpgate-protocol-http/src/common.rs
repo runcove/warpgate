@@ -399,7 +399,22 @@ async fn try_public_target_bypass(req: &Request) -> poem::Result<PublicBypassOut
 
     match decision {
         PublicTargetDecision::Bypass => {
-            let (target, _opts) = resolved.expect("Bypass decision implies a resolved target");
+            // FAIL CLOSED, and clippy was right to deny the `expect()` that
+            // stood here. `resolve_public_target_decision` only ever returns
+            // `Bypass` alongside `Some(target)`, so this arm is unreachable
+            // today -- but it is reachable in the TYPE, and the two ways of
+            // being wrong are not symmetric. A panic inside a request handler
+            // is a denial of service; a panic on the path that decides whether
+            // to SKIP AUTHENTICATION is that plus an invitation to probe for
+            // it. Refusing the bypass costs a public visitor one ordinary
+            // login prompt.
+            let Some((target, _opts)) = resolved else {
+                tracing::warn!(
+                    "public-target bypass resolved to Bypass with no target; \
+                     refusing the bypass and falling through to normal auth"
+                );
+                return Ok(PublicBypassOutcome::NotApplicable);
+            };
             let synthetic_auth = RequestAuthorization::Session(SessionAuthorization::Ticket {
                 user_id: Uuid::nil(),
                 username: "<public>".into(),
