@@ -648,8 +648,9 @@
                                         navigations are redirected straight to
                                         the provider instead of showing the
                                         login page. Append
-                                        <code>?login=password</code> to any URL
-                                        to reach the password login form.
+                                        <code>?login=password</code>
+                                        to any URL to reach the password login
+                                        form.
                                     </HelpText>
 
                                     <FormGroup
