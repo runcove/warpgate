@@ -21,15 +21,14 @@
 #      `--mount=type=cache` lines are a syntax error. Across separate CI
 #      runs — where `--mount=type=cache` mounts don't survive, and neither
 #      does anything else on the runner's ephemeral per-job dind — the CI
-#      workflow imports/exports a BuildKit *registry* cache
-#      (the internal registry's build cache). That only helps if
-#      something in this Dockerfile is actually stable enough to hit: hence
-#      cargo-chef (divergence 3).
+#      workflow imports/exports a BuildKit *registry* cache, whose ref the
+#      workflow supplies. That only helps if something in this Dockerfile is
+#      actually stable enough to hit: hence cargo-chef (divergence 3).
 #
 #   3. cargo-chef dependency layer (added 2026-09-15, after a cold compile
-#      with no working cache saturated shared cluster storage for 55 min
-#      and briefly took ~4% of cluster-wide Kubernetes API calls down with
-#      it — our internal incident notes). `chef`/`planner`/`builder`
+#      with no working cache exhausted the storage shared with the build
+#      runner and degraded the surrounding platform for the best part of an
+#      hour). `chef`/`planner`/`builder`
 #      below split "compile the dependency graph" from "compile our own
 #      crates". `cargo chef prepare` distills the full source into
 #      recipe.json — a manifest of Cargo.toml/Cargo.lock only, not source
@@ -101,9 +100,9 @@ ARG CARGO_BUILD_JOBS=default
 ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
 
 # Disabled in CI (2026-09-15 incident): incremental compilation's on-disk
-# artifacts added to the write volume that saturated shared cluster
-# storage during a cold compile (control-plane slowdown, ~4% cluster-wide API
-# failures). See the header comment for how the cargo-chef + registry-cache
+# artifacts added to the write volume that exhausted the storage shared with
+# the build runner during a cold compile, degrading the surrounding platform
+# with it. See the header comment for how the cargo-chef + registry-cache
 # combination below replaces it as the real fix for repeat-build speed.
 ARG CARGO_INCREMENTAL=0
 ENV CARGO_INCREMENTAL=${CARGO_INCREMENTAL}
