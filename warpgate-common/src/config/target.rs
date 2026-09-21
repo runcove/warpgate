@@ -101,7 +101,16 @@ pub struct TargetHTTPOptions {
     /// public target -> 401 (tokens are admin-API-scoped, not proxy-scoped).
     /// Default `false` preserves existing behaviour; serde-default backfills
     /// existing JSON-column rows so no DB migration is required.
+    ///
+    /// `#[oai(default)]` is NOT a duplicate of `#[serde(default)]`. serde's
+    /// governs JSON deserialisation; poem-openapi's `Object` derive is a
+    /// separate generator and marks every non-`Option` field REQUIRED in the
+    /// emitted schema unless it carries its own default. Without it the admin
+    /// API's OpenAPI document told clients they must send `public` on
+    /// POST /targets and PUT /targets/{id} -- a breaking change for any
+    /// existing client, against a field the code is perfectly happy without.
     #[serde(default)]
+    #[oai(default)]
     pub public: bool,
 }
 

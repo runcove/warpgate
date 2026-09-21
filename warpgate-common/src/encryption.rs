@@ -406,10 +406,20 @@ mod tests {
         let (head, payload) = encrypted.rsplit_once(':').unwrap();
 
         let mut bytes = BASE64.decode(payload.as_bytes()).unwrap();
-        let last = bytes.len() - 1;
-        bytes.swap(0, last);
+        // Flip a bit rather than swapping two. `bytes.swap(0, last)` stood
+        // here and is a no-op whenever those two bytes are equal -- byte 0 is
+        // a random nonce byte and the last is a random GCM tag byte, so that
+        // happens about once in 256 runs. The test then went red for the wrong
+        // reason, and worse, in those runs it was asserting that an UNTAMPERED
+        // ciphertext is rejected, which is the opposite of what it is for.
+        bytes[0] ^= 0x01;
 
         let tampered = format!("{head}:{}", BASE64.encode(&bytes));
+        // The mutation has to have mutated something. Without this, any future
+        // change that quietly stops altering the payload turns this into a
+        // test that passes only because decryption succeeds -- exactly the
+        // failure the swap had, but silent instead of red.
+        assert_ne!(tampered, encrypted);
         assert!(matches!(
             k.decrypt(&tampered),
             Err(EncryptionError::Corrupt)
