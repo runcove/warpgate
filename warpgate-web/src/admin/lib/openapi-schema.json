@@ -2,7 +2,7 @@
   "openapi": "3.0.0",
   "info": {
     "title": "Warpgate Web Admin",
-    "version": "v0.29.0-beta.1.1-1-g2f77f07b-modified"
+    "version": "v0.29.1-9-g5c27effe-modified"
   },
   "servers": [
     {
@@ -913,6 +913,9 @@
           },
           {
             "CookieSecurityScheme": []
+          },
+          {
+            "ClusterTokenSecurityScheme": []
           }
         ],
         "operationId": "delete_ticket"
@@ -7088,8 +7091,8 @@
           },
           "public": {
             "type": "boolean",
-            "default": false,
-            "description": "When `true`, the catchall HTTP proxy serves this target without\nrequiring a Warpgate login. Anonymous and session-authed clients pass\nthrough on a throwaway session that is never stored; admin, user and\ncluster tokens hit a public target -> 401 (tokens are not proxy-scoped).\nA target that requires admin approval is never bypassed. Default\n`false` preserves existing behaviour; serde-default backfills existing\nJSON-column rows so no DB migration is required.\n\n`#[oai(default)]` is NOT a duplicate of `#[serde(default)]`. serde's\ngoverns JSON deserialisation; poem-openapi's `Object` derive is a\nseparate generator and marks every non-`Option` field REQUIRED in the\nemitted schema unless it carries its own default. Without it the admin\nAPI's OpenAPI document would tell clients they must send `public` on\nPOST /targets and PUT /targets/{id}."
+            "description": "When `true`, the catchall HTTP proxy serves this target without\nrequiring a Warpgate login. Anonymous and session-authed clients pass\nthrough on a throwaway session that is never stored; admin, user and\ncluster tokens hit a public target -> 401 (tokens are not proxy-scoped).\nA target that requires admin approval is never bypassed. Default\n`false` preserves existing behaviour; serde-default backfills existing\nJSON-column rows so no DB migration is required.\n\n`#[oai(default)]` is NOT a duplicate of `#[serde(default)]`. serde's\ngoverns JSON deserialisation; poem-openapi's `Object` derive is a\nseparate generator and marks every non-`Option` field REQUIRED in the\nemitted schema unless it carries its own default. Without it the admin\nAPI's OpenAPI document would tell clients they must send `public` on\nPOST /targets and PUT /targets/{id}.",
+            "default": false
           }
         }
       },
