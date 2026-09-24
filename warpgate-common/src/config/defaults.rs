@@ -130,6 +130,10 @@ pub fn _default_ssh_ca_mount() -> String {
     "ssh".to_owned()
 }
 
+pub const fn _default_web_auth_wait_timeout() -> Duration {
+    Duration::from_secs(120)
+}
+
 #[allow(clippy::unnecessary_wraps)]
 pub fn _default_postgres_idle_timeout_str() -> Option<String> {
     Some("10m".to_string())
