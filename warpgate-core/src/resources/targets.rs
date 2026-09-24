@@ -5,6 +5,7 @@ use sea_orm::{
 };
 use uuid::Uuid;
 use warpgate_common::{StoredSecrets, TargetOptions, WarpgateError};
+use warpgate_db_entities::Target::TargetKind;
 use warpgate_db_entities::{
     KnownHost, Target, TargetRoleAssignment, TargetSession, Ticket, TicketRequest,
 };
@@ -33,6 +34,38 @@ fn serialize_options_for_storage(
 ) -> Result<serde_json::Value, WarpgateError> {
     options.encrypt_all()?;
     Ok(serde_json::to_value(options)?)
+}
+
+/// Returns true if any SSH target other than `exclude_target_id` has options
+/// whose `(host, port)` matches the given pair. Used when deleting an SSH
+/// target to decide whether the shared `known_hosts` entry is still needed.
+async fn other_ssh_targets_use_host_port<C: ConnectionTrait>(
+    db: &C,
+    exclude_target_id: Uuid,
+    host: &str,
+    port: u16,
+) -> Result<bool, WarpgateError> {
+    let candidates = Target::Entity::find()
+        .filter(Target::Column::Kind.eq(TargetKind::Ssh))
+        .filter(Target::Column::Id.ne(exclude_target_id))
+        .all(db)
+        .await?;
+
+    for other in candidates {
+        let Ok(options) = serde_json::from_value::<TargetOptions>(other.options) else {
+            // Skip rows whose options fail to deserialize - they cannot
+            // meaningfully claim ownership of the known_hosts entry.
+            continue;
+        };
+        if let TargetOptions::Ssh(opts) = options
+            && opts.host == host
+            && opts.port == port
+        {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
 }
 
 fn set_data(
@@ -118,11 +151,19 @@ pub async fn delete<C: ConnectionTrait + TransactionTrait>(
     let options = serde_json::from_value::<TargetOptions>(target.options.clone())
         .map_err(WarpgateError::from)?;
     if let TargetOptions::Ssh(ssh_options) = &options {
-        KnownHost::Entity::delete_many()
-            .filter(KnownHost::Column::Host.eq(&ssh_options.host))
-            .filter(KnownHost::Column::Port.eq(i32::from(ssh_options.port)))
-            .exec(&txn)
-            .await?;
+        // Only drop the known_hosts entry for (host, port) when no other SSH
+        // target references the same endpoint. Multiple targets frequently
+        // share a (host, port) pair, so eagerly deleting would wipe the host
+        // key cache for every sibling target, breaking subsequent auth.
+        if !other_ssh_targets_use_host_port(&txn, target.id, &ssh_options.host, ssh_options.port)
+            .await?
+        {
+            KnownHost::Entity::delete_many()
+                .filter(KnownHost::Column::Host.eq(&ssh_options.host))
+                .filter(KnownHost::Column::Port.eq(i32::from(ssh_options.port)))
+                .exec(&txn)
+                .await?;
+        }
     }
 
     target.delete(&txn).await?;

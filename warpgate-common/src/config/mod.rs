@@ -467,6 +467,10 @@ pub struct SshConfig {
     )]
     #[schemars(with = "String")]
     pub target_handshake_timeout: Duration,
+
+    /// Default SSH target name when no target is specified (e.g., `ssh warpgate` instead of `ssh user:target@warpgate`)
+    #[serde(default)]
+    pub default_target: Option<String>,
 }
 
 impl Default for SshConfig {
@@ -482,6 +486,7 @@ impl Default for SshConfig {
             inactivity_timeout: _default_ssh_inactivity_timeout(),
             keepalive_interval: None,
             target_handshake_timeout: _default_ssh_target_handshake_timeout(),
+            default_target: None,
         }
     }
 }

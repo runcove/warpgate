@@ -62,11 +62,11 @@ fn name_taken(err: DbErr) -> ResourceError {
 
 #[cfg(all(test, feature = "sqlite"))]
 mod tests {
-    use sea_orm::{Database, DatabaseConnection, EntityTrait};
+    use sea_orm::{ActiveModelTrait, Database, DatabaseConnection, EntityTrait, Set};
     use serde_json::json;
     use uuid::Uuid;
     use warpgate_db_entities::Parameters::{ConfigMigrationValues, set_config_migration_values};
-    use warpgate_db_entities::{Target, TargetRoleAssignment};
+    use warpgate_db_entities::{KnownHost, Target, TargetRoleAssignment};
     use warpgate_db_migrations::migrate_database;
 
     use super::roles::RoleDataRequest;
@@ -98,6 +98,33 @@ mod tests {
 
     fn ssh(name: &str) -> TargetDataRequest {
         target(name, json!({"ssh": {"host": "h"}}))
+    }
+
+    fn ssh_at(name: &str, host: &str, port: u16) -> TargetDataRequest {
+        target(name, json!({"ssh": {"host": host, "port": port}}))
+    }
+
+    async fn insert_known_host(db: &DatabaseConnection, host: &str, port: u16) -> Uuid {
+        let id = Uuid::new_v4();
+        KnownHost::ActiveModel {
+            id: Set(id),
+            host: Set(host.into()),
+            port: Set(i32::from(port)),
+            key_type: Set("ssh-ed25519".into()),
+            key_base64: Set("AAAA".into()),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        id
+    }
+
+    async fn known_host_exists(db: &DatabaseConnection, id: Uuid) -> bool {
+        KnownHost::Entity::find_by_id(id)
+            .one(db)
+            .await
+            .unwrap()
+            .is_some()
     }
 
     fn role(name: &str, is_default: Option<bool>) -> RoleDataRequest {
@@ -142,6 +169,45 @@ mod tests {
         assert_eq!(assignments(&db).await, 0);
         let result = targets::delete(&db, web.id).await;
         assert!(matches!(result, Err(ResourceError::NotFound)));
+    }
+
+    #[tokio::test]
+    async fn deleting_an_ssh_target_keeps_the_host_key_a_sibling_still_uses() {
+        let db = db().await;
+        let a = targets::create(&db, &ssh_at("a", "shared.example", 22))
+            .await
+            .unwrap();
+        let _b = targets::create(&db, &ssh_at("b", "shared.example", 22))
+            .await
+            .unwrap();
+        let kh = insert_known_host(&db, "shared.example", 22).await;
+
+        targets::delete(&db, a.id).await.unwrap();
+
+        assert!(
+            known_host_exists(&db, kh).await,
+            "known_hosts row for shared.example:22 must survive because target b still uses it",
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_an_ssh_target_drops_the_host_key_nobody_else_uses() {
+        let db = db().await;
+        let a = targets::create(&db, &ssh_at("a", "shared.example", 22))
+            .await
+            .unwrap();
+        // A sibling on another port or host does not share the host key.
+        let _b = targets::create(&db, &ssh_at("b", "shared.example", 2222))
+            .await
+            .unwrap();
+        let _c = targets::create(&db, &ssh_at("c", "other.example", 22))
+            .await
+            .unwrap();
+        let kh = insert_known_host(&db, "shared.example", 22).await;
+
+        targets::delete(&db, a.id).await.unwrap();
+
+        assert!(!known_host_exists(&db, kh).await);
     }
 
     #[tokio::test]
