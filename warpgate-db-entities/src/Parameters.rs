@@ -1,3 +1,4 @@
+use ipnet::IpNet;
 use poem_openapi::{Enum, Object, Union};
 use sea_orm::Set;
 use sea_orm::entity::prelude::*;
@@ -210,6 +211,11 @@ pub struct Model {
     pub lp_user_auto_unlock: bool,
     pub lp_user_lockout_duration_seconds: i32,
     pub lp_user_exempt_admins: bool,
+    /// JSON list of CIDR strings. A failed login from inside one of these
+    /// networks still counts towards the per-username limit, but never
+    /// blocks the address itself.
+    #[sea_orm(column_type = "Text")]
+    pub lp_ip_exempt_cidrs: String,
     #[sea_orm(column_type = "Text")]
     pub banner: String,
     pub web_clients_enabled: bool,
@@ -240,6 +246,20 @@ impl Model {
     /// silently reverting to disk.
     pub fn recordings_storage_config(&self) -> Result<RecordingsStorageConfig, serde_json::Error> {
         serde_json::from_str(&self.recordings_storage)
+    }
+
+    /// The stored exempt-CIDR list as written by the admin API. A value that
+    /// can't be read yields an empty list, i.e. no address is exempt.
+    pub fn lp_ip_exempt_cidr_list(&self) -> Vec<String> {
+        serde_json::from_str(&self.lp_ip_exempt_cidrs).unwrap_or_default()
+    }
+
+    /// The exempt networks, skipping any entry that doesn't parse.
+    pub fn lp_ip_exempt_networks(&self) -> Vec<IpNet> {
+        self.lp_ip_exempt_cidr_list()
+            .iter()
+            .filter_map(|cidr| cidr.parse().ok())
+            .collect()
     }
 
     /// The login banner shown to connecting clients, or `None` when it's blank.
@@ -315,6 +335,7 @@ impl Entity {
                     lp_user_auto_unlock: Set(true),
                     lp_user_lockout_duration_seconds: Set(3600),
                     lp_user_exempt_admins: Set(true),
+                    lp_ip_exempt_cidrs: Set("[]".into()),
                     banner: Set("".into()),
                     web_clients_enabled: Set(true),
                     analytics_consent: Set(AnalyticsConsent::Undecided),

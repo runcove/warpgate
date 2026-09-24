@@ -5858,6 +5858,13 @@
           "lp_user_exempt_admins": {
             "type": "boolean"
           },
+          "lp_ip_exempt_cidrs": {
+            "type": "array",
+            "description": "Replaces the whole list; `[]` clears it. Every entry must be a CIDR.",
+            "items": {
+              "type": "string"
+            }
+          },
           "banner": {
             "type": "string"
           },
@@ -5922,6 +5929,7 @@
           "lp_user_auto_unlock",
           "lp_user_lockout_duration_seconds",
           "lp_user_exempt_admins",
+          "lp_ip_exempt_cidrs",
           "banner",
           "web_ssh_enabled",
           "web_clients_enabled",
@@ -6047,6 +6055,13 @@
           },
           "lp_user_exempt_admins": {
             "type": "boolean"
+          },
+          "lp_ip_exempt_cidrs": {
+            "type": "array",
+            "description": "CIDR networks whose failed logins never block the address itself.",
+            "items": {
+              "type": "string"
+            }
           },
           "banner": {
             "type": "string"
