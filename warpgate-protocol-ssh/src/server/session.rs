@@ -134,6 +134,13 @@ pub struct ServerSession {
     /// sessions: a ticket binds one target and grants no account-wide
     /// authorization, so a ticket session reaching the menu fails closed.
     authorized_identity: Option<AuthorizedIdentity>,
+    /// `"user"` or `"ticket"`, sent downstream as `WARPGATE_AUTHENTICATION_TYPE`.
+    authentication_type: Option<String>,
+    /// The admitted target's own `env` map, captured when the target is
+    /// admitted. The selection moves on to `Connected` once dialled, so it
+    /// cannot be read back from [`Self::target`] when a channel asks for a
+    /// shell or exec.
+    target_env: Option<HashMap<String, String>>,
     session_handle: Option<russh::server::Handle>,
     channels: ChannelRegistry,
     /// Client-side events for channel ids no registered channel carries yet.
@@ -277,6 +284,8 @@ impl ServerSession {
             id,
             user_info: None,
             authorized_identity: None,
+            authentication_type: None,
+            target_env: None,
             session_handle: None,
             channels: ChannelRegistry::new(),
             deferred_server_events: vec![],
@@ -954,6 +963,7 @@ impl ServerSession {
 
     async fn stamp_approved_target(&mut self, admitted: AdmittedTarget<TargetSSHOptions>) {
         self.target_session_id = Some(admitted.id());
+        self.target_env = admitted.options().env.clone();
         self.target = TargetSelection::Found(admitted);
         self.start_pending_recordings().await;
     }
@@ -1117,6 +1127,8 @@ impl ServerSession {
                 let channel_id = self.map_channel(server_channel_id)?;
                 self.maybe_connect_remote().await?;
                 self.maybe_start_target_selection_menu(channel_id).await?;
+
+                self.inject_own_env(channel_id);
 
                 let _ = self.send_command(RCCommand::Channel(
                     channel_id,
@@ -1736,6 +1748,7 @@ impl ServerSession {
         let is_scp = command == "scp" || command.starts_with("scp ");
         let _ = self.maybe_connect_remote().await;
         self.maybe_start_target_selection_menu(channel_id).await?;
+        self.inject_own_env(channel_id);
         let _ = self.send_command(RCCommand::Channel(
             channel_id,
             ChannelOperation::RequestExec(command.to_string()),
@@ -1867,6 +1880,41 @@ impl ServerSession {
         ))
         .await?;
         Ok(())
+    }
+
+    /// Inject Warpgate identity and custom environment variables into the downstream SSH session.
+    /// Mirrors inject_own_headers() in the HTTP proxy.
+    fn inject_own_env(&mut self, channel_id: Uuid) {
+        // Collect all env vars first to avoid borrow conflicts with send_command
+        let mut env_vars: Vec<(String, String)> = Vec::new();
+
+        // Built-in: WARPGATE_USERNAME
+        if let Some(ref user_info) = self.user_info {
+            env_vars.push(("WARPGATE_USERNAME".to_string(), user_info.username.clone()));
+        }
+
+        // Built-in: WARPGATE_AUTHENTICATION_TYPE
+        if let Some(ref auth_type) = self.authentication_type {
+            env_vars.push((
+                "WARPGATE_AUTHENTICATION_TYPE".to_string(),
+                auth_type.clone(),
+            ));
+        }
+
+        // Custom env vars from target SSH config
+        if let Some(ref env) = self.target_env {
+            for (name, value) in env {
+                env_vars.push((name.clone(), value.clone()));
+            }
+        }
+
+        // Send all env vars
+        for (name, value) in env_vars {
+            let _ = self.send_command(RCCommand::Channel(
+                channel_id,
+                ChannelOperation::RequestEnv(name, value),
+            ));
+        }
     }
 
     async fn traffic_recorder_for(
@@ -2408,6 +2456,19 @@ impl ServerSession {
                     return Ok(AuthResult::Rejected);
                 }
 
+                // Resolve default SSH target when no target is specified
+                let resolved_target_name = if target_name.is_empty() {
+                    let config = self.services.config.lock().await;
+                    if let Some(ref default) = config.store.ssh.default_target {
+                        info!("No target specified, using default SSH target: {}", default);
+                        default.clone()
+                    } else {
+                        target_name.clone()
+                    }
+                } else {
+                    target_name.clone()
+                };
+
                 let state_arc = self
                     .get_auth_state(
                         username,
@@ -2461,19 +2522,19 @@ impl ServerSession {
                         let Some(identity) = AuthorizedIdentity::from_auth_state(&state) else {
                             return Ok(AuthResult::Rejected);
                         };
-                        let authorization = if target_name.is_empty() {
+                        let authorization = if resolved_target_name.is_empty() {
                             None
                         } else {
                             let Some(authorization) = authorize_for_target_by_name(
                                 self.services.config_provider.as_ref(),
                                 &identity,
-                                target_name,
+                                &resolved_target_name,
                             )
                             .await?
                             else {
                                 warn!(
                                     "Target {} not authorized for user {}",
-                                    target_name, username
+                                    resolved_target_name, username
                                 );
                                 return Ok(AuthResult::Rejected);
                             };
@@ -2481,6 +2542,7 @@ impl ServerSession {
                         };
                         self.authorized_identity = Some(identity);
                         self._auth_accept(user_info.clone(), authorization).await?;
+                        self.authentication_type = Some("user".to_string());
                         Ok(AuthResult::Accepted { user_info })
                     }
                     x => Ok(x),
@@ -2504,6 +2566,7 @@ impl ServerSession {
                         let user_info = authorization.user_info().clone();
                         self._auth_accept(user_info.clone(), Some(authorization))
                             .await?;
+                        self.authentication_type = Some("ticket".to_string());
 
                         Ok(AuthResult::Accepted { user_info })
                     }

@@ -578,28 +578,38 @@ async fn _handle_websocket_request_inner(
 
         let server_to_client = {
             let recorder_tx = recorder_tx.clone();
-            pump_websocket(server_source, client_sink, move |msg| {
+            pump_websocket(
+                server_source,
+                client_sink,
+                move |msg| {
+                    let recorder_tx = recorder_tx.clone();
+                    async move {
+                        tracing::debug!("Server: {:?}", msg);
+                        if let tungstenite::Message::Binary(data) = &msg {
+                            let _ = recorder_tx.send(data.to_vec()).await;
+                        }
+                        anyhow::Ok(msg)
+                    }
+                },
+                "k8s_browser_to_backend",
+            )
+        };
+
+        let client_to_server = pump_websocket(
+            client_source,
+            server_sink,
+            move |msg| {
                 let recorder_tx = recorder_tx.clone();
                 async move {
-                    tracing::debug!("Server: {:?}", msg);
+                    tracing::debug!("Client: {:?}", msg);
                     if let tungstenite::Message::Binary(data) = &msg {
                         let _ = recorder_tx.send(data.to_vec()).await;
                     }
                     anyhow::Ok(msg)
                 }
-            })
-        };
-
-        let client_to_server = pump_websocket(client_source, server_sink, move |msg| {
-            let recorder_tx = recorder_tx.clone();
-            async move {
-                tracing::debug!("Client: {:?}", msg);
-                if let tungstenite::Message::Binary(data) = &msg {
-                    let _ = recorder_tx.send(data.to_vec()).await;
-                }
-                anyhow::Ok(msg)
-            }
-        });
+            },
+            "k8s_backend_to_browser",
+        );
 
         // Whichever direction ends first takes the stream down; the other is
         // dropped rather than left to fail writing into the closed socket.
