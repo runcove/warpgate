@@ -777,6 +777,7 @@ mod tests {
             tls: Default::default(),
             headers: Default::default(),
             external_host: None,
+            public: false,
         }
     }
 
