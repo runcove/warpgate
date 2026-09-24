@@ -39,6 +39,11 @@ struct ExistingPublicKeyCredential {
     label: String,
     date_added: Option<OffsetDateTime>,
     last_used: Option<OffsetDateTime>,
+    /// Timestamp of the last step-up SSO refresh that stamped this credential.
+    /// `None` if the credential has never been gated on a fresh SSO - either
+    /// step-up is disabled, the user hasn't reconnected since the feature
+    /// shipped, or the feature is disabled globally.
+    last_sso_at: Option<OffsetDateTime>,
     openssh_public_key: String,
 }
 
@@ -54,6 +59,7 @@ impl From<PublicKeyCredential::Model> for ExistingPublicKeyCredential {
             id: credential.id,
             date_added: credential.date_added,
             last_used: credential.last_used,
+            last_sso_at: credential.last_sso_at,
             label: credential.label,
             openssh_public_key: credential.openssh_public_key,
         }
@@ -221,12 +227,26 @@ impl DetailApi {
             return Ok(UpdatePublicKeyCredentialResponse::Forbidden(Json(msg)));
         }
 
+        let new_key = UserPublicKeyCredential::try_from(&*body)?;
+        // The row id survives an in-place update, and with it the step-up SSO
+        // stamp. A replacement key must not inherit the old key's freshness,
+        // so new key material clears it; a label-only edit keeps it.
+        let key_replaced = PublicKeyCredential::Entity::find_by_id(id.0)
+            .filter(PublicKeyCredential::Column::UserId.eq(*user_id))
+            .one(db)
+            .await?
+            .is_none_or(|existing| existing.openssh_public_key != *new_key.key.expose_secret());
+        let mut values = PublicKeyCredential::ActiveModel {
+            date_added: Set(Some(OffsetDateTime::now_utc())),
+            label: Set(body.label.clone()),
+            ..<_>::from(new_key)
+        };
+        if key_replaced {
+            values.last_sso_at = Set(None);
+        }
+
         let updated = PublicKeyCredential::Entity::update_many()
-            .set(PublicKeyCredential::ActiveModel {
-                date_added: Set(Some(OffsetDateTime::now_utc())),
-                label: Set(body.label.clone()),
-                ..<_>::from(UserPublicKeyCredential::try_from(&*body)?)
-            })
+            .set(values)
             .filter(PublicKeyCredential::Column::Id.eq(id.0))
             .filter(PublicKeyCredential::Column::UserId.eq(*user_id))
             .exec(db)

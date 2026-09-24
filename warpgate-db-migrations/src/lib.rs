@@ -99,6 +99,19 @@ mod m00092_http_session_sso_identity;
 mod m00093_log_session_id_nullable;
 mod m00094_unique_role_names;
 
+// cove-patch migrations. Their names are frozen: SeaORM identifies a migration
+// by its module-name string (`DeriveMigrationName`) and decides what is pending
+// by comparing name sets, and these names are already recorded as applied on
+// our live database. Renaming, renumbering or deleting one makes startup fail
+// with "Migration file of version '...' is missing" before anything runs.
+// Position in the `migrations()` vec is what orders execution, not the name, so
+// they are registered after upstream's and a fresh database applies them last.
+mod m00040_credentials_public_key_user_id_index;
+mod m00041_credentials_public_key_last_sso_at;
+// Kept registered although nothing reads the column any more: the Kubernetes
+// step-up gate was dropped in the 0.29.1 upgrade, the migration record was not.
+mod m00042_credentials_certificate_last_sso_at;
+
 pub(crate) mod helpers;
 
 pub struct Migrator;
@@ -201,6 +214,10 @@ impl MigratorTrait for Migrator {
             Box::new(m00092_http_session_sso_identity::Migration),
             Box::new(m00093_log_session_id_nullable::Migration),
             Box::new(m00094_unique_role_names::Migration),
+            // cove-patch migrations registered after upstream's - see the mod block above.
+            Box::new(m00040_credentials_public_key_user_id_index::Migration),
+            Box::new(m00041_credentials_public_key_last_sso_at::Migration),
+            Box::new(m00042_credentials_certificate_last_sso_at::Migration),
         ]
     }
 }

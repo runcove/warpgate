@@ -186,6 +186,12 @@ impl StoredCredential {
         self.kind
     }
 
+    /// The id of the stored row this credential matched, e.g. the
+    /// `credentials_public_key` row the SSH step-up gate reads and stamps.
+    pub const fn id(&self) -> Uuid {
+        self.id
+    }
+
     /// serialize into a byte buffer for fingerprint generation of an entire credential set later
     pub(crate) fn write_canonical_bytes(&self, out: &mut Vec<u8>) {
         out.push(match self.kind {

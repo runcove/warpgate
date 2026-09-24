@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use super::{
     ApprovalKind, AuthCredential, CredentialKind, CredentialPolicy, CredentialPolicyResponse,
-    StoredCredential, ValidCredential,
+    StoredCredential, StoredCredentialKind, ValidCredential,
 };
 use crate::helpers::logging::format_related_ids;
 use crate::{Protocol, User, UserSessionId, WarpgateError};
@@ -273,6 +273,23 @@ pub struct AuthState {
     last_result: Option<AuthResult>,
     state_change_signal: broadcast::Sender<AuthResult>,
     authenticated_event_emitted: bool,
+    /// True when a step-up gate has decided the current credentials are
+    /// insufficient and a `WebUserApproval` must arrive before `verify()`
+    /// reports `Accepted`. Without this flag the browser's
+    /// `/api/auth/state/:id` poll would see `Accepted` (because the pubkey
+    /// already validated) and the UI would hide the Authorize button.
+    /// Cleared in `add_web_user_approval` when one lands.
+    pending_step_up: bool,
+    /// True when the `WebUserApproval` in `valid_credentials` was not collected
+    /// by this attempt at all, but injected by the grace-period bypass from an
+    /// approval remembered for an *earlier* attempt
+    /// (`Services::try_web_approval_bypass`). Such an approval proves nothing
+    /// about SSO freshness, so the SSH step-up gate must neither treat it as
+    /// satisfying the gate nor stamp `last_sso_at` from it - otherwise chained
+    /// reconnects inside the grace window slide the step-up window forward
+    /// forever with no SSO handshake ever happening.
+    /// Cleared again by a real `add_web_user_approval`.
+    web_approval_from_grace_bypass: bool,
 }
 
 fn generate_identification_string() -> String {
@@ -309,6 +326,8 @@ impl AuthState {
             last_result: None,
             state_change_signal,
             authenticated_event_emitted: false,
+            pending_step_up: false,
+            web_approval_from_grace_bypass: false,
         };
         this.maybe_update_verification_state();
         this
@@ -369,6 +388,47 @@ impl AuthState {
         &self.identification_string
     }
 
+    /// Mark this state as requiring a `WebUserApproval` step-up. The SSH
+    /// handler calls this when `step_up_interval.ssh` is set and the matched
+    /// pubkey's `last_sso_at` is stale. After this flag is set, `verify()`
+    /// reports `Need({WebUserApproval})` until a real one arrives - which is
+    /// what the browser approve UI and the pending-request listing both key
+    /// off. Fires the state-change signal so listening UIs get the new status.
+    pub fn require_step_up(&mut self) {
+        if !self.pending_step_up {
+            self.pending_step_up = true;
+            self.maybe_update_verification_state();
+        }
+    }
+
+    /// Whether a step-up gate has fired on this state and is still waiting for
+    /// its `WebUserApproval`.
+    ///
+    /// A step-up `Need` means "prove *this* credential just did a fresh SSO
+    /// handshake". It is deliberately distinguishable from a policy-raised
+    /// `Need(WebUserApproval)` so that the web-approval grace-period bypass
+    /// (`Services::try_web_approval_bypass`) can refuse to satisfy it from a
+    /// remembered approval on another session - which would defeat the
+    /// per-credential freshness guarantee the gate exists to provide.
+    #[must_use]
+    pub const fn is_step_up_pending(&self) -> bool {
+        self.pending_step_up
+    }
+
+    /// The row ids of the stored public keys validated so far in this
+    /// attempt. The SSH step-up gate reads and stamps `last_sso_at` on the
+    /// matched row; more than one id is unexpected and the gate treats it
+    /// as stale.
+    #[must_use]
+    pub fn matched_public_key_ids(&self) -> Vec<Uuid> {
+        self.valid_credentials
+            .iter()
+            .filter_map(ValidCredential::stored)
+            .filter(|stored| stored.kind() == StoredCredentialKind::PublicKey)
+            .map(StoredCredential::id)
+            .collect()
+    }
+
     /// Runs `validate` on the credential and records it only if it passes.
     /// This is the sole path for adding a credential that requires validation,
     /// so a credential in `valid_credentials` is validated by construction.
@@ -394,10 +454,51 @@ impl AuthState {
 
     /// Records a web user approval. Unlike other credential kinds, the act of
     /// approval is itself the validation, so there is nothing to check.
+    ///
+    /// This is the *real* approval path - a human just approved this attempt -
+    /// so it also clears the step-up flag and any earlier bypass marking.
     pub fn add_web_user_approval(&mut self) -> AuthResult {
+        self.pending_step_up = false;
+        self.web_approval_from_grace_bypass = false;
         self.valid_credentials
             .push(ValidCredential::WebUserApproval);
         self.maybe_update_verification_state()
+    }
+
+    /// Records a web user approval that came from the grace-period bypass
+    /// rather than from a human approving *this* attempt.
+    ///
+    /// Behaves exactly like [`Self::add_web_user_approval`] for policy
+    /// purposes - the credential is present and the policy is satisfied - but
+    /// marks the state so the SSH step-up gate can tell the two apart. See
+    /// [`Self::web_approval_from_grace_bypass`].
+    pub fn add_web_user_approval_via_grace_bypass(&mut self) -> AuthResult {
+        self.web_approval_from_grace_bypass = true;
+        self.valid_credentials
+            .push(ValidCredential::WebUserApproval);
+        self.maybe_update_verification_state()
+    }
+
+    /// Whether the `WebUserApproval` credential on this state (if any) was
+    /// injected by the grace-period bypass instead of being collected by this
+    /// attempt.
+    ///
+    /// The SSH step-up gate reads this to refuse to count a bypassed approval
+    /// as a fresh SSO handshake: it neither satisfies the freshness gate nor
+    /// stamps `last_sso_at`.
+    #[must_use]
+    pub const fn web_approval_from_grace_bypass(&self) -> bool {
+        self.web_approval_from_grace_bypass
+    }
+
+    /// Whether a web approval collected by *this* attempt is present, as
+    /// opposed to none or only one injected by the grace-period bypass.
+    #[must_use]
+    pub fn has_real_web_approval(&self) -> bool {
+        !self.web_approval_from_grace_bypass
+            && self
+                .valid_credentials
+                .contains(&ValidCredential::WebUserApproval)
     }
 
     pub fn reject(&mut self) {
@@ -416,7 +517,10 @@ impl AuthState {
         self.state_change_signal.subscribe()
     }
 
-    fn valid_credential_kinds(&self) -> HashSet<CredentialKind> {
+    /// The set of credential kinds that have been validated so far during
+    /// this auth attempt.
+    #[must_use]
+    pub fn valid_credential_kinds(&self) -> HashSet<CredentialKind> {
         self.valid_credentials
             .iter()
             .map(ValidCredential::kind)
@@ -502,6 +606,13 @@ impl AuthState {
     fn current_verification_state(&self) -> AuthResult {
         if self.force_rejected {
             return AuthResult::Rejected;
+        }
+        if self.pending_step_up && !self.has_real_web_approval() {
+            // A step-up gate has fired but no real WebUserApproval has landed
+            // yet. Short-circuit the policy so the browser's approve page
+            // renders the Authorize button and the approval wakes the SSH
+            // session.
+            return AuthResult::Need(HashSet::from([CredentialKind::WebUserApproval]));
         }
         match self
             .policy
@@ -760,5 +871,78 @@ mod tests {
             rx.recv().await.unwrap(),
             AuthResult::Accepted { .. }
         ));
+    }
+
+    #[test]
+    fn unit_require_step_up_overrides_accepted_verdict() {
+        // Without the override, a policy-satisfied state verifies as Accepted
+        // and the browser approve page hides the Authorize button. With
+        // require_step_up() the verdict flips to Need(WebUserApproval) until
+        // one lands, which is the contract the approve flow relies on.
+        let mut state = make_state(&[CredentialKind::WebUserApproval]);
+        let _ = state.add_web_user_approval();
+        assert!(matches!(state.verify(), AuthResult::Accepted { .. }));
+
+        // A fresh state on the same policy, gated by a step-up.
+        let mut state = make_state(&[CredentialKind::WebUserApproval]);
+        state.require_step_up();
+        assert!(state.is_step_up_pending());
+        let AuthResult::Need(needed) = state.verify() else {
+            panic!("expected Need");
+        };
+        assert!(needed.contains(&CredentialKind::WebUserApproval));
+
+        let _ = state.add_web_user_approval();
+        assert!(!state.is_step_up_pending());
+        assert!(
+            matches!(state.verify(), AuthResult::Accepted { .. }),
+            "WebUserApproval must clear the step-up flag"
+        );
+    }
+
+    /// An approval injected by the grace-period bypass is not a fresh SSO: it
+    /// cannot satisfy a pending step-up, and it is reported as bypassed so the
+    /// gate neither passes on it nor stamps from it.
+    #[test]
+    fn unit_bypassed_approval_does_not_satisfy_a_pending_step_up() {
+        let mut state = make_state(&[CredentialKind::WebUserApproval]);
+        let _ = state.add_web_user_approval_via_grace_bypass();
+        assert!(state.web_approval_from_grace_bypass());
+        assert!(!state.has_real_web_approval());
+        // For the policy alone, a bypassed approval still counts.
+        assert!(matches!(state.verify(), AuthResult::Accepted { .. }));
+
+        state.require_step_up();
+        assert!(matches!(state.verify(), AuthResult::Need(_)));
+
+        let _ = state.add_web_user_approval();
+        assert!(!state.web_approval_from_grace_bypass());
+        assert!(state.has_real_web_approval());
+        assert!(matches!(state.verify(), AuthResult::Accepted { .. }));
+    }
+
+    /// The gate addresses the exact public-key row that matched, which now
+    /// comes from upstream's `StoredCredential` rather than a copy of ours.
+    #[tokio::test]
+    async fn unit_matched_public_key_ids_lists_only_public_key_rows() {
+        let mut state = make_state(&[CredentialKind::Password, CredentialKind::PublicKey]);
+        let key_row = Uuid::new_v4();
+        let _ = state
+            .submit_credential(password(), |_, _| async { Ok(Some(stored_credential(1))) })
+            .await
+            .unwrap();
+        assert!(state.matched_public_key_ids().is_empty());
+
+        let _ = state
+            .submit_credential(password(), move |_, _| async move {
+                Ok(Some(StoredCredential::new(
+                    StoredCredentialKind::PublicKey,
+                    key_row,
+                    StoredCredentialFingerprint::of_stored_verifier([2; 32].as_slice()),
+                )))
+            })
+            .await
+            .unwrap();
+        assert_eq!(state.matched_public_key_ids(), vec![key_row]);
     }
 }
