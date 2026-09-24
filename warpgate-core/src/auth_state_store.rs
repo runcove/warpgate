@@ -1,11 +1,12 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::IpAddr;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use sea_orm::DatabaseConnection;
 use tokio::sync::{Mutex, broadcast};
-use tracing::error;
+use tracing::{error, warn};
 use warpgate_common::auth::{AuthResult, AuthState, CredentialKind, CredentialPolicy};
 use warpgate_common::helpers::ipnet::WarpgateIpNet;
 use warpgate_common::helpers::username::username_eq_ci;
@@ -288,7 +289,7 @@ impl AuthStateStore {
 
         // Small backlog so subscribers that briefly fall behind still see the
         // terminal transition
-        let (state_change_tx, mut state_change_rx) = broadcast::channel(8);
+        let (state_change_tx, state_change_rx) = broadcast::channel(8);
 
         let state = AuthState::new(
             id,
@@ -308,17 +309,16 @@ impl AuthStateStore {
         // avoid keeping the state alive
         let watched = Arc::downgrade(&state_arc);
 
-        tokio::spawn(async move {
-            while let Ok(AuthResult::Need(result)) = state_change_rx.recv().await {
-                if !result.contains(&CredentialKind::WebUserApproval) {
-                    continue;
-                }
+        tokio::spawn(forward_web_auth_requests(state_change_rx, id, move || {
+            let watched = watched.clone();
+            let request_sink = request_sink.clone();
+            async move {
                 let Some(watched) = watched.upgrade() else {
-                    break;
+                    return false;
                 };
 
                 let Some(sink) = &request_sink else {
-                    continue;
+                    return true;
                 };
                 if let Err(error) = crate::approvals::advertise_user_request(
                     &sink.db,
@@ -333,8 +333,9 @@ impl AuthStateStore {
                     session_id: id,
                     user_id,
                 });
+                true
             }
-        });
+        }));
 
         state_arc
     }
@@ -360,6 +361,58 @@ impl AuthStateStore {
     pub fn vacuum(&mut self) {
         self.store
             .retain(|_, (_, started_at)| started_at.elapsed() < *TIMEOUT);
+    }
+}
+
+/// Watches one auth state's changes and calls `on_web_approval_needed` for
+/// every `Need` that asks for a web approval, until the state goes away (the
+/// channel closes, or the callback answers `false`).
+///
+/// This is what makes a pending approval appear, and be approvable, in the web
+/// UI: on 0.29.1 the callback writes the approval-request row, so if this loop
+/// stopped early, `/auth/state/:id/approve` would find nothing and the waiting
+/// SSH session could only time out. So it survives everything except the
+/// state actually going away:
+///
+///   Ok(Need) containing WebUserApproval -> call back
+///   Ok(anything else)                   -> keep listening
+///   Err(Lagged)                         -> warn, keep listening
+///   Err(Closed)                         -> stop
+///
+/// Losing an intermediate state to `Lagged` is survivable and deliberately
+/// only warned about: the auth state itself stays authoritative.
+async fn forward_web_auth_requests<F, Fut>(
+    mut state_change_rx: broadcast::Receiver<AuthResult>,
+    id: UserSessionId,
+    mut on_web_approval_needed: F,
+) where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = bool>,
+{
+    loop {
+        match state_change_rx.recv().await {
+            Ok(AuthResult::Need(result)) => {
+                if result.contains(&CredentialKind::WebUserApproval)
+                    && !on_web_approval_needed().await
+                {
+                    break;
+                }
+            }
+            // Not a web-approval request, but the state machine can still emit
+            // a `Need` later in this auth attempt — keep listening.
+            Ok(_) => {}
+            // The channel has a small backlog, so a burst of state changes
+            // still drops values. Giving up here would strand the approval.
+            Err(broadcast::error::RecvError::Lagged(dropped)) => {
+                warn!(
+                    %id,
+                    dropped,
+                    "Auth state change stream lagged; continuing to watch for web-approval requests"
+                );
+            }
+            // The auth state is gone. Nothing further can arrive.
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
     }
 }
 
@@ -614,5 +667,107 @@ mod tests {
         assert!(ip_allowed(range.as_ref(), None));
         // No restriction configured.
         assert!(ip_allowed(None, Some("192.168.0.1".parse().unwrap())));
+    }
+
+    /// Drives `forward_web_auth_requests` over a pre-loaded channel with a
+    /// counting callback (the real one needs a database and a cluster).
+    ///
+    /// The sender is dropped before the forwarder runs, so the receiver drains
+    /// whatever is buffered and then observes `Closed` — which makes every case
+    /// below deterministic, with no sleeps and no task scheduling races. The
+    /// channel capacity of 1 is smaller than production's 8, which is what
+    /// makes the `Lagged` case reachable deterministically.
+    async fn drain(sent: Vec<AuthResult>) -> usize {
+        let (state_change_tx, state_change_rx) = broadcast::channel(1);
+        for value in sent {
+            let _ = state_change_tx.send(value);
+        }
+        drop(state_change_tx);
+
+        let fired = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = fired.clone();
+        forward_web_auth_requests(state_change_rx, UserSessionId(Uuid::new_v4()), move || {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                true
+            }
+        })
+        .await;
+        fired.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn need_web_approval() -> AuthResult {
+        AuthResult::Need(HashSet::from([CredentialKind::WebUserApproval]))
+    }
+
+    #[tokio::test]
+    async fn unit_forwarder_survives_a_non_need_verdict() {
+        // `Rejected` is not a web-approval request, but the state machine can
+        // still emit a `Need` afterwards. Bailing out on the first non-`Need`
+        // value strands the auth state with no request ever recorded.
+        assert_eq!(
+            drain(vec![AuthResult::Rejected, need_web_approval()]).await,
+            1,
+            "the request must still be recorded after a non-Need verdict"
+        );
+    }
+
+    #[tokio::test]
+    async fn unit_forwarder_survives_a_lagged_receiver() {
+        // The helper's channel capacity is 1, so pushing two values before the
+        // forwarder polls makes the receiver lag and `recv()` yield
+        // `Err(Lagged)`. Treating that as terminal kills the forwarder for the
+        // rest of the auth state's life.
+        assert_eq!(
+            drain(vec![
+                AuthResult::Rejected,
+                AuthResult::Rejected,
+                need_web_approval(),
+            ])
+            .await,
+            1,
+            "the request must still be recorded after a Lagged error"
+        );
+    }
+
+    #[tokio::test]
+    async fn unit_forwarder_ignores_need_without_web_approval() {
+        assert_eq!(
+            drain(vec![AuthResult::Need(HashSet::from([
+                CredentialKind::Password,
+            ]))])
+            .await,
+            0,
+            "a Need that does not ask for web approval must not be recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn unit_forwarder_exits_when_sender_is_dropped() {
+        // `drain` awaits the forwarder to completion, so this test hanging
+        // rather than failing is itself the regression signal for `Closed`
+        // no longer terminating the loop.
+        assert_eq!(drain(vec![]).await, 0);
+    }
+
+    #[tokio::test]
+    async fn unit_forwarder_stops_when_the_callback_says_the_state_is_gone() {
+        let (state_change_tx, state_change_rx) = broadcast::channel(4);
+        let _ = state_change_tx.send(need_web_approval());
+        let _ = state_change_tx.send(need_web_approval());
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = calls.clone();
+        // The sender is kept alive: only the callback's `false` can end this.
+        forward_web_auth_requests(state_change_rx, UserSessionId(Uuid::new_v4()), move || {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                false
+            }
+        })
+        .await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        drop(state_change_tx);
     }
 }

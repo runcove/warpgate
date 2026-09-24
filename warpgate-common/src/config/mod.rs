@@ -12,7 +12,7 @@ use defaults::{
     _default_http_listen, _default_kubernetes_listen, _default_mysql_advertised_version,
     _default_mysql_listen, _default_postgres_listen, _default_rdp_listen, _default_recordings_path,
     _default_retention, _default_session_max_age, _default_ssh_inactivity_timeout,
-    _default_ssh_listen, _default_vnc_listen,
+    _default_ssh_listen, _default_vnc_listen, _default_web_auth_wait_timeout,
 };
 use poem::http::uri::Authority;
 use poem_openapi::{Object, Union};
@@ -458,6 +458,17 @@ pub struct SshConfig {
     #[schemars(with = "Option<String>")]
     pub keepalive_interval: Option<Duration>,
 
+    /// Complete the SSH browser-approval round without a `Press Enter` prompt,
+    /// by polling the auth state across zero-prompt keyboard-interactive rounds.
+    #[serde(default)]
+    pub web_auth_auto_continue: bool,
+
+    /// How long one connection may keep polling for a browser approval before
+    /// the attempt is rejected.
+    #[serde(default = "_default_web_auth_wait_timeout", with = "humantime_serde")]
+    #[schemars(with = "String")]
+    pub web_auth_wait_timeout: Duration,
+
     /// Default SSH target name when no target is specified (e.g., `ssh warpgate` instead of `ssh user:target@warpgate`)
     #[serde(default)]
     pub default_target: Option<String>,
@@ -475,6 +486,8 @@ impl Default for SshConfig {
             external_host: None,
             inactivity_timeout: _default_ssh_inactivity_timeout(),
             keepalive_interval: None,
+            web_auth_auto_continue: false,
+            web_auth_wait_timeout: _default_web_auth_wait_timeout(),
             default_target: None,
         }
     }
@@ -1010,6 +1023,15 @@ impl Default for WarpgateConfigStore {
     }
 }
 
+/// Ceiling for `ssh.web_auth_wait_timeout`.
+///
+/// `AuthStateStore`'s vacuum reclaims auth states 10 minutes after they are
+/// created, so an SSH session waiting longer than that is waiting on a state
+/// that no longer exists: the extra time can never produce an approval. A
+/// larger configured value is not merely inadvisable, it is inert — so
+/// [`WarpgateConfig::validate`] clamps it here rather than only warning.
+pub const MAX_WEB_AUTH_WAIT_TIMEOUT: Duration = Duration::from_secs(600);
+
 #[derive(Debug, Clone)]
 pub struct WarpgateConfig {
     pub store: WarpgateConfigStore,
@@ -1022,7 +1044,9 @@ impl WarpgateConfig {
         Some(ext.parse::<Authority>().ok()?.host().to_owned())
     }
 
-    pub fn validate(&self) {
+    /// Warn about — and, where a value would otherwise be silently inert,
+    /// correct — config that parses but cannot do what it says.
+    pub fn validate(&mut self) {
         // Not an early return: the checks below must run whether or not
         // `external_host` is set.
         if let Some(ext) = self.store.external_host.as_deref() {
@@ -1049,6 +1073,21 @@ impl WarpgateConfig {
                 emit_config_warning("`step_up_interval.postgres` is accepted but currently no-ops (Postgres is password-only upstream, no SSO path).".to_owned());
             }
         }
+
+        if self.store.ssh.web_auth_wait_timeout > MAX_WEB_AUTH_WAIT_TIMEOUT {
+            let requested = self.store.ssh.web_auth_wait_timeout;
+            self.store.ssh.web_auth_wait_timeout = MAX_WEB_AUTH_WAIT_TIMEOUT;
+            emit_config_warning(format!(
+                "`ssh.web_auth_wait_timeout` was set to {}s, which exceeds the `AuthStateStore` vacuum horizon of 10 minutes; it has been clamped to {}s. Waiting longer cannot help — the auth state is vacuumed at that horizon.",
+                requested.as_secs(),
+                MAX_WEB_AUTH_WAIT_TIMEOUT.as_secs(),
+            ));
+        }
+        if self.store.ssh.web_auth_auto_continue
+            && self.store.ssh.web_auth_wait_timeout < Duration::from_secs(20)
+        {
+            emit_config_warning("`ssh.web_auth_auto_continue` is enabled with `web_auth_wait_timeout` < 20s (less than twice the 10s poll cadence).".to_owned());
+        }
     }
 }
 
@@ -1056,7 +1095,10 @@ impl WarpgateConfig {
 mod tests {
     use std::time::Duration;
 
-    use super::{SshConfig, StepUpIntervalConfig, WarpgateConfig, WarpgateConfigStore};
+    use super::{
+        MAX_WEB_AUTH_WAIT_TIMEOUT, SshConfig, StepUpIntervalConfig, WarpgateConfig,
+        WarpgateConfigStore,
+    };
 
     #[test]
     fn keepalive_interval_is_a_humantime_string() {
@@ -1162,5 +1204,74 @@ step_up_interval: {}
         assert!(s.kubernetes.is_none());
         assert!(s.mysql.is_none());
         assert!(s.postgres.is_none());
+    }
+
+    #[test]
+    fn unit_web_auth_auto_continue_config_defaults() {
+        let config = SshConfig::default();
+        assert!(!config.web_auth_auto_continue);
+        assert_eq!(config.web_auth_wait_timeout, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn unit_web_auth_wait_timeout_above_the_vacuum_horizon_is_clamped() {
+        // 700s parses fine, but the AuthStateStore vacuum reclaims the state at
+        // 600s, so the extra 100s can never yield an approval. validate() must
+        // correct it rather than leave a silently-inert value in place.
+        let yaml = r#"
+ssh:
+  enable: true
+  web_auth_wait_timeout: 700s
+"#;
+        let parsed: WarpgateConfigStore = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(parsed.ssh.web_auth_wait_timeout, Duration::from_secs(700));
+        let mut config = WarpgateConfig { store: parsed };
+        config.validate();
+        assert_eq!(
+            config.store.ssh.web_auth_wait_timeout,
+            MAX_WEB_AUTH_WAIT_TIMEOUT
+        );
+    }
+
+    /// The clamp must not depend on `external_host`: 0.29.1's `validate`
+    /// returned early when it was unset, which would have skipped this check.
+    #[test]
+    fn unit_web_auth_wait_timeout_is_clamped_with_or_without_external_host() {
+        for external_host in [None, Some("warpgate.example.com")] {
+            let mut config = WarpgateConfig {
+                store: WarpgateConfigStore {
+                    external_host: external_host.map(str::to_owned),
+                    ..Default::default()
+                },
+            };
+            config.store.ssh.web_auth_wait_timeout = Duration::from_secs(700);
+            config.validate();
+            assert_eq!(
+                config.store.ssh.web_auth_wait_timeout,
+                MAX_WEB_AUTH_WAIT_TIMEOUT,
+                "external_host = {external_host:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unit_web_auth_wait_timeout_at_or_below_the_horizon_is_left_alone() {
+        for secs in [30u64, 599, 600] {
+            let yaml = format!(
+                r#"
+ssh:
+  enable: true
+  web_auth_wait_timeout: {secs}s
+"#
+            );
+            let parsed: WarpgateConfigStore = serde_yaml::from_str(&yaml).unwrap();
+            let mut config = WarpgateConfig { store: parsed };
+            config.validate();
+            assert_eq!(
+                config.store.ssh.web_auth_wait_timeout,
+                Duration::from_secs(secs),
+                "{secs}s must not be clamped"
+            );
+        }
     }
 }
