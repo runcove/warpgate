@@ -39,11 +39,22 @@ pub(crate) async fn try_web_approval_bypass(
     // interlocks with advertise_user_request
     let mut state = state_arc.lock().await;
 
+    // A step-up SSO re-check asks for a fresh approval of *this* attempt.
+    // A remembered one, possibly from another session up to the grace
+    // period old, proves nothing about that, and letting it through would
+    // also re-stamp the key's `last_sso_at`, sliding the re-check window
+    // forward with no SSO at all.
+    if state.is_step_up_pending() {
+        return Ok(false);
+    }
+
     if !needs_web_approval(&state) {
         return Ok(false);
     }
 
-    state.add_web_user_approval();
+    // Marked as bypassed, so the SSH step-up gate neither passes on it
+    // nor stamps from it.
+    state.add_web_user_approval_via_grace_bypass();
     state.emit_web_approval_bypassed_event();
 
     let withdrawn = close_request(

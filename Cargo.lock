@@ -9159,6 +9159,7 @@ dependencies = [
  "sea-orm",
  "serde",
  "serde_json",
+ "serde_yaml",
  "sha2 0.11.0",
  "socket2",
  "strum 0.28.0",

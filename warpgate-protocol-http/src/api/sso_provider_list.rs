@@ -7,6 +7,7 @@ use poem_openapi::param::Query;
 use poem_openapi::payload::{Html, Json, Response};
 use poem_openapi::{ApiResponse, Enum, Object, OpenApi};
 use serde::Deserialize;
+use time::OffsetDateTime;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 use url::form_urlencoded;
@@ -29,6 +30,7 @@ use crate::common::{
     SessionExt, authorize_session, get_or_create_auth_state_for_request, session_id_for_request,
 };
 use crate::session::SessionStore;
+use crate::step_up::StepUpSessionExt;
 
 pub struct Api;
 
@@ -374,6 +376,13 @@ impl Api {
 
         if let Ok(user_info) = outcome.into_accepted() {
             authorize_session(req, &ctx, user_info).await?;
+            // Stamp the HTTP per-session step-up clock, after
+            // `authorize_session` (which can clear the session). Only the SSO
+            // return path stamps: password / OTP logins are not SSO handshakes
+            // and must not refresh the clock, else a user who only ever logs in
+            // via password would never re-SSO and the step-up gate would
+            // silently become a no-op.
+            session.set_last_sso_at(OffsetDateTime::now_utc());
             state.emit_authenticated_event_once();
             if let Some(ip) = client_ip {
                 let _ = services

@@ -8,6 +8,7 @@ pub mod proxy;
 mod session;
 mod session_handle;
 mod session_storage;
+mod step_up;
 
 use std::fmt::Debug;
 use std::sync::Arc;
