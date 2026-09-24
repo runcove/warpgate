@@ -1,10 +1,11 @@
 use poem_openapi::OpenApiService;
 use regex::Regex;
 use warpgate_admin::api;
-use warpgate_common::version::warpgate_version;
+use warpgate_version::warpgate_version;
 
 #[allow(clippy::unwrap_used)]
 pub fn main() {
+    warpgate_version::set_warpgate_version(warpgate_version::git_describe!());
     let api_service = OpenApiService::new(api::get(), "Warpgate Web Admin", warpgate_version())
         .server("/@warpgate/admin/api");
 

@@ -13,7 +13,7 @@ use sea_orm::{
 use tracing::{error, info};
 use uuid::Uuid;
 use warpgate_common::helpers::fs::{secure_directory, secure_file};
-use warpgate_common::version::warpgate_version;
+use warpgate_version::warpgate_version;
 use warpgate_common::{
     GlobalParams, HttpConfig, KubernetesConfig, ListenEndpoint, MySqlConfig, PostgresConfig,
     RdpConfig, Secret, SshConfig, SshHostKeyVerificationMode, VncConfig, WarpgateConfig,

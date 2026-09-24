@@ -31,7 +31,7 @@ use tracing::{Instrument, warn};
 use warpgate_admin::admin_api_app;
 use warpgate_common::ListenEndpoint;
 use warpgate_common::helpers::proxy_protocol::MaybeProxyProtocolAcceptor;
-use warpgate_common::version::warpgate_version;
+use warpgate_version::warpgate_version;
 use warpgate_common_http::auth::UnauthenticatedRequestContext;
 use warpgate_common_http::cluster_tls::{ClusterTlsConfigs, cluster_aware_tls_acceptor};
 use warpgate_common_http::errors::render_errors;
