@@ -5194,6 +5194,11 @@
             "type": "string",
             "format": "date-time"
           },
+          "last_sso_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Timestamp of the last step-up SSO refresh that stamped this credential.\n`None` if the credential has never been gated on a fresh SSO - either\nstep-up is disabled, the user hasn't reconnected since the feature\nshipped, or the feature is disabled globally."
+          },
           "openssh_public_key": {
             "type": "string"
           }
@@ -5832,6 +5837,9 @@
           "password_login_mode": {
             "$ref": "#/components/schemas/PasswordLoginMode"
           },
+          "sso_auto_redirect": {
+            "type": "boolean"
+          },
           "mfa_enforcement": {
             "$ref": "#/components/schemas/MfaEnforcement"
           },
@@ -5995,6 +6003,7 @@
           "ssh_client_auth_keyboard_interactive",
           "ssh_host_key_verification",
           "password_login_mode",
+          "sso_auto_redirect",
           "mfa_enforcement",
           "mfa_policy_exempt_sso_users",
           "default_credential_policy",
@@ -6050,6 +6059,9 @@
           },
           "password_login_mode": {
             "$ref": "#/components/schemas/PasswordLoginMode"
+          },
+          "sso_auto_redirect": {
+            "type": "boolean"
           },
           "mfa_enforcement": {
             "$ref": "#/components/schemas/MfaEnforcement"
@@ -7073,6 +7085,11 @@
           },
           "external_host": {
             "type": "string"
+          },
+          "public": {
+            "type": "boolean",
+            "default": false,
+            "description": "When `true`, the catchall HTTP proxy serves this target without\nrequiring a Warpgate login. Anonymous and session-authed clients pass\nthrough on a throwaway session that is never stored; admin, user and\ncluster tokens hit a public target -> 401 (tokens are not proxy-scoped).\nA target that requires admin approval is never bypassed. Default\n`false` preserves existing behaviour; serde-default backfills existing\nJSON-column rows so no DB migration is required.\n\n`#[oai(default)]` is NOT a duplicate of `#[serde(default)]`. serde's\ngoverns JSON deserialisation; poem-openapi's `Object` derive is a\nseparate generator and marks every non-`Option` field REQUIRED in the\nemitted schema unless it carries its own default. Without it the admin\nAPI's OpenAPI document would tell clients they must send `public` on\nPOST /targets and PUT /targets/{id}."
           }
         }
       },
@@ -7435,6 +7452,13 @@
           "jump_host": {
             "type": "string",
             "format": "uuid"
+          },
+          "env": {
+            "type": "object",
+            "description": "Custom environment variables to inject into downstream SSH sessions",
+            "additionalProperties": {
+              "type": "string"
+            }
           }
         }
       },
