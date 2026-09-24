@@ -1,0 +1,221 @@
+# syntax=docker/dockerfile:1.6
+# hadolint global ignore=DL3008
+#
+# Cove-patched Warpgate build.
+#
+# Patches are already applied in the source tree (branch cove-patches-v0.29.1).
+# This Dockerfile tracks upstream's docker/Dockerfile with three deliberate
+# divergences:
+#
+#   1. DEBIAN 12 (bookworm), NOT bullseye. Upstream is still on
+#      rust:1.97.1-bullseye / debian:bullseye-*, but Debian 11's security
+#      archive went EOL 2026-08-31 and `apt-get update` now 404s, so an
+#      upstream-identical image cannot be built at all. Both stages are
+#      pinned to bookworm by digest. Revisit when upstream moves.
+#
+#   2. Build caching, two layers of it. Within a single build, npm deps live
+#      in their own layer keyed on package-lock.json, and the cargo
+#      registry/git/target dirs are BuildKit cache mounts, so `cargo build`
+#      only recompiles crates whose sources actually changed. REQUIRES
+#      BuildKit (DOCKER_BUILDKIT=1 or docker >= 23); without it the
+#      `--mount=type=cache` lines are a syntax error. Across separate CI
+#      runs — where `--mount=type=cache` mounts don't survive, and neither
+#      does anything else on the runner's ephemeral per-job dind — the CI
+#      workflow imports/exports a BuildKit *registry* cache, whose ref the
+#      workflow supplies. That only helps if something in this Dockerfile is
+#      actually stable enough to hit: hence cargo-chef (divergence 3).
+#
+#   3. cargo-chef dependency layer (added 2026-09-15, after a cold compile
+#      with no working cache exhausted the storage shared with the build
+#      runner and degraded the surrounding platform for the best part of an
+#      hour). `chef`/`planner`/`builder`
+#      below split "compile the dependency graph" from "compile our own
+#      crates". `cargo chef prepare` distills the full source into
+#      recipe.json — a manifest of Cargo.toml/Cargo.lock only, not source
+#      code — and `cargo chef cook` builds *just* the dependencies from
+#      that. recipe.json's content only changes when Cargo.toml/Cargo.lock
+#      does, so on the common case (an upstream release or a patch that
+#      doesn't touch dependencies) the registry cache serves a hit on the
+#      expensive `cook` layer across *different* commits, not just a re-run
+#      of the same one — the thing plain `--mount=type=cache` mounts cannot
+#      do, since registry cache doesn't carry them. `--mount=type=cache` is
+#      kept below only for its original, single-build purpose (a fast
+#      *iterative* rebuild inside one `docker build` invocation); nothing
+#      here relies on it surviving between separate CI runs.
+#
+# Everything else is upstream's: Node 24 + openjdk-17 (the OpenAPI generator
+# needs a JRE), the just-driven frontend build, the mysql/postgres/rdp feature
+# set, `COPY .git/` for version embedding, SOURCE_DATE_EPOCH for rust-embed
+# determinism, and sqlite3/wget in the runtime image.
+#
+# Memory: aws-sdk-ec2 peaks around 6-8 GB during link at default all-cores
+# parallelism. On a memory-constrained host build with
+#   --build-arg CARGO_BUILD_JOBS=2
+# to cap rustc parallelism, otherwise the build OOMs. CARGO_INCREMENTAL=0
+# (2026-09-15, same incident as divergence 3) trades a little single-build
+# speed for a lot less write I/O; the registry cache above is what actually
+# keeps repeat builds fast, not incremental compilation.
+
+FROM rust:1.97.1-bookworm@sha256:408fe88047cef61a2087653b0c5255fa51c0f2d6d94ddedd7a2562a9b91a46f6 AS chef
+# Installed into our own already-proven, digest-pinned base rather than
+# switching to the lukemathwalker/cargo-chef image: that image is just a
+# rust base + cargo-chef too, and pulling a third-party one here would swap
+# out a toolchain this Dockerfile has already been verified against for one
+# we haven't, for no real benefit. Pinned to the latest stable release on
+# crates.io as of 2026-09-15.
+RUN cargo install --locked cargo-chef --version 0.1.78
+WORKDIR /opt/warpgate
+
+# The workspace pins nightly via rust-toolchain.toml (Cargo.toml declares
+# `cargo-features = ["profile-rustflags"]`, an unstable feature the stable
+# toolchain in this base image refuses to parse). `builder` below forks
+# directly from `chef` and never runs `COPY . .`, so without this it has no
+# rust-toolchain.toml at `cargo chef cook` time and fails with "the cargo
+# feature `profile-rustflags` requires a nightly version of Cargo, but this
+# is the `stable` channel" (hit in run 2372, 2026-09-15). Installing it here,
+# in the shared `chef` base both `planner` and `builder` fork from, means the
+# nightly download lands in a layer keyed only on rust-toolchain.toml — not
+# on recipe.json — so it isn't re-fetched every time dependencies change.
+COPY rust-toolchain.toml rust-toolchain.toml
+RUN cargo --version
+
+FROM chef AS planner
+# Recipe generation is static analysis over Cargo.toml/Cargo.lock — no JS
+# toolchain, no .git, no build outputs needed here.
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+RUN curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates-java nodejs openjdk-17-jdk mold \
+    && rm -rf /var/lib/apt/lists/* \
+    && cargo install --locked just@1.4.0
+
+ARG CARGO_BUILD_JOBS=default
+ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
+
+# Disabled in CI (2026-09-15 incident): incremental compilation's on-disk
+# artifacts added to the write volume that exhausted the storage shared with
+# the build runner during a cold compile, degrading the surrounding platform
+# with it. See the header comment for how the cargo-chef + registry-cache
+# combination below replaces it as the real fix for repeat-build speed.
+ARG CARGO_INCREMENTAL=0
+ENV CARGO_INCREMENTAL=${CARGO_INCREMENTAL}
+
+# Overrides the [profile.release] lto setting from Cargo.toml (which stays
+# `true`, untouched — this is an env var override, not a source edit, so
+# there is nothing extra to carry across an upstream rebase). Exists because
+# fat LTO's single whole-workspace link unit OOM'd under the 7 GiB job cap
+# linking warpgate itself (run 2374, ~6-8 GB documented peak). Defaults to
+# "true" so an unset build-arg reproduces Cargo.toml's own setting exactly;
+# CI passes "thin" or "false" explicitly when it needs to fit the cap.
+ARG CARGO_PROFILE_RELEASE_LTO=true
+ENV CARGO_PROFILE_RELEASE_LTO=${CARGO_PROFILE_RELEASE_LTO}
+
+# mold is installed here (a few MB) but NOT wired as the linker by default —
+# deliberately no RUSTFLAGS/EXTRA_RUSTFLAGS ARG here. .cargo/config.toml sets
+# `[target.'cfg(all())'] rustflags = ["--cfg", "tokio_unstable", ...]`
+# (required: warpgate-common/src/helpers/net.rs uses tokio::task::Builder,
+# gated behind tokio_unstable). Cargo's RUSTFLAGS env var REPLACES config.toml
+# rustflags outright rather than merging with it, even when set to an empty
+# string — an env var ARG/ENV pair here broke the default build with
+# `error[E0433]: cannot find Builder in task` (run 2375) purely by existing.
+# The mold-as-linker measurement (a separate ask, its own throwaway branch)
+# needs a RUSTFLAGS value that reproduces --cfg tokio_unstable plus the mold
+# flags together, done there — not as a standing option on this shared file.
+# Used for the linker-speed measurement requested across our Rust
+# projects; not (yet) this fork's shipping default.
+
+# The workspace's [patch.crates-io] table redirects ironrdp-async/-connector/
+# -session/picky/sspi to local forks under vendor/, and warpgate-protocol-vnc
+# path-depends on vendor/vnc-rs directly (see Cargo.toml's `exclude` comment:
+# they're kept out of [workspace] members only so Cranky's deny lints don't
+# apply to upstream code — they are still real, compiled path dependencies).
+# cargo-chef's dummy-source reconstruction only stubs out *workspace member*
+# crates; a path dependency excluded from the workspace isn't in that set, so
+# `cook` needs the real source on disk (it isn't self-contained in
+# recipe.json) — without this, cook fails with "failed to read
+# vendor/ironrdp-async/Cargo.toml: No such file or directory" (run 2373).
+# vendor/ is ~3.6 MB total and changes rarely (each fork carries its own
+# PATCHES.md), so this copy is cheap and cache-friendly on its own.
+COPY vendor/ vendor/
+
+# Cook just the dependency graph, keyed on recipe.json (and vendor/ above) —
+# this is the layer the registry cache exists to hit across commits. Same
+# feature flags as the real build below: a cook with different flags
+# compiles a different dependency set and the cache wouldn't line up with
+# what `cargo build` actually needs.
+COPY --from=planner /opt/warpgate/recipe.json recipe.json
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=warpgate-cargo-registry \
+    --mount=type=cache,target=/usr/local/cargo/git,id=warpgate-cargo-git \
+    --mount=type=cache,target=/opt/warpgate/target,id=warpgate-cargo-target \
+    cargo chef cook --release --features mysql,postgres,rdp-openssl-tls --recipe-path recipe.json
+
+# npm deps layer — invalidated only when package-lock.json changes.
+# --ignore-scripts skips the package.json postinstall (openapi client
+# generation), which needs source files not yet present in this layer;
+# `just openapi` below regenerates them after the full source copy.
+WORKDIR /opt/warpgate/warpgate-web
+COPY warpgate-web/package.json warpgate-web/package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm,id=warpgate-npm \
+    npm ci --ignore-scripts
+
+# Full source copy — this layer is busted on any edit, but the npm cache
+# above and the recipe-keyed dependency cook below survive it.
+WORKDIR /opt/warpgate
+COPY . .
+
+# Needed to correctly embed the version number and the dirty state flag.
+COPY .git/ /opt/warpgate/.git/
+
+# for rust-embed determinism
+ENV SOURCE_DATE_EPOCH=0
+
+# Frontend build. node_modules was populated in the deps layer and survives
+# the COPY above. `just openapi` regenerates the OpenAPI schema + TS clients
+# from source, replacing the postinstall that --ignore-scripts skipped.
+RUN just openapi \
+    && just npm run build
+
+# Rust release build. Dependencies are already compiled and sitting in the
+# warpgate-cargo-target cache mount from the `cargo chef cook` layer above
+# (same mount id, same buildkit cache store, populated earlier in this same
+# build) — this step only compiles our own crates against them. The binary
+# is copied out of the target cache mount so it lands in the image
+# filesystem rather than evaporating with the mount.
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=warpgate-cargo-registry \
+    --mount=type=cache,target=/usr/local/cargo/git,id=warpgate-cargo-git \
+    --mount=type=cache,target=/opt/warpgate/target,id=warpgate-cargo-target \
+    cargo build --features mysql,postgres,rdp-openssl-tls --release \
+    && cp target/release/warpgate /warpgate
+
+FROM debian:bookworm-slim@sha256:5ae3c39ebd15e229dcedd5cee596b2497182493d41ff162e824ba13fc1b2b867
+LABEL maintainer="cove-patched"
+ARG USER_ID=1000
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get -y update -qq \
+    && apt-get install --no-install-recommends --no-install-suggests -y \
+       ca-certificates wget sqlite3 \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN adduser warpgate --disabled-password --gecos "" --uid ${USER_ID} --home /data --shell /usr/sbin/nologin
+
+COPY --from=builder /warpgate /usr/local/bin/warpgate
+
+VOLUME /data
+
+ENV WARPGATE_CONFIG=/data/warpgate.yaml
+ENV DOCKER=1
+
+HEALTHCHECK CMD warpgate healthcheck
+
+USER warpgate
+ENTRYPOINT ["warpgate"]
+CMD ["run"]
