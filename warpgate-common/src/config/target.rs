@@ -94,6 +94,45 @@ pub struct TargetHTTPOptions {
 
     #[serde(default)]
     pub external_host: Option<String>,
+
+    /// When `true`, the catchall HTTP proxy serves this target without
+    /// requiring a Warpgate login. Anonymous and session-authed clients pass
+    /// through on a throwaway session that is never stored; admin, user and
+    /// cluster tokens hit a public target -> 401 (tokens are not proxy-scoped).
+    /// A target that requires admin approval is never bypassed. Default
+    /// `false` preserves existing behaviour; serde-default backfills existing
+    /// JSON-column rows so no DB migration is required.
+    ///
+    /// `#[oai(default)]` is NOT a duplicate of `#[serde(default)]`. serde's
+    /// governs JSON deserialisation; poem-openapi's `Object` derive is a
+    /// separate generator and marks every non-`Option` field REQUIRED in the
+    /// emitted schema unless it carries its own default. Without it the admin
+    /// API's OpenAPI document would tell clients they must send `public` on
+    /// POST /targets and PUT /targets/{id}.
+    #[serde(default)]
+    #[oai(default)]
+    pub public: bool,
+}
+
+#[cfg(test)]
+mod public_flag_tests {
+    //! `public: bool` on `TargetHTTPOptions`. Default `false` (private;
+    //! existing behaviour) unless explicitly opted in.
+    use super::*;
+
+    #[test]
+    fn deserializes_public_default_false() {
+        let json = r#"{"url": "http://x:80"}"#;
+        let opts: TargetHTTPOptions = serde_json::from_str(json).unwrap();
+        assert!(!opts.public);
+    }
+
+    #[test]
+    fn deserializes_public_explicit_true() {
+        let json = r#"{"url": "http://x:80", "public": true}"#;
+        let opts: TargetHTTPOptions = serde_json::from_str(json).unwrap();
+        assert!(opts.public);
+    }
 }
 
 // `#[serde(default)]` sits on the container, not on each field, so that

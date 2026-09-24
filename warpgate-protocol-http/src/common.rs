@@ -30,7 +30,11 @@ use warpgate_core::{ConfigProvider, vet_credential_bearer};
 use warpgate_db_entities::User;
 use warpgate_sso::WarpgateIdToken;
 
+use crate::catchall::{
+    PublicTargetDecision, is_warpgate_management_path, resolve_public_target_decision,
+};
 use crate::middleware::assert_mfa_setup_gate;
+use crate::middleware::ticket::TemporaryTicketSession;
 use crate::session::SessionStore;
 use crate::session_storage::SharedSessionStorage;
 use crate::step_up::{StepUpSessionExt, is_session_step_up_stale};
@@ -216,11 +220,143 @@ pub fn endpoint_auth<E: Endpoint + 'static>(e: E) -> impl Endpoint<Output = E::O
 
 pub fn page_auth<E: Endpoint + 'static>(e: E) -> impl Endpoint {
     e.around(|ep, req| async move {
+        // Public-target bypass. If the request resolves to an HTTP target
+        // with `public: true`, anonymous and session-authed clients are routed
+        // through to the catchall without the normal session/role gate, on a
+        // throwaway session; admin/user/cluster tokens get a 401 (they are not
+        // proxy-scoped). `page_auth` only wraps the catchall mount, so this
+        // never runs on the `/@warpgate` routes.
+        match try_public_target_bypass(&req).await? {
+            PublicBypassOutcome::Bypass {
+                synthetic_ctx,
+                target_id,
+            } => {
+                // Override any pre-existing AuthenticatedRequestContext with
+                // the synthetic Ticket-style auth so the catchall's Ticket arm
+                // (resolve by target_id, no role check) routes the request to
+                // the resolved public target. `_inner_auth`'s SSO step-up
+                // logic is gated on `Session(User { .. })` and so is also
+                // skipped.
+                let req = onto_throwaway_public_session(req, target_id);
+                return Ok(ep.data(synthetic_ctx).call(req).await?.into_response());
+            }
+            PublicBypassOutcome::Reject401 => {
+                return Err(poem::Error::from_string(
+                    "API tokens are not valid for public-target proxy access",
+                    StatusCode::UNAUTHORIZED,
+                ));
+            }
+            PublicBypassOutcome::NotApplicable => {}
+        }
+
         let err_resp = gateway_redirect(&req).into_response();
         Ok(_inner_auth(ep, req)
             .await?
             .map_or(err_resp, IntoResponse::into_response))
     })
+}
+
+/// Result of `try_public_target_bypass`. See [`page_auth`] for how each
+/// arm is handled.
+enum PublicBypassOutcome {
+    /// Public target resolved; route through with the synthetic Ticket
+    /// auth context so the catchall sees a target-scoped session.
+    Bypass {
+        synthetic_ctx: AuthenticatedRequestContext,
+        target_id: Uuid,
+    },
+    /// Public target resolved but the request carries an admin/user/cluster
+    /// token — return 401.
+    Reject401,
+    /// No bypass applies; existing auth flow runs unchanged.
+    NotApplicable,
+}
+
+/// The identity a public-target request is served under. `Uuid::nil()` and
+/// `"<public>"` are reachable through no credential path, so the audit log
+/// shows the bypass rather than impersonating a real user.
+fn public_session_authorization(target_id: Uuid) -> SessionAuthorization {
+    SessionAuthorization::Ticket {
+        user_id: Uuid::nil(),
+        username: "<public>".into(),
+        target_id,
+        ticket_id: None,
+    }
+}
+
+/// Moves a public-target request onto a throwaway session that is never
+/// stored, the way `TicketMiddleware` treats header-borne tickets.
+///
+/// The visitor's real cookie session is left untouched, so no cookie is set
+/// on a public host, nothing about the bypass outlives the request, and a
+/// logged-in visitor's own session is neither rewritten nor refused. The
+/// `SessionStore` recognises the request by its ticket key and serves every
+/// public request for a target from one unstored session per node.
+///
+/// Never write the synthetic authorization into the real cookie session: the
+/// catchall's Ticket arm would keep honouring it after `public` is turned off.
+fn onto_throwaway_public_session(mut req: Request, target_id: Uuid) -> Request {
+    let throwaway = Session::default();
+    throwaway.set_auth(public_session_authorization(target_id));
+    req.extensions_mut().insert(throwaway);
+    req.set_data(TemporaryTicketSession);
+    req
+}
+
+/// Inspect the request and decide whether the public-target bypass should
+/// fire. On `Bypass`, synthesises a `Ticket`-style `AuthenticatedRequestContext`
+/// pinned to the resolved target row so the catchall's Ticket arm proxies the
+/// request without role checks.
+async fn try_public_target_bypass(req: &Request) -> poem::Result<PublicBypassOutcome> {
+    // Defence-in-depth: never bypass auth on Warpgate's own management
+    // surfaces. `/@warpgate*` and `/_warpgate*` are nested ahead of the
+    // catchall so `page_auth` should not see them, but the guard keeps the
+    // guarantee from depending on routing order.
+    if is_warpgate_management_path(req.uri().path()) {
+        return Ok(PublicBypassOutcome::NotApplicable);
+    }
+
+    let unauth_ctx = Data::<&UnauthenticatedRequestContext>::from_request_without_body(req).await?;
+    let host = unauth_ctx.trusted_host_header(req);
+
+    // If `inject_request_authorization` already attached an
+    // `AuthenticatedRequestContext`, use its `auth` so the decision helper
+    // sees the real authorization state (tokens get rejected at the bypass
+    // instead of silently proxying).
+    let auth_ctx = Option::<Data<&AuthenticatedRequestContext>>::from_request_without_body(req)
+        .await
+        .ok()
+        .flatten();
+    let auth_ref = auth_ctx.as_deref().map(|c| &c.auth);
+
+    let (resolved, decision) =
+        resolve_public_target_decision(unauth_ctx.services(), host.as_deref(), auth_ref).await?;
+
+    match decision {
+        PublicTargetDecision::Bypass => {
+            // FAIL CLOSED. `resolve_public_target_decision` only ever returns
+            // `Bypass` alongside `Some(target)`, so this arm is unreachable
+            // today -- but it is reachable in the TYPE, and on the path that
+            // decides whether to SKIP AUTHENTICATION, refusing the bypass
+            // costs a public visitor one ordinary login prompt, where a panic
+            // would be a denial of service.
+            let Some((target, _opts)) = resolved else {
+                tracing::warn!(
+                    "public-target bypass resolved to Bypass with no target; \
+                     refusing the bypass and falling through to normal auth"
+                );
+                return Ok(PublicBypassOutcome::NotApplicable);
+            };
+            let synthetic_auth =
+                RequestAuthorization::Session(public_session_authorization(target.id));
+            Ok(PublicBypassOutcome::Bypass {
+                synthetic_ctx: unauth_ctx.to_authenticated(synthetic_auth),
+                target_id: target.id,
+            })
+        }
+        PublicTargetDecision::Reject401 => Ok(PublicBypassOutcome::Reject401),
+        PublicTargetDecision::NotApplicable => Ok(PublicBypassOutcome::NotApplicable),
+    }
 }
 
 pub fn redirect_navigations(
@@ -655,5 +791,119 @@ mod tests {
             "evil-example.com",
             "example.com"
         ));
+    }
+}
+
+#[cfg(test)]
+mod public_session_tests {
+    //! The public-target bypass runs on a throwaway session: whatever the
+    //! proxied request writes, the visitor's cookie is neither set nor
+    //! changed, so a browser keeps working across requests and a logged-in
+    //! visitor keeps their own login.
+    use poem::session::{CookieConfig, MemoryStorage, ServerSession, Session};
+    use poem::test::TestClient;
+    use poem::{Endpoint, EndpointExt, Request, Route, get, handler};
+    use uuid::Uuid;
+    use warpgate_common_http::SessionAuthorization;
+
+    use super::{SessionExt, onto_throwaway_public_session};
+    use crate::middleware::ticket::ticket_session_key;
+
+    const TARGET: Uuid = Uuid::from_u128(7);
+
+    #[handler]
+    fn login(session: &Session) -> &'static str {
+        session.set_auth(SessionAuthorization::User {
+            user_id: Uuid::from_u128(1),
+            username: "alice".into(),
+        });
+        "logged in"
+    }
+
+    #[handler]
+    fn whoami(session: &Session) -> String {
+        match session.get_auth() {
+            Some(SessionAuthorization::User { username, .. }) => username,
+            _ => "nobody".into(),
+        }
+    }
+
+    /// Stands in for the catchall: it writes to the session it is handed, as
+    /// the catchall does, and is recognised by the store as one shared
+    /// public session for the target.
+    #[handler]
+    fn proxied(req: &Request, session: &Session) -> String {
+        session.set_target_name("public-target".into());
+        match ticket_session_key(req, session) {
+            Some((user_id, target_id, None)) if user_id.is_nil() && target_id == TARGET => {
+                "proxied".into()
+            }
+            other => format!("wrong session key: {other:?}"),
+        }
+    }
+
+    fn app() -> impl Endpoint {
+        Route::new()
+            .at("/login", get(login))
+            .at("/whoami", get(whoami))
+            .at(
+                "/public",
+                get(proxied.around(|ep, req| async move {
+                    ep.call(onto_throwaway_public_session(req, TARGET)).await
+                })),
+            )
+            .with(ServerSession::new(
+                CookieConfig::default(),
+                MemoryStorage::new(),
+            ))
+    }
+
+    /// Two anonymous requests to a public target both succeed and neither
+    /// issues a cookie (0.28.6's synthetic ticket in the real cookie got a
+    /// 401 on the second request under 0.29.1's session model).
+    #[tokio::test]
+    async fn anonymous_public_requests_succeed_twice_without_a_cookie() {
+        let cli = TestClient::new(app());
+        for _ in 0..2 {
+            let resp = cli.get("/public").send().await;
+            resp.assert_status_is_ok();
+            resp.assert_header_is_not_exist("set-cookie");
+            resp.assert_text("proxied").await;
+        }
+    }
+
+    /// A logged-in visitor reaches a public target on the same cookie, twice,
+    /// and still has their own login afterwards.
+    #[tokio::test]
+    async fn a_logged_in_visitor_reaches_a_public_target_and_keeps_their_login() {
+        let cli = TestClient::new(app());
+        let resp = cli.get("/login").send().await;
+        resp.assert_status_is_ok();
+        let cookie = resp
+            .0
+            .headers()
+            .get("set-cookie")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .expect("the login sets a cookie")
+            .to_owned();
+
+        for _ in 0..2 {
+            let resp = cli
+                .get("/public")
+                .header("cookie", cookie.clone())
+                .send()
+                .await;
+            resp.assert_status_is_ok();
+            resp.assert_header_is_not_exist("set-cookie");
+            resp.assert_text("proxied").await;
+        }
+
+        cli.get("/whoami")
+            .header("cookie", cookie)
+            .send()
+            .await
+            .assert_text("alice")
+            .await;
     }
 }

@@ -360,6 +360,7 @@ mod tests {
                 tls: Tls::default(),
                 headers: Default::default(),
                 external_host: None,
+                public: false,
             }),
             rate_limit_bytes_per_second: None,
             group_id: None,
