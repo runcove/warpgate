@@ -41,6 +41,7 @@
         abbreviatePublicKey,
         getEffectivePossibleCredentials,
     } from 'common/protocols'
+    import RelativeDate from 'common/RelativeDate.svelte'
     import Fa from 'svelte-fa'
     import CertificateCredentialModal from '../../CertificateCredentialModal.svelte'
     import CreateOtpModal from '../../CreateOtpModal.svelte'
@@ -382,6 +383,16 @@
                         <small class="d-block text-muted"
                             >{abbreviatePublicKey(credential.opensshPublicKey)}</small
                         >
+                        <small class="d-block text-muted">
+                            Last step-up SSO:
+                            {#if credential.lastSsoAt}
+                                <RelativeDate
+                                    date={new Date(credential.lastSsoAt)}
+                                />
+                            {:else}
+                                never
+                            {/if}
+                        </small>
                     </div>
                     <CredentialUsedStateBadge {credential} />
                 {/if}

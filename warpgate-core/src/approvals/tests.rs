@@ -1478,6 +1478,86 @@ mod delivery {
         );
     }
 
+    /// A step-up SSO re-check must not be satisfied by a remembered approval,
+    /// nor counted as one. The first half is the control: the same remembered
+    /// approval does let an ordinary web-approval login through, so the
+    /// second half fails for the guard's reason and not the fixture's.
+    /// Remove the step-up guard in `try_web_approval_bypass` and the second
+    /// half fails.
+    #[tokio::test]
+    async fn step_up_need_is_not_satisfiable_by_a_recent_approval() {
+        use sea_orm::ActiveModelTrait;
+        use warpgate_db_entities::Parameters;
+
+        let db = migrated_db().await;
+        let services = test_services(&db).await;
+        let mut parameters: Parameters::ActiveModel =
+            Parameters::Entity::get(&db).await.unwrap().into();
+        parameters.web_approval_grace_period_seconds = Set(Some(3600));
+        parameters.update(&db).await.unwrap();
+
+        let user = test_user();
+        let remote_ip: std::net::IpAddr = "10.0.0.5".parse().unwrap();
+
+        // An earlier session's approval, remembered for this target.
+        let earlier = UserSessionId(Uuid::new_v4());
+        let subject = ApprovalSubject {
+            remote_ip: Some(remote_ip),
+            remember_by: RememberApprovalBy::from_credentials(vec![]),
+            ..user_subject(earlier, &user, "a-target")
+        };
+        advertise_row_on(&db, services.cluster.node_id, earlier, &subject).await;
+        assert!(
+            record_decision(
+                &db,
+                earlier,
+                ApprovalKind::User,
+                "a-target",
+                ApprovalDecision::Approved(ApprovalScope::Target),
+                admin_actor(),
+            )
+            .await
+            .unwrap()
+        );
+
+        let new_state = |session_id: UserSessionId| {
+            let services = services.clone();
+            let user = user.clone();
+            async move {
+                services.auth_state_store.lock().await.create(
+                    &session_id,
+                    &user,
+                    Protocol::Ssh,
+                    "a-target",
+                    Box::new(RequireWebApproval),
+                    Some(remote_ip),
+                )
+            }
+        };
+
+        // Control: an ordinary web-approval login is let through, marked as
+        // bypassed.
+        let plain = new_state(UserSessionId(Uuid::new_v4())).await;
+        assert!(services.try_web_approval_bypass(&plain).await.unwrap());
+        assert!(plain.lock().await.web_approval_from_grace_bypass());
+        assert!(matches!(
+            plain.lock().await.verify(),
+            AuthResult::Accepted { .. }
+        ));
+
+        // A pending step-up is not satisfied by it.
+        let stepped_up = new_state(UserSessionId(Uuid::new_v4())).await;
+        stepped_up.lock().await.require_step_up();
+        assert!(!services.try_web_approval_bypass(&stepped_up).await.unwrap());
+        let state = stepped_up.lock().await;
+        assert!(!state.has_real_web_approval());
+        assert!(!state.web_approval_from_grace_bypass());
+        assert!(matches!(
+            state.verify(),
+            AuthResult::Need(ref kinds) if kinds.contains(&CredentialKind::WebUserApproval)
+        ));
+    }
+
     /// A fresh attempt on the same connection can take the session's state
     /// over for a different user. An answer given about the previous user's
     /// login must not satisfy the new user's — same session, same target,

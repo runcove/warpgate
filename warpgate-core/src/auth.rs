@@ -5,6 +5,8 @@ use warpgate_common::auth::{AuthCredential, AuthState, SubmitOutcome};
 use crate::ConfigProvider;
 use crate::login_protection::LoginProtectionService;
 
+pub mod step_up;
+
 /// Single credential submission chokepoint that also triggers login protection checks
 pub async fn submit_credential<C: ConfigProvider>(
     state: &mut AuthState,

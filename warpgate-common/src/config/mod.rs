@@ -893,6 +893,50 @@ impl Default for LogConfig {
     }
 }
 
+/// Per-protocol step-up SSO re-auth intervals.
+///
+/// When set for a given protocol, the protocol handler consults a freshness
+/// stamp (e.g. `credentials_public_key.last_sso_at` for SSH pubkey) and, if
+/// the last step-up is older than the interval (or never happened), forces
+/// a `WebUserApproval` / SSO handshake before granting the session.
+///
+/// Leaving a field as `None` disables the step-up gate for that protocol -
+/// existing auth behaviour is unchanged. The Kubernetes, MySQL and Postgres
+/// fields are accepted so an existing config keeps parsing, but they no-op
+/// and warn at load time.
+#[derive(Debug, Deserialize, Serialize, Clone, Default, JsonSchema)]
+pub struct StepUpIntervalConfig {
+    /// Per-pubkey step-up interval for SSH (`credentials_public_key.last_sso_at`).
+    #[serde(default, with = "humantime_serde")]
+    #[schemars(with = "Option<String>")]
+    pub ssh: Option<Duration>,
+
+    /// Per-session step-up interval for HTTP (stored on the Poem session).
+    #[serde(default, with = "humantime_serde")]
+    #[schemars(with = "Option<String>")]
+    pub http: Option<Duration>,
+
+    /// Accepted for compatibility; no-ops and logs a warning on config load.
+    /// The Kubernetes certificate gate was never switched on (nothing stamped
+    /// a certificate, so enabling it would have refused every certificate)
+    /// and was dropped in the 0.29.1 upgrade.
+    #[serde(default, with = "humantime_serde")]
+    #[schemars(with = "Option<String>")]
+    pub kubernetes: Option<Duration>,
+
+    /// Accepted for forward-compat; MySQL is password-only upstream, so this
+    /// currently no-ops and logs a warning on config load.
+    #[serde(default, with = "humantime_serde")]
+    #[schemars(with = "Option<String>")]
+    pub mysql: Option<Duration>,
+
+    /// Accepted for forward-compat; Postgres is password-only upstream, so this
+    /// currently no-ops and logs a warning on config load.
+    #[serde(default, with = "humantime_serde")]
+    #[schemars(with = "Option<String>")]
+    pub postgres: Option<Duration>,
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone, JsonSchema)]
 pub struct WarpgateConfigStore {
     #[serde(default)]
@@ -931,6 +975,12 @@ pub struct WarpgateConfigStore {
 
     #[serde(default)]
     pub log: LogConfig,
+
+    /// Per-protocol step-up SSO re-auth intervals. See
+    /// [`StepUpIntervalConfig`]. `None` (the default) means no step-up on
+    /// any surface - existing behaviour unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_up_interval: Option<StepUpIntervalConfig>,
 }
 
 impl Default for WarpgateConfigStore {
@@ -948,6 +998,7 @@ impl Default for WarpgateConfigStore {
             vnc: <_>::default(),
             rdp: <_>::default(),
             log: <_>::default(),
+            step_up_interval: None,
         }
     }
 }
@@ -965,18 +1016,31 @@ impl WarpgateConfig {
     }
 
     pub fn validate(&self) {
-        let Some(ext) = self.store.external_host.as_deref() else {
-            return;
-        };
-        let tip = "`external_host` takes a bare hostname - set the external port via the `http.external_port` instead.";
-        match self.external_host_name() {
-            None => emit_config_warning(format!(
-                "Your `external_host` config option is set to `{ext}`, which is not a hostname and will be ignored. {tip}"
-            )),
-            Some(host) if host != ext => emit_config_warning(format!(
-                "Your `external_host` config option is set to `{ext}` - only `{host}` will be used. {tip}"
-            )),
-            Some(_) => {}
+        // Not an early return: the checks below must run whether or not
+        // `external_host` is set.
+        if let Some(ext) = self.store.external_host.as_deref() {
+            let tip = "`external_host` takes a bare hostname - set the external port via the `http.external_port` instead.";
+            match self.external_host_name() {
+                None => emit_config_warning(format!(
+                    "Your `external_host` config option is set to `{ext}`, which is not a hostname and will be ignored. {tip}"
+                )),
+                Some(host) if host != ext => emit_config_warning(format!(
+                    "Your `external_host` config option is set to `{ext}` - only `{host}` will be used. {tip}"
+                )),
+                Some(_) => {}
+            }
+        }
+
+        if let Some(ref step_up) = self.store.step_up_interval {
+            if step_up.kubernetes.is_some() {
+                emit_config_warning("`step_up_interval.kubernetes` is accepted but no-ops: the Kubernetes certificate step-up gate was removed.".to_owned());
+            }
+            if step_up.mysql.is_some() {
+                emit_config_warning("`step_up_interval.mysql` is accepted but currently no-ops (MySQL is password-only upstream, no SSO path).".to_owned());
+            }
+            if step_up.postgres.is_some() {
+                emit_config_warning("`step_up_interval.postgres` is accepted but currently no-ops (Postgres is password-only upstream, no SSO path).".to_owned());
+            }
         }
     }
 }
@@ -985,7 +1049,7 @@ impl WarpgateConfig {
 mod tests {
     use std::time::Duration;
 
-    use super::{SshConfig, WarpgateConfig, WarpgateConfigStore};
+    use super::{SshConfig, StepUpIntervalConfig, WarpgateConfig, WarpgateConfigStore};
 
     #[test]
     fn keepalive_interval_is_a_humantime_string() {
@@ -1028,5 +1092,68 @@ mod tests {
         );
         assert_eq!(name("https://warp.example.com:8888"), None);
         assert_eq!(name("warp.example.com/gateway"), None);
+    }
+
+    #[test]
+    fn unit_step_up_interval_default_is_none() {
+        // Backwards compat: an unset top-level key means "no step-up anywhere".
+        let store = WarpgateConfigStore::default();
+        assert!(store.step_up_interval.is_none());
+    }
+
+    #[test]
+    fn unit_step_up_interval_parses_humantime_per_protocol() {
+        // Use a minimal store YAML to exercise humantime_serde on each field.
+        let yaml = r#"
+step_up_interval:
+  ssh: 12h
+  http: 30m
+  kubernetes: 1d
+"#;
+        let parsed: WarpgateConfigStore = serde_yaml::from_str(yaml).unwrap();
+        let s = parsed.step_up_interval.expect("step_up_interval parsed");
+        assert_eq!(s.ssh, Some(Duration::from_secs(12 * 3600)));
+        assert_eq!(s.http, Some(Duration::from_secs(30 * 60)));
+        assert_eq!(s.kubernetes, Some(Duration::from_secs(24 * 3600)));
+        // Unset -> None, not an error.
+        assert_eq!(s.mysql, None);
+        assert_eq!(s.postgres, None);
+    }
+
+    #[test]
+    fn unit_step_up_interval_partial_populated_leaves_others_none() {
+        // Operators should be free to enable step-up on SSH only without
+        // having to declare every other protocol.
+        let yaml = r#"
+step_up_interval:
+  ssh: 6h
+"#;
+        let parsed: WarpgateConfigStore = serde_yaml::from_str(yaml).unwrap();
+        let s = parsed.step_up_interval.expect("step_up_interval parsed");
+        assert_eq!(s.ssh, Some(Duration::from_secs(6 * 3600)));
+        assert_eq!(s.http, None);
+        assert_eq!(s.kubernetes, None);
+    }
+
+    #[test]
+    fn unit_step_up_interval_empty_map_yields_all_none() {
+        // An empty `step_up_interval:` block is legal but a no-op.
+        let yaml = r#"
+step_up_interval: {}
+"#;
+        let parsed: WarpgateConfigStore = serde_yaml::from_str(yaml).unwrap();
+        let s = parsed.step_up_interval.expect("step_up_interval parsed");
+        assert_eq!(s.ssh, None);
+        assert_eq!(s.http, None);
+    }
+
+    #[test]
+    fn unit_step_up_interval_config_default_is_all_none() {
+        let s = StepUpIntervalConfig::default();
+        assert!(s.ssh.is_none());
+        assert!(s.http.is_none());
+        assert!(s.kubernetes.is_none());
+        assert!(s.mysql.is_none());
+        assert!(s.postgres.is_none());
     }
 }

@@ -12,7 +12,9 @@ use poem::{Endpoint, EndpointExt, FromRequest, IntoResponse, Request, Response};
 use sea_orm::EntityTrait;
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
+use time::OffsetDateTime;
 use tokio::sync::Mutex;
+use tracing::info;
 use uuid::Uuid;
 use warpgate_common::auth::{AuthResult, AuthState, AuthStateUserInfo, CredentialKind};
 use warpgate_common::helpers::username::username_eq_ci;
@@ -31,6 +33,7 @@ use warpgate_sso::WarpgateIdToken;
 use crate::middleware::assert_mfa_setup_gate;
 use crate::session::SessionStore;
 use crate::session_storage::SharedSessionStorage;
+use crate::step_up::{StepUpSessionExt, is_session_step_up_stale};
 
 pub const PROTOCOL_NAME: Protocol = Protocol::Http;
 static TARGET_SESSION_KEY: &str = "target_name";
@@ -145,9 +148,60 @@ pub async fn _inner_auth<E: Endpoint + 'static>(
     req: Request,
 ) -> poem::Result<Option<E::Output>> {
     let ctx = Option::<Data<&AuthenticatedRequestContext>>::from_request_without_body(&req).await?;
-    if ctx.is_none() {
+    let Some(ctx) = ctx else {
         return Ok(None);
+    };
+
+    // Per-session SSO step-up gate. If the session is authed as a `User` (not
+    // a ticket, not an API token) and the configured HTTP interval has elapsed
+    // since the last SSO handshake on this session, force a re-login: log the
+    // browser session out, then return `None` so that the surrounding
+    // `page_auth` / `endpoint_auth` wrapper redirects to the gateway login page
+    // (or answers 401). Tickets / tokens / anonymous fall through unchanged - we
+    // only pay the config-lock + session-read cost on the `User` path.
+    if let RequestAuthorization::Session(session_auth @ SessionAuthorization::User { .. }) =
+        &ctx.auth
+    {
+        // Pull the interval first; absent config -> feature off, skip the
+        // session read entirely to keep the hot path cheap.
+        let interval = ctx
+            .services()
+            .config
+            .lock()
+            .await
+            .store
+            .step_up_interval
+            .as_ref()
+            .and_then(|s| s.http);
+        if interval.is_some() {
+            let session = <&Session>::from_request_without_body(&req).await?;
+            let last_sso_at = session.get_last_sso_at();
+            if is_session_step_up_stale(
+                Some(session_auth),
+                last_sso_at,
+                interval,
+                OffsetDateTime::now_utc(),
+            ) {
+                info!(
+                    username = %session_auth.username(),
+                    has_stamp = last_sso_at.is_some(),
+                    "HTTP step-up required: session last_sso_at is stale or missing"
+                );
+                // A full logout rather than dropping only the auth claim: on
+                // 0.29.1 the browser session's server handle stays attributed
+                // to this user, and a cookie that no longer names the user is
+                // refused (401) by `SessionStore::handle_for_request` - which
+                // would block the very re-login this is asking for. SSO
+                // handshakes in flight live outside the Poem session, so
+                // nothing the re-login needs is lost.
+                let session_middleware =
+                    Data::<&Arc<Mutex<SessionStore>>>::from_request_without_body(&req).await?;
+                crate::api::common::logout(session, &mut *session_middleware.lock().await);
+                return Ok(None);
+            }
+        }
     }
+
     return ep.call(req).await.map(Some);
 }
 

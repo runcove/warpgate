@@ -1066,6 +1066,7 @@ mod tests {
             label: Set("from LDAP".to_owned()),
             date_added: Set(Some(OffsetDateTime::UNIX_EPOCH)),
             last_used: Set(Some(OffsetDateTime::UNIX_EPOCH)),
+            last_sso_at: Set(None),
             openssh_public_key: Set(key.to_owned()),
         }
         .insert(db)
@@ -1156,6 +1157,7 @@ mod tests {
             label: Set(String::new()),
             date_added: Set(None),
             last_used: Set(None),
+            last_sso_at: Set(None),
             openssh_public_key: Set(key.to_owned()),
         }
         .insert(db)
