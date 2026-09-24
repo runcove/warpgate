@@ -22,7 +22,6 @@ clap = { version = "4.0", features = [
 data-encoding.workspace = true
 delegate.workspace = true
 futures.workspace = true
-git-version = { version = "0.3.9", default-features = false }
 governor.workspace = true
 humantime-serde = { version = "1.1", default-features = false }
 ipnet.workspace = true

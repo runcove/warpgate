@@ -27,6 +27,7 @@ members = [
     "warpgate-web-clients-common",
     "warpgate-web-desktop",
     "warpgate-web-ssh",
+    "warpgate-version",
 ]
 # Vendored third-party forks (path deps / patches). They are excluded from the workspace
 # so Cranky's deny lints don't apply to their upstream code. Each carries a PATCHES.md

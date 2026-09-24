@@ -11,7 +11,6 @@ pub mod http_headers;
 mod state;
 mod try_macro;
 mod types;
-pub mod version;
 
 pub use config::*;
 pub use error::{UserFacingReason, WarpgateError};
