@@ -11,6 +11,7 @@ use tracing::{error, info};
 use uuid::Uuid;
 use warpgate_common::{UserSessionId, WarpgateError};
 use warpgate_common_http::auth::UnauthenticatedRequestContext;
+use warpgate_common_http::logging::get_client_ip_addr;
 use warpgate_common_http::{SessionAuthorization, SessionKeepalive};
 use warpgate_core::{State, UserSessionStateInit, WarpgateServerHandle};
 use warpgate_db_entities::{HttpSession, UserSession};
@@ -186,7 +187,7 @@ impl SessionStore {
         let session = <&Session>::from_request_without_body(req).await?;
 
         let (session_handle, session_handle_rx) = HttpSessionHandle::new();
-        let init = Self::state_init_for(req, session_handle).await?;
+        let init = Self::state_init_for(req, ctx, session_handle).await?;
         // A header-ticket session is held open by this node's entry alone: it
         // has no stored browser session, so the orphan sweep would end it
         // while it is still serving. Its lifetime is this node's, and it
@@ -247,20 +248,43 @@ impl SessionStore {
             &ctx.services().state,
             id,
             PROTOCOL_NAME,
-            Self::state_init_for(req, session_handle).await?,
+            Self::state_init_for(req, ctx, session_handle).await?,
         )
         .await;
         self.install_entry(req, ctx, id, server_handle.clone(), session_handle_rx)?;
         Ok(Some(server_handle))
     }
 
+    /// With `http.client_ip_header` set, the session records the address from
+    /// that header (the visitor behind the tunnel), not the tunnel's own peer
+    /// address. Both the create and the adopt path come through here.
     async fn state_init_for(
         req: &Request,
+        ctx: &UnauthenticatedRequestContext,
         session_handle: HttpSessionHandle,
     ) -> poem::Result<UserSessionStateInit> {
-        let remote_address = <&RemoteAddr>::from_request_without_body(req).await?;
+        let use_header = ctx
+            .services()
+            .config
+            .lock()
+            .await
+            .store
+            .http
+            .client_ip_header
+            .is_some();
+        let remote_address = if use_header {
+            get_client_ip_addr(req, ctx.services())
+                .await
+                .map(|ip| std::net::SocketAddr::new(ip, 0))
+        } else {
+            <&RemoteAddr>::from_request_without_body(req)
+                .await?
+                .0
+                .as_socket_addr()
+                .copied()
+        };
         Ok(UserSessionStateInit {
-            remote_address: remote_address.0.as_socket_addr().copied(),
+            remote_address,
             handle: Box::new(session_handle),
         })
     }

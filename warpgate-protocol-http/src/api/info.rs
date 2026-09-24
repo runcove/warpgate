@@ -121,6 +121,7 @@ pub struct Info {
     control_plane_host: Option<String>,
     ports: PortsInfo,
     password_login_mode: Parameters::PasswordLoginMode,
+    sso_auto_redirect: bool,
     authorized_via_ticket: bool,
     authorized_via_sso_with_single_logout: bool,
     local_logout_disabled: bool,
@@ -315,6 +316,7 @@ impl Api {
             selected_target: session.get_target_name(),
             external_host,
             password_login_mode: parameters.password_login_mode,
+            sso_auto_redirect: parameters.sso_auto_redirect,
             authorized_via_ticket: matches!(
                 session.get_auth(),
                 Some(SessionAuthorization::Ticket { .. })

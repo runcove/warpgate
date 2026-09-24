@@ -27,12 +27,20 @@ pub fn raw_remote_ip(req: &Request) -> Option<String> {
 }
 
 pub async fn get_client_ip(req: &Request, services: &Services) -> Option<String> {
-    let trust_x_forwarded_headers = {
+    let (trust_x_forwarded_headers, client_ip_header) = {
         let config = services.config.lock().await;
-        config.store.http.trust_x_forwarded_headers
+        (
+            config.store.http.trust_x_forwarded_headers,
+            config.store.http.client_ip_header.clone(),
+        )
     };
 
-    trusted_client_ip(req, raw_remote_ip(req), trust_x_forwarded_headers)
+    trusted_client_ip(
+        req,
+        raw_remote_ip(req),
+        trust_x_forwarded_headers,
+        client_ip_header.as_deref(),
+    )
 }
 
 pub async fn get_client_ip_addr(req: &Request, services: &Services) -> Option<IpAddr> {

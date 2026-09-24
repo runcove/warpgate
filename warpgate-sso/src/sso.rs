@@ -126,6 +126,10 @@ pub struct SsoResult {
     pub token: WarpgateIdToken,
     pub claims: WarpgateIdTokenClaims,
     pub userinfo_claims: Option<UserInfoClaims<WarpgateClaims, CoreGenderClaim>>,
+    /// Raw ID token claims as JSON for custom claim extraction.
+    /// Only the specific configured claim is read from this — avoids serde(flatten)
+    /// which could allow OIDC claim injection into typed fields.
+    pub raw_id_token_claims: Option<serde_json::Value>,
 }
 
 pub struct SsoClient {
@@ -389,10 +393,15 @@ impl SsoClient {
                 None
             };
 
+        // Extract raw ID token claims as JSON for custom claim lookup.
+        // This avoids serde(flatten) which could let malicious claims shadow typed fields.
+        let raw_id_token_claims = serde_json::to_value(&claims).ok();
+
         Ok(SsoResult {
             token: id_token.clone(),
             userinfo_claims,
             claims,
+            raw_id_token_claims,
         })
     }
 
@@ -453,10 +462,15 @@ impl SsoClient {
             }
         }
 
+        // Extract raw ID token claims as JSON for custom claim lookup.
+        // This avoids serde(flatten) which could let malicious claims shadow typed fields.
+        let raw_id_token_claims = serde_json::to_value(&claims).ok();
+
         Ok(SsoResult {
             token: id_token,
             claims,
             userinfo_claims: None,
+            raw_id_token_claims,
         })
     }
 

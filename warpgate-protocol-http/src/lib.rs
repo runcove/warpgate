@@ -8,6 +8,7 @@ pub mod proxy;
 mod session;
 mod session_handle;
 mod session_storage;
+mod sso_request_store;
 mod step_up;
 
 use std::fmt::Debug;
@@ -104,6 +105,8 @@ impl ProtocolServer for HTTPProtocolServer {
         let session_storage = SharedSessionStorage::new(self.services.db.clone());
         let session_store = SessionStore::new();
         let http_client_cache = HttpClientCache::new(std::time::Duration::MAX);
+        let sso_request_store: crate::sso_request_store::SsoRequestStore =
+            crate::sso_request_store::SsoRequestStore::new();
 
         let cache_bust = || {
             SetHeader::new().overriding(
@@ -314,6 +317,7 @@ impl ProtocolServer for HTTPProtocolServer {
             .data(UnauthenticatedRequestContext::new(self.services.clone()).await)
             .data(http_client_cache.clone())
             .data(session_store.clone())
+            .data(sso_request_store.clone())
             .data(session_storage.clone())
             // Outermost on purpose: session loading and header parsing run
             // before routing and fail the same way a handler does.
@@ -334,6 +338,7 @@ impl ProtocolServer for HTTPProtocolServer {
                 if let Err(error) = session_storage.gc(cookie_max_age).await {
                     warn!(%error, "Failed to expire stored HTTP sessions");
                 }
+                sso_request_store.vacuum().await;
                 tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             }
         });
