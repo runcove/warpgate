@@ -8952,6 +8952,7 @@ dependencies = [
  "warpgate-protocol-ssh",
  "warpgate-protocol-vnc",
  "warpgate-tls",
+ "warpgate-version",
  "yaml_serde",
 ]
 
@@ -8995,6 +8996,7 @@ dependencies = [
  "warpgate-protocol-kubernetes",
  "warpgate-protocol-ssh",
  "warpgate-tls",
+ "warpgate-version",
 ]
 
 [[package]]
@@ -9056,7 +9058,6 @@ dependencies = [
  "data-encoding",
  "delegate",
  "futures",
- "git-version",
  "governor",
  "humantime-serde",
  "ipnet",
@@ -9328,6 +9329,7 @@ dependencies = [
  "warpgate-db-migrations",
  "warpgate-sso",
  "warpgate-tls",
+ "warpgate-version",
  "warpgate-web",
  "warpgate-web-clients-common",
  "warpgate-web-desktop",
@@ -9593,6 +9595,13 @@ dependencies = [
  "warpgate-ca",
  "webpki",
  "x509-parser",
+]
+
+[[package]]
+name = "warpgate-version"
+version = "0.30.0"
+dependencies = [
+ "git-version",
 ]
 
 [[package]]

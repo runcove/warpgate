@@ -13,7 +13,6 @@ pub mod secrets;
 mod state;
 mod try_macro;
 mod types;
-pub mod version;
 
 pub use config::*;
 pub use error::{UserFacingReason, WarpgateError, io_connect_reason};
