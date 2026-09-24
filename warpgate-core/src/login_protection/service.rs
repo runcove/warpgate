@@ -1,6 +1,7 @@
 use std::net::IpAddr;
 use std::time::Duration;
 
+use ipnet::IpNet;
 use sea_orm::sea_query::IntoCondition;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseConnection, EntityTrait,
@@ -48,6 +49,17 @@ struct LoginProtectionConfig {
     retention_seconds: u32,
     ip_rate_limit: IpRateLimitConfig,
     user_lockout: UserLockoutConfig,
+    /// Addresses in these networks are never blocked; their failed attempts
+    /// still count towards the per-username limit.
+    ip_exempt: Vec<IpNet>,
+}
+
+impl LoginProtectionConfig {
+    fn is_ip_exempt(&self, ip: &IpAddr) -> bool {
+        // An IPv4 client on a dual-stack socket arrives as ::ffff:a.b.c.d.
+        let ip = ip.to_canonical();
+        self.ip_exempt.iter().any(|network| network.contains(&ip))
+    }
 }
 
 /// Information about a failed login attempt.
@@ -94,7 +106,7 @@ pub struct LoginProtectionService {
 
 impl LoginProtectionService {
     /// Build a [`LoginProtectionConfig`] from a `Parameters` DB row.
-    const fn config_from_params(params: &Parameters::Model) -> LoginProtectionConfig {
+    fn config_from_params(params: &Parameters::Model) -> LoginProtectionConfig {
         LoginProtectionConfig {
             enabled: params.login_protection_enabled,
             retention_seconds: params.login_protection_retention_seconds as u32,
@@ -113,6 +125,7 @@ impl LoginProtectionService {
                 lockout_duration_seconds: params.lp_user_lockout_duration_seconds as u32,
                 exempt_admins: params.lp_user_exempt_admins,
             },
+            ip_exempt: params.lp_ip_exempt_networks(),
         }
     }
 
@@ -164,7 +177,10 @@ impl LoginProtectionService {
         ip: &IpAddr,
     ) -> Result<Option<IpBlockInfo>, WarpgateError> {
         let db = &self.db;
-        if !Self::read_config(db).await?.enabled {
+        let config = Self::read_config(db).await?;
+        // An exempt address is never reported blocked, even by a block row
+        // written before it was added to the list.
+        if !config.enabled || config.is_ip_exempt(ip) {
             return Ok(None);
         }
 
@@ -272,18 +288,24 @@ impl LoginProtectionService {
         .insert(&txn)
         .await?;
 
-        let ip_window_start =
-            now - time::Duration::seconds(i64::from(config.ip_rate_limit.time_window_seconds));
-        let ip_count = FailedLoginAttempt::Entity::find()
-            .filter(FailedLoginAttempt::Column::RemoteIp.eq(attempt.remote_ip.to_string()))
-            .filter(FailedLoginAttempt::Column::Timestamp.gte(ip_window_start))
-            .count(&txn)
-            .await?;
-        let new_block = if ip_count >= u64::from(config.ip_rate_limit.max_attempts) {
-            Some(Self::create_or_update_ip_block(&txn, &attempt.remote_ip, now, &config).await?)
-        } else {
-            None
-        };
+        // The attempt row above is still written for an exempt address, so the
+        // per-username count below sees it; only the per-address block is skipped.
+        let ip_exempt = config.is_ip_exempt(&attempt.remote_ip);
+        let mut ip_count = 0;
+        let mut new_block = None;
+        if !ip_exempt {
+            let ip_window_start =
+                now - time::Duration::seconds(i64::from(config.ip_rate_limit.time_window_seconds));
+            ip_count = FailedLoginAttempt::Entity::find()
+                .filter(FailedLoginAttempt::Column::RemoteIp.eq(attempt.remote_ip.to_string()))
+                .filter(FailedLoginAttempt::Column::Timestamp.gte(ip_window_start))
+                .count(&txn)
+                .await?;
+            if ip_count >= u64::from(config.ip_rate_limit.max_attempts) {
+                new_block =
+                    Self::create_or_update_ip_block(&txn, &attempt.remote_ip, now, &config).await?;
+            }
+        }
 
         let user_window_start =
             now - time::Duration::seconds(i64::from(config.user_lockout.time_window_seconds));
@@ -329,6 +351,7 @@ impl LoginProtectionService {
             ip = %attempt.remote_ip,
             username = %attempt.username,
             protocol = %attempt.protocol,
+            ip_exempt,
             ip_attempt_count = ip_count,
             user_attempt_count = user_count,
             "Recorded failed login attempt"
@@ -342,12 +365,19 @@ impl LoginProtectionService {
         ip: &IpAddr,
         now: OffsetDateTime,
         config: &LoginProtectionConfig,
-    ) -> Result<IpBlockInfo, WarpgateError> {
+    ) -> Result<Option<IpBlockInfo>, WarpgateError> {
         let ip_str = ip.to_string();
         let existing = IpBlock::Entity::find()
             .filter(IpBlock::Column::IpAddress.eq(&ip_str))
             .one(db)
             .await?;
+
+        // A retry from an address that is still blocked leaves the block as it
+        // is. Re-arming it on every attempt meant a client that kept retrying
+        // was never let go.
+        if existing.as_ref().is_some_and(|e| e.expires_at > now) {
+            return Ok(None);
+        }
 
         // Escalate the block count unless the IP has been quiet long enough.
         let cooldown =
@@ -388,13 +418,13 @@ impl LoginProtectionService {
             "IP blocked"
         );
 
-        Ok(IpBlockInfo {
+        Ok(Some(IpBlockInfo {
             ip_address: *ip,
             blocked_at: now,
             expires_at,
             block_count,
             reason,
-        })
+        }))
     }
 
     async fn create_user_lockout<C: ConnectionTrait>(
@@ -662,7 +692,231 @@ fn calculate_block_duration(block_count: u32, config: &IpRateLimitConfig) -> Dur
 
 #[cfg(test)]
 mod tests {
+    use sea_orm::{Database, IntoActiveModel};
+    use warpgate_db_entities::Parameters::{ConfigMigrationValues, set_config_migration_values};
+    use warpgate_db_migrations::migrate_database;
+
     use super::*;
+
+    // Documentation and private ranges only: this branch is public.
+    const EXEMPT_V4: &str = "10.20.30.40";
+    const OTHER_V4: &str = "192.0.2.10";
+
+    async fn setup_db(exempt: &[&str]) -> DatabaseConnection {
+        set_config_migration_values(ConfigMigrationValues::default());
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        migrate_database(&db).await.unwrap();
+        set_exempt(&db, exempt).await;
+
+        User::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            username: Set("alice".into()),
+            description: Set(String::new()),
+            credential_policy: Set(serde_json::json!({})),
+            rate_limit_bytes_per_second: Set(None),
+            ldap_server_id: Set(None),
+            ldap_object_uuid: Set(None),
+            allowed_ip_ranges: Set(serde_json::Value::Null),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        db
+    }
+
+    async fn set_exempt(db: &DatabaseConnection, exempt: &[&str]) {
+        let mut params = Parameters::Entity::get(db)
+            .await
+            .unwrap()
+            .into_active_model();
+        params.login_protection_enabled = Set(true);
+        params.lp_ip_exempt_cidrs = Set(serde_json::to_string(exempt).unwrap());
+        params.update(db).await.unwrap();
+    }
+
+    async fn fail(service: &LoginProtectionService, ip: &str, times: usize) {
+        for _ in 0..times {
+            service
+                .record_failed_attempt(FailedAttemptInfo {
+                    username: "alice".into(),
+                    remote_ip: ip.parse().unwrap(),
+                    protocol: Protocol::Ssh,
+                    credential_type: "password".into(),
+                })
+                .await
+                .unwrap();
+        }
+    }
+
+    async fn block_row(db: &DatabaseConnection, ip: &str) -> Option<IpBlock::Model> {
+        IpBlock::Entity::find()
+            .filter(IpBlock::Column::IpAddress.eq(ip))
+            .one(db)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn exempt_address_is_never_blocked() {
+        let db = setup_db(&["10.0.0.0/8"]).await;
+        let service = LoginProtectionService::new(db.clone()).await.unwrap();
+
+        fail(&service, EXEMPT_V4, 20).await;
+
+        assert!(
+            service
+                .check_ip_blocked(&EXEMPT_V4.parse().unwrap())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(block_row(&db, EXEMPT_V4).await.is_none());
+        // The attempts themselves are still on record.
+        assert_eq!(FailedLoginAttempt::Entity::find().count(&db).await.unwrap(), 20);
+    }
+
+    #[tokio::test]
+    async fn username_limit_still_applies_to_an_exempt_address() {
+        let db = setup_db(&["10.0.0.0/8"]).await;
+        let service = LoginProtectionService::new(db.clone()).await.unwrap();
+
+        // lp_user_max_attempts defaults to 10.
+        fail(&service, EXEMPT_V4, 10).await;
+
+        assert!(service.check_user_locked("alice").await.unwrap().is_some());
+        assert!(
+            service
+                .check_ip_blocked(&EXEMPT_V4.parse().unwrap())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn address_outside_the_list_is_blocked_as_before() {
+        let db = setup_db(&["10.0.0.0/8", "2001:db8::/32"]).await;
+        let service = LoginProtectionService::new(db.clone()).await.unwrap();
+
+        // lp_ip_max_attempts defaults to 5.
+        fail(&service, OTHER_V4, 4).await;
+        assert!(
+            service
+                .check_ip_blocked(&OTHER_V4.parse().unwrap())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        fail(&service, OTHER_V4, 1).await;
+        assert!(
+            service
+                .check_ip_blocked(&OTHER_V4.parse().unwrap())
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_list_blocks_every_address() {
+        let db = setup_db(&[]).await;
+        let service = LoginProtectionService::new(db.clone()).await.unwrap();
+
+        fail(&service, EXEMPT_V4, 5).await;
+
+        assert!(
+            service
+                .check_ip_blocked(&EXEMPT_V4.parse().unwrap())
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_block_is_ignored_once_the_address_is_exempt() {
+        let db = setup_db(&[]).await;
+        let service = LoginProtectionService::new(db.clone()).await.unwrap();
+        let ip: IpAddr = EXEMPT_V4.parse().unwrap();
+
+        fail(&service, EXEMPT_V4, 5).await;
+        assert!(service.check_ip_blocked(&ip).await.unwrap().is_some());
+
+        set_exempt(&db, &["10.20.0.0/16"]).await;
+
+        // The row (and the cache entry) are still there, but no longer count.
+        assert!(block_row(&db, EXEMPT_V4).await.is_some());
+        assert!(service.check_ip_blocked(&ip).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn retries_from_a_blocked_address_do_not_move_its_block() {
+        let db = setup_db(&[]).await;
+        let service = LoginProtectionService::new(db.clone()).await.unwrap();
+
+        fail(&service, OTHER_V4, 5).await;
+        let first = block_row(&db, OTHER_V4).await.unwrap();
+        assert_eq!(first.block_count, 1);
+
+        fail(&service, OTHER_V4, 5).await;
+        let after = block_row(&db, OTHER_V4).await.unwrap();
+
+        assert_eq!(after, first);
+        let cached = service
+            .check_ip_blocked(&OTHER_V4.parse().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cached.expires_at, first.expires_at);
+        assert_eq!(cached.block_count, 1);
+    }
+
+    #[tokio::test]
+    async fn ipv6_networks_are_exempt_too() {
+        let db = setup_db(&["2001:db8:1::/48"]).await;
+        let service = LoginProtectionService::new(db.clone()).await.unwrap();
+
+        fail(&service, "2001:db8:1::5", 10).await;
+        assert!(
+            service
+                .check_ip_blocked(&"2001:db8:1::5".parse().unwrap())
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        fail(&service, "2001:db8:2::5", 5).await;
+        assert!(
+            service
+                .check_ip_blocked(&"2001:db8:2::5".parse().unwrap())
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    async fn config_with_stored_list(stored: &str) -> LoginProtectionConfig {
+        let db = setup_db(&[]).await;
+        let mut params = Parameters::Entity::get(&db).await.unwrap();
+        params.lp_ip_exempt_cidrs = stored.into();
+        LoginProtectionService::config_from_params(&params)
+    }
+
+    #[tokio::test]
+    async fn ipv4_mapped_address_matches_an_ipv4_network() {
+        let config = config_with_stored_list(r#"["10.0.0.0/8"]"#).await;
+        assert!(config.is_ip_exempt(&"::ffff:10.1.2.3".parse().unwrap()));
+        assert!(config.is_ip_exempt(&"10.1.2.3".parse().unwrap()));
+        assert!(!config.is_ip_exempt(&"::ffff:192.0.2.1".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn unreadable_list_exempts_nothing() {
+        for stored in ["", "not json", r#"["not-a-network"]"#] {
+            let config = config_with_stored_list(stored).await;
+            assert!(!config.is_ip_exempt(&"10.1.2.3".parse().unwrap()), "{stored}");
+        }
+    }
 
     fn default_config() -> IpRateLimitConfig {
         IpRateLimitConfig {
