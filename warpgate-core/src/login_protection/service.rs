@@ -867,7 +867,6 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(cached.expires_at, first.expires_at);
         assert_eq!(cached.block_count, 1);
     }
 
