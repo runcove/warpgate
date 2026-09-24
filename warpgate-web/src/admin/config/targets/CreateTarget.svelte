@@ -46,6 +46,7 @@
                         verify: true,
                     },
                     headers: {},
+                    _public: false,
                 },
                 MySql: {
                     kind: TargetKind.MySql,
