@@ -50,6 +50,13 @@
     const serverErrorMessage = new URLSearchParams(location.search).get(
         'login_error',
     )
+    // Break-glass: `?login=password` (in the hash query or the real query
+    // string) keeps the password form reachable even when single-provider
+    // auto-SSO is enabled. Mirrors the server-side `?login=password` bypass in
+    // warpgate-protocol-http (`request_has_password_bypass`).
+    const passwordBypass =
+        urlParams.get('login') === 'password' ||
+        new URLSearchParams(location.search).get('login') === 'password'
     const initPromise = init()
 
     async function init() {
@@ -64,6 +71,42 @@
                 throw err
             }
         }
+
+        // Opt-in single-provider auto-SSO. On a fresh, un-errored login page
+        // with exactly one provider, start SSO immediately so the user never
+        // has to click the provider button. The server-side `/sso/auto-start`
+        // redirect normally means we never render here at all; this covers
+        // direct visits to the login SPA (bookmarks, other front doors).
+        // `?login=password` and a surfaced login error both suppress it so the
+        // form stays reachable.
+        //
+        // This trigger is `NotStarted`-only and returns before
+        // `continueWithState()`. Upstream's own single-provider auto-start
+        // lives in `continueWithState` under `SsoNeeded`, so the two can never
+        // both fire on one page load: `authState` holds a single value, and
+        // `continueWithState` does nothing at all for `NotStarted`.
+        if (
+            authState === ApiAuthState.NotStarted &&
+            !passwordBypass &&
+            !serverErrorMessage
+        ) {
+            try {
+                if (!$serverInfo) {
+                    await reloadServerInfo()
+                }
+            } catch {
+                // Info fetch failed — fall through to the manual login UI.
+            }
+            if ($serverInfo?.ssoAutoRedirect) {
+                const providers = await ssoProvidersPromise
+                if (providers.length === 1) {
+                    // biome-ignore lint/style/noNonNullAssertion: length checked above
+                    startSSO(providers[0]!)
+                    return
+                }
+            }
+        }
+
         await continueWithState()
     }
 
@@ -117,8 +160,9 @@
     async function _login() {
         error = null
         credentialRejected = false
+        const submittingOtp = authState === ApiAuthState.OtpNeeded
         try {
-            if (authState === ApiAuthState.OtpNeeded) {
+            if (submittingOtp) {
                 await api.otpLogin({
                     otpLoginRequest: {
                         otp,
@@ -142,6 +186,17 @@
                     )
                     authState = failure.state
                     credentialRejected = failure.credentialRejected ?? false
+
+                    // A rejected OTP deliberately comes back as the opaque
+                    // `Failed` shape, identical to what an unknown account
+                    // gets, so the endpoint can't be used to test whether an
+                    // account exists. The OTP step is therefore tracked here
+                    // rather than read back off the response, so a mistyped
+                    // code leaves the user on the OTP field instead of
+                    // bouncing them back to the password form.
+                    if (submittingOtp && authState === ApiAuthState.Failed) {
+                        authState = ApiAuthState.OtpNeeded
+                    }
 
                     // Don't auto-advance to another auth method (e.g. SSO) when
                     // the submitted credential was rejected — show the error and

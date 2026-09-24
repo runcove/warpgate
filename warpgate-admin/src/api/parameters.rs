@@ -66,6 +66,7 @@ struct ParameterValues {
     pub ssh_client_auth_keyboard_interactive: bool,
     pub ssh_host_key_verification: Parameters::SshHostKeyVerificationMode,
     pub password_login_mode: Parameters::PasswordLoginMode,
+    pub sso_auto_redirect: bool,
     pub mfa_enforcement: Parameters::MfaEnforcement,
     pub mfa_policy_exempt_sso_users: bool,
     pub default_credential_policy: UserRequireCredentialsPolicy,
@@ -118,6 +119,7 @@ struct ParameterUpdate {
     pub ssh_client_auth_keyboard_interactive: Option<bool>,
     pub ssh_host_key_verification: Option<Parameters::SshHostKeyVerificationMode>,
     pub password_login_mode: Option<Parameters::PasswordLoginMode>,
+    pub sso_auto_redirect: Option<bool>,
     pub mfa_enforcement: Option<Parameters::MfaEnforcement>,
     pub mfa_policy_exempt_sso_users: Option<bool>,
     pub default_credential_policy: Option<UserRequireCredentialsPolicy>,
@@ -231,6 +233,7 @@ impl Api {
             ssh_client_auth_keyboard_interactive: parameters.ssh_client_auth_keyboard_interactive,
             ssh_host_key_verification: parameters.ssh_host_key_verification,
             password_login_mode: parameters.password_login_mode,
+            sso_auto_redirect: parameters.sso_auto_redirect,
             mfa_enforcement: parameters.mfa_enforcement,
             mfa_policy_exempt_sso_users: parameters.mfa_policy_exempt_sso_users,
             default_credential_policy: parameters.default_credential_policy()?,
@@ -330,6 +333,7 @@ impl Api {
             .map_or(NotSet, Set);
         parameters.ssh_host_key_verification = body.ssh_host_key_verification.map_or(NotSet, Set);
         parameters.password_login_mode = body.password_login_mode.map_or(NotSet, Set);
+        parameters.sso_auto_redirect = body.sso_auto_redirect.map_or(NotSet, Set);
         parameters.mfa_enforcement = body.mfa_enforcement.map_or(NotSet, Set);
         parameters.mfa_policy_exempt_sso_users =
             body.mfa_policy_exempt_sso_users.map_or(NotSet, Set);

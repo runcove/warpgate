@@ -194,6 +194,11 @@ pub struct Model {
     pub ssh_client_auth_keyboard_interactive: bool,
     pub ssh_host_key_verification: SshHostKeyVerificationMode,
     pub password_login_mode: PasswordLoginMode,
+    /// When true (and exactly one SSO provider is configured), an
+    /// unauthenticated browser navigation is 302-redirected straight to the
+    /// SSO provider's authorize URL instead of the gateway login SPA.
+    /// Column added by `m00059_sso_auto_redirect`.
+    pub sso_auto_redirect: bool,
     pub mfa_enforcement: MfaEnforcement,
     pub mfa_policy_exempt_sso_users: bool,
     pub ticket_self_service_enabled: bool,
@@ -411,6 +416,7 @@ mod tests {
             ssh_client_auth_keyboard_interactive: true,
             ssh_host_key_verification: SshHostKeyVerificationMode::Prompt,
             password_login_mode: PasswordLoginMode::Enabled,
+            sso_auto_redirect: false,
             mfa_enforcement: MfaEnforcement::Off,
             mfa_policy_exempt_sso_users: false,
             ticket_self_service_enabled: false,

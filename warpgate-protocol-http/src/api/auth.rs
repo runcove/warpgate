@@ -581,11 +581,30 @@ async fn submit_and_finalize(
                 )
                 .await;
             }
-            Ok(LoginResponse::Failure(Json(LoginFailureResponse {
-                state: match rejection.state {
+            // Enumeration hardening: only surface the specific next-factor
+            // state (SsoNeeded/OtpNeeded/...) when the presented credential
+            // actually validated - a legitimate multi-factor step reachable
+            // only by proving a real credential. An invalid credential returns
+            // a generic `Failed` (matching the unknown-user branch) so the
+            // response can't be used to tell whether an account exists or
+            // which auth method it uses. This covers the password and the OTP
+            // step alike, since both end here. The SPA renders available
+            // methods from instance config, not from this per-username
+            // response, so no UX is lost.
+            //
+            // An invalid extra credential can also leave the overall state
+            // `Accepted`; the attempt was still rejected, so it must report a
+            // failure rather than `Success` to the client.
+            let response_state = if rejection.credential_rejected {
+                ApiAuthState::Failed
+            } else {
+                match rejection.state {
                     AuthResult::Accepted { .. } => ApiAuthState::Failed,
                     other => other.into(),
-                },
+                }
+            };
+            Ok(LoginResponse::Failure(Json(LoginFailureResponse {
+                state: response_state,
                 credential_rejected: rejection.credential_rejected,
             })))
         }
@@ -615,10 +634,16 @@ async fn serve_otp_login(
         ))));
     }
 
+    // Enumeration hardening: an `AuthState` exists on this session as soon as
+    // the username resolved to a real user - `get_or_create_auth_state_for_request`
+    // creates it *before* the password is validated - so "no state" means
+    // "no such user" and would otherwise be a one-request existence oracle on
+    // this endpoint. Report the same opaque rejection a rejected OTP gets for
+    // a real account, so the two are indistinguishable.
     let Some(state_arc) = get_auth_state_for_request(req, ctx).await? else {
-        return Ok(LoginResponse::Failure(Json(LoginFailureResponse::state(
-            ApiAuthState::NotStarted,
-        ))));
+        return Ok(LoginResponse::Failure(Json(
+            LoginFailureResponse::credential_rejected(ApiAuthState::Failed),
+        )));
     };
 
     let mut state = state_arc.lock().await;
