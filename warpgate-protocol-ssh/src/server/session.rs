@@ -357,6 +357,17 @@ fn reject_with_allowed_auth_methods(allowed_auth_methods: MethodSet) -> russh::s
     }
 }
 
+/// Whether a client-sent environment variable falls in the namespace Warpgate
+/// itself sets downstream (`WARPGATE_USERNAME`, `WARPGATE_AUTHENTICATION_TYPE`).
+///
+/// Such requests are dropped. With OpenSSH, Warpgate's own value is sent later
+/// and wins anyway, but anything downstream that trusts these variables must
+/// never be able to see a value the client chose - for instance if Warpgate's
+/// injection were ever skipped for a channel.
+fn is_reserved_env_name(name: &str) -> bool {
+    name.starts_with("WARPGATE_")
+}
+
 /// Whether a `WebUserApproval` sitting in `valid_credentials` is evidence that
 /// *this* attempt just completed a step-up SSO handshake.
 ///
@@ -456,9 +467,25 @@ mod tests {
 
     use super::{
         MAX_WEB_AUTH_WAITS, PendingKeyboardInteractiveAuth, WebApprovalWait, WebAuthStep,
-        bump_waits, carry_forward, next_web_auth_step, reject_with_allowed_auth_methods,
-        round_creates_wait, wait_for_state,
+        bump_waits, carry_forward, is_reserved_env_name, next_web_auth_step,
+        reject_with_allowed_auth_methods, round_creates_wait, wait_for_state,
     };
+
+    /// A client cannot set the variables Warpgate injects about the user;
+    /// everything else a client sends still passes.
+    #[test]
+    fn client_env_requests_in_the_warpgate_namespace_are_refused() {
+        for name in [
+            "WARPGATE_USERNAME",
+            "WARPGATE_AUTHENTICATION_TYPE",
+            "WARPGATE_ANYTHING_ELSE",
+        ] {
+            assert!(is_reserved_env_name(name), "{name} must be dropped");
+        }
+        for name in ["LANG", "TERM", "LC_ALL", "MY_WARPGATE_USERNAME", "WARPGATE"] {
+            assert!(!is_reserved_env_name(name), "{name} must pass through");
+        }
+    }
 
     /// The step-up gate and the `last_sso_at` stamp must both refuse an
     /// approval that the grace-period bypass injected. Otherwise a user whose
@@ -2470,6 +2497,12 @@ impl ServerSession {
         value: String,
     ) -> Result<()> {
         let channel_id = self.map_channel(server_channel_id)?;
+        if is_reserved_env_name(&name) {
+            // Logged without the value: the client chose it, and nothing
+            // downstream should ever see it.
+            warn!(channel=%channel_id, %name, "Dropping a client-sent environment variable in Warpgate's reserved WARPGATE_ namespace");
+            return Ok(());
+        }
         debug!(channel=%channel_id, %name, %value, "Environment");
         self.send_command_and_wait(RCCommand::Channel(
             channel_id,
