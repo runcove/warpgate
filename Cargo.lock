@@ -8954,6 +8954,7 @@ dependencies = [
  "warpgate-protocol-ssh",
  "warpgate-protocol-vnc",
  "warpgate-tls",
+ "warpgate-version",
 ]
 
 [[package]]
@@ -8996,6 +8997,7 @@ dependencies = [
  "warpgate-protocol-kubernetes",
  "warpgate-protocol-ssh",
  "warpgate-tls",
+ "warpgate-version",
 ]
 
 [[package]]
@@ -9057,7 +9059,6 @@ dependencies = [
  "data-encoding",
  "delegate",
  "futures",
- "git-version",
  "governor",
  "humantime-serde",
  "ipnet",
@@ -9302,6 +9303,7 @@ dependencies = [
  "warpgate-db-migrations",
  "warpgate-sso",
  "warpgate-tls",
+ "warpgate-version",
  "warpgate-web",
  "warpgate-web-desktop",
  "warpgate-web-ssh",
@@ -9539,6 +9541,13 @@ dependencies = [
  "warpgate-ca",
  "webpki",
  "x509-parser",
+]
+
+[[package]]
+name = "warpgate-version"
+version = "0.28.6"
+dependencies = [
+ "git-version",
 ]
 
 [[package]]
