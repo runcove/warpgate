@@ -6,7 +6,7 @@ use poem_openapi::payload::Json;
 use poem_openapi::{ApiResponse, Object, OpenApi};
 use sea_orm::{EntityTrait, IntoActiveModel, Set};
 use serde::Serialize;
-use warpgate_common::version::warpgate_version;
+use warpgate_version::warpgate_version;
 use warpgate_common::{AdminPermission, AdminPermissionSet, warnings};
 use warpgate_common_http::auth::UnauthenticatedRequestContext;
 use warpgate_common_http::ext::construct_external_url;

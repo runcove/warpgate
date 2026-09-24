@@ -9,7 +9,7 @@ use anyhow::Result;
 use clap::{ArgAction, Parser};
 use logging::init_logging;
 use tracing::error;
-use warpgate_common::version::warpgate_version;
+use warpgate_version::warpgate_version;
 use warpgate_common::{GlobalParams, LogFormat, Secret};
 
 use crate::config::load_config;
@@ -226,6 +226,7 @@ async fn _main() -> Result<()> {
 
 #[tokio::main]
 async fn main() {
+    warpgate_version::set_warpgate_version(warpgate_version::git_describe!());
     if let Err(error) = _main().await {
         error!(?error, "Fatal error");
         std::process::exit(1);

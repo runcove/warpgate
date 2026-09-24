@@ -31,7 +31,7 @@ use tracing::{Instrument, debug, warn};
 use warpgate_admin::admin_api_app;
 use warpgate_common::ListenEndpoint;
 use warpgate_common::helpers::proxy_protocol::MaybeProxyProtocolAcceptor;
-use warpgate_common::version::warpgate_version;
+use warpgate_version::warpgate_version;
 use warpgate_common_http::auth::UnauthenticatedRequestContext;
 use warpgate_common_http::ext::construct_external_url;
 use warpgate_common_http::logging::{
