@@ -50,11 +50,17 @@ pub fn trusted_client_ip(
     req: &Request,
     remote_ip: Option<String>,
     trust_x_forwarded: bool,
+    client_ip_header: Option<&str>,
 ) -> Option<String> {
     if is_cluster_peer_request(req)
         && let Some(ip) = req.header(&X_WARPGATE_CLUSTER_CLIENT_IP)
     {
         Some(ip.to_string())
+    } else if let Some(name) = client_ip_header {
+        req.header(name)
+            .and_then(|value| value.trim().parse::<std::net::IpAddr>().ok())
+            .map(|ip| ip.to_string())
+            .or(remote_ip)
     } else if trust_x_forwarded
         && let Some(ip) = req
             .header(&X_FORWARDED_FOR)
@@ -151,7 +157,7 @@ mod tests {
             .finish();
 
         assert_eq!(
-            trusted_client_ip(&req, Some("10.0.0.1".to_string()), true),
+            trusted_client_ip(&req, Some("10.0.0.1".to_string()), true, None),
             Some("203.0.113.10".to_string())
         );
     }
@@ -163,7 +169,7 @@ mod tests {
             .finish();
 
         assert_eq!(
-            trusted_client_ip(&req, Some("10.0.0.1".to_string()), true),
+            trusted_client_ip(&req, Some("10.0.0.1".to_string()), true, None),
             Some("10.0.0.1".to_string())
         );
     }
@@ -173,7 +179,7 @@ mod tests {
         let req = Request::builder().header(&X_FORWARDED_FOR, " , ").finish();
 
         assert_eq!(
-            trusted_client_ip(&req, Some("10.0.0.1".to_string()), true),
+            trusted_client_ip(&req, Some("10.0.0.1".to_string()), true, None),
             Some("10.0.0.1".to_string())
         );
     }
@@ -185,7 +191,7 @@ mod tests {
             .finish();
 
         assert_eq!(
-            trusted_client_ip(&req, Some("10.0.0.1".to_string()), false),
+            trusted_client_ip(&req, Some("10.0.0.1".to_string()), false, None),
             Some("10.0.0.1".to_string())
         );
     }
@@ -202,7 +208,7 @@ mod tests {
         });
 
         assert_eq!(
-            trusted_client_ip(&req, Some("10.0.0.1".to_string()), false),
+            trusted_client_ip(&req, Some("10.0.0.1".to_string()), false, None),
             Some("203.0.113.10".to_string())
         );
     }
@@ -214,8 +220,72 @@ mod tests {
             .finish();
 
         assert_eq!(
-            trusted_client_ip(&req, Some("10.0.0.1".to_string()), false),
+            trusted_client_ip(&req, Some("10.0.0.1".to_string()), false, None),
             Some("10.0.0.1".to_string())
+        );
+    }
+
+    #[test]
+    fn client_ip_header_wins_over_forwarded_for() {
+        let req = Request::builder()
+            .header(&X_FORWARDED_FOR, "198.51.100.66")
+            .header("cf-connecting-ip", "203.0.113.10")
+            .finish();
+
+        assert_eq!(
+            trusted_client_ip(
+                &req,
+                Some("10.244.1.5".to_string()),
+                false,
+                Some("CF-Connecting-IP")
+            ),
+            Some("203.0.113.10".to_string())
+        );
+    }
+
+    #[test]
+    fn client_ip_header_missing_falls_back_to_peer_not_forwarded_for() {
+        let req = Request::builder()
+            .header(&X_FORWARDED_FOR, "198.51.100.66")
+            .finish();
+
+        assert_eq!(
+            trusted_client_ip(
+                &req,
+                Some("10.244.1.5".to_string()),
+                true,
+                Some("CF-Connecting-IP")
+            ),
+            Some("10.244.1.5".to_string())
+        );
+    }
+
+    #[test]
+    fn client_ip_header_rejects_a_value_that_is_not_an_address() {
+        let req = Request::builder()
+            .header("cf-connecting-ip", "203.0.113.10, 198.51.100.66")
+            .finish();
+
+        assert_eq!(
+            trusted_client_ip(
+                &req,
+                Some("10.244.1.5".to_string()),
+                false,
+                Some("CF-Connecting-IP")
+            ),
+            Some("10.244.1.5".to_string())
+        );
+    }
+
+    #[test]
+    fn client_ip_header_accepts_ipv6() {
+        let req = Request::builder()
+            .header("cf-connecting-ip", "2001:db8::7")
+            .finish();
+
+        assert_eq!(
+            trusted_client_ip(&req, None, false, Some("CF-Connecting-IP")),
+            Some("2001:db8::7".to_string())
         );
     }
 }
