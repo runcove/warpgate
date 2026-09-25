@@ -2,7 +2,7 @@
   "openapi": "3.0.0",
   "info": {
     "title": "Warpgate Web Admin",
-    "version": "v0.28.6-48-g532ee4e8-modified"
+    "version": "v0.28.6-cove.2-3-gaf6b59c2-modified"
   },
   "servers": [
     {
@@ -6935,8 +6935,7 @@
         "title": "TargetHTTPOptions",
         "required": [
           "url",
-          "tls",
-          "public"
+          "tls"
         ],
         "properties": {
           "url": {
@@ -6956,7 +6955,8 @@
           },
           "public": {
             "type": "boolean",
-            "description": "Per-VM-proxy P0 (M9): when `true`, the catchall HTTP proxy serves\nthis target without requiring a Warpgate session. Anonymous and\nsession-authed clients pass through; admin/user API tokens hit a\npublic target -> 401 (tokens are admin-API-scoped, not proxy-scoped).\nDefault `false` preserves existing behaviour; serde-default backfills\nexisting JSON-column rows so no DB migration is required."
+            "description": "Per-VM-proxy P0 (M9): when `true`, the catchall HTTP proxy serves\nthis target without requiring a Warpgate session. Anonymous and\nsession-authed clients pass through; admin/user API tokens hit a\npublic target -> 401 (tokens are admin-API-scoped, not proxy-scoped).\nDefault `false` preserves existing behaviour; serde-default backfills\nexisting JSON-column rows so no DB migration is required.\n\n`#[oai(default)]` is NOT a duplicate of `#[serde(default)]`. serde's\ngoverns JSON deserialisation; poem-openapi's `Object` derive is a\nseparate generator and marks every non-`Option` field REQUIRED in the\nemitted schema unless it carries its own default. Without it the admin\nAPI's OpenAPI document told clients they must send `public` on\nPOST /targets and PUT /targets/{id} -- a breaking change for any\nexisting client, against a field the code is perfectly happy without.",
+            "default": false
           }
         }
       },
