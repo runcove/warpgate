@@ -32,7 +32,7 @@ use warpgate_tls::{TlsMode, configure_tls_connector};
 use warpgate_web::lookup_built_file;
 
 use crate::client_cache::HttpClientCache;
-use crate::common::{SESSION_COOKIE_NAME, SessionExt};
+use crate::common::{SESSION_COOKIE_NAME, SessionExt, is_public_session_authorization};
 
 static X_WARPGATE_USERNAME: HeaderName = HeaderName::from_static("x-warpgate-username");
 static X_WARPGATE_AUTHENTICATION_TYPE: HeaderName =
@@ -311,7 +311,11 @@ fn inject_forwarding_headers<B: SomeRequestBuilder>(
 
 async fn inject_own_headers<B: SomeRequestBuilder>(req: &Request, mut target: B) -> Result<B> {
     let session = <&Session>::from_request_without_body(req).await?;
-    if let Some(auth) = session.get_auth() {
+    // The public-target bypass's throwaway session names no one: an
+    // anonymous request goes upstream with no identity headers at all.
+    if let Some(auth) = session.get_auth()
+        && !is_public_session_authorization(&auth)
+    {
         target = target.header(&X_WARPGATE_USERNAME, auth.username()).header(
             &X_WARPGATE_AUTHENTICATION_TYPE,
             match auth {
@@ -321,6 +325,21 @@ async fn inject_own_headers<B: SomeRequestBuilder>(req: &Request, mut target: B)
         );
     }
     Ok(target)
+}
+
+/// The headers an upstream request served for `req` carries from the
+/// caller's own headers and the proxy's identity headers, built in the order
+/// `proxy_normal_request` and `proxy_websocket_request` build them.
+#[cfg(test)]
+pub(crate) async fn upstream_headers_for_test(req: &Request) -> http::HeaderMap {
+    let builder =
+        copy_server_request(req, http::Request::builder()).expect("copying the caller's headers");
+    inject_own_headers(req, builder)
+        .await
+        .expect("adding the identity headers")
+        .headers_ref()
+        .expect("a valid upstream request")
+        .clone()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -679,6 +698,81 @@ async fn proxy_ws_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The header steps `proxy_normal_request` and `proxy_ws_inner` both run,
+    /// in their order: the caller's headers, Warpgate's identity headers, the
+    /// target's configured headers.
+    async fn caller_then_configured<B: SomeRequestBuilder>(
+        req: &Request,
+        target: B,
+        options: &TargetHTTPOptions,
+    ) -> B {
+        let target = copy_server_request(req, target).unwrap();
+        let target = inject_own_headers(req, target).await.unwrap();
+        rewrite_request(target, options).unwrap()
+    }
+
+    /// A target's configured header (a backend token, say) reaches the
+    /// upstream exactly once with the configured value, whatever the caller
+    /// sends under the same name: on the reqwest builder of the plain (and
+    /// streamed) path and on the `http` builder of the websocket path.
+    #[tokio::test]
+    async fn a_configured_header_wins_once_over_the_callers_on_both_builders() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let client = reqwest::Client::builder().build().unwrap();
+        let options: TargetHTTPOptions = serde_json::from_value(serde_json::json!({
+            "url": "http://upstream.example/",
+            "headers": {"X-Backend-Token": "configured"},
+        }))
+        .unwrap();
+        let cases: &[&[(&str, &str)]] = &[
+            &[],
+            &[("X-Backend-Token", "forged")],
+            &[("x-BACKEND-token", "forged")],
+            &[
+                ("X-Backend-Token", "forged"),
+                ("x-backend-token", "forged-again"),
+            ],
+        ];
+        for headers in cases {
+            let mut builder = Request::builder();
+            for (name, value) in *headers {
+                builder = builder.header(*name, *value);
+            }
+            let mut req = builder.finish();
+            // Positive control: poem's builder silently drops a header it
+            // cannot parse.
+            assert_eq!(req.headers().len(), headers.len(), "{headers:?}");
+            // An anonymous browser session, as the session middleware gives
+            // every proxied request.
+            req.extensions_mut().insert(Session::default());
+
+            let plain =
+                caller_then_configured(&req, client.get("http://upstream.example/"), &options)
+                    .await
+                    .build()
+                    .unwrap()
+                    .headers()
+                    .clone();
+            let websocket = caller_then_configured(&req, http::request::Builder::new(), &options)
+                .await
+                .headers_ref()
+                .unwrap()
+                .clone();
+            for (path, upstream) in [("plain", plain), ("websocket", websocket)] {
+                let values: Vec<_> = upstream
+                    .get_all("x-backend-token")
+                    .iter()
+                    .map(|value| value.to_str().unwrap().to_owned())
+                    .collect();
+                assert_eq!(
+                    values,
+                    ["configured"],
+                    "{path} path, caller sent {headers:?}"
+                );
+            }
+        }
+    }
 
     fn forwarded_cookie_header(values: &[&str]) -> Option<String> {
         let mut request = Request::builder();
