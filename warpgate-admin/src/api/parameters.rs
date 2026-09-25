@@ -28,6 +28,20 @@ fn parse_nullable<T: ParseFromJSON>(value: Option<Value>) -> ParseResult<Option<
     })
 }
 
+/// Every entry must parse as a CIDR network (a bare address is refused); one
+/// bad entry fails the whole request, so nothing is saved.
+fn parse_cidr_list(value: Option<Value>) -> ParseResult<Option<Vec<String>>> {
+    let Some(cidrs) = Option::<Vec<String>>::parse_from_json(value)? else {
+        return Ok(None);
+    };
+    for cidr in &cidrs {
+        if let Err(e) = cidr.parse::<ipnet::IpNet>() {
+            return Err(ParseError::custom(format!("{cidr:?} is not a CIDR network: {e}")));
+        }
+    }
+    Ok(Some(cidrs))
+}
+
 /// The stored S3 secret is never sent to the browser.
 fn redact_secret(mut config: RecordingsStorageConfig) -> RecordingsStorageConfig {
     if let RecordingsStorageConfig::S3(s3) = &mut config
@@ -96,6 +110,8 @@ struct ParameterValues {
     pub lp_user_auto_unlock: bool,
     pub lp_user_lockout_duration_seconds: i32,
     pub lp_user_exempt_admins: bool,
+    /// CIDR networks whose failed logins never block the address itself.
+    pub lp_ip_exempt_cidrs: Vec<String>,
     pub banner: String,
     pub web_clients_enabled: bool,
     pub logo_etag: Option<String>,
@@ -163,6 +179,9 @@ struct ParameterUpdate {
     #[oai(validator(minimum(value = "1")))]
     pub lp_user_lockout_duration_seconds: Option<i32>,
     pub lp_user_exempt_admins: Option<bool>,
+    /// Replaces the whole list; `[]` clears it. Every entry must be a CIDR.
+    #[oai(deserialize_with = "parse_cidr_list")]
+    pub lp_ip_exempt_cidrs: Option<Vec<String>>,
     pub banner: Option<String>,
     /// Only browser-renderable image data URLs are stored: the value is served
     /// to every visitor as an image, so nothing else must ever end up in it.
@@ -276,6 +295,7 @@ impl Api {
             lp_user_auto_unlock: parameters.lp_user_auto_unlock,
             lp_user_lockout_duration_seconds: parameters.lp_user_lockout_duration_seconds,
             lp_user_exempt_admins: parameters.lp_user_exempt_admins,
+            lp_ip_exempt_cidrs: parameters.lp_ip_exempt_cidr_list(),
             banner: parameters.banner,
             logo_etag,
             web_clients_enabled: parameters.web_clients_enabled,
@@ -411,6 +431,10 @@ impl Api {
         parameters.lp_user_lockout_duration_seconds =
             body.lp_user_lockout_duration_seconds.map_or(NotSet, Set);
         parameters.lp_user_exempt_admins = body.lp_user_exempt_admins.map_or(NotSet, Set);
+        parameters.lp_ip_exempt_cidrs = match &body.lp_ip_exempt_cidrs {
+            Some(cidrs) => Set(serde_json::to_string(cidrs)?),
+            None => NotSet,
+        };
         parameters.banner = body.banner.clone().map_or(NotSet, Set);
         parameters.logo = body.logo.clone().map_or(NotSet, Set);
         parameters.web_clients_enabled = body.web_clients_enabled.map_or(NotSet, Set);
@@ -538,6 +562,41 @@ mod tests {
             json!({ "ticket_max_duration_seconds": 0 }),
             json!({ "lp_ip_max_attempts": -5 }),
             json!({ "lp_ip_block_duration_multiplier": 0.5 }),
+        ] {
+            assert!(
+                ParameterUpdate::parse_from_json(Some(body.clone())).is_err(),
+                "{body} was accepted"
+            );
+        }
+    }
+
+    fn parse_cidrs(value: serde_json::Value) -> Option<Vec<String>> {
+        match ParameterUpdate::parse_from_json(Some(value)) {
+            Ok(v) => v.lp_ip_exempt_cidrs,
+            Err(e) => panic!("{}", e.into_message()),
+        }
+    }
+
+    #[test]
+    fn exempt_cidrs_accept_ipv4_and_ipv6_networks() {
+        assert_eq!(parse_cidrs(json!({})), None);
+        assert_eq!(
+            parse_cidrs(json!({ "lp_ip_exempt_cidrs": [] })),
+            Some(vec![])
+        );
+        assert_eq!(
+            parse_cidrs(json!({ "lp_ip_exempt_cidrs": ["10.0.0.0/8", "2001:db8::/32"] })),
+            Some(vec!["10.0.0.0/8".to_owned(), "2001:db8::/32".to_owned()])
+        );
+    }
+
+    #[test]
+    fn exempt_cidrs_refuse_anything_unparsable() {
+        for body in [
+            json!({ "lp_ip_exempt_cidrs": ["not-a-network"] }),
+            json!({ "lp_ip_exempt_cidrs": ["10.0.0.0/8", "192.0.2.0/33"] }),
+            json!({ "lp_ip_exempt_cidrs": ["192.0.2.1"] }),
+            json!({ "lp_ip_exempt_cidrs": "10.0.0.0/8" }),
         ] {
             assert!(
                 ParameterUpdate::parse_from_json(Some(body.clone())).is_err(),
