@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use poem_openapi::types::{ParseFromJSON, ParseResult};
 use poem_openapi::{Enum, Object, Union};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -35,7 +36,15 @@ pub struct TargetSSHOptions {
     pub port: u16,
     #[serde(default = "_default_username")]
     pub username: String,
-    #[serde(default)]
+    // It was an `Option<bool>` before 0.29.1, so clients send it as null or
+    // not at all, and rows and config files written then may hold a null;
+    // both mean false, as they did then. The admin API parses with
+    // poem-openapi, everything else with serde, so each gets the rule.
+    // Parsing only: the schema still lists the field as required, which is
+    // what every response carries (an `#[oai(default)]` would make it
+    // optional in responses too).
+    #[serde(default, deserialize_with = "deserialize_absent_or_null_as_false")]
+    #[oai(deserialize_with = "parse_absent_or_null_as_false")]
     pub allow_insecure_algos: bool,
     #[serde(default)]
     pub auth: SSHTargetAuth,
@@ -45,6 +54,22 @@ pub struct TargetSSHOptions {
     /// Custom environment variables to inject into downstream SSH sessions
     #[serde(default)]
     pub env: Option<HashMap<String, String>>,
+}
+
+/// An absent or null boolean parses as false (poem-openapi).
+fn parse_absent_or_null_as_false(value: Option<serde_json::Value>) -> ParseResult<bool> {
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(false),
+        value => bool::parse_from_json(value),
+    }
+}
+
+/// A null boolean deserializes as false (serde; an absent one takes the
+/// field's `#[serde(default)]`).
+fn deserialize_absent_or_null_as_false<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<bool, D::Error> {
+    Ok(Option::<bool>::deserialize(deserializer)?.unwrap_or(false))
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, Union)]
@@ -549,6 +574,84 @@ mod tests {
         let empty_password = DatabaseTargetAuth::Password(DatabaseTargetPasswordAuth::default());
         assert_eq!(mysql.auth, empty_password);
         assert_eq!(postgres.auth, empty_password);
+    }
+
+    /// Registering an SSH target through the admin API: `allow_insecure_algos`
+    /// absent or null is accepted and stored as false (it was an
+    /// `Option<bool>` before 0.29.1), and true is still stored as true.
+    #[test]
+    fn ssh_allow_insecure_algos_absent_or_null_registers_as_false() {
+        use poem_openapi::types::ParseFromJSON;
+
+        use super::TargetOptions;
+
+        let register = |allow_insecure_algos: Option<serde_json::Value>| {
+            let mut body = serde_json::json!({
+                "kind": "Ssh",
+                "host": "h",
+                "port": 22,
+                "username": "u",
+                "auth": {"kind": "PublicKey"},
+            });
+            if let Some(value) = allow_insecure_algos {
+                body["allow_insecure_algos"] = value;
+            }
+            let parsed = TargetOptions::parse_from_json(Some(body))
+                .unwrap_or_else(|error| panic!("refused: {}", error.message()));
+            let TargetOptions::Ssh(ref ssh) = parsed else {
+                panic!("not an SSH target: {parsed:?}");
+            };
+            // What the admin API writes to the options column: the options
+            // under their kind.
+            let stored = serde_json::to_value(&parsed).unwrap();
+            assert_eq!(
+                stored["ssh"]["allow_insecure_algos"],
+                serde_json::Value::Bool(ssh.allow_insecure_algos),
+                "{stored}"
+            );
+            ssh.allow_insecure_algos
+        };
+
+        assert!(!register(None));
+        assert!(!register(Some(serde_json::Value::Null)));
+        assert!(!register(Some(serde_json::Value::Bool(false))));
+        assert!(register(Some(serde_json::Value::Bool(true))));
+    }
+
+    /// The same rule through serde, which reads the options column and the
+    /// config file: absent or null is false, true stays true.
+    #[test]
+    fn ssh_allow_insecure_algos_absent_or_null_deserializes_as_false() {
+        use super::TargetOptions;
+
+        for (options, expected) in [
+            (serde_json::json!({"host": "h"}), false),
+            (
+                serde_json::json!({"host": "h", "allow_insecure_algos": null}),
+                false,
+            ),
+            (
+                serde_json::json!({"host": "h", "allow_insecure_algos": false}),
+                false,
+            ),
+            (
+                serde_json::json!({"host": "h", "allow_insecure_algos": true}),
+                true,
+            ),
+        ] {
+            let ssh: TargetSSHOptions = serde_json::from_value(options.clone())
+                .unwrap_or_else(|error| panic!("{options} refused: {error}"));
+            assert_eq!(ssh.allow_insecure_algos, expected, "{options}");
+
+            // A stored row: the options under their kind.
+            let row = serde_json::json!({ "ssh": options });
+            let stored: TargetOptions = serde_json::from_value(row.clone())
+                .unwrap_or_else(|error| panic!("{row} refused: {error}"));
+            let TargetOptions::Ssh(ref ssh) = stored else {
+                panic!("not an SSH target: {stored:?}");
+            };
+            assert_eq!(ssh.allow_insecure_algos, expected, "{row}");
+        }
     }
 
     #[test]
