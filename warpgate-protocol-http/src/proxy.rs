@@ -190,6 +190,29 @@ fn rewrite_request<B: SomeRequestBuilder>(mut req: B, options: &TargetHTTPOption
     Ok(req)
 }
 
+/// Apply the target URL's embedded credentials (`user:pass@host`) as the
+/// upstream Authorization header, if the URL carries any -- the LAST header
+/// step both proxy paths run, after the caller's forwarded headers and the
+/// target's configured ones, so nothing earlier can survive under the same
+/// name (runcove-ljvj.27).
+///
+/// `set_header` REPLACES rather than appends: a caller must never be able
+/// to substitute their own Authorization for the one the target's URL
+/// configures, whether by sending one that arrives before this step's value
+/// (the plain/SSE path's old order) or after it (the websocket path's old
+/// order) -- either shape left upstream with two Authorization values, and
+/// which one it read was whichever the shared header step ran last, not a
+/// decision this proxy made on purpose.
+fn apply_url_credentials<B: SomeRequestBuilder>(
+    req: B,
+    authorization_header: Option<HeaderValue>,
+) -> B {
+    match authorization_header {
+        Some(value) => req.set_header(http::header::AUTHORIZATION, value),
+        None => req,
+    }
+}
+
 fn rewrite_response(
     resp: &mut Response,
     options: &TargetHTTPOptions,
@@ -369,9 +392,7 @@ pub async fn proxy_normal_request(
     client_request = inject_forwarding_headers(req, ctx, client_request);
     client_request = inject_own_headers(req, client_request).await?;
     client_request = rewrite_request(client_request, &options)?;
-    if let Some(authorization_header) = authorization_header {
-        client_request = client_request.header(http::header::AUTHORIZATION, authorization_header);
-    }
+    client_request = apply_url_credentials(client_request, authorization_header);
 
     if req.headers().contains_key(http::header::CONTENT_LENGTH)
         || req.headers().contains_key(http::header::TRANSFER_ENCODING)
@@ -575,14 +596,11 @@ async fn proxy_ws_inner(
                 .to_string(),
         );
 
-    if let Some(authorization_header) = authorization_header {
-        client_request = client_request.header(http::header::AUTHORIZATION, authorization_header);
-    }
-
     client_request = copy_server_request(req, client_request)?;
     client_request = inject_forwarding_headers(req, ctx, client_request);
     client_request = inject_own_headers(req, client_request).await?;
     client_request = rewrite_request(client_request, &options)?;
+    client_request = apply_url_credentials(client_request, authorization_header);
 
     let tls_config = configure_tls_connector(!options.tls.verify, false, None)
         .await
@@ -768,6 +786,95 @@ mod tests {
                 assert_eq!(
                     values,
                     ["configured"],
+                    "{path} path, caller sent {headers:?}"
+                );
+            }
+        }
+    }
+
+    /// The Authorization-relevant part of the header steps `proxy_normal_request`
+    /// and `proxy_ws_inner` both run, in their order: the caller's headers,
+    /// the target's configured headers, then -- last, so nothing earlier can
+    /// survive under the same name -- the target URL's embedded credentials.
+    /// Forwarding headers and Warpgate's own identity headers are left out:
+    /// neither touches Authorization, and including them would need a real
+    /// `AuthenticatedRequestContext` for no gain (same reasoning as
+    /// `caller_then_configured` above, which leaves out forwarding headers).
+    fn caller_then_url_credentials<B: SomeRequestBuilder>(
+        req: &Request,
+        target: B,
+        options: &TargetHTTPOptions,
+        authorization_header: Option<HeaderValue>,
+    ) -> B {
+        let target = copy_server_request(req, target).unwrap();
+        let target = rewrite_request(target, options).unwrap();
+        apply_url_credentials(target, authorization_header)
+    }
+
+    /// A target URL's embedded credentials replace, rather than append to, a
+    /// caller's own Authorization header, whatever the caller sends under
+    /// that name: on the reqwest builder of the plain (and streamed) path and
+    /// on the `http` builder of the websocket path (runcove-ljvj.27). Without
+    /// the fix, upstream would see the caller's value ahead of the URL's (the
+    /// old plain-path order) or the caller's appended after it (the old
+    /// websocket-path order) -- either way, more than exactly the URL's.
+    #[tokio::test]
+    async fn url_credentials_replace_the_callers_authorization_on_both_builders() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let client = reqwest::Client::builder().build().unwrap();
+        // Documentation domain only: this branch is public.
+        let options: TargetHTTPOptions = serde_json::from_value(serde_json::json!({
+            "url": "http://configured:sekrit@upstream.example/",
+        }))
+        .unwrap();
+        let uri = Uri::try_from(options.url.clone()).unwrap();
+        let (authorization_header, uri) = extract_basic_auth(uri).unwrap();
+        let authorization_header =
+            authorization_header.expect("the configured URL carries credentials");
+
+        let cases: &[&[(&str, &str)]] = &[
+            &[],
+            &[("Authorization", "Bearer forged")],
+            &[("authorization", "Bearer forged")],
+        ];
+        for headers in cases {
+            let mut builder = Request::builder();
+            for (name, value) in *headers {
+                builder = builder.header(*name, *value);
+            }
+            let req = builder.finish();
+            // Positive control, same as the configured-header test above.
+            assert_eq!(req.headers().len(), headers.len(), "{headers:?}");
+
+            let plain = caller_then_url_credentials(
+                &req,
+                client.request(reqwest::Method::GET, uri.to_string()),
+                &options,
+                Some(authorization_header.clone()),
+            )
+            .build()
+            .unwrap()
+            .headers()
+            .clone();
+            let websocket = caller_then_url_credentials(
+                &req,
+                http::request::Builder::new(),
+                &options,
+                Some(authorization_header.clone()),
+            )
+            .headers_ref()
+            .unwrap()
+            .clone();
+
+            for (path, upstream) in [("plain", plain), ("websocket", websocket)] {
+                let values: Vec<_> = upstream
+                    .get_all(http::header::AUTHORIZATION)
+                    .iter()
+                    .map(|value| value.to_str().unwrap().to_owned())
+                    .collect();
+                assert_eq!(
+                    values,
+                    [authorization_header.to_str().unwrap()],
                     "{path} path, caller sent {headers:?}"
                 );
             }
