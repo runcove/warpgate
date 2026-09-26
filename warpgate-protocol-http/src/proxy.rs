@@ -208,7 +208,12 @@ fn apply_url_credentials<B: SomeRequestBuilder>(
     authorization_header: Option<HeaderValue>,
 ) -> B {
     match authorization_header {
-        Some(value) => req.set_header(http::header::AUTHORIZATION, value),
+        // RED-PROOF (runcove-ljvj.27): `.header()` appends instead of
+        // replacing, reproducing the exact bug this bead is about. Revert
+        // of this one line, on a wip/ branch, to prove
+        // url_credentials_replace_the_callers_authorization_on_both_builders
+        // fails without the fix. Never land this arm.
+        Some(value) => req.header(http::header::AUTHORIZATION, value),
         None => req,
     }
 }
