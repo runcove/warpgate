@@ -5300,7 +5300,8 @@
           "blocked_at",
           "expires_at",
           "block_count",
-          "reason"
+          "reason",
+          "is_exempt"
         ],
         "properties": {
           "ip_address": {
@@ -5320,6 +5321,9 @@
           },
           "reason": {
             "type": "string"
+          },
+          "is_exempt": {
+            "type": "boolean"
           }
         }
       },
