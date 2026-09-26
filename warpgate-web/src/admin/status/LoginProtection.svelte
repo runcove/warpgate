@@ -140,7 +140,10 @@
                                         date={new Date(ip.expiresAt)}
                                     />
                                     {#if ip.isExempt}
-                                        &middot; <span class="text-warning">exempt, not enforced</span>
+                                        &middot;
+                                        <span class="text-warning"
+                                            >exempt, not enforced</span
+                                        >
                                     {/if}
                                 </small>
                             </div>
