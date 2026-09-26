@@ -98,7 +98,17 @@ impl SomeRequestBuilder for http::request::Builder {
 
     fn set_header(mut self, k: HeaderName, v: HeaderValue) -> Self {
         if let Some(headers) = self.headers_mut() {
-            headers.insert(k, v);
+            // RED-PROOF (runcove-ljvj.27): `append` adds a second value
+            // instead of replacing the first, reproducing the websocket
+            // path's OWN pre-fix defect -- isolated to this one builder impl,
+            // which only `proxy_ws_inner` uses, so the reqwest impl above
+            // (the plain/SSE path) is untouched and stays a real replace.
+            // Revert of this one line, on a wip/ branch, to prove
+            // url_credentials_replace_the_callers_authorization_on_both_builders
+            // fails on ITS "websocket" assertion specifically, while the
+            // "plain" assertion in the same run stays green. Never land this
+            // arm.
+            headers.append(k, v);
         }
         self
     }
