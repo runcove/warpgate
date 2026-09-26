@@ -2,7 +2,7 @@
   "openapi": "3.0.0",
   "info": {
     "title": "Warpgate Web Admin",
-    "version": "v0.29.1-9-g5c27effe-modified"
+    "version": "v0.29.1-cove.3-1-g3c60821b-modified"
   },
   "servers": [
     {
@@ -4854,7 +4854,8 @@
             "type": "string"
           },
           "is_exempt": {
-            "type": "boolean"
+            "type": "boolean",
+            "description": "True when this address is currently on the exempt list, in which\ncase the block is NOT enforced (a stale row can outlive the address\nbeing exempted, or the exempt list changing after it was written)."
           }
         }
       },
