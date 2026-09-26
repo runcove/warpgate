@@ -363,10 +363,14 @@ mod hold_while_tests {
         }
 
         let held = std::future::pending::<()>();
+        // RED ARM, never to be merged: the pump reads a second channel whose
+        // sender stays alive, so nothing takes `events` off during the hold.
+        // The assertion below must fail.
+        let (_keep, mut elsewhere) = unbounded_channel::<ServerEvent>();
         assert!(
             tokio::time::timeout(
                 Duration::from_millis(200),
-                hold_while(held, &mut events, &viewer(), &mut screen, || {
+                hold_while(held, &mut elsewhere, &viewer(), &mut screen, || {
                     HoldFrame::Connecting
                 }),
             )
