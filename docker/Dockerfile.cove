@@ -7,11 +7,16 @@
 # This Dockerfile tracks upstream's docker/Dockerfile with three deliberate
 # divergences:
 #
-#   1. DEBIAN 12 (bookworm), NOT bullseye. Upstream is still on
-#      rust:1.97.1-bullseye / debian:bullseye-*, but Debian 11's security
-#      archive went EOL 2026-08-31 and `apt-get update` now 404s, so an
-#      upstream-identical image cannot be built at all. Both stages are
-#      pinned to bookworm by digest. Revisit when upstream moves.
+#   1. FEDORA 44, NOT bullseye. Upstream is still on rust:1.97.1-bullseye /
+#      debian:bullseye-*, but Debian 11's security archive went EOL
+#      2026-08-31 and `apt-get update` now 404s, so an upstream-identical
+#      image cannot be built at all. This file moved to Debian 12 first and
+#      then, with the rest of our build images, to Fedora for newer packages
+#      and faster security fixes. Every stage is on one Fedora release, pinned
+#      by digest, so the binary's glibc is the runtime's. The toolchain comes
+#      from rustup (the workspace pins a nightly in rust-toolchain.toml). The
+#      runtime user keeps uid and gid 1000, and the CA bundle keeps its Debian
+#      path, /etc/ssl/certs/ca-certificates.crt, as a symlink to Fedora's.
 #
 #   2. Build caching, two layers of it. Within a single build, npm deps live
 #      in their own layer keyed on package-lock.json, and the cargo
@@ -43,8 +48,8 @@
 #      *iterative* rebuild inside one `docker build` invocation); nothing
 #      here relies on it surviving between separate CI runs.
 #
-# Everything else is upstream's: Node 24 + openjdk-17 (the OpenAPI generator
-# needs a JRE), the just-driven frontend build, the mysql/postgres/rdp feature
+# Everything else is upstream's: Node 24 + a JRE (the OpenAPI generator needs
+# one; Fedora 44 ships OpenJDK 25), the just-driven frontend build, the mysql/postgres/rdp feature
 # set, `COPY .git/` for version embedding, SOURCE_DATE_EPOCH for rust-embed
 # determinism, and sqlite3/wget in the runtime image.
 #
@@ -56,10 +61,22 @@
 # speed for a lot less write I/O; the registry cache above is what actually
 # keeps repeat builds fast, not incremental compilation.
 
-FROM rust:1.97.1-bookworm@sha256:408fe88047cef61a2087653b0c5255fa51c0f2d6d94ddedd7a2562a9b91a46f6 AS chef
-# Installed into our own already-proven, digest-pinned base rather than
-# switching to the lukemathwalker/cargo-chef image: that image is just a
-# rust base + cargo-chef too, and pulling a third-party one here would swap
+FROM fedora:44@sha256:43b29f65a41eb9c35e1cd5323e3bdf3b655c2357a9f4f1ff2f9c2798e5045d80 AS chef
+# What the rust image carried: a C toolchain for build scripts and the
+# vendored OpenSSL (whose Configure is perl), git for version embedding, and
+# rustup with 1.97.1 as its default, the toolchain the rust:1.97.1 image
+# carried (cargo-chef below is built with it); rust-toolchain.toml still
+# selects the pinned nightly for the workspace itself.
+ENV CARGO_HOME=/usr/local/cargo RUSTUP_HOME=/usr/local/rustup
+ENV PATH=/usr/local/cargo/bin:$PATH
+RUN dnf -y --setopt=install_weak_deps=False install \
+       gcc gcc-c++ make perl pkgconf-pkg-config openssl-devel git curl ca-certificates \
+    && dnf clean all \
+    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+       | sh -s -- -y --no-modify-path --profile minimal --default-toolchain 1.97.1
+# Installed into our own digest-pinned base rather than switching to the
+# lukemathwalker/cargo-chef image: that image is just a rust base +
+# cargo-chef too, and pulling a third-party one here would swap
 # out a toolchain this Dockerfile has already been verified against for one
 # we haven't, for no real benefit. Pinned to the latest stable release on
 # crates.io as of 2026-09-15.
@@ -87,13 +104,10 @@ RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
 
-ENV DEBIAN_FRONTEND=noninteractive
-
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
-RUN curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates-java nodejs openjdk-17-jdk mold \
-    && rm -rf /var/lib/apt/lists/* \
+RUN dnf -y --setopt=install_weak_deps=False install \
+       nodejs24 nodejs24-bin nodejs24-npm nodejs24-npm-bin java-25-openjdk-headless mold \
+    && dnf clean all \
     && cargo install --locked just@1.4.0
 
 ARG CARGO_BUILD_JOBS=default
@@ -194,18 +208,19 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=warpgate-cargo-regist
     cargo build --features mysql,postgres,rdp-openssl-tls --release \
     && cp target/release/warpgate /warpgate
 
-FROM debian:bookworm-slim@sha256:5ae3c39ebd15e229dcedd5cee596b2497182493d41ff162e824ba13fc1b2b867
+FROM fedora:44@sha256:43b29f65a41eb9c35e1cd5323e3bdf3b655c2357a9f4f1ff2f9c2798e5045d80
 LABEL maintainer="cove-patched"
 ARG USER_ID=1000
+ARG GROUP_ID=1000
 
-ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get -y update -qq \
-    && apt-get install --no-install-recommends --no-install-suggests -y \
-       ca-certificates wget sqlite3 \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
+RUN dnf -y --setopt=install_weak_deps=False upgrade \
+    && dnf -y --setopt=install_weak_deps=False install \
+       ca-certificates wget2-wget sqlite shadow-utils \
+    && dnf clean all \
+    && ln -s /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem /etc/pki/tls/certs/ca-certificates.crt
 
-RUN adduser warpgate --disabled-password --gecos "" --uid ${USER_ID} --home /data --shell /usr/sbin/nologin
+RUN groupadd --gid ${GROUP_ID} warpgate \
+    && useradd --uid ${USER_ID} --gid ${GROUP_ID} --create-home --home-dir /data --shell /usr/sbin/nologin warpgate
 
 COPY --from=builder /warpgate /usr/local/bin/warpgate
 
