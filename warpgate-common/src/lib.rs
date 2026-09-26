@@ -1,3 +1,4 @@
+// CI proof of the Fedora job image through publish (runcove-ljvj.26), not for merge.
 pub mod api;
 pub mod audit;
 pub mod auth;
