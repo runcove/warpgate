@@ -1,3 +1,4 @@
+// CI proof that the 8 real dind jobs work with TLS (runcove-r087), not for merge.
 pub mod api;
 pub mod audit;
 pub mod auth;
