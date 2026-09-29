@@ -421,7 +421,8 @@ pub(crate) fn is_public_session_authorization(auth: &SessionAuthorization) -> bo
 ///
 /// The visitor's real cookie session is left untouched, so no cookie is set
 /// on a public host and nothing about the bypass outlives the request.
-/// Logged-in visitors never come here (see [`onto_public_target_session`]). The
+/// Logged-in visitors and holders of a ticket for this target never come here
+/// (see [`onto_public_target_session`]). The
 /// `SessionStore` recognises the request by its ticket key and serves every
 /// public request for a target from one unstored session per node.
 ///
@@ -445,15 +446,23 @@ fn onto_throwaway_public_session(mut req: Request, target_id: Uuid) -> Request {
 /// and the target session is stamped with the same user the session already
 /// holds. Nothing is written to their session.
 ///
-/// Anyone else (anonymous, or a cookie holding a ticket) is moved onto the
-/// throwaway `<public>` session.
+/// A visitor holding a ticket issued for this same target keeps its own
+/// session too, whether the ticket came in a header (a temporary session keyed
+/// by the ticket) or in the query (the cookie session): the proxied request
+/// carries the ticket's user with authentication type `ticket`, the target
+/// session opens under the session that ticket authorized, and the ticket's
+/// id stays attached to it. A ticket is scoped to the one target it was
+/// issued for, so a ticket for any other target asserts no identity here.
+///
+/// Anyone else (anonymous, or holding a ticket for a different target) is
+/// moved onto the throwaway `<public>` session.
 fn onto_public_target_session(req: Request, target_id: Uuid) -> (Request, SessionAuthorization) {
     let visitor = req
         .extensions()
         .get::<Session>()
         .and_then(SessionExt::get_auth);
-    if let Some(SessionAuthorization::User { user_id, username }) = visitor {
-        return (
+    match visitor {
+        Some(SessionAuthorization::User { user_id, username }) => (
             req,
             SessionAuthorization::Ticket {
                 user_id,
@@ -461,12 +470,26 @@ fn onto_public_target_session(req: Request, target_id: Uuid) -> (Request, Sessio
                 target_id,
                 ticket_id: None,
             },
-        );
+        ),
+        Some(SessionAuthorization::Ticket {
+            user_id,
+            username,
+            target_id: ticket_target_id,
+            ticket_id,
+        }) if !user_id.is_nil() && ticket_target_id == target_id => (
+            req,
+            SessionAuthorization::Ticket {
+                user_id,
+                username,
+                target_id,
+                ticket_id,
+            },
+        ),
+        _ => (
+            onto_throwaway_public_session(req, target_id),
+            public_session_authorization(target_id),
+        ),
     }
-    (
-        onto_throwaway_public_session(req, target_id),
-        public_session_authorization(target_id),
-    )
 }
 
 /// Inspect the request and decide whether the public-target bypass should
@@ -1060,7 +1083,9 @@ mod public_session_tests {
     //! `<public>` session whose writes never reach a cookie, so a browser
     //! keeps working across requests, and goes upstream with no identity
     //! headers; a logged-in visitor is proxied as themselves, on their own
-    //! session, and keeps their login.
+    //! session, and keeps their login; a ticket issued for the target is
+    //! proxied as its user, on the session that ticket authorized, while a
+    //! ticket for another target is served as anonymous.
     use poem::session::{CookieConfig, MemoryStorage, ServerSession, Session};
     use poem::test::{TestClient, TestResponse};
     use poem::web::{Data, Path};
@@ -1069,10 +1094,12 @@ mod public_session_tests {
     use warpgate_common_http::SessionAuthorization;
 
     use super::{SessionExt, onto_public_target_session, public_session_authorization};
-    use crate::middleware::ticket::ticket_session_key;
+    use crate::middleware::ticket::{TemporaryTicketSession, ticket_session_key};
     use crate::proxy::upstream_headers_for_test;
 
     const TARGET: Uuid = Uuid::from_u128(7);
+    const OTHER_TARGET: Uuid = Uuid::from_u128(8);
+    const TICKET: Uuid = Uuid::from_u128(5);
     const VISITS_KEY: &str = "test_visits";
 
     fn user_id_of(name: &str) -> Uuid {
@@ -1090,6 +1117,22 @@ mod public_session_tests {
             username: name,
         });
         "logged in"
+    }
+
+    /// Stands in for `TicketMiddleware` spending a `?warpgate-ticket=` query
+    /// ticket: the ticket's authorization is written into the cookie session.
+    #[handler]
+    fn ticket_login(
+        Path((name, target)): Path<(String, String)>,
+        session: &Session,
+    ) -> &'static str {
+        session.set_auth(SessionAuthorization::Ticket {
+            user_id: user_id_of(&name),
+            username: name,
+            target_id: Uuid::parse_str(&target).unwrap_or_default(),
+            ticket_id: Some(TICKET),
+        });
+        "ticket spent"
     }
 
     #[handler]
@@ -1135,7 +1178,7 @@ mod public_session_tests {
             user_id,
             username,
             target_id,
-            ticket_id: None,
+            ticket_id,
         } = ctx_auth.0
         else {
             return format!("not a target-scoped ticket: {:?}", ctx_auth.0);
@@ -1149,16 +1192,38 @@ mod public_session_tests {
         // target authorization whose user is not the session's user.
         let session_owner = match ticket_session_key(req, session) {
             Some((key_user, key_target, None))
-                if key_user.is_nil() && key_target == TARGET && user_id.is_nil() =>
+                if key_user.is_nil()
+                    && key_target == TARGET
+                    && user_id.is_nil()
+                    && ticket_id.is_none() =>
             {
                 "the shared public session".to_owned()
+            }
+            Some(key) if ticket_id.is_some() && key == (*user_id, *target_id, *ticket_id) => {
+                format!("{username}'s own ticket session")
             }
             None => match session.get_auth() {
                 Some(SessionAuthorization::User {
                     user_id: session_user,
                     username: session_name,
-                }) if session_user == *user_id && session_name == *username => {
+                }) if session_user == *user_id
+                    && session_name == *username
+                    && ticket_id.is_none() =>
+                {
                     format!("{session_name}'s own session")
+                }
+                Some(SessionAuthorization::Ticket {
+                    user_id: session_user,
+                    username: session_name,
+                    target_id: session_target,
+                    ticket_id: session_ticket,
+                }) if session_user == *user_id
+                    && session_name == *username
+                    && session_target == *target_id
+                    && session_ticket.is_some()
+                    && session_ticket == *ticket_id =>
+                {
+                    format!("{session_name}'s own ticket session")
                 }
                 other => format!("a session that is not the ticket's user: {other:?}"),
             },
@@ -1170,6 +1235,7 @@ mod public_session_tests {
     fn app() -> impl Endpoint {
         Route::new()
             .at("/login/:name", get(login))
+            .at("/ticket-login/:name/:target", get(ticket_login))
             .at("/whoami", get(whoami))
             .at(
                 "/public",
@@ -1441,5 +1507,138 @@ mod public_session_tests {
             identity_headers(&ticket).await,
             (Some("bob".into()), Some("ticket".into()))
         );
+    }
+
+    /// A request authorized by a ticket for `ticket_target`, on the session
+    /// `TicketMiddleware` leaves it on: a header-borne ticket on a temporary
+    /// session marked `TemporaryTicketSession`, a query ticket on the cookie
+    /// session.
+    fn ticket_request(ticket_target: Uuid, from_header: bool) -> Request {
+        let session = Session::default();
+        session.set_auth(SessionAuthorization::Ticket {
+            user_id: user_id_of("alice"),
+            username: "alice".into(),
+            target_id: ticket_target,
+            ticket_id: Some(TICKET),
+        });
+        let mut req = Request::builder().finish();
+        req.extensions_mut().insert(session);
+        if from_header {
+            req.set_data(TemporaryTicketSession);
+        }
+        req
+    }
+
+    /// The ticket key of the session a request ends up on.
+    fn session_key(req: &Request) -> Option<(Uuid, Uuid, Option<Uuid>)> {
+        let session = req.extensions().get::<Session>().expect("a session");
+        ticket_session_key(req, session)
+    }
+
+    /// A ticket for the public target, from a header or from the query, goes
+    /// upstream as its user with authentication type `ticket`, once, and the
+    /// catchall gets a Ticket for that user on the target, carrying the
+    /// ticket's id.
+    #[tokio::test]
+    async fn a_ticket_for_the_public_target_goes_upstream_as_its_user() {
+        for from_header in [true, false] {
+            let (req, auth) =
+                onto_public_target_session(ticket_request(TARGET, from_header), TARGET);
+
+            assert!(
+                matches!(
+                    &auth,
+                    SessionAuthorization::Ticket {
+                        user_id,
+                        username,
+                        target_id,
+                        ticket_id,
+                    } if *user_id == user_id_of("alice")
+                        && username == "alice"
+                        && *target_id == TARGET
+                        && *ticket_id == Some(TICKET)
+                ),
+                "header: {from_header}: {auth:?}"
+            );
+
+            let upstream = upstream_headers_for_test(&req).await;
+            assert_eq!(
+                header_values(&upstream, "x-warpgate-username"),
+                ["alice"],
+                "header: {from_header}"
+            );
+            assert_eq!(
+                header_values(&upstream, "x-warpgate-authentication-type"),
+                ["ticket"],
+                "header: {from_header}"
+            );
+        }
+    }
+
+    /// A header ticket stays on its own temporary session, keyed by the
+    /// ticket, not on the shared `<public>` one; a query ticket stays on the
+    /// cookie session, which has no ticket key.
+    #[tokio::test]
+    async fn a_ticket_for_the_public_target_keeps_its_own_session() {
+        let (req, _) = onto_public_target_session(ticket_request(TARGET, true), TARGET);
+        assert_eq!(
+            session_key(&req),
+            Some((user_id_of("alice"), TARGET, Some(TICKET)))
+        );
+
+        let (req, _) = onto_public_target_session(ticket_request(TARGET, false), TARGET);
+        assert_eq!(session_key(&req), None);
+    }
+
+    /// A ticket issued for another target asserts no identity on a public
+    /// target: it is served on the shared `<public>` session with no identity
+    /// headers, from a header or from the query.
+    #[tokio::test]
+    async fn a_ticket_for_another_target_is_served_as_anonymous() {
+        for from_header in [true, false] {
+            let (req, auth) =
+                onto_public_target_session(ticket_request(OTHER_TARGET, from_header), TARGET);
+
+            assert!(auth.user_id().is_nil(), "header: {from_header}: {auth:?}");
+            assert_eq!(
+                session_key(&req),
+                Some((Uuid::nil(), TARGET, None)),
+                "header: {from_header}"
+            );
+            let upstream = upstream_headers_for_test(&req).await;
+            assert_eq!(
+                warpgate_headers(&upstream),
+                Vec::<String>::new(),
+                "header: {from_header}"
+            );
+        }
+    }
+
+    /// Through a cookie: a spent query ticket for the public target is
+    /// proxied as its user on its own session, on every visit, and a ticket
+    /// for another target is proxied as nobody on the shared public session.
+    #[tokio::test]
+    async fn a_query_ticket_cookie_reaches_a_public_target_as_its_user() {
+        let cli = TestClient::new(app());
+
+        let resp = cli
+            .get(format!("/ticket-login/alice/{TARGET}"))
+            .send()
+            .await;
+        resp.assert_status_is_ok();
+        let cookie = cookie_pair(&resp).expect("the ticket sets a cookie");
+        visit(&cli, &cookie, "alice/ticket on alice's own ticket session, visit 1").await;
+        visit(&cli, &cookie, "alice/ticket on alice's own ticket session, visit 2").await;
+
+        let resp = cli
+            .get(format!("/ticket-login/bob/{OTHER_TARGET}"))
+            .send()
+            .await;
+        resp.assert_status_is_ok();
+        let cookie = cookie_pair(&resp).expect("the ticket sets a cookie");
+        let resp = cli.get("/public").header("cookie", &cookie).send().await;
+        resp.assert_status_is_ok();
+        resp.assert_text("-/- on the shared public session, visit 1")
+            .await;
     }
 }
