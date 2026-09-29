@@ -130,3 +130,43 @@ pub fn log_request_error(method: &Method, url: &Uri, client_ip: Option<&str>, er
     let client_ip = client_ip.unwrap_or("<unknown>");
     error!(%method, %url, ?error, %client_ip, "Request failed");
 }
+
+#[cfg(test)]
+mod log_line_tests {
+    use poem::http::{Method, StatusCode, Uri};
+
+    use super::{log_request_error, log_request_result};
+    use crate::test_log::logged;
+
+    const SECRET: &str = "s3cr3t-ticket-value";
+
+    /// A request carrying a ticket in its query is logged with the ticket's
+    /// value redacted, whether it succeeded, failed or errored. Each line is
+    /// checked to contain the redacted address, so an empty or missing line
+    /// cannot pass.
+    #[test]
+    fn a_logged_request_never_contains_the_ticket() {
+        let uri: Uri = format!("/app?a=1&warpgate-ticket={SECRET}")
+            .parse()
+            .unwrap();
+        let mut lines = Vec::new();
+        for status in [StatusCode::OK, StatusCode::NOT_FOUND] {
+            lines.push(logged(|| {
+                log_request_result(&Method::GET, &uri, Some("192.0.2.1"), status);
+            }));
+        }
+        for status in [StatusCode::FOUND, StatusCode::INTERNAL_SERVER_ERROR] {
+            let error = poem::Error::from_status(status);
+            lines.push(logged(|| {
+                log_request_error(&Method::GET, &uri, None, &error);
+            }));
+        }
+        for line in lines {
+            assert!(
+                line.contains("/app?a=1&warpgate-ticket=redacted"),
+                "{line}"
+            );
+            assert!(!line.contains(SECRET), "{line}");
+        }
+    }
+}

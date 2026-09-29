@@ -7,6 +7,9 @@ mod keepalive;
 pub mod logging;
 pub mod mtls_acceptor;
 mod request;
+#[cfg(test)]
+mod test_log;
+pub mod ticket_query;
 
 pub use auth::{AuthenticatedRequestContext, RequestAuthorization, SessionAuthorization};
 pub use cluster_tls::{ClusterPeer, cluster_peer, cluster_peer_extension, is_cluster_peer_request};
