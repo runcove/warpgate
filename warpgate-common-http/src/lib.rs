@@ -5,6 +5,9 @@ pub mod internal_page;
 mod keepalive;
 pub mod logging;
 mod request;
+#[cfg(test)]
+mod test_log;
+pub mod ticket_query;
 
 pub use auth::{AuthenticatedRequestContext, RequestAuthorization, SessionAuthorization};
 pub use keepalive::{SessionKeepalive, SessionKeepaliveGuard};

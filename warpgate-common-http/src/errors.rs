@@ -10,6 +10,7 @@ use warpgate_common::{UserFacingReason, WarpgateError};
 
 use crate::ext::is_navigation_request;
 use crate::internal_page::internal_page;
+use crate::ticket_query::loggable_uri;
 
 // Response-body JSON errors do not hit render_error and need manual logging here
 pub fn bad_request(reason: impl Into<String>) -> Json<String> {
@@ -32,6 +33,8 @@ pub fn render_error(error: poem::Error, method: &Method, uri: &Uri, as_document:
     };
     let message = if status.is_server_error() {
         let correlation_id = Uuid::new_v4();
+        // The address with any query ticket's value redacted.
+        let uri = loggable_uri(uri);
         tracing::error!(
             correlation_id = %correlation_id,
             %method,
@@ -80,6 +83,7 @@ mod tests {
     use warpgate_common::WarpgateError;
 
     use super::{Method, Uri, render_error, render_errors};
+    use crate::test_log::logged;
 
     const LEAK: &str = "no such table: credentials";
 
@@ -234,5 +238,23 @@ mod tests {
             .finish();
         let page = app.call(browser).await.unwrap();
         assert_eq!(page.content_type(), Some("text/html; charset=utf-8"));
+    }
+
+    /// An internal error on a request carrying a ticket in its query is
+    /// logged with the ticket's value redacted.
+    #[test]
+    fn an_internal_error_is_logged_without_the_ticket() {
+        const SECRET: &str = "s3cr3t-ticket-value";
+        let uri: Uri = format!("/app?warpgate-ticket={SECRET}").parse().unwrap();
+        let line = logged(|| {
+            let _ = render_error(
+                poem::Error::from_status(StatusCode::INTERNAL_SERVER_ERROR),
+                &Method::GET,
+                &uri,
+                false,
+            );
+        });
+        assert!(line.contains("/app?warpgate-ticket=[REDACTED]"), "{line}");
+        assert!(!line.contains(SECRET), "{line}");
     }
 }

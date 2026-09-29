@@ -22,6 +22,7 @@ use warpgate_common::{Protocol, UserSessionId, WarpgateError};
 use warpgate_common_http::auth::UnauthenticatedRequestContext;
 use warpgate_common_http::ext::{construct_external_url, is_navigation_request};
 use warpgate_common_http::logging::get_client_ip_addr;
+use warpgate_common_http::ticket_query::without_ticket_query_param;
 use warpgate_common_http::{
     AuthenticatedRequestContext, RequestAuthorization, SessionAuthorization,
     X_WARPGATE_CLUSTER_IDENTITY, is_cluster_peer_request,
@@ -352,7 +353,7 @@ async fn try_auto_sso_redirect(req: &Request) -> poem::Result<Option<Response>> 
     };
 
     let session = <&Session>::from_request_without_body(req).await?;
-    let next = req.original_uri().path_and_query().map(ToString::to_string);
+    let next = next_after_login(req);
 
     match crate::api::sso_provider_detail::start_sso_and_get_auth_url(
         req,
@@ -558,11 +559,19 @@ pub fn redirect_navigations(
     Redirect::temporary(location).into_response()
 }
 
-pub fn gateway_redirect(req: &Request) -> Response {
-    let path = req
-        .original_uri()
+/// The request's path and query as the page to return to after a login,
+/// without any `warpgate-ticket` parameter. A request that reaches the login
+/// flow was not authenticated by its ticket, and the ticket is not carried
+/// along: `next` travels through the browser's address bar and the query of
+/// the login requests, which are logged.
+fn next_after_login(req: &Request) -> Option<String> {
+    req.original_uri()
         .path_and_query()
-        .map_or_else(String::new, ToString::to_string);
+        .map(|path| without_ticket_query_param(path.as_str()))
+}
+
+pub fn gateway_redirect(req: &Request) -> Response {
+    let path = next_after_login(req).unwrap_or_default();
 
     redirect_navigations(
         req,
@@ -912,6 +921,25 @@ mod tests {
                 .unwrap_or_default();
             assert!(location.starts_with("/@warpgate#/login"));
         }
+    }
+
+    /// A ticket in the address of a request sent to the login page is not
+    /// carried into the page to return to; the rest of the address is.
+    #[test]
+    fn gateway_redirect_leaves_a_ticket_out_of_next() {
+        let req = poem::Request::builder()
+            .uri_str("/app?a=1&warpgate-ticket=s3cr3t-ticket-value")
+            .header("accept", BROWSER_ACCEPT)
+            .header("sec-fetch-mode", "navigate")
+            .finish();
+        let resp = gateway_redirect(&req);
+        assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+        let location = resp
+            .headers()
+            .get(http::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert_eq!(location, "/@warpgate#/login?next=%2Fapp%3Fa%3D1");
     }
 
     #[test]

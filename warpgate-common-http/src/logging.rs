@@ -7,6 +7,7 @@ use tracing::*;
 use warpgate_core::{Services, WarpgateServerHandle};
 
 use crate::request::trusted_client_ip;
+use crate::ticket_query::loggable_uri;
 
 /// The peer IP of the connection itself, ignoring any forwarding headers.
 pub fn raw_remote_ip(req: &Request) -> Option<String> {
@@ -71,7 +72,11 @@ pub async fn span_for_request(
     })
 }
 
+/// Logs a finished request. The address is logged with the value of any
+/// `warpgate-ticket` parameter redacted: a ticket in the query is a
+/// credential, and log lines outlive it and travel further than it should.
 pub fn log_request_result(method: &Method, url: &Uri, client_ip: Option<&str>, status: StatusCode) {
+    let url = loggable_uri(url);
     let client_ip = client_ip.unwrap_or("<unknown>");
     if status.is_server_error() || status.is_client_error() {
         warn!(%method, %url, %status, %client_ip, "Request failed");
@@ -86,6 +91,47 @@ pub fn log_request_error(method: &Method, url: &Uri, client_ip: Option<&str>, er
         log_request_result(method, url, client_ip, status);
         return;
     }
+    let url = loggable_uri(url);
     let client_ip = client_ip.unwrap_or("<unknown>");
     error!(%method, %url, ?error, %client_ip, "Request failed");
+}
+
+#[cfg(test)]
+mod tests {
+    use poem::http::{Method, StatusCode, Uri};
+
+    use super::{log_request_error, log_request_result};
+    use crate::test_log::logged;
+
+    const SECRET: &str = "s3cr3t-ticket-value";
+
+    /// A request carrying a ticket in its query is logged with the ticket's
+    /// value redacted, whether it succeeded, failed or errored. Each line is
+    /// checked to contain the redacted address, so an empty or missing line
+    /// cannot pass.
+    #[test]
+    fn a_logged_request_never_contains_the_ticket() {
+        let uri: Uri = format!("/app?a=1&warpgate-ticket={SECRET}")
+            .parse()
+            .unwrap();
+        let mut lines = Vec::new();
+        for status in [StatusCode::OK, StatusCode::NOT_FOUND] {
+            lines.push(logged(|| {
+                log_request_result(&Method::GET, &uri, Some("192.0.2.1"), status);
+            }));
+        }
+        for status in [StatusCode::FOUND, StatusCode::INTERNAL_SERVER_ERROR] {
+            let error = poem::Error::from_status(status);
+            lines.push(logged(|| {
+                log_request_error(&Method::GET, &uri, None, &error);
+            }));
+        }
+        for line in lines {
+            assert!(
+                line.contains("/app?a=1&warpgate-ticket=[REDACTED]"),
+                "{line}"
+            );
+            assert!(!line.contains(SECRET), "{line}");
+        }
+    }
 }

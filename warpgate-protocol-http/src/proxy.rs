@@ -24,6 +24,7 @@ use warpgate_common::http_headers::{
 };
 use warpgate_common::{TargetHTTPOptions, WarpgateError, try_block};
 use warpgate_common_http::logging::{get_client_ip, log_request_result};
+use warpgate_common_http::ticket_query::without_ticket_query_param;
 use warpgate_common_http::{
     AuthenticatedRequestContext, SessionAuthorization, SessionKeepalive, SessionKeepaliveGuard,
 };
@@ -317,46 +318,6 @@ fn authorization_header_for_target(req: &Request) -> Option<String> {
         .filter(|v| !is_warpgate_authorization(v))
         .collect::<Vec<_>>();
     (!values.is_empty()).then(|| values.join("; "))
-}
-
-/// True for a `key=value` pair of a query string whose key, once decoded, is
-/// `warpgate-ticket` -- the parameter `TicketMiddleware` reads a ticket from.
-fn is_ticket_query_pair(pair: &str) -> bool {
-    form_urlencoded::parse(pair.as_bytes())
-        .next()
-        .is_some_and(|(key, _)| key == "warpgate-ticket")
-}
-
-/// `url` with every `warpgate-ticket` query parameter removed. Everything
-/// else -- the other parameters, in their order and their original encoding,
-/// and any fragment -- is kept exactly as it was, and a URL without the
-/// parameter is returned unchanged.
-fn without_ticket_query_param(url: &str) -> String {
-    let (before_fragment, fragment) = match url.split_once('#') {
-        Some((before, fragment)) => (before, Some(fragment)),
-        None => (url, None),
-    };
-    let Some((base, query)) = before_fragment.split_once('?') else {
-        return url.to_owned();
-    };
-    if !query.split('&').any(is_ticket_query_pair) {
-        return url.to_owned();
-    }
-    let query = query
-        .split('&')
-        .filter(|pair| !is_ticket_query_pair(pair))
-        .collect::<Vec<_>>()
-        .join("&");
-    let mut stripped = base.to_owned();
-    if !query.is_empty() {
-        stripped.push('?');
-        stripped.push_str(&query);
-    }
-    if let Some(fragment) = fragment {
-        stripped.push('#');
-        stripped.push_str(fragment);
-    }
-    stripped
 }
 
 /// The caller's `Referer` header as the target receives it. A page opened
