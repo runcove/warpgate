@@ -219,6 +219,9 @@ class TestHTTPUserAuthTicket:
         assert response.status_code != 303
         assert not response.headers.get("Location", "").startswith("//")
         assert response.headers["Referrer-Policy"] == "no-referrer"
+        # Positive control: the ticket did authenticate this request, so the
+        # page load really reached the redirect decision.
+        assert uses_left() == 0
 
     def test_non_http_ticket_opens_no_session(self, shared_wg: WarpgateProcess):
         url = f"https://localhost:{shared_wg.http_port}"

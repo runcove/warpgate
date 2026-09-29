@@ -57,9 +57,11 @@ pub static X_WARPGATE_TOKEN: HeaderName = HeaderName::from_static("x-warpgate-to
 /// answered with a redirect that sets this cookie, and the browser follows it
 /// in a navigation that began cross-site, in which it does not send a Strict
 /// cookie: every such link would land unauthenticated, with its ticket
-/// already spent. `CookieHostMiddleware` sets `SameSite=None` on HTTPS;
-/// without an attribute, browsers treat the cookie as `Lax` or `None`, both
-/// of which are sent there.
+/// already spent. On HTTPS, `CookieHostMiddleware` sets `SameSite=None` for
+/// localhost, the base domain and its subdomains (and when there is no Host
+/// header and a base domain is set); on any other host, and on plain HTTP,
+/// the cookie carries no attribute, which browsers treat as `Lax` or `None`.
+/// Both are sent there.
 pub fn session_cookie_config() -> CookieConfig {
     CookieConfig::default()
         .secure(false)
