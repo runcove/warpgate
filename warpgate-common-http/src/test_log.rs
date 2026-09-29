@@ -43,12 +43,32 @@ impl Subscriber for Captured {
 }
 
 /// Everything `f` logs on this thread.
-pub fn logged(f: impl FnOnce()) -> String {
-    let captured = Captured::default();
-    tracing::subscriber::with_default(captured.clone(), f);
-    captured
-        .0
-        .lock()
-        .map(|out| out.clone())
-        .unwrap_or_default()
+///
+/// `tracing` caches, per log call site, whether any subscriber wants its
+/// events. While at most one scoped subscriber is alive, a thread that
+/// reaches a call site for the first time computes that from its own default
+/// subscriber alone, without a lock. Another test that reaches the same call
+/// site with no subscriber, while this one installs its own, can therefore
+/// leave the site cached as unwanted, and this subscriber then sees nothing
+/// from it. So the cache is rebuilt once this subscriber is in place, and `f`
+/// is run again, a bounded number of times, if a run still captured nothing.
+/// A call site that does not log captures nothing on every run, so a caller's
+/// positive control still fails for it.
+pub fn logged(f: impl Fn()) -> String {
+    for _ in 0..3 {
+        let captured = Captured::default();
+        tracing::subscriber::with_default(captured.clone(), || {
+            tracing::callsite::rebuild_interest_cache();
+            f();
+        });
+        let out = captured
+            .0
+            .lock()
+            .map(|out| out.clone())
+            .unwrap_or_default();
+        if !out.is_empty() {
+            return out;
+        }
+    }
+    String::new()
 }
