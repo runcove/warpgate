@@ -293,9 +293,17 @@ fn cookie_header_for_target(req: &Request) -> Result<Option<String>> {
     Ok((!cookies.is_empty()).then(|| cookies.join("; ")))
 }
 
-/// True for an `Authorization` value in Warpgate's own `Warpgate <ticket>`
-/// scheme, the scheme compared without regard to case, as `TicketMiddleware`
-/// compares it when it reads the ticket.
+/// True for an `Authorization` or `Proxy-Authorization` value in Warpgate's own
+/// `Warpgate <ticket>` scheme: the first whitespace-separated token, after any
+/// leading whitespace, compared without regard to case.
+///
+/// The set this drops is deliberately WIDER than the one `TicketMiddleware`
+/// spends. The middleware reads a ticket from `Authorization` only, and only
+/// in the exact `Warpgate <ticket>` form; this drops every value whose scheme
+/// is Warpgate (a bare `Warpgate`, a tab separator, a leading space) and does
+/// the same for `Proxy-Authorization`, which the middleware never reads. A
+/// value that is not a ticket the middleware accepts is still a credential
+/// aimed at Warpgate, and dropping too much here costs the target nothing.
 fn is_warpgate_authorization(value: &str) -> bool {
     value
         .trim_start()
@@ -304,15 +312,17 @@ fn is_warpgate_authorization(value: &str) -> bool {
         .is_some_and(|scheme| scheme.eq_ignore_ascii_case("Warpgate"))
 }
 
-/// The caller's `Authorization` header as the target receives it: every value
-/// except those in the `Warpgate` scheme. A ticket presented that way is a
-/// credential for Warpgate, spent here to authenticate the caller, and is
-/// never the target's to see. Any other scheme (`Basic`, `Bearer`, ...) is the
-/// target's own and is forwarded unchanged.
-fn authorization_header_for_target(req: &Request) -> Option<String> {
+/// The caller's `Authorization` or `Proxy-Authorization` header (`name`) as the
+/// target receives it: every value except those in the `Warpgate` scheme, and
+/// except any value that is not valid text (dropped, never forwarded on a
+/// guess about what it holds). A ticket presented that way is a credential for
+/// Warpgate, spent here to authenticate the caller, and is never the target's
+/// to see. Any other scheme (`Basic`, `Bearer`, ...) is the target's own and is
+/// forwarded unchanged.
+fn credentials_header_for_target(req: &Request, name: &HeaderName) -> Option<String> {
     let values = req
         .headers()
-        .get_all(http::header::AUTHORIZATION)
+        .get_all(name)
         .iter()
         .filter_map(|v| v.to_str().ok())
         .filter(|v| !is_warpgate_authorization(v))
@@ -342,8 +352,8 @@ fn copy_server_request<B: SomeRequestBuilder>(req: &Request, mut target: B) -> R
         if !may_forward_header(k) {
             continue;
         }
-        if k == http::header::AUTHORIZATION {
-            if let Some(value) = authorization_header_for_target(req) {
+        if k == http::header::AUTHORIZATION || k == http::header::PROXY_AUTHORIZATION {
+            if let Some(value) = credentials_header_for_target(req, k) {
                 target = target.header(k.clone(), value);
             }
             continue;
@@ -943,20 +953,15 @@ mod tests {
         }
     }
 
-    /// The `Authorization` values the upstream receives for a caller who sent
-    /// `headers`, on the reqwest builder of the plain (and streamed) path and
-    /// on the `http` builder of the websocket path, for a target whose URL
-    /// carries no credentials.
-    fn upstream_authorization(headers: &[(&str, &str)]) -> [(&'static str, Vec<String>); 2] {
-        upstream_header_values(headers, &http::header::AUTHORIZATION)
-    }
-
-    /// The values of the header `name` the upstream receives for a caller who
-    /// sent `headers`, on both builders, for a target whose URL carries no
-    /// credentials.
-    fn upstream_header_values(
-        headers: &[(&str, &str)],
-        name: &HeaderName,
+    /// The values of the `name` header the upstream receives for a caller who
+    /// sent `headers` (raw bytes, so a value that is not valid text can be
+    /// sent), on the reqwest builder of the plain (and streamed) path and on
+    /// the `http` builder of the websocket path, for a target whose URL
+    /// carries no credentials. A value the upstream got that is not valid
+    /// text is reported as its lossy form, so a leak is still visible.
+    fn upstream_values(
+        name: &http::header::HeaderName,
+        headers: &[(&str, &[u8])],
     ) -> [(&'static str, Vec<String>); 2] {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let client = reqwest::Client::builder().build().unwrap();
@@ -965,8 +970,8 @@ mod tests {
         }))
         .unwrap();
         let mut builder = Request::builder();
-        for (name, value) in headers {
-            builder = builder.header(*name, *value);
+        for (header, value) in headers {
+            builder = builder.header(*header, HeaderValue::from_bytes(value).unwrap());
         }
         let req = builder.finish();
         // Positive control: poem's builder silently drops a header it cannot
@@ -992,10 +997,20 @@ mod tests {
             let values = upstream
                 .get_all(name)
                 .iter()
-                .map(|value| value.to_str().unwrap().to_owned())
+                .map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned())
                 .collect();
             (path, values)
         })
+    }
+
+    /// The `Authorization` values the upstream receives for a caller who sent
+    /// `headers`, for a target whose URL carries no credentials.
+    fn upstream_authorization(headers: &[(&str, &str)]) -> [(&'static str, Vec<String>); 2] {
+        let raw: Vec<(&str, &[u8])> = headers
+            .iter()
+            .map(|(name, value)| (*name, value.as_bytes()))
+            .collect();
+        upstream_values(&http::header::AUTHORIZATION, &raw)
     }
 
     /// A Warpgate ticket sent as `Authorization: Warpgate <ticket>` is spent
@@ -1084,7 +1099,7 @@ mod tests {
         ] {
             for header in ["Referer", "referer"] {
                 for (path, values) in
-                    upstream_header_values(&[(header, sent)], &http::header::REFERER)
+                    upstream_values(&http::header::REFERER, &[(header, sent.as_bytes())])
                 {
                     assert_eq!(values, [expected], "{path} path, caller sent {sent:?}");
                 }
@@ -1106,9 +1121,95 @@ mod tests {
             "https://app.example/page#warpgate-ticket=secret",
         ] {
             for (path, values) in
-                upstream_header_values(&[("Referer", sent)], &http::header::REFERER)
+                upstream_values(&http::header::REFERER, &[("Referer", sent.as_bytes())])
             {
                 assert_eq!(values, [sent], "{path} path, caller sent {sent:?}");
+            }
+        }
+    }
+
+    /// The same rule for `Proxy-Authorization`: a ticket presented there is
+    /// never the target's to see either, in any case of the scheme or of the
+    /// header name, on both builders. (`TicketMiddleware` never reads this
+    /// header; the stripped set is deliberately wider than what it spends.)
+    #[test]
+    fn a_warpgate_ticket_in_proxy_authorization_never_reaches_the_upstream() {
+        for headers in [
+            &[("Proxy-Authorization", "Warpgate ticket-secret")][..],
+            &[("proxy-authorization", "Warpgate ticket-secret")],
+            &[("Proxy-Authorization", "warpgate ticket-secret")],
+            &[("Proxy-Authorization", "WARPGATE ticket-secret")],
+            &[
+                ("Proxy-Authorization", "Warpgate ticket-secret"),
+                ("proxy-authorization", "warpgate another-secret"),
+            ],
+        ] {
+            let raw: Vec<(&str, &[u8])> = headers
+                .iter()
+                .map(|(name, value)| (*name, value.as_bytes()))
+                .collect();
+            for (path, values) in upstream_values(&http::header::PROXY_AUTHORIZATION, &raw) {
+                assert_eq!(
+                    values,
+                    Vec::<String>::new(),
+                    "{path} path, caller sent {headers:?}"
+                );
+            }
+        }
+    }
+
+    /// `Proxy-Authorization` in any other scheme reaches the upstream as sent,
+    /// and next to a ticket only the ticket is dropped. The two headers are
+    /// filtered independently: a ticket in one does not touch the other.
+    #[test]
+    fn other_proxy_authorization_schemes_reach_the_upstream_and_headers_are_independent() {
+        for value in ["Basic dXNlcjpwYXNz", "Bearer x", "WarpgateX ticket-secret"] {
+            for (path, values) in upstream_values(
+                &http::header::PROXY_AUTHORIZATION,
+                &[("Proxy-Authorization", value.as_bytes())],
+            ) {
+                assert_eq!(values, [value], "{path} path, caller sent {value:?}");
+            }
+        }
+        let mixed: &[(&str, &[u8])] = &[
+            ("Proxy-Authorization", &b"Warpgate ticket-secret"[..]),
+            ("Proxy-Authorization", &b"Basic dXNlcjpwYXNz"[..]),
+            ("Authorization", &b"Bearer x"[..]),
+        ];
+        for (path, values) in upstream_values(&http::header::PROXY_AUTHORIZATION, mixed) {
+            assert_eq!(values, ["Basic dXNlcjpwYXNz"], "{path} path");
+        }
+        for (path, values) in upstream_values(&http::header::AUTHORIZATION, mixed) {
+            assert_eq!(values, ["Bearer x"], "{path} path");
+        }
+    }
+
+    /// The edges of "the scheme is Warpgate": a tab as the separator, a bare
+    /// scheme with no ticket, and leading whitespace are all the Warpgate
+    /// scheme (dropped), on both headers; a value that is not valid text is
+    /// dropped rather than forwarded on a guess, whatever its scheme.
+    #[test]
+    fn the_warpgate_scheme_is_read_the_same_way_at_its_edges() {
+        let dropped: &[&[u8]] = &[
+            b"Warpgate\tticket-secret",
+            b"Warpgate",
+            b" Warpgate ticket-secret",
+            b"\tWarpgate ticket-secret",
+            b"Warpgate \xff",
+            b"Bearer \xff",
+        ];
+        for name in [
+            http::header::AUTHORIZATION,
+            http::header::PROXY_AUTHORIZATION,
+        ] {
+            for &value in dropped {
+                for (path, values) in upstream_values(&name, &[(name.as_str(), value)]) {
+                    assert_eq!(
+                        values,
+                        Vec::<String>::new(),
+                        "{path} path, {name} was {value:?}"
+                    );
+                }
             }
         }
     }
