@@ -319,6 +319,63 @@ fn authorization_header_for_target(req: &Request) -> Option<String> {
     (!values.is_empty()).then(|| values.join("; "))
 }
 
+/// True for a `key=value` pair of a query string whose key, once decoded, is
+/// `warpgate-ticket` -- the parameter `TicketMiddleware` reads a ticket from.
+fn is_ticket_query_pair(pair: &str) -> bool {
+    form_urlencoded::parse(pair.as_bytes())
+        .next()
+        .is_some_and(|(key, _)| key == "warpgate-ticket")
+}
+
+/// `url` with every `warpgate-ticket` query parameter removed. Everything
+/// else -- the other parameters, in their order and their original encoding,
+/// and any fragment -- is kept exactly as it was, and a URL without the
+/// parameter is returned unchanged.
+fn without_ticket_query_param(url: &str) -> String {
+    let (before_fragment, fragment) = match url.split_once('#') {
+        Some((before, fragment)) => (before, Some(fragment)),
+        None => (url, None),
+    };
+    let Some((base, query)) = before_fragment.split_once('?') else {
+        return url.to_owned();
+    };
+    if !query.split('&').any(is_ticket_query_pair) {
+        return url.to_owned();
+    }
+    let query = query
+        .split('&')
+        .filter(|pair| !is_ticket_query_pair(pair))
+        .collect::<Vec<_>>()
+        .join("&");
+    let mut stripped = base.to_owned();
+    if !query.is_empty() {
+        stripped.push('?');
+        stripped.push_str(&query);
+    }
+    if let Some(fragment) = fragment {
+        stripped.push('#');
+        stripped.push_str(fragment);
+    }
+    stripped
+}
+
+/// The caller's `Referer` header as the target receives it. A page opened
+/// with `?warpgate-ticket=<ticket>` has the ticket in its address, and the
+/// browser sends that address as the `Referer` of the requests the page
+/// makes; the ticket is a credential for Warpgate, spent here, and is never
+/// the target's to see, so it is removed. The rest of the address is
+/// forwarded unchanged.
+fn referer_header_for_target(req: &Request) -> Option<String> {
+    let values = req
+        .headers()
+        .get_all(http::header::REFERER)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .map(without_ticket_query_param)
+        .collect::<Vec<_>>();
+    (!values.is_empty()).then(|| values.join("; "))
+}
+
 fn copy_server_request<B: SomeRequestBuilder>(req: &Request, mut target: B) -> Result<B> {
     for k in req.headers().keys() {
         if !may_forward_header(k) {
@@ -326,6 +383,12 @@ fn copy_server_request<B: SomeRequestBuilder>(req: &Request, mut target: B) -> R
         }
         if k == http::header::AUTHORIZATION {
             if let Some(value) = authorization_header_for_target(req) {
+                target = target.header(k.clone(), value);
+            }
+            continue;
+        }
+        if k == http::header::REFERER {
+            if let Some(value) = referer_header_for_target(req) {
                 target = target.header(k.clone(), value);
             }
             continue;
@@ -924,6 +987,16 @@ mod tests {
     /// on the `http` builder of the websocket path, for a target whose URL
     /// carries no credentials.
     fn upstream_authorization(headers: &[(&str, &str)]) -> [(&'static str, Vec<String>); 2] {
+        upstream_header_values(headers, &http::header::AUTHORIZATION)
+    }
+
+    /// The values of the header `name` the upstream receives for a caller who
+    /// sent `headers`, on both builders, for a target whose URL carries no
+    /// credentials.
+    fn upstream_header_values(
+        headers: &[(&str, &str)],
+        name: &HeaderName,
+    ) -> [(&'static str, Vec<String>); 2] {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let client = reqwest::Client::builder().build().unwrap();
         let options: TargetHTTPOptions = serde_json::from_value(serde_json::json!({
@@ -956,7 +1029,7 @@ mod tests {
                 .clone();
         [("plain", plain), ("websocket", websocket)].map(|(path, upstream)| {
             let values = upstream
-                .get_all(http::header::AUTHORIZATION)
+                .get_all(name)
                 .iter()
                 .map(|value| value.to_str().unwrap().to_owned())
                 .collect();
@@ -1017,6 +1090,65 @@ mod tests {
         ];
         for (path, values) in upstream_authorization(&headers) {
             assert_eq!(values, ["Bearer x"], "{path} path, caller sent {headers:?}");
+        }
+    }
+
+    /// A page opened with a ticket in its address sends that address as the
+    /// `Referer` of the requests it makes; the upstream receives the address
+    /// without the ticket, with the other parameters in their order and
+    /// encoding and the fragment kept, on both builders.
+    #[test]
+    fn a_ticket_in_the_referer_never_reaches_the_upstream() {
+        for (sent, expected) in [
+            (
+                "https://app.example/page?warpgate-ticket=secret",
+                "https://app.example/page",
+            ),
+            (
+                "https://app.example/page?a=1&warpgate-ticket=secret&b=two%20words#frag",
+                "https://app.example/page?a=1&b=two%20words#frag",
+            ),
+            (
+                "https://app.example/page?warpgate-ticket=secret#frag",
+                "https://app.example/page#frag",
+            ),
+            (
+                "https://app.example/?warpgate-ticket=one&x=1&warpgate-ticket=two",
+                "https://app.example/?x=1",
+            ),
+            (
+                "https://app.example/?warpgate%2Dticket=secret&x=1",
+                "https://app.example/?x=1",
+            ),
+        ] {
+            for header in ["Referer", "referer"] {
+                for (path, values) in
+                    upstream_header_values(&[(header, sent)], &http::header::REFERER)
+                {
+                    assert_eq!(values, [expected], "{path} path, caller sent {sent:?}");
+                }
+            }
+        }
+    }
+
+    /// A `Referer` without a ticket parameter reaches the upstream exactly as
+    /// the caller sent it, including one that only mentions the name in a
+    /// value, a fragment or a longer key, on both builders.
+    #[test]
+    fn a_referer_without_a_ticket_reaches_the_upstream_unchanged() {
+        for sent in [
+            "https://app.example/page",
+            "https://app.example/page?a=1&b=two%20words#frag",
+            "https://app.example/page?q=warpgate-ticket",
+            "https://app.example/page?not-warpgate-ticket=1&warpgate-tickets=2",
+            "https://app.example/page?warpgate-target=app",
+            "https://app.example/page#warpgate-ticket=secret",
+        ] {
+            for (path, values) in
+                upstream_header_values(&[("Referer", sent)], &http::header::REFERER)
+            {
+                assert_eq!(values, [sent], "{path} path, caller sent {sent:?}");
+            }
         }
     }
 
