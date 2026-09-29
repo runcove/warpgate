@@ -292,9 +292,42 @@ fn cookie_header_for_target(req: &Request) -> Result<Option<String>> {
     Ok((!cookies.is_empty()).then(|| cookies.join("; ")))
 }
 
+/// True for an `Authorization` value in Warpgate's own `Warpgate <ticket>`
+/// scheme, the scheme compared without regard to case, as `TicketMiddleware`
+/// compares it when it reads the ticket.
+fn is_warpgate_authorization(value: &str) -> bool {
+    value
+        .trim_start()
+        .split(|c: char| c.is_ascii_whitespace())
+        .next()
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("Warpgate"))
+}
+
+/// The caller's `Authorization` header as the target receives it: every value
+/// except those in the `Warpgate` scheme. A ticket presented that way is a
+/// credential for Warpgate, spent here to authenticate the caller, and is
+/// never the target's to see. Any other scheme (`Basic`, `Bearer`, ...) is the
+/// target's own and is forwarded unchanged.
+fn authorization_header_for_target(req: &Request) -> Option<String> {
+    let values = req
+        .headers()
+        .get_all(http::header::AUTHORIZATION)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .filter(|v| !is_warpgate_authorization(v))
+        .collect::<Vec<_>>();
+    (!values.is_empty()).then(|| values.join("; "))
+}
+
 fn copy_server_request<B: SomeRequestBuilder>(req: &Request, mut target: B) -> Result<B> {
     for k in req.headers().keys() {
         if !may_forward_header(k) {
+            continue;
+        }
+        if k == http::header::AUTHORIZATION {
+            if let Some(value) = authorization_header_for_target(req) {
+                target = target.header(k.clone(), value);
+            }
             continue;
         }
         if k == http::header::COOKIE {
@@ -836,6 +869,11 @@ mod tests {
             &[],
             &[("Authorization", "Bearer forged")],
             &[("authorization", "Bearer forged")],
+            &[("Authorization", "Warpgate forged")],
+            &[
+                ("Authorization", "warpgate forged"),
+                ("Authorization", "Bearer forged"),
+            ],
         ];
         for headers in cases {
             let mut builder = Request::builder();
@@ -878,6 +916,107 @@ mod tests {
                     "{path} path, caller sent {headers:?}"
                 );
             }
+        }
+    }
+
+    /// The `Authorization` values the upstream receives for a caller who sent
+    /// `headers`, on the reqwest builder of the plain (and streamed) path and
+    /// on the `http` builder of the websocket path, for a target whose URL
+    /// carries no credentials.
+    fn upstream_authorization(headers: &[(&str, &str)]) -> [(&'static str, Vec<String>); 2] {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let client = reqwest::Client::builder().build().unwrap();
+        let options: TargetHTTPOptions = serde_json::from_value(serde_json::json!({
+            "url": "http://upstream.example/",
+        }))
+        .unwrap();
+        let mut builder = Request::builder();
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let req = builder.finish();
+        // Positive control: poem's builder silently drops a header it cannot
+        // parse.
+        assert_eq!(req.headers().len(), headers.len(), "{headers:?}");
+
+        let plain = caller_then_url_credentials(
+            &req,
+            client.get("http://upstream.example/"),
+            &options,
+            None,
+        )
+        .build()
+        .unwrap()
+        .headers()
+        .clone();
+        let websocket =
+            caller_then_url_credentials(&req, http::request::Builder::new(), &options, None)
+                .headers_ref()
+                .unwrap()
+                .clone();
+        [("plain", plain), ("websocket", websocket)].map(|(path, upstream)| {
+            let values = upstream
+                .get_all(http::header::AUTHORIZATION)
+                .iter()
+                .map(|value| value.to_str().unwrap().to_owned())
+                .collect();
+            (path, values)
+        })
+    }
+
+    /// A Warpgate ticket sent as `Authorization: Warpgate <ticket>` is spent
+    /// by Warpgate and never reaches the upstream, whatever the case of the
+    /// scheme or of the header name, on both builders.
+    #[test]
+    fn a_warpgate_ticket_in_authorization_never_reaches_the_upstream() {
+        for headers in [
+            &[("Authorization", "Warpgate ticket-secret")][..],
+            &[("authorization", "Warpgate ticket-secret")],
+            &[("Authorization", "warpgate ticket-secret")],
+            &[("Authorization", "WARPGATE ticket-secret")],
+            &[("Authorization", "wArPgAtE ticket-secret")],
+            &[
+                ("Authorization", "Warpgate ticket-secret"),
+                ("authorization", "warpgate another-secret"),
+            ],
+        ] {
+            for (path, values) in upstream_authorization(headers) {
+                assert_eq!(
+                    values,
+                    Vec::<String>::new(),
+                    "{path} path, caller sent {headers:?}"
+                );
+            }
+        }
+    }
+
+    /// Any other scheme is the target's own and reaches the upstream exactly
+    /// as the caller sent it, including one that merely starts with, or
+    /// carries, the word `Warpgate`.
+    #[test]
+    fn other_authorization_schemes_reach_the_upstream_unchanged() {
+        for value in [
+            "Bearer x",
+            "Basic dXNlcjpwYXNz",
+            "Bearer Warpgate",
+            "WarpgateX ticket-secret",
+        ] {
+            for (path, values) in upstream_authorization(&[("Authorization", value)]) {
+                assert_eq!(values, [value], "{path} path, caller sent {value:?}");
+            }
+        }
+    }
+
+    /// Next to another scheme, only the Warpgate ticket is dropped: the
+    /// target's own credential still reaches it.
+    #[test]
+    fn only_the_warpgate_ticket_is_dropped_next_to_another_scheme() {
+        let headers = [
+            ("Authorization", "Warpgate ticket-secret"),
+            ("Authorization", "Bearer x"),
+        ];
+        for (path, values) in upstream_authorization(&headers) {
+            assert_eq!(values, ["Bearer x"], "{path} path, caller sent {headers:?}");
         }
     }
 
