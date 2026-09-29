@@ -923,15 +923,37 @@ mod tests {
         }
     }
 
+    /// A request as the server builds it. poem's `RequestBuilder` leaves
+    /// `original_uri` at `/` whatever the URI, and `gateway_redirect` reads
+    /// `original_uri`.
+    fn served_request(uri: &str, headers: &[(&str, &str)]) -> poem::Request {
+        let mut builder = poem::http::Request::builder().uri(uri);
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let (parts, ()) = builder.body(()).unwrap().into_parts();
+        let req = poem::Request::from_parts(
+            poem::RequestParts::from((
+                parts,
+                poem::web::LocalAddr::default(),
+                poem::web::RemoteAddr::default(),
+                poem::http::uri::Scheme::HTTP,
+            )),
+            poem::Body::empty(),
+        );
+        // Positive control: the address under test is the one the code reads.
+        assert_eq!(req.original_uri().to_string(), uri);
+        req
+    }
+
     /// A ticket in the address of a request sent to the login page is not
     /// carried into the page to return to; the rest of the address is.
     #[test]
     fn gateway_redirect_leaves_a_ticket_out_of_next() {
-        let req = poem::Request::builder()
-            .uri_str("/app?a=1&warpgate-ticket=s3cr3t-ticket-value")
-            .header("accept", BROWSER_ACCEPT)
-            .header("sec-fetch-mode", "navigate")
-            .finish();
+        let req = served_request(
+            "/app?a=1&warpgate-ticket=s3cr3t-ticket-value",
+            &[("accept", BROWSER_ACCEPT), ("sec-fetch-mode", "navigate")],
+        );
         let resp = gateway_redirect(&req);
         assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
         let location = resp
