@@ -68,19 +68,39 @@ impl<E: Endpoint> Middleware<E> for TicketMiddleware {
 /// ticket, rather than served at the ticket-bearing address.
 ///
 /// Only a browser's top-level page load qualifies: a `GET` that says so
-/// explicitly with `Sec-Fetch-Mode: navigate` and is not a protocol upgrade.
-/// A client that does not send `Sec-Fetch-Mode` (curl, scripts, older
-/// browsers) keeps being served directly, since it may not carry the session
-/// cookie across a redirect and would arrive unauthenticated; any other
-/// method would lose its body or change method; a websocket upgrade cannot
-/// be redirected.
+/// explicitly with `Sec-Fetch-Mode: navigate` and `Sec-Fetch-Dest: document`
+/// and is not a protocol upgrade.
+/// A client that does not send those headers (curl, scripts, older browsers)
+/// keeps being served directly, since it may not carry the session cookie
+/// across a redirect and would arrive unauthenticated; a framed page
+/// (`Sec-Fetch-Dest: iframe`) may have its cookie blocked as a third-party
+/// one; any other method would lose its body or change method; a websocket
+/// upgrade cannot be redirected.
+///
+/// The path must also be one the redirect can only lead back to this origin
+/// (see [`is_same_origin_path`]); anything else is served in place.
 fn should_redirect_to_clean_address(req: &Request) -> bool {
+    let header_is = |name: &str, expected: &str| {
+        req.headers()
+            .get(name)
+            .is_some_and(|value| value == expected)
+    };
     req.method() == Method::GET
-        && req
-            .headers()
-            .get("sec-fetch-mode")
-            .is_some_and(|mode| mode == "navigate")
+        && header_is("sec-fetch-mode", "navigate")
+        && header_is("sec-fetch-dest", "document")
         && !req.headers().contains_key(header::UPGRADE)
+        && is_same_origin_path(req.original_uri().path())
+}
+
+/// True for a path that, used as a `Location`, a browser resolves on the
+/// current origin: one that starts with a single `/`. A path starting `//`
+/// is read as a scheme-relative address on another host, and so is one
+/// starting `/\`, since browsers treat `\` as `/` in http(s) addresses. The
+/// path is used exactly as it arrived, never percent-decoded, so an encoded
+/// `/%2F` or `/%5C` stays a path segment on this origin.
+fn is_same_origin_path(path: &str) -> bool {
+    let mut chars = path.chars();
+    chars.next() == Some('/') && !matches!(chars.next(), Some('/' | '\\'))
 }
 
 /// Stops the browser sending the address of the page this response belongs
@@ -213,25 +233,85 @@ mod tests {
 
     const BROWSER_ACCEPT: &str = "text/html,application/xhtml+xml,*/*;q=0.8";
 
-    fn request(method: Method, headers: &[(&str, &str)]) -> Request {
-        let mut builder = Request::builder()
-            .method(method)
-            .uri_str("/app?a=1&warpgate-ticket=s3cr3t-ticket-value&b=two%20words");
+    /// A request as the server builds it. poem's `RequestBuilder` leaves
+    /// `original_uri` at `/` whatever the URI, and the redirect reads
+    /// `original_uri`.
+    fn served_request(method: Method, uri: &str, headers: &[(&str, &str)]) -> Request {
+        let mut builder = poem::http::Request::builder().method(method).uri(uri);
         for (name, value) in headers {
             builder = builder.header(*name, *value);
         }
-        builder.finish()
+        let (parts, ()) = builder.body(()).unwrap().into_parts();
+        let req = Request::from_parts(
+            poem::RequestParts::from((
+                parts,
+                poem::web::LocalAddr::default(),
+                poem::web::RemoteAddr::default(),
+                poem::http::uri::Scheme::HTTP,
+            )),
+            poem::Body::empty(),
+        );
+        // Positive control: the address under test is the one the code reads.
+        assert_eq!(req.original_uri().to_string(), uri);
+        req
     }
 
-    /// A browser's page load, which says so with `Sec-Fetch-Mode: navigate`,
-    /// is redirected to the clean address.
+    fn request(method: Method, headers: &[(&str, &str)]) -> Request {
+        served_request(
+            method,
+            "/app?a=1&warpgate-ticket=s3cr3t-ticket-value&b=two%20words",
+            headers,
+        )
+    }
+
+    const PAGE_LOAD: &[(&str, &str)] = &[
+        ("accept", BROWSER_ACCEPT),
+        ("sec-fetch-mode", "navigate"),
+        ("sec-fetch-dest", "document"),
+    ];
+
+    /// A browser's top-level page load, which says so with `Sec-Fetch-Mode:
+    /// navigate` and `Sec-Fetch-Dest: document`, is redirected to the clean
+    /// address.
     #[test]
     fn a_page_load_is_redirected_to_the_clean_address() {
-        let req = request(
-            Method::GET,
-            &[("accept", BROWSER_ACCEPT), ("sec-fetch-mode", "navigate")],
-        );
+        let req = request(Method::GET, PAGE_LOAD);
         assert!(should_redirect_to_clean_address(&req));
+    }
+
+    /// A page load whose path a browser would read as another host (`//` or
+    /// `/\` at the start) is never redirected: served in place, it cannot
+    /// send the visitor off-site. An encoded slash or backslash stays a path
+    /// segment on this origin, since the path is never decoded, and is
+    /// redirected with the path unchanged.
+    #[test]
+    fn a_path_naming_another_host_is_not_redirected() {
+        for path in [
+            "//evil.example/?warpgate-ticket=s",
+            "//evil.example/x?a=1&warpgate-ticket=s",
+            "///evil.example/?warpgate-ticket=s",
+            "/\\evil.example/?warpgate-ticket=s",
+            "/\\/evil.example/?warpgate-ticket=s",
+        ] {
+            let req = served_request(Method::GET, path, PAGE_LOAD);
+            assert!(!should_redirect_to_clean_address(&req), "{path}");
+        }
+
+        for (path, location) in [
+            ("/%2Fevil.example/?warpgate-ticket=s", "/%2Fevil.example/"),
+            ("/%5Cevil.example/?warpgate-ticket=s", "/%5Cevil.example/"),
+            ("/%2f%2fevil.example/?warpgate-ticket=s", "/%2f%2fevil.example/"),
+        ] {
+            let req = served_request(Method::GET, path, PAGE_LOAD);
+            assert!(should_redirect_to_clean_address(&req), "{path}");
+            assert_eq!(
+                clean_address_redirect(&req)
+                    .headers()
+                    .get(header::LOCATION)
+                    .unwrap(),
+                location
+            );
+        }
     }
 
     /// Anything that is not an explicit page load is served where it is: a
@@ -242,20 +322,28 @@ mod tests {
         for (method, headers) in [
             (Method::GET, &[("accept", BROWSER_ACCEPT)][..]),
             (Method::GET, &[("accept", "*/*")]),
-            (Method::GET, &[("sec-fetch-mode", "cors")]),
-            (Method::GET, &[("sec-fetch-mode", "no-cors")]),
             (
-                Method::POST,
-                &[("accept", BROWSER_ACCEPT), ("sec-fetch-mode", "navigate")],
-            ),
-            (
-                Method::HEAD,
+                Method::GET,
                 &[("accept", BROWSER_ACCEPT), ("sec-fetch-mode", "navigate")],
             ),
             (
                 Method::GET,
+                &[("sec-fetch-mode", "navigate"), ("sec-fetch-dest", "iframe")],
+            ),
+            (
+                Method::GET,
+                &[("sec-fetch-mode", "navigate"), ("sec-fetch-dest", "frame")],
+            ),
+            (Method::GET, &[("sec-fetch-dest", "document")]),
+            (Method::GET, &[("sec-fetch-mode", "cors")]),
+            (Method::GET, &[("sec-fetch-mode", "no-cors")]),
+            (Method::POST, PAGE_LOAD),
+            (Method::HEAD, PAGE_LOAD),
+            (
+                Method::GET,
                 &[
                     ("sec-fetch-mode", "navigate"),
+                    ("sec-fetch-dest", "document"),
                     ("connection", "upgrade"),
                     ("upgrade", "websocket"),
                 ],
@@ -287,9 +375,8 @@ mod tests {
             "no-referrer"
         );
 
-        let only_ticket = Request::builder()
-            .uri_str("/?warpgate-ticket=s3cr3t-ticket-value")
-            .finish();
+        let only_ticket =
+            served_request(Method::GET, "/?warpgate-ticket=s3cr3t-ticket-value", &[]);
         assert_eq!(
             clean_address_redirect(&only_ticket)
                 .headers()

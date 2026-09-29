@@ -51,6 +51,15 @@ pub static X_WARPGATE_TOKEN: HeaderName = HeaderName::from_static("x-warpgate-to
 /// the `ServerSession` middleware writes the cookie through this config, and
 /// [`storage_session_id`] reads it back through the same one. `max_age` is
 /// applied at the middleware wiring, where the write happens.
+///
+/// Never make this cookie `SameSite=Strict`. A page opened from a link with a
+/// query ticket (a shared link clicked in another site or an e-mail) is
+/// answered with a redirect that sets this cookie, and the browser follows it
+/// in a navigation that began cross-site, in which it does not send a Strict
+/// cookie: every such link would land unauthenticated, with its ticket
+/// already spent. `CookieHostMiddleware` sets `SameSite=None` on HTTPS;
+/// without an attribute, browsers treat the cookie as `Lax` or `None`, both
+/// of which are sent there.
 pub fn session_cookie_config() -> CookieConfig {
     CookieConfig::default()
         .secure(false)
