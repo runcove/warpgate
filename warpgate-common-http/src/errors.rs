@@ -86,6 +86,7 @@ mod tests {
     use warpgate_common::WarpgateError;
 
     use super::{Method, Uri, render_error, render_errors};
+    use crate::test_log::logged;
 
     const LEAK: &str = "no such table: credentials";
 
@@ -241,5 +242,23 @@ mod tests {
         let page = app.call(browser).await.unwrap();
         assert_eq!(page.content_type(), Some("text/html; charset=utf-8"));
         assert_eq!(page.header("x-content-type-options"), Some("nosniff"));
+    }
+
+    /// An internal error on a request carrying a ticket in its query is
+    /// logged with the ticket's value redacted.
+    #[test]
+    fn an_internal_error_is_logged_without_the_ticket() {
+        const SECRET: &str = "s3cr3t-ticket-value";
+        let uri: Uri = format!("/app?warpgate-ticket={SECRET}").parse().unwrap();
+        let line = logged(|| {
+            let _ = render_error(
+                poem::Error::from_status(StatusCode::INTERNAL_SERVER_ERROR),
+                &Method::GET,
+                &uri,
+                false,
+            );
+        });
+        assert!(line.contains("/app?warpgate-ticket=redacted"), "{line}");
+        assert!(!line.contains(SECRET), "{line}");
     }
 }
