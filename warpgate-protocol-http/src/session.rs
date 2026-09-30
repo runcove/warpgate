@@ -54,7 +54,8 @@ pub struct SessionStore {
 }
 
 /// A server handle vetted against the request's own authorization: minted only
-/// by [`SessionStore::handle_for_request`], after the user check every branch
+/// by [`SessionStore::handle_for_request`] (or its login-path variant
+/// [`SessionStore::handle_for_login`]), after the user check every branch
 /// runs. Request-serving code takes this instead of a bare handle, so a new
 /// code path cannot skip the check.
 pub struct UserBoundHandle(Arc<Mutex<WarpgateServerHandle>>);
@@ -65,6 +66,29 @@ impl std::ops::Deref for UserBoundHandle {
     fn deref(&self) -> &Self::Target {
         &self.0
     }
+}
+
+/// Why the cookie's session cannot serve the request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refusal {
+    /// The session is attributed to a user other than the cookie's
+    /// authorization (or the cookie carries none).
+    OtherUser,
+    /// The session is gone or ended, but the cookie still carries an
+    /// authorization issued under it.
+    EndedWithAuth,
+}
+
+enum Resolved {
+    Handle(UserBoundHandle),
+    Refused(Refusal),
+}
+
+enum Adoption {
+    Adopted(Arc<Mutex<WarpgateServerHandle>>),
+    /// The row is gone, ended or not a cookie-backed HTTP session.
+    Gone,
+    OtherUser,
 }
 
 /// The user the request's browser session is authorized as, if any.
@@ -115,6 +139,77 @@ impl SessionStore {
         req: &Request,
         ctx: &UnauthenticatedRequestContext,
     ) -> poem::Result<UserBoundHandle> {
+        match self.resolve_handle(req, ctx).await? {
+            Resolved::Handle(handle) => Ok(handle),
+            Resolved::Refused(refusal) => {
+                if refusal == Refusal::EndedWithAuth {
+                    // The cookie names a session that is gone or ended. If it
+                    // also carries an authorization, that authorization was
+                    // issued under the ended session: deleting the stored
+                    // browser sessions is what makes an administrative close
+                    // cluster-wide, but a request already in flight when that
+                    // happened writes its copy back afterwards, so a revoked
+                    // cookie can outlive the close. Registering a replacement
+                    // session would hand it a fresh login and undo the close,
+                    // so the browser session is dropped instead and the caller
+                    // has to authenticate again.
+                    <&Session>::from_request_without_body(req).await?.purge();
+                }
+                Err(poem::Error::from_status(
+                    poem::http::StatusCode::UNAUTHORIZED,
+                ))
+            }
+        }
+    }
+
+    /// [`Self::handle_for_request`] for the login entry points (SSO start, SSO
+    /// return, password and OTP submission), which are where a browser holding
+    /// a stale cookie goes to get a working one.
+    ///
+    /// Where [`Self::handle_for_request`] refuses the cookie's session — it is
+    /// attributed to a user other than the cookie's authorization, or it is
+    /// gone or ended while the cookie still carries an authorization — this
+    /// discards the browser session's contents and registers a fresh,
+    /// unauthenticated session in its place, so the login can proceed. The
+    /// refusal is an error, and an error skips the session middleware's
+    /// write-back, so without this the stale cookie would come back unchanged
+    /// and be refused again on every attempt.
+    ///
+    /// Security invariant: the refusal of an ended session's authorization is
+    /// what keeps a revoked cookie from regaining it after an administrative
+    /// close. The replacement carries nothing from the old browser session —
+    /// no authorization, no session id — so the caller holds no login until
+    /// it completes the IdP or password login again.
+    pub async fn handle_for_login(
+        &mut self,
+        req: &Request,
+        ctx: &UnauthenticatedRequestContext,
+    ) -> poem::Result<UserBoundHandle> {
+        match self.resolve_handle(req, ctx).await? {
+            Resolved::Handle(handle) => Ok(handle),
+            Resolved::Refused(refusal) => {
+                let session = <&Session>::from_request_without_body(req).await?;
+                info!(
+                    ?refusal,
+                    "Replacing a stale browser session at a login entry point"
+                );
+                // `clear`, not `purge`: a purged session ignores every later
+                // write, so the replacement's session id would be dropped and
+                // the cookie removed. A cleared one is marked changed and is
+                // written back under the same cookie id — which also survives
+                // a forwarded request, whose own cookie changes never reach
+                // the browser — with only the replacement's entries.
+                session.clear();
+                Ok(UserBoundHandle(self.create_handle_for(req, ctx).await?))
+            }
+        }
+    }
+
+    async fn resolve_handle(
+        &mut self,
+        req: &Request,
+        ctx: &UnauthenticatedRequestContext,
+    ) -> poem::Result<Resolved> {
         let session = <&Session>::from_request_without_body(req).await?;
 
         // A header-borne ticket has no cookie to resolve, so it is recognised
@@ -128,9 +223,11 @@ impl SessionStore {
                 .and_then(|id| self.sessions.get_mut(&id))
             {
                 entry.last_activity = Instant::now();
-                return Ok(UserBoundHandle(entry.handle.clone()));
+                return Ok(Resolved::Handle(UserBoundHandle(entry.handle.clone())));
             }
-            return Ok(UserBoundHandle(self.create_handle_for(req, ctx).await?));
+            return Ok(Resolved::Handle(UserBoundHandle(
+                self.create_handle_for(req, ctx).await?,
+            )));
         }
 
         if let Some(handle) = self.handle_for(session) {
@@ -147,36 +244,28 @@ impl SessionStore {
                 .as_ref()
                 .map(|user| user.id);
             if state_user_id.is_some() && state_user_id != request_auth_user_id(session) {
-                return Err(poem::Error::from_status(
-                    poem::http::StatusCode::UNAUTHORIZED,
-                ));
+                return Ok(Resolved::Refused(Refusal::OtherUser));
             }
-            return Ok(UserBoundHandle(handle));
+            return Ok(Resolved::Handle(UserBoundHandle(handle)));
         }
         if let Some(id) = session.get_session_id() {
-            if let Some(handle) = self.adopt_handle_for(req, ctx, id).await? {
-                return Ok(UserBoundHandle(handle));
+            match self.adopt_handle_for(req, ctx, id).await? {
+                Adoption::Adopted(handle) => {
+                    return Ok(Resolved::Handle(UserBoundHandle(handle)));
+                }
+                Adoption::OtherUser => return Ok(Resolved::Refused(Refusal::OtherUser)),
+                Adoption::Gone => {}
             }
-            // The cookie names a session that is gone or ended. If it also
-            // carries an authorization, that authorization was issued under
-            // the ended session: deleting the stored browser sessions is what
-            // makes an administrative close cluster-wide, but a request
-            // already in flight when that happened writes its copy back
-            // afterwards, so a revoked cookie can outlive the close.
-            // Registering a replacement session would hand it a fresh login
-            // and undo the close, so the browser session is dropped instead
-            // and the caller has to authenticate again.
             if request_auth_user_id(session).is_some() {
-                session.purge();
-                return Err(poem::Error::from_status(
-                    poem::http::StatusCode::UNAUTHORIZED,
-                ));
+                return Ok(Resolved::Refused(Refusal::EndedWithAuth));
             }
             // Unauthenticated, so there is no authority to carry over and
             // nothing to undo — the id is a leftover (its session reaped while
             // the cookie lived on) and this is someone arriving to log in.
         }
-        Ok(UserBoundHandle(self.create_handle_for(req, ctx).await?))
+        Ok(Resolved::Handle(UserBoundHandle(
+            self.create_handle_for(req, ctx).await?,
+        )))
     }
 
     async fn create_handle_for(
@@ -216,9 +305,9 @@ impl SessionStore {
         req: &Request,
         ctx: &UnauthenticatedRequestContext,
         id: UserSessionId,
-    ) -> poem::Result<Option<Arc<Mutex<WarpgateServerHandle>>>> {
+    ) -> poem::Result<Adoption> {
         if let Some(entry) = self.sessions.get(&id) {
-            return Ok(Some(entry.handle.clone()));
+            return Ok(Adoption::Adopted(entry.handle.clone()));
         }
 
         let session = <&Session>::from_request_without_body(req).await?;
@@ -235,12 +324,10 @@ impl SessionStore {
                     && row.protocol == PROTOCOL_NAME.to_string()
             })
         else {
-            return Ok(None);
+            return Ok(Adoption::Gone);
         };
         if row.user_id != request_auth_user_id(session) {
-            return Err(poem::Error::from_status(
-                poem::http::StatusCode::UNAUTHORIZED,
-            ));
+            return Ok(Adoption::OtherUser);
         }
 
         let (session_handle, session_handle_rx) = HttpSessionHandle::new();
@@ -252,7 +339,7 @@ impl SessionStore {
         )
         .await;
         self.install_entry(req, ctx, id, server_handle.clone(), session_handle_rx)?;
-        Ok(Some(server_handle))
+        Ok(Adoption::Adopted(server_handle))
     }
 
     /// With `http.client_ip_header` set, the session records the address from
@@ -489,5 +576,280 @@ mod tests {
             now,
             Duration::from_secs(1)
         ));
+    }
+}
+
+#[cfg(test)]
+mod stale_cookie_login_tests {
+    //! A browser whose cookie names a session the store refuses — attributed
+    //! to another user, or gone while the cookie still carries a login — gets
+    //! a fresh, unauthenticated session at a login entry point, and keeps it:
+    //! the refusal is an error, which the session middleware does not write
+    //! back, so unless the login path replaces the session itself the same
+    //! cookie is refused on every attempt. Anywhere else the refusal stands.
+    use std::path::PathBuf;
+
+    use poem::session::{CookieConfig, MemoryStorage, ServerSession};
+    use poem::test::{TestClient, TestResponse};
+    use poem::web::Data;
+    use poem::{Endpoint, EndpointExt, Route, get, handler};
+    use sea_orm::sea_query::Expr;
+    use sea_orm::{ColumnTrait, Database, QueryFilter};
+    use time::OffsetDateTime;
+    use warpgate_common::auth::AuthStateUserInfo;
+    use warpgate_common::{GlobalParams, WarpgateConfig, WarpgateConfigStore};
+    use warpgate_core::cluster::Cluster;
+    use warpgate_core::login_protection::LoginProtectionService;
+    use warpgate_core::rate_limiting::RateLimiterRegistry;
+    use warpgate_core::recordings::SessionRecordings;
+    use warpgate_core::{ApprovalRequestSink, AuthStateStore, DatabaseConfigProvider, Services};
+
+    use super::*;
+
+    const ALICE: Uuid = Uuid::from_u128(1);
+    const BOB: Uuid = Uuid::from_u128(2);
+
+    async fn services() -> Services {
+        warpgate_db_entities::Parameters::set_config_migration_values(
+            warpgate_db_entities::Parameters::ConfigMigrationValues::default(),
+        );
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        warpgate_db_migrations::migrate_database(&db).await.unwrap();
+        let params = GlobalParams::new(PathBuf::from("/warpgate.yaml"), false).unwrap();
+        let rate_limiter_registry = Arc::new(Mutex::new(RateLimiterRegistry::new(db.clone())));
+        let cluster = Arc::new(Cluster::new(db.clone(), 0).await.unwrap());
+        Services {
+            db: db.clone(),
+            recordings: Arc::new(SessionRecordings::new(db.clone(), &params)),
+            config: Arc::new(Mutex::new(WarpgateConfig {
+                store: WarpgateConfigStore::default(),
+            })),
+            state: State::new(&db, &rate_limiter_registry, cluster.node_id),
+            cluster: cluster.clone(),
+            rate_limiter_registry,
+            config_provider: Arc::new(DatabaseConfigProvider::new(&db).into()),
+            auth_state_store: Arc::new(Mutex::new(AuthStateStore::new(ApprovalRequestSink {
+                db: db.clone(),
+                cluster,
+            }))),
+            admin_token: Arc::new(None),
+            login_protection: Arc::new(LoginProtectionService::new(db.clone()).await.unwrap()),
+            global_params: Arc::new(params),
+            listener_status: Default::default(),
+        }
+    }
+
+    type Store = Arc<Mutex<SessionStore>>;
+
+    /// What the resolved session looks like: its user session id and the
+    /// login the browser session carries.
+    fn describe(id: UserSessionId, session: &Session) -> String {
+        let user = match session.get_auth() {
+            Some(SessionAuthorization::User { username, .. }) => username,
+            Some(SessionAuthorization::Ticket { username, .. }) => format!("ticket:{username}"),
+            None => "nobody".into(),
+        };
+        format!("{id} {user}")
+    }
+
+    /// A login entry point: resolves the session the way SSO start, SSO
+    /// return and password/OTP submission do.
+    #[handler]
+    async fn login_entry(
+        req: &Request,
+        session: &Session,
+        ctx: Data<&UnauthenticatedRequestContext>,
+    ) -> poem::Result<String> {
+        let id = crate::common::session_id_for_login(req, ctx.0)
+            .await
+            .map_err(poem::Error::from)?;
+        Ok(describe(id, session))
+    }
+
+    /// Any other caller of the store, such as the catchall.
+    #[handler]
+    async fn other_entry(
+        req: &Request,
+        session: &Session,
+        store: Data<&Store>,
+        ctx: Data<&UnauthenticatedRequestContext>,
+    ) -> poem::Result<String> {
+        let handle = store.lock().await.handle_for_request(req, ctx.0).await?;
+        let id = handle.lock().await.user_session_id();
+        Ok(describe(id, session))
+    }
+
+    /// Case (1): a live session attributed to alice, behind a cookie that is
+    /// logged in as bob.
+    #[handler]
+    async fn seed_other_user(
+        req: &Request,
+        session: &Session,
+        store: Data<&Store>,
+        ctx: Data<&UnauthenticatedRequestContext>,
+    ) -> poem::Result<String> {
+        let handle = store.lock().await.handle_for_request(req, ctx.0).await?;
+        handle
+            .lock()
+            .await
+            .set_user_info(AuthStateUserInfo {
+                id: ALICE,
+                username: "alice".into(),
+            })
+            .await?;
+        session.set_auth(SessionAuthorization::User {
+            user_id: BOB,
+            username: "bob".into(),
+        });
+        let id = handle.lock().await.user_session_id();
+        Ok(describe(id, session))
+    }
+
+    /// Case (2): a cookie logged in as alice that names a user session that
+    /// no longer exists (closed and reaped, or never on this cluster).
+    #[handler]
+    fn seed_gone_with_auth(session: &Session) -> String {
+        let gone = UserSessionId(Uuid::new_v4());
+        session.set(SESSION_ID_SESSION_KEY, gone);
+        session.set_auth(SessionAuthorization::User {
+            user_id: ALICE,
+            username: "alice".into(),
+        });
+        describe(gone, session)
+    }
+
+    /// Case (2) as an administrative close leaves it: alice's session, ended
+    /// in the database and dropped from this node, behind her logged-in
+    /// cookie.
+    #[handler]
+    async fn seed_ended_with_auth(
+        req: &Request,
+        session: &Session,
+        store: Data<&Store>,
+        ctx: Data<&UnauthenticatedRequestContext>,
+    ) -> poem::Result<String> {
+        let mut store = store.lock().await;
+        let handle = store.handle_for_request(req, ctx.0).await?;
+        let alice = AuthStateUserInfo {
+            id: ALICE,
+            username: "alice".into(),
+        };
+        handle.lock().await.set_user_info(alice).await?;
+        session.set_auth(SessionAuthorization::User {
+            user_id: ALICE,
+            username: "alice".into(),
+        });
+        let id = handle.lock().await.user_session_id();
+        drop(handle);
+        UserSession::Entity::update_many()
+            .col_expr(
+                UserSession::Column::Ended,
+                Expr::value(OffsetDateTime::now_utc()),
+            )
+            .filter(UserSession::Column::Id.eq(id))
+            .exec(&ctx.services().db)
+            .await
+            .map_err(WarpgateError::from)?;
+        store.remove_session_by_id(id);
+        Ok(describe(id, session))
+    }
+
+    async fn app() -> impl Endpoint {
+        let ctx = UnauthenticatedRequestContext::new(services().await).await;
+        let store: Store = SessionStore::new();
+        Route::new()
+            .at("/login", get(login_entry))
+            .at("/other", get(other_entry))
+            .at("/seed/other-user", get(seed_other_user))
+            .at("/seed/gone-with-auth", get(seed_gone_with_auth))
+            .at("/seed/ended-with-auth", get(seed_ended_with_auth))
+            .data(store)
+            .data(ctx)
+            .with(ServerSession::new(
+                CookieConfig::default(),
+                MemoryStorage::new(),
+            ))
+    }
+
+    fn cookie_pair(resp: &TestResponse) -> Option<String> {
+        resp.0
+            .headers()
+            .get("set-cookie")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .map(ToOwned::to_owned)
+    }
+
+    /// Runs a seed endpoint; returns its cookie and the stale session's
+    /// description.
+    async fn seed(cli: &TestClient<impl Endpoint>, path: &str) -> (String, String) {
+        let resp = cli.get(path).send().await;
+        resp.assert_status_is_ok();
+        let cookie = cookie_pair(&resp).expect("the seed sets a cookie");
+        (cookie, resp.0.into_body().into_string().await.unwrap())
+    }
+
+    /// Asserts a login-path request on the stale cookie succeeds on a fresh
+    /// session that carries no login, then that the cookie the browser holds
+    /// afterwards resolves to that same replacement.
+    async fn assert_login_replaces_stale_session(path: &str) {
+        let cli = TestClient::new(app().await);
+        let (cookie, stale) = seed(&cli, path).await;
+        let stale_id = stale.split(' ').next().unwrap().to_owned();
+
+        let resp = cli.get("/login").header("cookie", &cookie).send().await;
+        resp.assert_status_is_ok();
+        let cookie = cookie_pair(&resp).unwrap_or(cookie);
+        let first = resp.0.into_body().into_string().await.unwrap();
+        let (fresh_id, user) = first.split_once(' ').unwrap();
+        assert_ne!(fresh_id, stale_id, "the stale session was reused");
+        assert_eq!(user, "nobody", "the replacement kept the old login");
+
+        // The replacement was written back: the browser's cookie now resolves
+        // to it, on the login path and off it.
+        for path in ["/login", "/other"] {
+            let resp = cli.get(path).header("cookie", &cookie).send().await;
+            resp.assert_status_is_ok();
+            resp.assert_text(&first).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn login_replaces_a_session_attributed_to_another_user() {
+        assert_login_replaces_stale_session("/seed/other-user").await;
+    }
+
+    #[tokio::test]
+    async fn login_replaces_a_gone_session_whose_cookie_is_logged_in() {
+        assert_login_replaces_stale_session("/seed/gone-with-auth").await;
+    }
+
+    #[tokio::test]
+    async fn login_replaces_an_ended_session_whose_cookie_is_logged_in() {
+        assert_login_replaces_stale_session("/seed/ended-with-auth").await;
+    }
+
+    /// Off the login path the refusal is unchanged: a logged-in cookie naming
+    /// a gone session is refused, not given a session of its own — the
+    /// administrative close it outlived stays in force.
+    #[tokio::test]
+    async fn other_callers_still_refuse_a_gone_session_whose_cookie_is_logged_in() {
+        for seed_path in ["/seed/gone-with-auth", "/seed/ended-with-auth"] {
+            let cli = TestClient::new(app().await);
+            let (cookie, _) = seed(&cli, seed_path).await;
+            for _ in 0..2 {
+                let resp = cli.get("/other").header("cookie", &cookie).send().await;
+                resp.assert_status(poem::http::StatusCode::UNAUTHORIZED);
+            }
+        }
+    }
+
+    /// Likewise for a live session attributed to another user.
+    #[tokio::test]
+    async fn other_callers_still_refuse_a_session_attributed_to_another_user() {
+        let cli = TestClient::new(app().await);
+        let (cookie, _) = seed(&cli, "/seed/other-user").await;
+        let resp = cli.get("/other").header("cookie", &cookie).send().await;
+        resp.assert_status(poem::http::StatusCode::UNAUTHORIZED);
     }
 }
