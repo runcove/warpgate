@@ -41,7 +41,7 @@ use crate::common::{
     get_or_create_auth_state_for_request, session_id_for_login,
 };
 use crate::session::SessionStore;
-use crate::session_storage::SharedSessionStorage;
+use crate::session_storage::{LoginSnapshot, SharedSessionStorage};
 pub struct Api;
 
 #[derive(Object)]
@@ -716,26 +716,20 @@ where
 {
     let owner = auth_state_owner(ctx, session.get_session_id()).await?;
     let forwarded = matches!(owner, Owner::Remote(_));
-    let authed_before_hop = session.get_auth().is_some();
+    let before_hop = LoginSnapshot::of(session);
     let result = proxy_or_serve_pending_login(ctx, req, owner, body, serve_local).await;
 
     if forwarded {
         // The peer acts on the same browser session - and on success writes the
         // authorization into it - so take its version over the copy this node
-        // has been holding since before the hop.
+        // has been holding since before the hop. If that logged the session
+        // in, the cookie is rotated _here_, since cookies set by a forwarded
+        // request are not passed back to the client.
         let jar = <&CookieJar>::from_request_without_body(req).await?;
         let storage = Data::<&SharedSessionStorage>::from_request_without_body(req).await?;
         storage
-            .adopt_stored(crate::common::storage_session_id(jar), session)
+            .adopt_forwarded_login(crate::common::storage_session_id(jar), session, before_hop)
             .await?;
-
-        if !authed_before_hop && session.get_auth().is_some() {
-            // the forwarded request just got us logged in
-            // now we must rotate the cookie _here_ since cookies set by a forwarded request are not passed back to the client
-            storage
-                .rotate_session_id(crate::common::storage_session_id(jar), session)
-                .await?;
-        }
     }
 
     result
