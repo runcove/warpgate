@@ -149,7 +149,7 @@ pub(crate) async fn start_sso_and_get_auth_url(
     let client = SsoClient::new(provider_config.provider.clone())?;
 
     // Release the global `config` lock before the IdP network round-trip
-    // (`start_login`) and `session_id_for_request` (which locks the SessionStore).
+    // (`start_login`) and `session_id_for_login` (which locks the SessionStore).
     // Both the SSH and HTTP front-ends take this same lock per connection, so
     // holding it across these awaits serializes the whole gateway and wedges it
     // under concurrent SSO load — new SSH handshakes and HTTP requests block on
@@ -176,7 +176,7 @@ pub(crate) async fn start_sso_and_get_auth_url(
     // read-modify-write blob is clobbered by concurrent requests that share the
     // cross-subdomain cookie (the auto-SSO redirect, other subdomain tabs, the
     // SPA's auth-state polls). See `crate::sso_request_store`.
-    let session_id = crate::common::session_id_for_request(req, ctx).await?;
+    let session_id = crate::common::session_id_for_login(req, ctx).await?;
     let sso_store =
         Data::<&crate::sso_request_store::SsoRequestStore<SsoContext>>::from_request_without_body(
             req,

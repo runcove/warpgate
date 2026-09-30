@@ -38,7 +38,7 @@ use super::common::{emit_unknown_authentication_failed_event, logout};
 use crate::api::auth_scheme::AuthedSession;
 use crate::common::{
     SessionExt, authorize_session, get_auth_state_for_request,
-    get_or_create_auth_state_for_request, session_id_for_request,
+    get_or_create_auth_state_for_request, session_id_for_login,
 };
 use crate::session::SessionStore;
 use crate::session_storage::SharedSessionStorage;
@@ -496,7 +496,7 @@ async fn serve_login(
     .await
     {
         Err(WarpgateError::UserNotFound(_)) => {
-            let session_id = session_id_for_request(req, ctx).await?;
+            let session_id = session_id_for_login(req, ctx).await?;
             emit_unknown_authentication_failed_event(
                 session_id,
                 client_ip,
@@ -509,7 +509,7 @@ async fn serve_login(
             )));
         }
         Err(WarpgateError::IpAddrNotAllowed(..)) => {
-            let session_id = session_id_for_request(req, ctx).await?;
+            let session_id = session_id_for_login(req, ctx).await?;
             emit_unknown_authentication_failed_event(
                 session_id,
                 client_ip,

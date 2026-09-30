@@ -109,7 +109,7 @@ pub trait SessionExt {
     fn get_auth(&self) -> Option<SessionAuthorization>;
     fn set_auth(&self, auth: SessionAuthorization);
     /// The Warpgate session id of this browser session, once one has been
-    /// registered for it. Unlike [`session_id_for_request`] this never creates
+    /// registered for it. Unlike [`session_id_for_login`] this never creates
     /// one.
     fn get_session_id(&self) -> Option<UserSessionId>;
 
@@ -617,8 +617,9 @@ pub async fn get_or_create_auth_state_for_request(
 
     // Pass the browser session id so the auth state is keyed by it: a web
     // approval landing on another node resolves the owner from the session's
-    // `node_id` in the DB (see `api::auth::auth_state_owner`).
-    let session_id = session_id_for_request(req, ctx).await?;
+    // `node_id` in the DB (see `api::auth::auth_state_owner`). Every caller is
+    // a login entry point, so a stale cookie is replaced rather than refused.
+    let session_id = session_id_for_login(req, ctx).await?;
 
     let state = ctx
         .services()
@@ -663,7 +664,13 @@ pub async fn get_auth_state_for_request(
         .get(&session_id))
 }
 
-pub async fn session_id_for_request(
+/// The Warpgate session id of this browser session, registering one if
+/// needed, for the login entry points (SSO start, SSO return, password and OTP
+/// submission) — its only callers. A cookie whose session is refused as stale
+/// is replaced by a fresh, unauthenticated session instead of failing the
+/// request: see [`SessionStore::handle_for_login`] for why and for the security
+/// invariant it keeps.
+pub async fn session_id_for_login(
     req: &Request,
     ctx: &UnauthenticatedRequestContext,
 ) -> Result<UserSessionId, WarpgateError> {
@@ -674,7 +681,7 @@ pub async fn session_id_for_request(
     let server_handle = session_middleware
         .lock()
         .await
-        .handle_for_request(req, ctx)
+        .handle_for_login(req, ctx)
         .await
         .context("creating session handle")?;
 

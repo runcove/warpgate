@@ -26,7 +26,7 @@ use crate::SsoLoginState;
 use crate::api::auth_scheme::AuthedSession;
 use crate::api::common::{emit_unknown_authentication_failed_event, logout};
 use crate::common::{
-    SessionExt, authorize_session, get_or_create_auth_state_for_request, session_id_for_request,
+    SessionExt, authorize_session, get_or_create_auth_state_for_request, session_id_for_login,
 };
 use crate::session::SessionStore;
 use crate::step_up::StepUpSessionExt;
@@ -278,7 +278,7 @@ impl Api {
         // `state`, bound to this session (see `crate::sso_request_store`) —
         // NOT from the Poem session, which loses it under concurrency and is
         // exactly what caused spurious "Invalid SSO state parameter" failures.
-        let session_id = session_id_for_request(req, ctx.0).await?;
+        let session_id = session_id_for_login(req, ctx.0).await?;
         let Some(context) = sso_store.take(state, &session_id).await else {
             return Ok(Err("Not in an active SSO process".to_string()));
         };
@@ -341,7 +341,7 @@ impl Api {
             )
             .await?;
         let Some(username) = username else {
-            let session_id = session_id_for_request(req, &ctx).await?;
+            let session_id = session_id_for_login(req, &ctx).await?;
             emit_unknown_authentication_failed_event(
                 session_id,
                 client_ip,
@@ -357,7 +357,7 @@ impl Api {
             Ok(state) => state,
             Err(e) => {
                 if matches!(e, WarpgateError::IpAddrNotAllowed(..)) {
-                    let session_id = session_id_for_request(req, &ctx).await?;
+                    let session_id = session_id_for_login(req, &ctx).await?;
                     emit_unknown_authentication_failed_event(
                         session_id,
                         client_ip,
