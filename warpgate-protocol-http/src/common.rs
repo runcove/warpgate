@@ -213,9 +213,11 @@ pub async fn _inner_auth<E: Endpoint + 'static>(
                 // A full logout rather than dropping only the auth claim: on
                 // 0.29.1 the browser session's server handle stays attributed
                 // to this user, and a cookie that no longer names the user is
-                // refused (401) by `SessionStore::handle_for_request` - which
-                // would block the very re-login this is asking for. SSO
-                // handshakes in flight live outside the Poem session, so
+                // refused (401) by `SessionStore::handle_for_request` on every
+                // route off the login path. The login entry points would
+                // replace such a session (`SessionStore::handle_for_login`),
+                // but the logout leaves nothing stale to refuse or replace.
+                // SSO handshakes in flight live outside the Poem session, so
                 // nothing the re-login needs is lost.
                 let session_middleware =
                     Data::<&Arc<Mutex<SessionStore>>>::from_request_without_body(&req).await?;

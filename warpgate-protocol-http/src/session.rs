@@ -7,7 +7,7 @@ use poem::web::RemoteAddr;
 use poem::{FromRequest, Request};
 use sea_orm::{DatabaseConnection, EntityTrait};
 use tokio::sync::{Mutex, broadcast, mpsc};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 use warpgate_common::{UserSessionId, WarpgateError};
 use warpgate_common_http::auth::UnauthenticatedRequestContext;
@@ -177,9 +177,26 @@ impl SessionStore {
     ///
     /// Security invariant: the refusal of an ended session's authorization is
     /// what keeps a revoked cookie from regaining it after an administrative
-    /// close. The replacement carries nothing from the old browser session —
-    /// no authorization, no session id — so the caller holds no login until
-    /// it completes the IdP or password login again.
+    /// close. The replacement carries none of the old browser session's
+    /// entries — no authorization, no user session id — so the caller holds
+    /// no login until it completes the IdP or password login again. The
+    /// cookie's storage id is deliberately kept, so the write-back reaches the
+    /// browser even from a forwarded request; the login that completes on it
+    /// rotates that id, like every completed login (`authorize_session` on the
+    /// first hop, `SharedSessionStorage::adopt_forwarded_login` after a
+    /// forwarded step).
+    ///
+    /// Known limitations, all failing safe:
+    /// - A password login that finds an in-progress auth state still keyed by
+    ///   the stale session id (they live until the auth state store's vacuum)
+    ///   reuses it and never gets here, so it still ends refused, as before,
+    ///   until that state ages out.
+    /// - Concurrent login entries on one stale cookie each register a
+    ///   replacement and the last write-back wins; an SSO handshake bound to
+    ///   a losing replacement fails at its return and has to be retried.
+    /// - If the SSO return fails after replacing the session, the replacement
+    ///   is not written back: the browser keeps the stale cookie, and the
+    ///   unused replacement is ended by the orphan sweep.
     pub async fn handle_for_login(
         &mut self,
         req: &Request,
@@ -189,10 +206,7 @@ impl SessionStore {
             Resolved::Handle(handle) => Ok(handle),
             Resolved::Refused(refusal) => {
                 let session = <&Session>::from_request_without_body(req).await?;
-                info!(
-                    ?refusal,
-                    "Replacing a stale browser session at a login entry point"
-                );
+                let old_session_id = session.get_session_id();
                 // `clear`, not `purge`: a purged session ignores every later
                 // write, so the replacement's session id would be dropped and
                 // the cookie removed. A cleared one is marked changed and is
@@ -200,7 +214,25 @@ impl SessionStore {
                 // a forwarded request, whose own cookie changes never reach
                 // the browser — with only the replacement's entries.
                 session.clear();
-                Ok(UserBoundHandle(self.create_handle_for(req, ctx).await?))
+                let handle = self.create_handle_for(req, ctx).await?;
+                let new_session_id = session.get_session_id();
+                match refusal {
+                    // A cookie authorized as one user naming another user's
+                    // session is an inconsistency worth an operator's look.
+                    Refusal::OtherUser => warn!(
+                        ?refusal,
+                        ?old_session_id,
+                        ?new_session_id,
+                        "Replacing a browser session attributed to another user at login"
+                    ),
+                    Refusal::EndedWithAuth => info!(
+                        ?refusal,
+                        ?old_session_id,
+                        ?new_session_id,
+                        "Replacing a stale browser session at a login entry point"
+                    ),
+                }
+                Ok(UserBoundHandle(handle))
             }
         }
     }
@@ -589,7 +621,7 @@ mod stale_cookie_login_tests {
     //! cookie is refused on every attempt. Anywhere else the refusal stands.
     use std::path::PathBuf;
 
-    use poem::session::{CookieConfig, MemoryStorage, ServerSession};
+    use poem::session::{CookieConfig, MemoryStorage, ServerSession, SessionStorage};
     use poem::test::{TestClient, TestResponse};
     use poem::web::Data;
     use poem::{Endpoint, EndpointExt, Route, get, handler};
@@ -605,6 +637,7 @@ mod stale_cookie_login_tests {
     use warpgate_core::{ApprovalRequestSink, AuthStateStore, DatabaseConfigProvider, Services};
 
     use super::*;
+    use crate::session_storage::SharedSessionStorage;
 
     const ALICE: Uuid = Uuid::from_u128(1);
     const BOB: Uuid = Uuid::from_u128(2);
@@ -756,6 +789,10 @@ mod stale_cookie_login_tests {
 
     async fn app() -> impl Endpoint {
         let ctx = UnauthenticatedRequestContext::new(services().await).await;
+        app_on(ctx, MemoryStorage::new())
+    }
+
+    fn app_on(ctx: UnauthenticatedRequestContext, storage: impl SessionStorage) -> impl Endpoint {
         let store: Store = SessionStore::new();
         Route::new()
             .at("/login", get(login_entry))
@@ -765,10 +802,7 @@ mod stale_cookie_login_tests {
             .at("/seed/ended-with-auth", get(seed_ended_with_auth))
             .data(store)
             .data(ctx)
-            .with(ServerSession::new(
-                CookieConfig::default(),
-                MemoryStorage::new(),
-            ))
+            .with(ServerSession::new(CookieConfig::default(), storage))
     }
 
     fn cookie_pair(resp: &TestResponse) -> Option<String> {
@@ -799,7 +833,12 @@ mod stale_cookie_login_tests {
 
         let resp = cli.get("/login").header("cookie", &cookie).send().await;
         resp.assert_status_is_ok();
-        let cookie = cookie_pair(&resp).unwrap_or(cookie);
+        // Written back under the same cookie id: a forwarded login's cookie
+        // changes never reach the browser, so a new id would be lost there.
+        assert!(
+            cookie_pair(&resp).is_none(),
+            "the replacement was given a new cookie id"
+        );
         let first = resp.0.into_body().into_string().await.unwrap();
         let (fresh_id, user) = first.split_once(' ').unwrap();
         assert_ne!(fresh_id, stale_id, "the stale session was reused");
@@ -827,6 +866,53 @@ mod stale_cookie_login_tests {
     #[tokio::test]
     async fn login_replaces_an_ended_session_whose_cookie_is_logged_in() {
         assert_login_replaces_stale_session("/seed/ended-with-auth").await;
+    }
+
+    /// On the database-backed storage production uses, the replacement
+    /// updates the browser session's stored row in place: it now names the
+    /// replacement, and it was never removed — removing it would have ended
+    /// the old user session, which it was the only backing of.
+    #[tokio::test]
+    async fn login_replacement_updates_the_stored_browser_session_in_place() {
+        let services = services().await;
+        let db = services.db.clone();
+        let ctx = UnauthenticatedRequestContext::new(services).await;
+        let cli = TestClient::new(app_on(ctx, SharedSessionStorage::new(db.clone())));
+        let (cookie, stale) = seed(&cli, "/seed/other-user").await;
+        let stale_id = UserSessionId(stale.split(' ').next().unwrap().parse().unwrap());
+
+        let resp = cli.get("/login").header("cookie", &cookie).send().await;
+        resp.assert_status_is_ok();
+        assert!(
+            cookie_pair(&resp).is_none(),
+            "the replacement was given a new cookie id"
+        );
+        let first = resp.0.into_body().into_string().await.unwrap();
+        let (fresh_id, user) = first.split_once(' ').unwrap();
+        let fresh_id = UserSessionId(fresh_id.parse().unwrap());
+        assert_ne!(fresh_id, stale_id, "the stale session was reused");
+        assert_eq!(user, "nobody", "the replacement kept the old login");
+
+        let (_, storage_id) = cookie.split_once('=').unwrap();
+        let row = HttpSession::Entity::find_by_id(storage_id.to_owned())
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.user_session_id, Some(fresh_id));
+        let stale_row = UserSession::Entity::find_by_id(stale_id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            stale_row.ended.is_none(),
+            "the browser session's row was removed"
+        );
+
+        let resp = cli.get("/other").header("cookie", &cookie).send().await;
+        resp.assert_status_is_ok();
+        resp.assert_text(&first).await;
     }
 
     /// Off the login path the refusal is unchanged: a logged-in cookie naming
