@@ -915,6 +915,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn removing_an_absent_id_does_not_wait_for_a_concurrent_writer() {
+        let (s, _temp) = file_storage(Duration::from_secs(30)).await;
+
+        let writer = hold_write_lock(&s, HOLD).await;
+        let started = Instant::now();
+        s.remove_session("absent").await.unwrap();
+        let elapsed = started.elapsed();
+        writer.await.unwrap();
+
+        assert!(elapsed < HOLD / 2, "removal waited {elapsed:?}");
+    }
+
+    #[tokio::test]
     async fn gc_waits_for_a_concurrent_writer() {
         let (s, _temp) = file_storage(Duration::from_secs(30)).await;
         HttpSession::Entity::insert(expired_row("orphan"))
