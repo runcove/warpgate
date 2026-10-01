@@ -328,6 +328,26 @@ pub async fn activate_ticket_request(
     request_id: Uuid,
     user_id: Uuid,
 ) -> Result<ActivatedTicket, ActivateTicketRequestError> {
+    let prepared = prepare_activation(db, request_id, user_id).await?;
+    commit_activation(db, prepared).await
+}
+
+/// What an activation read and decided before it writes anything.
+struct PreparedActivation {
+    request: TicketRequest::Model,
+    target: Target::Model,
+    effective_duration: Option<i64>,
+    max_uses: Option<i16>,
+}
+
+/// The reads and checks of an activation, on the plain connection. Two
+/// concurrent activations of one request can both pass them, so they decide
+/// nothing on their own: [`commit_activation`] is what claims the request.
+async fn prepare_activation(
+    db: &sea_orm::DatabaseConnection,
+    request_id: Uuid,
+    user_id: Uuid,
+) -> Result<PreparedActivation, ActivateTicketRequestError> {
     let db_conn = db;
 
     let Some(request) = TicketRequest::Entity::find_by_id(request_id)
@@ -367,7 +387,28 @@ pub async fn activate_ticket_request(
 
     let max_uses = target.ticket_max_uses.or(policy.ticket_max_uses);
 
-    let txn = db_conn.begin().await?;
+    Ok(PreparedActivation {
+        request,
+        target,
+        effective_duration,
+        max_uses,
+    })
+}
+
+/// Mints the ticket and records it on the request, in one transaction.
+async fn commit_activation(
+    db: &sea_orm::DatabaseConnection,
+    prepared: PreparedActivation,
+) -> Result<ActivatedTicket, ActivateTicketRequestError> {
+    let PreparedActivation {
+        request,
+        target,
+        effective_duration,
+        max_uses,
+    } = prepared;
+    let request_id = request.id;
+
+    let txn = db.begin().await?;
 
     let (ticket_id, secret) = insert_self_service_ticket(
         &txn,
@@ -465,4 +506,114 @@ pub async fn delete_ticket(
     txn.commit().await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use sea_orm::Database;
+    use warpgate_db_entities::Parameters::{ConfigMigrationValues, set_config_migration_values};
+    use warpgate_db_entities::Target::TargetKind;
+    use warpgate_db_entities::User;
+    use warpgate_db_migrations::migrate_database;
+
+    use super::*;
+
+    async fn migrated_db() -> sea_orm::DatabaseConnection {
+        set_config_migration_values(ConfigMigrationValues::default());
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        migrate_database(&db).await.unwrap();
+        db
+    }
+
+    /// An approved request that has not been activated: (request id, its user).
+    async fn approved_request(db: &sea_orm::DatabaseConnection) -> (Uuid, Uuid) {
+        let user_id = Uuid::new_v4();
+        User::Entity::insert(User::ActiveModel {
+            id: Set(user_id),
+            username: Set(format!("user-{user_id}")),
+            credential_policy: Set(serde_json::Value::Null),
+            description: Set(String::new()),
+            rate_limit_bytes_per_second: Set(None),
+            ldap_server_id: Set(None),
+            ldap_object_uuid: Set(None),
+            allowed_ip_ranges: Set(serde_json::Value::Null),
+        })
+        .exec(db)
+        .await
+        .unwrap();
+
+        let target_id = Uuid::new_v4();
+        Target::Entity::insert(Target::ActiveModel {
+            id: Set(target_id),
+            name: Set(format!("target-{target_id}")),
+            description: Set(String::new()),
+            kind: Set(TargetKind::Ssh),
+            options: Set(serde_json::Value::Null),
+            rate_limit_bytes_per_second: Set(None),
+            group_id: Set(None),
+            ticket_max_duration_seconds: Set(None),
+            ticket_requests_disabled: Set(false),
+            ticket_require_approval: Set(true),
+            ticket_max_uses: Set(None),
+            require_approval: Set(false),
+        })
+        .exec(db)
+        .await
+        .unwrap();
+
+        let id = Uuid::new_v4();
+        TicketRequest::Entity::insert(TicketRequest::ActiveModel {
+            id: Set(id),
+            user_id: Set(user_id),
+            target_id: Set(target_id),
+            requested_duration_seconds: Set(Some(3600)),
+            description: Set(String::new()),
+            status: Set(TicketRequestStatus::Approved),
+            resolved_by_user_id: Set(None),
+            ticket_id: Set(None),
+            created: Set(OffsetDateTime::now_utc()),
+            resolved_at: Set(Some(OffsetDateTime::now_utc())),
+            deny_reason: Set(None),
+        })
+        .exec(db)
+        .await
+        .unwrap();
+        (id, user_id)
+    }
+
+    /// Two activations of one approved request that both pass their checks
+    /// before either writes - as two concurrent requests can - mint ONE
+    /// ticket between them: the second is refused and leaves nothing behind.
+    /// Driven by hand, phase by phase, so the interleaving is not left to
+    /// timing.
+    #[tokio::test]
+    async fn two_activations_of_one_request_mint_one_ticket() {
+        let db = migrated_db().await;
+        let (request_id, user_id) = approved_request(&db).await;
+
+        let first = prepare_activation(&db, request_id, user_id).await.unwrap();
+        let second = prepare_activation(&db, request_id, user_id).await.unwrap();
+        let won = commit_activation(&db, first).await.unwrap();
+        let lost = commit_activation(&db, second).await;
+
+        assert!(
+            matches!(lost, Err(ActivateTicketRequestError::AlreadyActivated)),
+            "the second activation of one request minted a ticket too"
+        );
+        let tickets = Ticket::Entity::find().all(&db).await.unwrap();
+        assert_eq!(tickets.len(), 1, "the losing activation left its ticket behind");
+        assert_eq!(won.request.ticket_id, Some(tickets[0].id));
+        let stored = TicketRequest::Entity::find_by_id(request_id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.ticket_id, Some(tickets[0].id));
+
+        // And, as before, a later activation is refused at its checks.
+        assert!(matches!(
+            activate_ticket_request(&db, request_id, user_id).await,
+            Err(ActivateTicketRequestError::AlreadyActivated)
+        ));
+    }
 }
