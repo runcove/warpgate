@@ -22,6 +22,7 @@ reqwest = { workspace = true, features = ["json"] }
 sea-orm.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sqlx.workspace = true
 subtle.workspace = true
 thiserror.workspace = true
 time.workspace = true

@@ -234,7 +234,7 @@ impl SharedSessionStorage {
         let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
         while let Some(current) = source {
             if let Some(code) = current
-                .downcast_ref::<sea_orm::sqlx::Error>()
+                .downcast_ref::<sqlx::Error>()
                 .and_then(|error| error.as_database_error())
                 .and_then(|error| error.code())
                 .and_then(|code| code.parse::<i32>().ok())
