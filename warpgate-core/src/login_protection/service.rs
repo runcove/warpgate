@@ -8,7 +8,7 @@ use sea_orm::{
     PaginatorTrait, QueryFilter, Set, TransactionTrait,
 };
 use time::OffsetDateTime;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 use warpgate_common::{Protocol, WarpgateError};
 use warpgate_db_entities::{
@@ -279,7 +279,38 @@ impl LoginProtectionService {
     }
 
     /// Record a failed login attempt; may trigger an IP block or user lockout.
+    ///
+    /// A failure to record is logged here, once, at warn: every caller drops
+    /// the result (`let _ =`) so that a login is never failed by the
+    /// bookkeeping, and without this line an attempt lost to a database
+    /// error would leave no trace while not counting toward any block or
+    /// lockout. The error is still returned; whether a login should fail
+    /// closed when it cannot be counted is a separate decision.
     pub async fn record_failed_attempt(
+        &self,
+        attempt: FailedAttemptInfo,
+    ) -> Result<(), WarpgateError> {
+        let (remote_ip, username, protocol, credential_type) = (
+            attempt.remote_ip,
+            attempt.username.clone(),
+            attempt.protocol,
+            attempt.credential_type.clone(),
+        );
+        let result = self.record_failed_attempt_inner(attempt).await;
+        if let Err(error) = &result {
+            warn!(
+                ip = %remote_ip,
+                username = %username,
+                protocol = %protocol,
+                credential_type = %credential_type,
+                %error,
+                "Failed login attempt could not be recorded; it does not count toward IP blocking or user lockout"
+            );
+        }
+        result
+    }
+
+    async fn record_failed_attempt_inner(
         &self,
         attempt: FailedAttemptInfo,
     ) -> Result<(), WarpgateError> {
