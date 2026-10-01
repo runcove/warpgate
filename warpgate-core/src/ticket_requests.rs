@@ -398,20 +398,33 @@ async fn prepare_activation(
 }
 
 /// Mints the ticket and records it on the request, in one transaction whose
-/// write is its own guard (runcove-ha44m): the request is claimed by
+/// write is its own guard: the request is claimed by
 /// `UPDATE ... SET ticket_id = <new> WHERE id = ? AND user_id = ? AND
 /// status = 'approved' AND ticket_id IS NULL`, and only the activation whose
 /// UPDATE changed the row keeps its ticket. A loser rolls back, which
 /// discards the ticket it minted, and is told the request is already
 /// activated.
 ///
+/// The claim must stay this ONE guarded UPDATE. A check inside the
+/// transaction followed by an unguarded update (`SELECT ... WHERE ticket_id
+/// IS NULL`, then `ActiveModel::update`) is check-then-act again: on
+/// PostgreSQL at READ COMMITTED two transactions both see NULL before
+/// either writes, and both mint a ticket. The test below cannot tell the two
+/// apart, because its commits run one after the other, so this comment is
+/// the only guard against that refactor.
+///
 /// The ticket is inserted first because `ticket_requests.ticket_id`
 /// references it. Two racers then contend only on the one request row: on
 /// PostgreSQL and MySQL the second UPDATE waits for the first to commit and
 /// re-reads the committed row, finding `ticket_id` set, so it changes
-/// nothing; neither holds a lock the other needs, so there is no deadlock.
-/// On SQLite the second transaction's first write waits for the first to
-/// commit, so they run one after the other.
+/// nothing; neither holds a lock the other needs, so two activations cannot
+/// deadlock. On SQLite the second transaction's first write waits for the
+/// first to commit, so they run one after the other. Under a non-default
+/// isolation level (SERIALIZABLE, or PostgreSQL's REPEATABLE READ) the
+/// loser's UPDATE fails with a serialisation error instead, which surfaces
+/// as an internal error rather than AlreadyActivated. That is still safe,
+/// since the transaction rolls back and no ticket is kept; never "fix" it by
+/// retrying the write without the guard.
 async fn commit_activation(
     db: &sea_orm::DatabaseConnection,
     prepared: PreparedActivation,
