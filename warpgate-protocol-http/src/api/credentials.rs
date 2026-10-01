@@ -4,9 +4,10 @@ use poem::{Endpoint, EndpointExt, FromRequest, IntoResponse};
 use poem_openapi::param::Path;
 use poem_openapi::payload::Json;
 use poem_openapi::{ApiResponse, Enum, Object, OpenApi};
+use sea_orm::sea_query::Expr;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, ModelTrait, QueryFilter,
-    QuerySelect, Set, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, DbBackend, EntityTrait,
+    ModelTrait, QueryFilter, QuerySelect, Set, TransactionTrait,
 };
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -260,6 +261,21 @@ async fn delete_own_otp(
     enforced: bool,
 ) -> Result<OtpDeletion, WarpgateError> {
     let tx = db.begin().await?;
+    // On SQLite the `FOR UPDATE` below is dropped, so the transaction would
+    // read first and then fail at once with SQLITE_BUSY when it deletes;
+    // a no-op write first takes the write lock and waits for it instead.
+    // See `SharedSessionStorage::remove_stored_row`. PostgreSQL and MySQL
+    // already lock the rows with the `FOR UPDATE` and are unchanged.
+    if db.get_database_backend() == DbBackend::Sqlite {
+        entities::OtpCredential::Entity::update_many()
+            .col_expr(
+                entities::OtpCredential::Column::Id,
+                Expr::col(entities::OtpCredential::Column::Id).into(),
+            )
+            .filter(entities::OtpCredential::Column::UserId.eq(user.id))
+            .exec(&tx)
+            .await?;
+    }
     let otp_creds = user
         .find_related(entities::OtpCredential::Entity)
         .lock_exclusive()
