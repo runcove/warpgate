@@ -226,9 +226,10 @@ impl Api {
     async fn api_auth_logout(
         &self,
         session: &Session,
+        ctx: Data<&UnauthenticatedRequestContext>,
         session_middleware: Data<&Arc<Mutex<SessionStore>>>,
     ) -> poem::Result<LogoutResponse> {
-        logout(session, &mut *session_middleware.lock().await);
+        logout(session, session_middleware.0, &ctx.services().db).await;
         Ok(LogoutResponse::Success)
     }
 

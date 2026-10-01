@@ -463,8 +463,10 @@ impl Api {
 
         let client = SsoClient::new(provider_config.provider.clone())?;
         let logout_url = client.logout(state.token, return_url).await?;
+        // Not held while the logout waits for the database.
+        drop(config);
 
-        logout(session, &mut *session_middleware.lock().await);
+        logout(session, session_middleware.0, &ctx.services().db).await;
 
         Ok(StartSloResponse::Ok(Json(StartSloResponseParams {
             url: logout_url.to_string(),

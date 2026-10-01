@@ -2,7 +2,8 @@ use poem::session::Session;
 use poem::web::websocket::WebSocket;
 use poem::{Endpoint, EndpointExt, FromRequest, IntoResponse, Response};
 use sea_orm::{DatabaseConnection, EntityTrait};
-use tracing::info;
+use tokio::sync::Mutex;
+use tracing::{error, info};
 use uuid::Uuid;
 use warpgate_admin::api::cluster_proxy::{Owner, forward_websocket};
 use warpgate_common::{Protocol, TargetOptions, UserSessionId, WarpgateError};
@@ -12,6 +13,7 @@ use warpgate_common_http::auth::{
 use warpgate_core::{ConfigProvider, TargetAuthorization, authorize_for_target};
 use warpgate_db_entities as entities;
 
+use crate::common::SessionExt;
 use crate::session::SessionStore;
 
 pub fn emit_unknown_authentication_failed_event(
@@ -35,10 +37,45 @@ pub fn emit_unknown_authentication_failed_event(
     );
 }
 
-pub fn logout(session: &Session, session_middleware: &mut SessionStore) {
-    session_middleware.remove_session(session);
-    session.clear();
+/// Logs the browser session out: ends its login, then purges it, so the
+/// session middleware deletes the stored browser session and clears the
+/// cookie.
+///
+/// This fails closed unless every database write fails. If ending the login
+/// fails, deleting the stored browser session ends it too when that was its
+/// last backing. If the deletion fails, the response is an error and the
+/// browser keeps its cookie, but the login is already ended.
+pub async fn logout(
+    session: &Session,
+    session_middleware: &Mutex<SessionStore>,
+    db: &DatabaseConnection,
+) {
+    end_login(session, session_middleware, db).await;
+    session.purge();
     info!("Logged out");
+}
+
+/// Ends the browser session's login and detaches it from this node, leaving
+/// the browser session's own contents to the caller.
+///
+/// The login is ended first, in its own transaction. Once it is ended, no
+/// node accepts a cookie that still carries its authorization
+/// (`SessionStore::handle_for_request`), and a request still in flight cannot
+/// write the authorization back (`SharedSessionStorage::update_session`).
+/// The store is locked only to detach the session, not while waiting for the
+/// database.
+pub async fn end_login(
+    session: &Session,
+    session_middleware: &Mutex<SessionStore>,
+    db: &DatabaseConnection,
+) {
+    if let Some(id) = session.get_session_id()
+        && let Err(error) =
+            entities::UserSession::mark_ended_including_target_sessions(db, id).await
+    {
+        error!(%error, %id, "Could not end the user session at logout");
+    }
+    session_middleware.lock().await.remove_session(session);
 }
 
 /// Outcome of the checks that guard the in-browser clients. Each endpoint maps
@@ -175,14 +212,13 @@ mod logout_tests {
     use poem::web::Data;
     use poem::{Endpoint, EndpointExt, Request, Route, get, handler};
     use poem_openapi::OpenApiService;
-    use tokio::sync::Mutex;
     use warpgate_common::auth::AuthStateUserInfo;
     use warpgate_common_http::SessionAuthorization;
     use warpgate_common_http::auth::UnauthenticatedRequestContext;
     use warpgate_db_entities::{HttpSession, UserSession};
 
     use super::*;
-    use crate::common::{SESSION_COOKIE_NAME, SessionExt, session_cookie_config};
+    use crate::common::{SESSION_COOKIE_NAME, session_cookie_config};
     use crate::session_storage::SharedSessionStorage;
     use crate::test_db::{file_db, hold_write_lock, memory_db, services};
 

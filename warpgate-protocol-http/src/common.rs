@@ -218,10 +218,16 @@ pub async fn _inner_auth<E: Endpoint + 'static>(
                 // replace such a session (`SessionStore::handle_for_login`),
                 // but the logout leaves nothing stale to refuse or replace.
                 // SSO handshakes in flight live outside the Poem session, so
-                // nothing the re-login needs is lost.
+                // nothing the re-login needs is lost. The login is ended as in
+                // `logout`, but the browser session is cleared, not purged: a
+                // purged session ignores every later write in this request,
+                // and the caller goes on to the login flow.
                 let session_middleware =
                     Data::<&Arc<Mutex<SessionStore>>>::from_request_without_body(&req).await?;
-                crate::api::common::logout(session, &mut *session_middleware.lock().await);
+                crate::api::common::end_login(session, session_middleware.0, &ctx.services().db)
+                    .await;
+                session.clear();
+                info!("Logged out");
                 return Ok(Err(req));
             }
         }
