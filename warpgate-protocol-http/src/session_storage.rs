@@ -256,6 +256,18 @@ impl SharedSessionStorage {
         session_id: &str,
         only_if_expired: Option<(OffsetDateTime, Duration)>,
     ) -> Result<(), WarpgateError> {
+        // The write lock taken below is only worth waiting for when there is
+        // a row to remove: after `rotate_session_id`, poem removes the old id,
+        // whose row is already gone. A row that disappears after this read is
+        // caught by the reads inside the transaction.
+        if self.db.get_database_backend() == DbBackend::Sqlite
+            && HttpSession::Entity::find_by_id(session_id.to_owned())
+                .one(&self.db)
+                .await?
+                .is_none()
+        {
+            return Ok(());
+        }
         let transaction = self.db.begin().await?;
         // On SQLite, a transaction that has read and then writes cannot wait
         // for another writer: the upgrade fails at once with SQLITE_BUSY and
