@@ -203,7 +203,9 @@ pub fn forward_ws_to_session_owner<E: Endpoint + 'static>(
 #[cfg(test)]
 mod logout_tests {
     //! Logging out ends the login everywhere: at once, against a request
-    //! still in flight, and when the database is briefly busy.
+    //! still in flight, when the database is briefly busy, when the IdP's
+    //! single logout cannot run, and at the SSO step-up's forced logout.
+    use std::str::FromStr;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -212,13 +214,18 @@ mod logout_tests {
     use poem::web::Data;
     use poem::{Endpoint, EndpointExt, Request, Route, get, handler};
     use poem_openapi::OpenApiService;
+    use sea_orm::ActiveValue::Set;
+    use time::OffsetDateTime;
+    use warpgate_common::StepUpIntervalConfig;
     use warpgate_common::auth::AuthStateUserInfo;
-    use warpgate_common_http::SessionAuthorization;
     use warpgate_common_http::auth::UnauthenticatedRequestContext;
+    use warpgate_common_http::{RequestAuthorization, SessionAuthorization};
+    use warpgate_core::Services;
     use warpgate_db_entities::{HttpSession, UserSession};
+    use warpgate_sso::WarpgateIdToken;
 
     use super::*;
-    use crate::common::{SESSION_COOKIE_NAME, session_cookie_config};
+    use crate::common::{SESSION_COOKIE_NAME, SsoLoginState, session_cookie_config};
     use crate::session_storage::SharedSessionStorage;
     use crate::test_db::{file_db, hold_write_lock, memory_db, services};
 
@@ -259,14 +266,78 @@ mod logout_tests {
             .map_or_else(|| "nobody".into(), |auth| auth.username().to_owned())
     }
 
-    /// The real logout endpoint behind the session middleware production
+    /// Marks the browser session as an SSO login through `provider`, with an
+    /// unsigned ID token: nothing on the logout path verifies it.
+    #[handler]
+    fn seed_sso_login(session: &Session) {
+        let segment = |json: &str| data_encoding::BASE64URL_NOPAD.encode(json.as_bytes());
+        let token = format!(
+            "{}.{}.{}",
+            segment(r#"{"alg":"RS256"}"#),
+            segment(
+                r#"{"iss":"https://idp.invalid","aud":["warpgate"],"exp":4102444800,"iat":1700000000,"sub":"alice"}"#
+            ),
+            segment("signature"),
+        );
+        session.set_sso_login_state(SsoLoginState {
+            token: WarpgateIdToken::from_str(&token).unwrap(),
+            provider: "removed".into(),
+            supports_single_logout: true,
+        });
+    }
+
+    const AFTER_GATE: &str = "written_after_the_gate";
+
+    /// A route behind the real step-up gate (`_inner_auth`). When the gate
+    /// logs the session out, the request goes on, as `page_auth` does into
+    /// the login flow, and writes to the session.
+    #[handler]
+    fn gated() -> &'static str {
+        "past the gate"
+    }
+
+    async fn step_up_gate<E: Endpoint + 'static>(
+        ep: Arc<E>,
+        mut req: Request,
+    ) -> poem::Result<String> {
+        let session = <&Session>::from_request_without_body(&req).await?.clone();
+        let auth = session
+            .get_auth()
+            .ok_or_else(|| poem::Error::from_status(poem::http::StatusCode::UNAUTHORIZED))?;
+        let ctx = Data::<&UnauthenticatedRequestContext>::from_request_without_body(&req)
+            .await?
+            .to_authenticated(RequestAuthorization::Session(auth));
+        req.set_data(ctx);
+        match crate::common::_inner_auth(ep, req).await? {
+            Ok(_) => Ok("past the gate".into()),
+            Err(_) => {
+                session.set(AFTER_GATE, true);
+                Ok("stepped up".into())
+            }
+        }
+    }
+
+    /// The real logout endpoints behind the session middleware production
     /// uses.
     async fn app(db: DatabaseConnection, storage: SharedSessionStorage) -> impl Endpoint {
-        let ctx = UnauthenticatedRequestContext::new(services(db).await).await;
+        app_with(services(db).await, storage).await
+    }
+
+    async fn app_with(services: Services, storage: SharedSessionStorage) -> impl Endpoint {
+        let ctx = UnauthenticatedRequestContext::new(services).await;
         Route::new()
             .at("/login", get(log_in))
             .at("/whoami", get(whoami))
-            .nest("/api", OpenApiService::new(crate::api::auth::Api, "test", "1.0"))
+            .at("/seed/sso-login", get(seed_sso_login))
+            .at("/gated", get(gated).around(step_up_gate))
+            .nest(
+                "/api",
+                OpenApiService::new(
+                    (crate::api::auth::Api, crate::api::sso_provider_list::Api),
+                    "test",
+                    "1.0",
+                ),
+            )
             .data(SessionStore::new())
             .data(ctx)
             .with(ServerSession::new(session_cookie_config(), storage))
@@ -406,7 +477,10 @@ mod logout_tests {
         resp.assert_status(poem::http::StatusCode::CREATED);
     }
 
-    /// A logout that could not write anything must not report success.
+    /// A logout that could not write anything must not report success. The
+    /// login itself survives here, which is accepted: without a database
+    /// write nothing can end it cluster-wide, and clearing the browser's
+    /// cookie alone is a separate decision.
     #[tokio::test]
     async fn logout_that_cannot_write_is_not_reported_as_success() {
         let (db, _temp) = file_db(Duration::from_millis(200)).await;
@@ -418,5 +492,78 @@ mod logout_tests {
         writer.await.unwrap();
 
         assert!(!resp.0.status().is_success(), "status {}", resp.0.status());
+    }
+
+    /// The login must not depend on its last stored browser session for
+    /// ending: with a second one naming it, removing the logged-out one does
+    /// not end it, so only the logout's own step can.
+    #[tokio::test]
+    async fn logout_ends_a_login_that_has_another_browser_session() {
+        let db = memory_db().await;
+        let cli = TestClient::new(app(db.clone(), SharedSessionStorage::new(db.clone())).await);
+        let login = log_in_as_alice(&cli).await;
+        HttpSession::Entity::insert(HttpSession::ActiveModel {
+            id: Set("another-browser".into()),
+            expires: Set(None),
+            data: Set("{}".into()),
+            updated: Set(OffsetDateTime::now_utc()),
+            user_session_id: Set(Some(login.id)),
+        })
+        .exec(&db)
+        .await
+        .unwrap();
+
+        let resp = cli.post(LOGOUT).header("cookie", &login.cookie).send().await;
+        resp.assert_status(poem::http::StatusCode::CREATED);
+
+        assert!(is_ended(&db, login.id).await, "the login was not ended");
+    }
+
+    /// The SSO logout ends the Warpgate login even when the IdP's single
+    /// logout cannot run, here because the provider is no longer configured.
+    #[tokio::test]
+    async fn sso_logout_ends_the_login_when_the_provider_is_gone() {
+        let db = memory_db().await;
+        let cli = TestClient::new(app(db.clone(), SharedSessionStorage::new(db.clone())).await);
+        let login = log_in_as_alice(&cli).await;
+        cli.get("/seed/sso-login")
+            .header("cookie", &login.cookie)
+            .send()
+            .await
+            .assert_status_is_ok();
+
+        cli.get("/api/sso/logout")
+            .header("cookie", &login.cookie)
+            .header("host", "localhost")
+            .send()
+            .await;
+
+        assert!(is_ended(&db, login.id).await, "the login was not ended");
+    }
+
+    /// The step-up's forced logout ends the login, and keeps the browser
+    /// session writable for the login flow the request goes on to.
+    #[tokio::test]
+    async fn step_up_ends_the_login_and_keeps_later_session_writes() {
+        let db = memory_db().await;
+        let storage = SharedSessionStorage::new(db.clone());
+        let services = services(db.clone()).await;
+        services.config.lock().await.store.step_up_interval = Some(StepUpIntervalConfig {
+            http: Some(Duration::from_secs(3600)),
+            ..Default::default()
+        });
+        let cli = TestClient::new(app_with(services, storage.clone()).await);
+        let login = log_in_as_alice(&cli).await;
+
+        let resp = cli.get("/gated").header("cookie", &login.cookie).send().await;
+        resp.assert_status_is_ok();
+        resp.assert_text("stepped up").await;
+
+        assert!(is_ended(&db, login.id).await, "the login was not ended");
+        let stored = storage.load_session(&login.storage_id).await.unwrap();
+        assert!(
+            stored.is_some_and(|entries| entries.contains_key(AFTER_GATE)),
+            "the write after the gate was lost"
+        );
     }
 }
