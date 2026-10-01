@@ -865,11 +865,11 @@ pub fn api_get_web_auth_requests_stream(
 
 #[cfg(test)]
 mod tests {
-    //! The forwarding node's side of a login step another node owns, driven
-    //! through [`run_login_step`] under the session middleware production uses:
-    //! the step is forwarded to a stand-in peer, which serves it with the
-    //! browser's cookie the way a real peer does and stores the login, and the
-    //! cookie the browser gets back must then be a new one.
+    //! [`run_login_step`] driven under a session middleware over the shared
+    //! table. A step another node owns is forwarded to a stand-in peer, which
+    //! serves it with the browser's cookie the way a real peer does and stores
+    //! the login, and the cookie the browser gets back must then be a new one.
+    //! A step this node owns is served here and its login kept as served.
     use poem::endpoint::BoxEndpoint;
     use poem::session::{ServerSession, SessionStorage};
     use poem::test::{TestClient, TestResponse};
@@ -911,8 +911,10 @@ mod tests {
         id
     }
 
-    /// A node's session middleware over the shared table, as production
-    /// wires it.
+    /// A node's session middleware over the shared table, with the session
+    /// cookie config production uses. Production also gives the cookie a max
+    /// age and its host attributes (`CookieHostMiddleware`), which these tests
+    /// neither add nor assert: they compare cookie values only.
     fn node(routes: Route, storage: SharedSessionStorage) -> impl Endpoint {
         routes
             .data(storage.clone())
@@ -968,6 +970,36 @@ mod tests {
         .await
     }
 
+    /// This node's login step, owned by this node: served here, logging the
+    /// browser session in.
+    #[handler]
+    async fn local_step(req: &Request, session: &Session) -> poem::Result<String> {
+        run_login_step(req, session, Owner::Local, |owner| async move {
+            assert!(matches!(owner, Owner::Local), "the step was not served locally");
+            session.set_auth(SessionAuthorization::User {
+                user_id: ALICE,
+                username: "alice".into(),
+            });
+            Ok("logged in".to_string())
+        })
+        .await
+    }
+
+    /// The browser session stored under the cookie `pair` (`name=id`).
+    async fn stored_session(storage: &SharedSessionStorage, pair: &str) -> Session {
+        let (_, id) = pair.split_once('=').unwrap();
+        let session = Session::default();
+        let entries = storage
+            .load_session(id)
+            .await
+            .unwrap()
+            .expect("no browser session is stored under the cookie");
+        for (key, value) in entries {
+            session.set(&key, value);
+        }
+        session
+    }
+
     #[tokio::test]
     async fn a_forwarded_login_step_rotates_the_cookie_id() {
         let db = db().await;
@@ -995,18 +1027,55 @@ mod tests {
 
         let resp = cli.post("/step").header("cookie", &before).send().await;
         resp.assert_status_is_ok();
-        let after = cookie_pair(&resp).expect("the forwarded login kept its pre-login cookie id");
+        let after = cookie_pair(&resp).expect("no new cookie after the forwarded login");
         assert_ne!(after, before);
 
-        // The pre-login id is retired and the new one carries the login.
+        // The pre-login id is retired, the login's user session is still
+        // open (removing the old id first would have ended it, being its only
+        // backing), and the new id carries the login.
         let (_, before_id) = before.split_once('=').unwrap();
-        let (_, after_id) = after.split_once('=').unwrap();
         assert!(storage.load_session(before_id).await.unwrap().is_none());
-        let session = Session::default();
-        for (key, value) in storage.load_session(after_id).await.unwrap().unwrap() {
-            session.set(&key, value);
-        }
+        let parent = UserSession::Entity::find_by_id(user_session)
+            .one(&db)
+            .await
+            .unwrap()
+            .expect("the login's user session row is gone");
+        assert!(parent.ended.is_none(), "the rotation ended the login's user session");
+        let session = stored_session(&storage, &after).await;
         assert_eq!(session.get_auth().map(|auth| auth.user_id()), Some(ALICE));
+        assert_eq!(session.get_session_id(), Some(user_session));
+    }
+
+    /// A login step this node owns keeps the login it wrote: nothing is
+    /// adopted from storage after it, which would replace that login with the
+    /// stored pre-login row.
+    #[tokio::test]
+    async fn a_local_login_step_keeps_its_login() {
+        let db = db().await;
+        let user_session = insert_user_session(&db).await;
+        let storage = SharedSessionStorage::new(db.clone());
+        let cli = TestClient::new(node(
+            Route::new()
+                .at("/start", post(start.data(user_session)))
+                .at("/step", post(local_step)),
+            storage.clone(),
+        ));
+
+        let resp = cli.post("/start").send().await;
+        resp.assert_status_is_ok();
+        let before = cookie_pair(&resp).expect("the login was given a cookie");
+
+        let resp = cli.post("/step").header("cookie", &before).send().await;
+        resp.assert_status_is_ok();
+        // Whichever cookie the browser now holds: a local step may rotate it
+        // (authorize_session does), and run_login_step must not care.
+        let held = cookie_pair(&resp).unwrap_or(before);
+        let session = stored_session(&storage, &held).await;
+        assert_eq!(
+            session.get_auth().map(|auth| auth.user_id()),
+            Some(ALICE),
+            "the local login did not stick"
+        );
         assert_eq!(session.get_session_id(), Some(user_session));
     }
 }
