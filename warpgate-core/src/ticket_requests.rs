@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use anyhow::anyhow;
 use sea_orm::ActiveValue::Set;
+use sea_orm::sea_query::Expr;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, PaginatorTrait, QueryFilter,
     QueryOrder, TransactionTrait,
@@ -342,7 +343,8 @@ struct PreparedActivation {
 
 /// The reads and checks of an activation, on the plain connection. Two
 /// concurrent activations of one request can both pass them, so they decide
-/// nothing on their own: [`commit_activation`] is what claims the request.
+/// nothing on their own: [`commit_activation`]'s guarded write is what claims
+/// the request.
 async fn prepare_activation(
     db: &sea_orm::DatabaseConnection,
     request_id: Uuid,
@@ -395,7 +397,21 @@ async fn prepare_activation(
     })
 }
 
-/// Mints the ticket and records it on the request, in one transaction.
+/// Mints the ticket and records it on the request, in one transaction whose
+/// write is its own guard (runcove-ha44m): the request is claimed by
+/// `UPDATE ... SET ticket_id = <new> WHERE id = ? AND user_id = ? AND
+/// status = 'approved' AND ticket_id IS NULL`, and only the activation whose
+/// UPDATE changed the row keeps its ticket. A loser rolls back, which
+/// discards the ticket it minted, and is told the request is already
+/// activated.
+///
+/// The ticket is inserted first because `ticket_requests.ticket_id`
+/// references it. Two racers then contend only on the one request row: on
+/// PostgreSQL and MySQL the second UPDATE waits for the first to commit and
+/// re-reads the committed row, finding `ticket_id` set, so it changes
+/// nothing; neither holds a lock the other needs, so there is no deadlock.
+/// On SQLite the second transaction's first write waits for the first to
+/// commit, so they run one after the other.
 async fn commit_activation(
     db: &sea_orm::DatabaseConnection,
     prepared: PreparedActivation,
@@ -420,9 +436,31 @@ async fn commit_activation(
     )
     .await?;
 
-    let mut active: TicketRequest::ActiveModel = request.into();
-    active.ticket_id = Set(Some(ticket_id));
-    let updated = active.update(&txn).await?;
+    let claimed = TicketRequest::Entity::update_many()
+        .col_expr(TicketRequest::Column::TicketId, Expr::value(ticket_id))
+        .filter(TicketRequest::Column::Id.eq(request_id))
+        .filter(TicketRequest::Column::UserId.eq(request.user_id))
+        .filter(TicketRequest::Column::Status.eq(TicketRequestStatus::Approved))
+        .filter(TicketRequest::Column::TicketId.is_null())
+        .exec(&txn)
+        .await?
+        .rows_affected;
+    if claimed != 1 {
+        txn.rollback().await?;
+        let activated = TicketRequest::Entity::find_by_id(request_id)
+            .one(db)
+            .await?
+            .is_some_and(|r| r.ticket_id.is_some());
+        return Err(if activated {
+            ActivateTicketRequestError::AlreadyActivated
+        } else {
+            ActivateTicketRequestError::NotFound
+        });
+    }
+    let updated = TicketRequest::Entity::find_by_id(request_id)
+        .one(&txn)
+        .await?
+        .ok_or(ActivateTicketRequestError::NotFound)?;
 
     txn.commit().await?;
 
