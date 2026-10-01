@@ -739,3 +739,66 @@ impl Api {
         Ok(DeleteCertificateCredentialResponse::Ok)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use sea_orm::PaginatorTrait;
+
+    use super::*;
+    use crate::test_db::{HOLD, file_db, hold_write_lock};
+
+    async fn user_with_two_otp_credentials(
+        db: &DatabaseConnection,
+    ) -> (entities::User::Model, Uuid) {
+        let user = entities::User::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            username: Set("alice".into()),
+            credential_policy: Set(serde_json::Value::Null),
+            description: Set(String::new()),
+            rate_limit_bytes_per_second: Set(None),
+            ldap_server_id: Set(None),
+            ldap_object_uuid: Set(None),
+            allowed_ip_ranges: Set(serde_json::Value::Null),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        let mut ids = vec![];
+        for _ in 0..2 {
+            let id = Uuid::new_v4();
+            entities::OtpCredential::ActiveModel {
+                id: Set(id),
+                user_id: Set(user.id),
+                secret_key: Set(vec![0; 32]),
+            }
+            .insert(db)
+            .await
+            .unwrap();
+            ids.push(id);
+        }
+        (user, ids[0])
+    }
+
+    #[tokio::test]
+    async fn deleting_an_otp_credential_waits_for_a_concurrent_writer() {
+        let (db, _temp) = file_db(Duration::from_secs(30)).await;
+        let (user, id) = user_with_two_otp_credentials(&db).await;
+
+        let writer = hold_write_lock(&db, HOLD).await;
+        let started = Instant::now();
+        let deleted = delete_own_otp(&db, &user, id, true).await.unwrap();
+        let elapsed = started.elapsed();
+        writer.await.unwrap();
+
+        assert_eq!(deleted, OtpDeletion::Deleted);
+        assert!(elapsed >= HOLD / 2, "the deletion did not contend");
+        let remaining = user
+            .find_related(entities::OtpCredential::Entity)
+            .count(&db)
+            .await
+            .unwrap();
+        assert_eq!(remaining, 1);
+    }
+}
