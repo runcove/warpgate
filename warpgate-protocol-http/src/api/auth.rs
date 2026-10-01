@@ -738,7 +738,7 @@ where
     S: FnOnce(Owner) -> Fut,
     Fut: Future<Output = poem::Result<R>>,
 {
-    let forwarded = matches!(owner, Owner::Remote(_));
+    let forwarded = true; // RED-PROOF: the forwarded branch runs for a local owner too
     let before_hop = LoginSnapshot::of(session);
     let result = step(owner).await;
 
