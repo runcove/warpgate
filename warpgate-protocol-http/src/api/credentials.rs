@@ -5,8 +5,8 @@ use poem_openapi::param::Path;
 use poem_openapi::payload::Json;
 use poem_openapi::{ApiResponse, Enum, Object, OpenApi};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, EntityTrait, ModelTrait, QueryFilter, QuerySelect, Set,
-    TransactionTrait,
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, ModelTrait, QueryFilter,
+    QuerySelect, Set, TransactionTrait,
 };
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -242,6 +242,42 @@ pub fn parameters_based_auth<E: Endpoint + 'static>(e: E) -> impl Endpoint {
         }
         Ok(endpoint_auth(ep).call(req).await?.into_response())
     })
+}
+
+/// What deleting one of a user's own OTP credentials did.
+#[derive(Debug, PartialEq, Eq)]
+enum OtpDeletion {
+    Deleted,
+    NotFound,
+    /// It is the user's last one and MFA is enforced for them.
+    Forbidden,
+}
+
+async fn delete_own_otp(
+    db: &DatabaseConnection,
+    user: &entities::User::Model,
+    id: Uuid,
+    enforced: bool,
+) -> Result<OtpDeletion, WarpgateError> {
+    let tx = db.begin().await?;
+    let otp_creds = user
+        .find_related(entities::OtpCredential::Entity)
+        .lock_exclusive()
+        .all(&tx)
+        .await?;
+
+    let Some(model) = otp_creds.iter().find(|c| c.id == id) else {
+        return Ok(OtpDeletion::NotFound);
+    };
+
+    // Disallow deleting last TOTP cred
+    if enforced && otp_creds.len() <= 1 {
+        return Ok(OtpDeletion::Forbidden);
+    }
+
+    model.clone().delete(&tx).await?;
+    tx.commit().await?;
+    Ok(OtpDeletion::Deleted)
 }
 
 #[OpenApi]
@@ -568,25 +604,10 @@ impl Api {
             .await?
             != MfaEnforcement::Off;
 
-        {
-            let tx = db.begin().await?;
-            let otp_creds = user
-                .find_related(entities::OtpCredential::Entity)
-                .lock_exclusive()
-                .all(&tx)
-                .await?;
-
-            let Some(model) = otp_creds.iter().find(|c| c.id == id.0) else {
-                return Ok(DeleteCredentialResponse::NotFound);
-            };
-
-            // Disallow deleting last TOTP cred
-            if enforced && otp_creds.len() <= 1 {
-                return Ok(DeleteCredentialResponse::Forbidden);
-            }
-
-            model.clone().delete(&tx).await?;
-            tx.commit().await?;
+        match delete_own_otp(db, &user, id.0, enforced).await? {
+            OtpDeletion::Deleted => {}
+            OtpDeletion::NotFound => return Ok(DeleteCredentialResponse::NotFound),
+            OtpDeletion::Forbidden => return Ok(DeleteCredentialResponse::Forbidden),
         }
 
         AuditEvent::CredentialDeleted {
