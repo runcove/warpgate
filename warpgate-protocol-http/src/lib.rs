@@ -10,6 +10,8 @@ mod session_handle;
 mod session_storage;
 mod sso_request_store;
 mod step_up;
+#[cfg(test)]
+mod test_db;
 
 use std::fmt::Debug;
 use std::sync::Arc;
