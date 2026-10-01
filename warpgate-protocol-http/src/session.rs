@@ -619,22 +619,15 @@ mod stale_cookie_login_tests {
     //! the refusal is an error, which the session middleware does not write
     //! back, so unless the login path replaces the session itself the same
     //! cookie is refused on every attempt. Anywhere else the refusal stands.
-    use std::path::PathBuf;
-
     use poem::session::{CookieConfig, MemoryStorage, ServerSession, SessionStorage};
     use poem::test::{TestClient, TestResponse};
     use poem::web::Data;
     use poem::{Endpoint, EndpointExt, Route, get, handler};
     use sea_orm::sea_query::Expr;
-    use sea_orm::{ColumnTrait, Database, QueryFilter};
+    use sea_orm::{ColumnTrait, QueryFilter};
     use time::OffsetDateTime;
     use warpgate_common::auth::AuthStateUserInfo;
-    use warpgate_common::{GlobalParams, WarpgateConfig, WarpgateConfigStore};
-    use warpgate_core::cluster::Cluster;
-    use warpgate_core::login_protection::LoginProtectionService;
-    use warpgate_core::rate_limiting::RateLimiterRegistry;
-    use warpgate_core::recordings::SessionRecordings;
-    use warpgate_core::{ApprovalRequestSink, AuthStateStore, DatabaseConfigProvider, Services};
+    use warpgate_core::Services;
 
     use super::*;
     use crate::session_storage::SharedSessionStorage;
@@ -643,33 +636,7 @@ mod stale_cookie_login_tests {
     const BOB: Uuid = Uuid::from_u128(2);
 
     async fn services() -> Services {
-        warpgate_db_entities::Parameters::set_config_migration_values(
-            warpgate_db_entities::Parameters::ConfigMigrationValues::default(),
-        );
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        warpgate_db_migrations::migrate_database(&db).await.unwrap();
-        let params = GlobalParams::new(PathBuf::from("/warpgate.yaml"), false).unwrap();
-        let rate_limiter_registry = Arc::new(Mutex::new(RateLimiterRegistry::new(db.clone())));
-        let cluster = Arc::new(Cluster::new(db.clone(), 0).await.unwrap());
-        Services {
-            db: db.clone(),
-            recordings: Arc::new(SessionRecordings::new(db.clone(), &params)),
-            config: Arc::new(Mutex::new(WarpgateConfig {
-                store: WarpgateConfigStore::default(),
-            })),
-            state: State::new(&db, &rate_limiter_registry, cluster.node_id),
-            cluster: cluster.clone(),
-            rate_limiter_registry,
-            config_provider: Arc::new(DatabaseConfigProvider::new(&db).into()),
-            auth_state_store: Arc::new(Mutex::new(AuthStateStore::new(ApprovalRequestSink {
-                db: db.clone(),
-                cluster,
-            }))),
-            admin_token: Arc::new(None),
-            login_protection: Arc::new(LoginProtectionService::new(db.clone()).await.unwrap()),
-            global_params: Arc::new(params),
-            listener_status: Default::default(),
-        }
+        crate::test_db::services(crate::test_db::memory_db().await).await
     }
 
     type Store = Arc<Mutex<SessionStore>>;

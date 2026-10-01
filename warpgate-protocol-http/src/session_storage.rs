@@ -485,6 +485,7 @@ mod tests {
     use warpgate_common_http::SessionAuthorization;
 
     use super::*;
+    use crate::test_db::{HOLD, TempDb, file_db};
 
     async fn storage() -> SharedSessionStorage {
         warpgate_db_entities::Parameters::set_config_migration_values(
@@ -495,72 +496,17 @@ mod tests {
         SharedSessionStorage::new(db)
     }
 
-    /// An on-disk database removed on drop. Lock contention needs a real file
-    /// in WAL mode, as in production: in-memory SQLite has neither.
-    struct TempDb(std::path::PathBuf);
-
-    impl Drop for TempDb {
-        fn drop(&mut self) {
-            for suffix in ["", "-wal", "-shm"] {
-                let mut path = self.0.clone().into_os_string();
-                path.push(suffix);
-                let _ = std::fs::remove_file(path);
-            }
-        }
-    }
-
-    /// Connects the way `warpgate_core::db` does: WAL, with the given busy
-    /// timeout (production uses 30 s).
     async fn file_storage(busy_timeout: Duration) -> (SharedSessionStorage, TempDb) {
-        use sea_orm::SqlxSqliteConnector;
-        use sea_orm::sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
-
-        warpgate_db_entities::Parameters::set_config_migration_values(
-            warpgate_db_entities::Parameters::ConfigMigrationValues::default(),
-        );
-        let path = std::env::temp_dir().join(format!("warpgate-sessions-{}.db", Uuid::new_v4()));
-        let temp = TempDb(path.clone());
-        let options = SqliteConnectOptions::new()
-            .filename(&path)
-            .create_if_missing(true)
-            .journal_mode(SqliteJournalMode::Wal)
-            .busy_timeout(busy_timeout);
-        let pool = SqlitePoolOptions::new()
-            .max_connections(5)
-            .connect_with(options)
-            .await
-            .unwrap();
-        let db = SqlxSqliteConnector::from_sqlx_sqlite_pool(pool);
-        warpgate_db_migrations::migrate_database(&db).await.unwrap();
+        let (db, temp) = file_db(busy_timeout).await;
         (SharedSessionStorage::new(db), temp)
     }
 
-    /// Holds the database's write lock from another connection for `hold`,
-    /// as a concurrent request's write would. Returns once the lock is held.
     async fn hold_write_lock(
         storage: &SharedSessionStorage,
         hold: Duration,
     ) -> tokio::task::JoinHandle<()> {
-        let mut conn = storage
-            .db
-            .get_sqlite_connection_pool()
-            .acquire()
-            .await
-            .unwrap();
-        sea_orm::sqlx::query("BEGIN IMMEDIATE")
-            .execute(&mut *conn)
-            .await
-            .unwrap();
-        tokio::spawn(async move {
-            tokio::time::sleep(hold).await;
-            sea_orm::sqlx::query("COMMIT")
-                .execute(&mut *conn)
-                .await
-                .unwrap();
-        })
+        crate::test_db::hold_write_lock(&storage.db, hold).await
     }
-
-    const HOLD: Duration = Duration::from_millis(500);
 
     fn entries(auth: &str) -> BTreeMap<String, Value> {
         let mut m = BTreeMap::new();
