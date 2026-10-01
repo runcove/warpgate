@@ -716,9 +716,31 @@ where
     Fut: Future<Output = poem::Result<R>>,
 {
     let owner = auth_state_owner(ctx, session.get_session_id()).await?;
+    run_login_step(req, session, owner, move |owner| {
+        proxy_or_serve_pending_login(ctx, req, owner, body, serve_local)
+    })
+    .await
+}
+
+/// [`on_login_owner`] once the owner is known: runs `step` against it - the
+/// forward to a peer, or the local login step - and after a forward adopts what
+/// the peer stored, rotating the cookie id if the step logged the browser in
+/// (the rotation itself lives in [`SharedSessionStorage::adopt_forwarded_login`]).
+/// Separate from the owner lookup only so a test can drive it with a stand-in
+/// peer.
+async fn run_login_step<S, Fut, R>(
+    req: &Request,
+    session: &Session,
+    owner: Owner,
+    step: S,
+) -> poem::Result<R>
+where
+    S: FnOnce(Owner) -> Fut,
+    Fut: Future<Output = poem::Result<R>>,
+{
     let forwarded = matches!(owner, Owner::Remote(_));
     let before_hop = LoginSnapshot::of(session);
-    let result = proxy_or_serve_pending_login(ctx, req, owner, body, serve_local).await;
+    let result = step(owner).await;
 
     if forwarded {
         // The peer acts on the same browser session - and on success writes the
@@ -840,4 +862,152 @@ pub fn api_get_web_auth_requests_stream(
             _ => None,
         },
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    //! The forwarding node's side of a login step another node owns, driven
+    //! through [`run_login_step`] under the session middleware production uses:
+    //! the step is forwarded to a stand-in peer, which serves it with the
+    //! browser's cookie the way a real peer does and stores the login, and the
+    //! cookie the browser gets back must then be a new one.
+    use poem::endpoint::BoxEndpoint;
+    use poem::session::{ServerSession, SessionStorage};
+    use poem::test::{TestClient, TestResponse};
+    use poem::{Endpoint, EndpointExt, Route, post};
+    use sea_orm::ActiveValue::Set;
+    use sea_orm::{Database, DatabaseConnection};
+    use warpgate_core::cluster::RemoteNode;
+
+    use super::*;
+    use crate::session::SESSION_ID_SESSION_KEY;
+
+    const ALICE: Uuid = Uuid::from_u128(1);
+
+    async fn db() -> DatabaseConnection {
+        warpgate_db_entities::Parameters::set_config_migration_values(
+            warpgate_db_entities::Parameters::ConfigMigrationValues::default(),
+        );
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        warpgate_db_migrations::migrate_database(&db).await.unwrap();
+        db
+    }
+
+    async fn insert_user_session(db: &DatabaseConnection) -> UserSessionId {
+        let id = UserSessionId(Uuid::new_v4());
+        UserSession::Entity::insert(UserSession::ActiveModel {
+            id: Set(id),
+            username: Set(None),
+            user_id: Set(None),
+            remote_address: Set("127.0.0.1:443".into()),
+            started: Set(OffsetDateTime::now_utc()),
+            ended: Set(None),
+            protocol: Set("HTTP".into()),
+            node_id: Set(None),
+            auth_state_node_id: Set(None),
+        })
+        .exec(db)
+        .await
+        .unwrap();
+        id
+    }
+
+    /// A node's session middleware over the shared table, as production
+    /// wires it.
+    fn node(routes: Route, storage: SharedSessionStorage) -> impl Endpoint {
+        routes
+            .data(storage.clone())
+            .with(ServerSession::new(crate::common::session_cookie_config(), storage))
+    }
+
+    fn cookie_pair(resp: &TestResponse) -> Option<String> {
+        resp.0
+            .headers()
+            .get("set-cookie")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .map(ToOwned::to_owned)
+    }
+
+    /// Starts a login on the browser session: its user session, no login yet.
+    #[handler]
+    fn start(session: &Session, user_session: Data<&UserSessionId>) -> String {
+        session.set(SESSION_ID_SESSION_KEY, *user_session.0);
+        "started".into()
+    }
+
+    /// The peer's side of the forwarded step: it logs the browser session in.
+    #[handler]
+    fn peer_step(session: &Session) -> String {
+        session.set_auth(SessionAuthorization::User {
+            user_id: ALICE,
+            username: "alice".into(),
+        });
+        "logged in".into()
+    }
+
+    type Peer = Arc<TestClient<BoxEndpoint<'static>>>;
+
+    /// This node's login step, owned by another node: forwarded, with the
+    /// browser's cookie, to the stand-in peer.
+    #[handler]
+    async fn step(req: &Request, session: &Session, peer: Data<&Peer>) -> poem::Result<String> {
+        let cookie = req
+            .header("cookie")
+            .expect("the browser sent its cookie")
+            .to_owned();
+        let owner = Owner::Remote(RemoteNode {
+            address: "peer.invalid:8888".into(),
+            tls_spki_sha256: None,
+        });
+        run_login_step(req, session, owner, |owner| async move {
+            assert!(matches!(owner, Owner::Remote(_)), "the step was not forwarded");
+            let resp = peer.0.post("/step").header("cookie", cookie).send().await;
+            resp.assert_status_is_ok();
+            Ok(resp.0.into_body().into_string().await.unwrap())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_forwarded_login_step_rotates_the_cookie_id() {
+        let db = db().await;
+        let user_session = insert_user_session(&db).await;
+        // Two nodes on one database, each with its own storage, as in a cluster.
+        let peer: Peer = Arc::new(TestClient::new(
+            node(
+                Route::new().at("/step", post(peer_step)),
+                SharedSessionStorage::new(db.clone()),
+            )
+            .map_to_response()
+            .boxed(),
+        ));
+        let storage = SharedSessionStorage::new(db.clone());
+        let cli = TestClient::new(node(
+            Route::new()
+                .at("/start", post(start.data(user_session)))
+                .at("/step", post(step.data(peer))),
+            storage.clone(),
+        ));
+
+        let resp = cli.post("/start").send().await;
+        resp.assert_status_is_ok();
+        let before = cookie_pair(&resp).expect("the login was given a cookie");
+
+        let resp = cli.post("/step").header("cookie", &before).send().await;
+        resp.assert_status_is_ok();
+        let after = cookie_pair(&resp).expect("the forwarded login kept its pre-login cookie id");
+        assert_ne!(after, before);
+
+        // The pre-login id is retired and the new one carries the login.
+        let (_, before_id) = before.split_once('=').unwrap();
+        let (_, after_id) = after.split_once('=').unwrap();
+        assert!(storage.load_session(before_id).await.unwrap().is_none());
+        let session = Session::default();
+        for (key, value) in storage.load_session(after_id).await.unwrap().unwrap() {
+            session.set(&key, value);
+        }
+        assert_eq!(session.get_auth().map(|auth| auth.user_id()), Some(ALICE));
+        assert_eq!(session.get_session_id(), Some(user_session));
+    }
 }
