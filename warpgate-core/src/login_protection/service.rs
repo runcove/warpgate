@@ -782,6 +782,49 @@ mod tests {
             .unwrap()
     }
 
+    /// runcove-q2cuy: every caller drops the result, so an attempt that
+    /// cannot be recorded must say so in the log -- once, from here -- and
+    /// the error still reaches the caller.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn an_attempt_that_cannot_be_recorded_is_logged() {
+        let events = crate::approvals::tests::audit_events();
+        let db = setup_db(&[]).await;
+        let service = LoginProtectionService::new(db.clone()).await.unwrap();
+        // The attempts table is gone, so the insert fails as a database
+        // error would in production.
+        db.execute_unprepared("DROP TABLE failed_login_attempts").await.unwrap();
+        let username = format!("q2cuy-{}", Uuid::new_v4());
+
+        let result = service
+            .record_failed_attempt(FailedAttemptInfo {
+                username: username.clone(),
+                remote_ip: OTHER_V4.parse().unwrap(),
+                protocol: Protocol::Ssh,
+                credential_type: "password".into(),
+            })
+            .await;
+
+        assert!(result.is_err(), "the error is still returned to the caller");
+        let logged: Vec<_> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|v| v.get("username") == Some(&username))
+            .cloned()
+            .collect();
+        assert_eq!(logged.len(), 1, "logged exactly once: {logged:?}");
+        let event = &logged[0];
+        assert!(
+            event.get("message").is_some_and(|m| m.contains("could not be recorded")),
+            "{event:?}"
+        );
+        assert_eq!(event.get("ip").map(String::as_str), Some(OTHER_V4));
+        assert_eq!(event.get("protocol").map(String::as_str), Some("SSH"));
+        assert_eq!(event.get("credential_type").map(String::as_str), Some("password"));
+        assert!(event.get("error").is_some_and(|e| e.contains("database error")), "{event:?}");
+    }
+
     #[tokio::test]
     async fn exempt_address_is_never_blocked() {
         let db = setup_db(&["10.0.0.0/8"]).await;
