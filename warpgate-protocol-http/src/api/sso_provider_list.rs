@@ -446,27 +446,31 @@ impl Api {
             return Ok(StartSloResponse::NotInSsoSession);
         };
 
-        let config = ctx.services().config.lock().await;
+        // Log out of Warpgate first. The IdP's single logout below is
+        // best-effort on top of it: a provider no longer configured, an IdP
+        // that cannot be reached or one without single logout must not leave
+        // the Warpgate login live.
+        logout(session, session_middleware.0, &ctx.services().db).await;
 
-        let return_url = construct_external_url(Some(req), &config, None).await?;
+        // The configuration lock is not held across the IdP's network calls.
+        let (provider, return_url) = {
+            let config = ctx.services().config.lock().await;
+            let return_url = construct_external_url(Some(req), &config, None).await?;
+            let Some(provider_config) = config
+                .store
+                .sso_providers
+                .iter()
+                .find(|p| p.name == state.provider)
+            else {
+                warn!(provider = %state.provider, "SSO logout requested for a provider that is no longer configured");
+                return Ok(StartSloResponse::NotFound);
+            };
+            (provider_config.provider.clone(), return_url)
+        };
         debug!("Return URL: {}", &return_url);
 
-        let Some(provider_config) = config
-            .store
-            .sso_providers
-            .iter()
-            .find(|p| p.name == state.provider)
-        else {
-            warn!(provider = %state.provider, "SSO logout requested for a provider that is no longer configured");
-            return Ok(StartSloResponse::NotFound);
-        };
-
-        let client = SsoClient::new(provider_config.provider.clone())?;
+        let client = SsoClient::new(provider)?;
         let logout_url = client.logout(state.token, return_url).await?;
-        // Not held while the logout waits for the database.
-        drop(config);
-
-        logout(session, session_middleware.0, &ctx.services().db).await;
 
         Ok(StartSloResponse::Ok(Json(StartSloResponseParams {
             url: logout_url.to_string(),
