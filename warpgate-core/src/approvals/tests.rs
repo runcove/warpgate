@@ -1187,14 +1187,15 @@ async fn session_teardown_gives_held_uses_back() {
 }
 
 /// Every audit event this test binary emits, so an assertion can pick out
-/// its own by session id.
+/// its own by session id. Shared with login_protection's tests (runcove-q2cuy):
+/// the one global subscriber a test binary can install.
 ///
 /// Installed once and globally rather than per-test with `set_default`:
 /// `tracing` caches a callsite first reached with no subscriber listening
 /// as never-interested for the whole process, so a thread-local subscriber
 /// set afterwards sees nothing whenever another test thread got there
 /// first — which passes alone and fails in the suite.
-fn audit_events() -> &'static Mutex<Vec<HashMap<&'static str, String>>> {
+pub(crate) fn audit_events() -> &'static Mutex<Vec<HashMap<&'static str, String>>> {
     use tracing_subscriber::layer::SubscriberExt;
 
     use crate::logging::layer::ValuesLogLayer;
