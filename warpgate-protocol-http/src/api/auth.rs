@@ -235,7 +235,7 @@ impl Api {
         if local_logout_disabled(session, &*ctx.services().config.lock().await) {
             return Ok(LogoutResponse::LocalLogoutDisabled);
         }
-        logout(session, &mut *session_middleware.lock().await);
+        logout(session, session_middleware.0, &ctx.services().db).await;
         Ok(LogoutResponse::Success)
     }
 
