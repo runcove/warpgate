@@ -983,6 +983,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn gc_stops_at_the_first_busy_row() {
+        // The lock is held for longer than three removals would take to time
+        // out one after another.
+        const BUSY_TIMEOUT: Duration = Duration::from_secs(1);
+        let (s, _temp) = file_storage(BUSY_TIMEOUT).await;
+        for id in ["a", "b", "c"] {
+            HttpSession::Entity::insert(expired_row(id))
+                .exec(&s.db)
+                .await
+                .unwrap();
+        }
+
+        let writer = hold_write_lock(&s, BUSY_TIMEOUT * 5).await;
+        let started = Instant::now();
+        s.gc(Duration::from_secs(86400)).await.unwrap();
+        let elapsed = started.elapsed();
+        writer.await.unwrap();
+
+        assert!(elapsed < BUSY_TIMEOUT * 2, "GC kept going after a busy row: {elapsed:?}");
+        for id in ["a", "b", "c"] {
+            assert!(
+                HttpSession::Entity::find_by_id(id.to_string())
+                    .one(&s.db)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "{id} removed while the database was busy"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn contention_past_the_busy_timeout_is_reported_as_busy() {
         let (s, _temp) = file_storage(Duration::ZERO).await;
         s.update_session("id1", &entries("a"), Some(Duration::from_secs(3600)))
