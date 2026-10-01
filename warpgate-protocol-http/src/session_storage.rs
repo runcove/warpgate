@@ -8,12 +8,12 @@ use poem::session::{Session, SessionStorage};
 use sea_orm::ActiveValue::Set;
 use sea_orm::sea_query::{Expr, OnConflict};
 use sea_orm::{
-    ColumnTrait, Condition, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
-    TransactionTrait,
+    ColumnTrait, Condition, ConnectionTrait, DatabaseConnection, DbBackend, EntityTrait,
+    PaginatorTrait, QueryFilter, TransactionTrait,
 };
 use serde_json::Value;
 use time::OffsetDateTime;
-use tracing::error;
+use tracing::{error, warn};
 use uuid::Uuid;
 use warpgate_common::{UserSessionId, WarpgateError};
 use warpgate_db_entities::{HttpSession, UserSession};
@@ -195,7 +195,13 @@ impl SharedSessionStorage {
             .await?;
         for row in rows {
             if let Err(error) = self.remove_stored_row(&row.id, Some((now, max_age))).await {
-                error!(%error, id = %row.id, "Could not remove an expired browser session");
+                if self.is_busy(&error) {
+                    // Contention with another writer that outlasted the busy
+                    // timeout; the row is still expired on the next sweep.
+                    warn!(%error, id = %row.id, "Database busy, will retry removing an expired browser session on the next sweep");
+                } else {
+                    error!(%error, id = %row.id, "Could not remove an expired browser session");
+                }
             }
         }
         Ok(())
@@ -217,6 +223,27 @@ impl SharedSessionStorage {
         Ok(())
     }
 
+    /// Whether `error` is SQLite reporting lock contention (`SQLITE_BUSY` or
+    /// `SQLITE_LOCKED`, including their extended codes).
+    fn is_busy(&self, error: &WarpgateError) -> bool {
+        if self.db.get_database_backend() != DbBackend::Sqlite {
+            return false;
+        }
+        let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+        while let Some(current) = source {
+            if let Some(code) = current
+                .downcast_ref::<sqlx::Error>()
+                .and_then(|error| error.as_database_error())
+                .and_then(|error| error.code())
+                .and_then(|code| code.parse::<i32>().ok())
+            {
+                return matches!(code & 0xff, 5 | 6);
+            }
+            source = current.source();
+        }
+        false
+    }
+
     fn row_is_expired(row: &HttpSession::Model, now: OffsetDateTime, max_age: Duration) -> bool {
         row.expires.is_some_and(|expires| expires < now) || row.updated < now - max_age
     }
@@ -230,6 +257,25 @@ impl SharedSessionStorage {
         only_if_expired: Option<(OffsetDateTime, Duration)>,
     ) -> Result<(), WarpgateError> {
         let transaction = self.db.begin().await?;
+        // On SQLite, a transaction that has read and then writes cannot wait
+        // for another writer: the upgrade fails at once with SQLITE_BUSY and
+        // `busy_timeout` never applies. Making the first statement a write
+        // takes the database's write lock up front, which does wait. This is
+        // what `BEGIN IMMEDIATE` would do, but sea-orm 1.1 always begins with
+        // a plain `BEGIN` and ignores `begin_with_config`'s options on SQLite.
+        // The no-op update touches only the row being removed, and only on
+        // SQLite: on PostgreSQL and MySQL it would lock this row before its
+        // parent, the reverse of `update_session`'s order.
+        if self.db.get_database_backend() == DbBackend::Sqlite {
+            HttpSession::Entity::update_many()
+                .col_expr(
+                    HttpSession::Column::Id,
+                    Expr::col(HttpSession::Column::Id).into(),
+                )
+                .filter(HttpSession::Column::Id.eq(session_id))
+                .exec(&transaction)
+                .await?;
+        }
         let Some(initial) = HttpSession::Entity::find_by_id(session_id.to_owned())
             .one(&transaction)
             .await?
@@ -434,6 +480,73 @@ mod tests {
         warpgate_db_migrations::migrate_database(&db).await.unwrap();
         SharedSessionStorage::new(db)
     }
+
+    /// An on-disk database removed on drop. Lock contention needs a real file
+    /// in WAL mode, as in production: in-memory SQLite has neither.
+    struct TempDb(std::path::PathBuf);
+
+    impl Drop for TempDb {
+        fn drop(&mut self) {
+            for suffix in ["", "-wal", "-shm"] {
+                let mut path = self.0.clone().into_os_string();
+                path.push(suffix);
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+
+    /// Connects the way `warpgate_core::db` does: WAL, with the given busy
+    /// timeout (production uses 30 s).
+    async fn file_storage(busy_timeout: Duration) -> (SharedSessionStorage, TempDb) {
+        use sea_orm::SqlxSqliteConnector;
+        use sea_orm::sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+
+        warpgate_db_entities::Parameters::set_config_migration_values(
+            warpgate_db_entities::Parameters::ConfigMigrationValues::default(),
+        );
+        let path = std::env::temp_dir().join(format!("warpgate-sessions-{}.db", Uuid::new_v4()));
+        let temp = TempDb(path.clone());
+        let options = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(busy_timeout);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect_with(options)
+            .await
+            .unwrap();
+        let db = SqlxSqliteConnector::from_sqlx_sqlite_pool(pool);
+        warpgate_db_migrations::migrate_database(&db).await.unwrap();
+        (SharedSessionStorage::new(db), temp)
+    }
+
+    /// Holds the database's write lock from another connection for `hold`,
+    /// as a concurrent request's write would. Returns once the lock is held.
+    async fn hold_write_lock(
+        storage: &SharedSessionStorage,
+        hold: Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        let mut conn = storage
+            .db
+            .get_sqlite_connection_pool()
+            .acquire()
+            .await
+            .unwrap();
+        sea_orm::sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            tokio::time::sleep(hold).await;
+            sea_orm::sqlx::query("COMMIT")
+                .execute(&mut *conn)
+                .await
+                .unwrap();
+        })
+    }
+
+    const HOLD: Duration = Duration::from_millis(500);
 
     fn entries(auth: &str) -> BTreeMap<String, Value> {
         let mut m = BTreeMap::new();
@@ -772,6 +885,91 @@ mod tests {
                 .is_none()
         );
         assert!(s.load_session("live").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn remove_waits_for_a_concurrent_writer() {
+        let (s, _temp) = file_storage(Duration::from_secs(30)).await;
+        let id = insert_user_session(&s).await;
+        let data = entries_for_user_session(id);
+        s.update_session("id1", &data, Some(Duration::from_secs(3600)))
+            .await
+            .unwrap();
+
+        let writer = hold_write_lock(&s, HOLD).await;
+        let started = Instant::now();
+        s.remove_session("id1").await.unwrap();
+        assert!(started.elapsed() >= HOLD / 2, "removal did not contend");
+        writer.await.unwrap();
+
+        assert!(s.load_session("id1").await.unwrap().is_none());
+        assert!(
+            UserSession::Entity::find_by_id(id)
+                .one(&s.db)
+                .await
+                .unwrap()
+                .unwrap()
+                .ended
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn gc_waits_for_a_concurrent_writer() {
+        let (s, _temp) = file_storage(Duration::from_secs(30)).await;
+        HttpSession::Entity::insert(expired_row("orphan"))
+            .exec(&s.db)
+            .await
+            .unwrap();
+        let id = insert_user_session(&s).await;
+        let mut backed = expired_row("backed");
+        backed.user_session_id = Set(Some(id));
+        HttpSession::Entity::insert(backed)
+            .exec(&s.db)
+            .await
+            .unwrap();
+
+        let writer = hold_write_lock(&s, HOLD).await;
+        let started = Instant::now();
+        s.gc(Duration::from_secs(86400)).await.unwrap();
+        let elapsed = started.elapsed();
+        writer.await.unwrap();
+
+        for id in ["orphan", "backed"] {
+            assert!(
+                HttpSession::Entity::find_by_id(id.to_string())
+                    .one(&s.db)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{id} survived GC"
+            );
+        }
+        assert!(elapsed >= HOLD / 2, "GC did not contend");
+        assert!(
+            UserSession::Entity::find_by_id(id)
+                .one(&s.db)
+                .await
+                .unwrap()
+                .unwrap()
+                .ended
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn contention_past_the_busy_timeout_is_reported_as_busy() {
+        let (s, _temp) = file_storage(Duration::ZERO).await;
+        s.update_session("id1", &entries("a"), Some(Duration::from_secs(3600)))
+            .await
+            .unwrap();
+
+        let writer = hold_write_lock(&s, HOLD).await;
+        let error = s.remove_stored_row("id1", None).await.unwrap_err();
+        writer.await.unwrap();
+
+        assert!(s.is_busy(&error), "{error}");
+        assert!(!s.is_busy(&WarpgateError::SessionEnd));
     }
 
     #[tokio::test]
