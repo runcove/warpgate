@@ -52,7 +52,7 @@ pub async fn logout(
 ) {
     end_login(session, session_middleware, db).await;
     session.purge();
-    info!("Logged out");
+    info!("Logout requested");
 }
 
 /// Ends the browser session's login and detaches it from this node, leaving

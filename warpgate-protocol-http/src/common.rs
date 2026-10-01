@@ -227,7 +227,7 @@ pub async fn _inner_auth<E: Endpoint + 'static>(
                 crate::api::common::end_login(session, session_middleware.0, &ctx.services().db)
                     .await;
                 session.clear();
-                info!("Logged out");
+                info!("Logout requested");
                 return Ok(Err(req));
             }
         }

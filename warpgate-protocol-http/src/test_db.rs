@@ -49,7 +49,7 @@ pub async fn file_db(busy_timeout: Duration) -> (DatabaseConnection, TempDb) {
     warpgate_db_entities::Parameters::set_config_migration_values(
         warpgate_db_entities::Parameters::ConfigMigrationValues::default(),
     );
-    let path = std::env::temp_dir().join(format!("warpgate-sessions-{}.db", Uuid::new_v4()));
+    let path = std::env::temp_dir().join(format!("warpgate-test-{}.db", Uuid::new_v4()));
     let temp = TempDb(path.clone());
     let options = SqliteConnectOptions::new()
         .filename(&path)
