@@ -197,8 +197,10 @@ impl SharedSessionStorage {
             if let Err(error) = self.remove_stored_row(&row.id, Some((now, max_age))).await {
                 if self.is_busy(&error) {
                     // Contention with another writer that outlasted the busy
-                    // timeout; the row is still expired on the next sweep.
-                    warn!(%error, id = %row.id, "Database busy, will retry removing an expired browser session on the next sweep");
+                    // timeout. Every further row would wait as long again, so
+                    // stop here: the rest are still expired on the next sweep.
+                    warn!(%error, id = %row.id, "Database busy, will retry removing expired browser sessions on the next sweep");
+                    break;
                 } else {
                     error!(%error, id = %row.id, "Could not remove an expired browser session");
                 }
