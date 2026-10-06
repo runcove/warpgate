@@ -289,11 +289,13 @@ class TestHTTPUserAuthOIDC:
         ):
             with admin_client(wg_url) as api:
                 role = api.create_role(sdk.RoleDataRequest(name=f"role-{uuid4()}"))
+                # Bound to the full host it is requested on, port included,
+                # as hostname bindings are matched.
                 target = _create_echo_target(
                     api,
                     echo_server_port,
                     role.id,
-                    external_host="target.warpgate.acme.inc",
+                    external_host=f"target.warpgate.acme.inc:{wg.http_port}",
                 )
                 user = api.create_user(
                     sdk.CreateUserRequest(username=f"user-{uuid4()}")
