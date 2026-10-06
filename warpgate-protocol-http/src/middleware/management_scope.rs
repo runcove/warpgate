@@ -21,9 +21,40 @@ use crate::catchall::bound_to_host;
 /// Paths are matched exactly; a dot or empty segment, or an escape in an
 /// asset path, is never part of the login flow.
 pub(crate) fn is_login_flow_route(method: &Method, path: &str) -> bool {
-    // As yet every route counts as the login flow.
-    let _ = (method, path, warpgate_surface_path);
-    true
+    let Some(path) = warpgate_surface_path(path) else {
+        return false;
+    };
+    if path.is_empty() || path == "/" {
+        return method == Method::GET;
+    }
+    if path
+        .split('/')
+        .skip(1)
+        .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    {
+        return false;
+    }
+    if path.starts_with("/assets/") {
+        return method == Method::GET && !path.contains('%');
+    }
+    if let Some(name) = path
+        .strip_prefix("/api/sso/providers/")
+        .and_then(|rest| rest.strip_suffix("/start"))
+    {
+        return method == Method::GET && !name.contains('/');
+    }
+    match path {
+        "/api/info" | "/api/sso/providers" | "/api/sso/auto-start" | "/api/sso/logout" => {
+            method == Method::GET
+        }
+        "/api/auth/login" | "/api/auth/otp" | "/api/auth/logout" => method == Method::POST,
+        // The browser's own login only; `/api/auth/state/:id` and its
+        // approve and reject routes act on someone else's.
+        "/api/auth/state" => method == Method::GET || method == Method::DELETE,
+        // GET for the query response mode, POST for form_post.
+        "/api/sso/return" => method == Method::GET || method == Method::POST,
+        _ => false,
+    }
 }
 
 /// Whether the request's host is bound to an HTTP target, resolved as the
