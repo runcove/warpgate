@@ -41,7 +41,7 @@ export const protocolInfo: Partial<Record<TargetKind, string>> = {
 ## Warpgate ↔ client
 
 * Warpgate requires TLS from the client and sets HSTS.
-* Target selection: through the menu, \`?warpgate-target=<name>\` or a subdomain bound in the target options.
+* Target selection: through the menu, or a subdomain bound in the target options. A target bound to a subdomain is served on that subdomain only; \`?warpgate-target=<name>\` selects a target that is not bound to one.
 
 ## HTTP protocol
 
