@@ -258,11 +258,15 @@ pub(crate) fn select_target_name(
 }
 
 /// Whether a target may be served on a request whose Host header is
-/// `request_host`, given the target's `external_host`. Pure, so it can be
-/// tested without a config provider.
+/// `request_host`, given the target's `external_host`. A target bound to a
+/// host is served only on that host, compared as `get_target_by_hostname`
+/// compares it (the full Host header, port included); an unbound target is
+/// served on any host. Pure, so it can be tested without a config provider.
 pub(crate) fn served_on_host(external_host: Option<&str>, request_host: Option<&str>) -> bool {
-    let _ = (external_host, request_host);
-    true
+    match external_host.filter(|host| !host.is_empty()) {
+        Some(bound) => request_host == Some(bound),
+        None => true,
+    }
 }
 
 /// [`served_on_host`] for a target row: its `external_host`, if it is an
