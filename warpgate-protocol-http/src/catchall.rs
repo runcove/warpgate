@@ -237,19 +237,21 @@ pub(crate) async fn resolve_public_target_decision(
     Ok((resolved, decision))
 }
 
-/// Which target a session-authorized request is for, by name: the
-/// `warpgate-target` query parameter, else the target bound to the request's
-/// hostname, else the one remembered in the session. Pure, so the order can
-/// be tested without a config provider.
+/// Which target a session-authorized request is for, by name. A hostname
+/// bound to a target serves that target: the `warpgate-target` query
+/// parameter is honoured there only when it names the same target, and any
+/// other name is ignored. On a host with no binding, the query parameter
+/// picks the target, else the one remembered in the session. Pure, so the
+/// order can be tested without a config provider.
 pub(crate) fn select_target_name(
     query: Option<&str>,
     host_target: Option<&str>,
     session_target: Option<String>,
 ) -> Option<String> {
-    if let Some(query) = query {
-        Some(query.to_owned())
-    } else if let Some(host_target) = host_target {
+    if let Some(host_target) = host_target {
         Some(host_target.to_owned())
+    } else if let Some(query) = query {
+        Some(query.to_owned())
     } else {
         session_target
     }
@@ -358,6 +360,14 @@ async fn get_target_for_request(
         None
     };
 
+    if let (Some(query), Some(bound)) = (&params.warpgate_target, &host_based_target)
+        && *query != bound.name
+    {
+        debug!(
+            "Ignoring a warpgate-target naming another target on a host bound to target {}",
+            bound.name
+        );
+    }
     let selected_target_name = select_target_name(
         params.warpgate_target.as_deref(),
         host_based_target.as_ref().map(|target| target.name.as_str()),
