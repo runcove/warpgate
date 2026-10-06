@@ -30,7 +30,13 @@
     }
 
     async function reloadWebAuthRequests() {
-        webAuthRequests = await api.getWebAuthRequests()
+        try {
+            webAuthRequests = await api.getWebAuthRequests()
+        } catch {
+            // Not served on a host bound to a target (approving other
+            // logins is only offered on the main host): show none.
+            webAuthRequests = []
+        }
     }
 
     async function requireLogin(detail: RouteDetail) {
