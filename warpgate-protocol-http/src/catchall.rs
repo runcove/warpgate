@@ -237,6 +237,42 @@ pub(crate) async fn resolve_public_target_decision(
     Ok((resolved, decision))
 }
 
+/// Which target a session-authorized request is for, by name: the
+/// `warpgate-target` query parameter, else the target bound to the request's
+/// hostname, else the one remembered in the session. Pure, so the order can
+/// be tested without a config provider.
+pub(crate) fn select_target_name(
+    query: Option<&str>,
+    host_target: Option<&str>,
+    session_target: Option<String>,
+) -> Option<String> {
+    if let Some(query) = query {
+        Some(query.to_owned())
+    } else if let Some(host_target) = host_target {
+        Some(host_target.to_owned())
+    } else {
+        session_target
+    }
+}
+
+/// Whether a target may be served on a request whose Host header is
+/// `request_host`, given the target's `external_host`. Pure, so it can be
+/// tested without a config provider.
+pub(crate) fn served_on_host(external_host: Option<&str>, request_host: Option<&str>) -> bool {
+    let _ = (external_host, request_host);
+    true
+}
+
+/// [`served_on_host`] for a target row: its `external_host`, if it is an
+/// HTTP target.
+fn target_served_on_host(target: &Target, request_host: Option<&str>) -> bool {
+    let external_host = match &target.options {
+        TargetOptions::Http(options) => options.external_host.as_deref(),
+        _ => None,
+    };
+    served_on_host(external_host, request_host)
+}
+
 fn is_http_authorization(
     authorization: TargetAuthorization,
 ) -> Option<TargetAuthorization<TargetHTTPOptions>> {
@@ -272,6 +308,17 @@ async fn get_target_for_request(
             .into());
         }
 
+        // A target bound to a host is served only on that host, for a ticket
+        // as for anyone else.
+        let request_host = ctx.trusted_host_header(req);
+        if !target_served_on_host(&target, request_host.as_deref()) {
+            debug!(
+                "Ticket target {} is not served on host {:?}",
+                target.name, request_host
+            );
+            return Ok(None);
+        }
+
         return Ok(is_http_authorization(
             TargetAuthorization::for_ticket_session(
                 AuthStateUserInfo {
@@ -297,10 +344,8 @@ async fn get_target_for_request(
     // `external_host` verbatim.
     let request_host = ctx.trusted_host_header(req);
 
-    let host_based_target = if let Some(host) = request_host {
-        let found = config_provider
-            .get_target_by_hostname(host.as_str())
-            .await?;
+    let host_based_target = if let Some(host) = request_host.as_deref() {
+        let found = config_provider.get_target_by_hostname(host).await?;
         if found.is_some() {
             debug!(
                 "Domain rebinding detected: host={} -> target={:?}",
@@ -313,19 +358,15 @@ async fn get_target_for_request(
         None
     };
 
-    let selected_target_name = if let Some(warpgate_target) = params.warpgate_target {
-        Some(warpgate_target)
-    } else if let Some(ref rebound_target) = host_based_target {
-        Some(rebound_target.name.clone())
-    } else {
-        session.get_target_name()
-    };
+    let selected_target_name = select_target_name(
+        params.warpgate_target.as_deref(),
+        host_based_target.as_ref().map(|target| target.name.as_str()),
+        session.get_target_name(),
+    );
 
     let domain_rebinding_configured = host_based_target.is_some();
-    let final_target_name = selected_target_name
-        .or_else(|| host_based_target.as_ref().map(|target| target.name.clone()));
 
-    if let Some(target_name) = final_target_name {
+    if let Some(target_name) = selected_target_name {
         let target =
             if let Some(target) = host_based_target.filter(|target| target.name == target_name) {
                 Some(target)
@@ -334,6 +375,16 @@ async fn get_target_for_request(
                     .get_target_by_name(target_name.as_str())
                     .await?
             };
+        let target = target.filter(|target| {
+            let served = target_served_on_host(target, request_host.as_deref());
+            if !served {
+                debug!(
+                    "Target {} is not served on host {:?}",
+                    target.name, request_host
+                );
+            }
+            served
+        });
 
         // Reached only for a `SessionAuthorization::User` (ticket sessions are
         // handled separately above), so the session is the prior-auth evidence.
@@ -648,5 +699,161 @@ mod public_target_tests {
                 "{path} must not be classified as a management path",
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod target_selection_tests {
+    //! The order `get_target_for_request` picks a target name in, and the
+    //! hosts a target selected by name may be served on.
+
+    use uuid::Uuid;
+    use warpgate_common::{Target, TargetHTTPOptions, TargetOptions, Tls};
+
+    use super::{select_target_name, served_on_host, target_served_on_host};
+
+    fn http_target(external_host: Option<&str>) -> Target {
+        Target {
+            id: Uuid::nil(),
+            name: "t".into(),
+            description: String::new(),
+            allow_roles: vec![],
+            options: TargetOptions::Http(TargetHTTPOptions {
+                url: "http://upstream:80".into(),
+                tls: Tls::default(),
+                headers: Default::default(),
+                external_host: external_host.map(str::to_string),
+                public: false,
+            }),
+            rate_limit_bytes_per_second: None,
+            group_id: None,
+            ticket_max_duration_seconds: None,
+            ticket_requests_disabled: false,
+            ticket_require_approval: false,
+            require_approval: false,
+            ticket_max_uses: None,
+        }
+    }
+
+    /// The check a ticket's target and a target selected by name both pass
+    /// through.
+    #[test]
+    fn a_target_row_is_served_on_its_own_host_only() {
+        let bound = http_target(Some("t.example"));
+        assert!(target_served_on_host(&bound, Some("t.example")));
+        assert!(!target_served_on_host(&bound, Some("warpgate.example")));
+        let unbound = http_target(None);
+        assert!(target_served_on_host(&unbound, Some("warpgate.example")));
+    }
+
+    /// Targets by name and `external_host`: `v` and `c` bound to their own
+    /// hosts, `u` not bound to any.
+    const TARGETS: &[(&str, Option<&str>)] = &[
+        ("v", Some("v.example")),
+        ("c", Some("c.example:8443")),
+        ("u", None),
+    ];
+
+    /// What `get_target_for_request` serves for a request on `request_host`,
+    /// over `TARGETS`: the host's own target if it has one, the selection,
+    /// then whether the selected target may be served on that host.
+    fn serve(query: Option<&str>, request_host: &str, session: Option<&str>) -> Option<String> {
+        let host_target = TARGETS
+            .iter()
+            .find(|(_, host)| *host == Some(request_host))
+            .map(|(name, _)| *name);
+        let name = select_target_name(query, host_target, session.map(str::to_owned))?;
+        let (_, external_host) = TARGETS.iter().find(|(n, _)| *n == name)?;
+        served_on_host(*external_host, Some(request_host)).then_some(name)
+    }
+
+    #[test]
+    fn a_bound_target_is_not_served_on_the_main_host() {
+        assert_eq!(serve(Some("v"), "warpgate.example", None), None);
+        assert_eq!(serve(None, "warpgate.example", Some("v")), None);
+    }
+
+    #[test]
+    fn a_bound_target_is_not_served_on_another_targets_host() {
+        assert_eq!(serve(Some("c"), "v.example", None), Some("v".into()));
+        assert_eq!(serve(Some("c"), "x.example", None), None);
+        assert_eq!(serve(None, "x.example", Some("c")), None);
+    }
+
+    #[test]
+    fn a_bound_target_is_served_on_its_own_host() {
+        assert_eq!(serve(Some("v"), "v.example", None), Some("v".into()));
+        assert_eq!(serve(None, "v.example", None), Some("v".into()));
+        assert_eq!(serve(None, "c.example:8443", Some("u")), Some("c".into()));
+    }
+
+    #[test]
+    fn an_unbound_target_is_served_on_any_host() {
+        assert_eq!(serve(Some("u"), "warpgate.example", None), Some("u".into()));
+        assert_eq!(serve(None, "warpgate.example", Some("u")), Some("u".into()));
+        assert_eq!(serve(Some("u"), "x.example", None), Some("u".into()));
+    }
+
+    #[test]
+    fn the_host_must_match_the_binding_exactly() {
+        // As `get_target_by_hostname` matches it: the full Host header, port
+        // included.
+        assert!(served_on_host(Some("c.example:8443"), Some("c.example:8443")));
+        assert!(!served_on_host(Some("c.example:8443"), Some("c.example")));
+        assert!(!served_on_host(Some("v.example"), Some("v.example:8443")));
+        assert!(!served_on_host(Some("v.example"), None));
+        assert!(served_on_host(None, None));
+        // An empty `external_host` binds nothing.
+        assert!(served_on_host(Some(""), Some("warpgate.example")));
+    }
+
+    #[test]
+    fn a_hostname_bound_target_is_not_switched_by_the_query_parameter() {
+        assert_eq!(
+            select_target_name(Some("b"), Some("a"), None),
+            Some("a".into())
+        );
+        assert_eq!(
+            select_target_name(Some("b"), Some("a"), Some("c".into())),
+            Some("a".into())
+        );
+    }
+
+    #[test]
+    fn a_hostname_bound_target_honours_a_query_parameter_naming_it() {
+        assert_eq!(
+            select_target_name(Some("a"), Some("a"), None),
+            Some("a".into())
+        );
+        assert_eq!(
+            select_target_name(Some("a"), Some("a"), Some("c".into())),
+            Some("a".into())
+        );
+    }
+
+    #[test]
+    fn an_unbound_host_takes_the_query_parameter() {
+        assert_eq!(select_target_name(Some("b"), None, None), Some("b".into()));
+        assert_eq!(
+            select_target_name(Some("b"), None, Some("c".into())),
+            Some("b".into())
+        );
+    }
+
+    #[test]
+    fn a_hostname_bound_target_wins_over_the_session() {
+        assert_eq!(
+            select_target_name(None, Some("a"), Some("c".into())),
+            Some("a".into())
+        );
+    }
+
+    #[test]
+    fn an_unbound_host_falls_back_to_the_session() {
+        assert_eq!(
+            select_target_name(None, None, Some("c".into())),
+            Some("c".into())
+        );
+        assert_eq!(select_target_name(None, None, None), None);
     }
 }
