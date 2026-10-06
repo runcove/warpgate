@@ -282,12 +282,15 @@ class TestHTTPUserAuthOIDC:
         )
         wg_url = f"https://{login_host}:{wg.http_port}"
         target_url = f"https://target.warpgate.acme.inc:{wg.http_port}"
+        # The admin API is not served on a host bound to a target, which
+        # login_host is in some cases.
+        external_host_url = f"https://warpgate.acme.inc:{wg.http_port}"
 
         with _resolve_hosts_to_localhost(
             "warpgate.acme.inc",
             "target.warpgate.acme.inc",
         ):
-            with admin_client(wg_url) as api:
+            with admin_client(external_host_url) as api:
                 role = api.create_role(sdk.RoleDataRequest(name=f"role-{uuid4()}"))
                 # Bound to the full host it is requested on, port included,
                 # as hostname bindings are matched.

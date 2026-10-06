@@ -55,8 +55,8 @@ use crate::api::common::forward_ws_to_session_owner;
 use crate::client_cache::{HTTP_CLIENT_CACHE_VACUUM_INTERVAL, HttpClientCache};
 use crate::common::{endpoint_auth, page_auth};
 use crate::middleware::{
-    ContentSecurityPolicyMiddleware, CookieHostMiddleware, TicketMiddleware,
-    WARPGATE_PLAYGROUND_CSP,
+    ContentSecurityPolicyMiddleware, CookieHostMiddleware, ManagementScopeMiddleware,
+    OriginCheckMiddleware, TicketMiddleware, WARPGATE_PLAYGROUND_CSP,
 };
 use crate::session::SessionStore;
 use crate::session_handle::warpgate_server_handle_for_request;
@@ -271,6 +271,11 @@ impl ProtocolServer for HTTPProtocolServer {
                     EmbeddedFileEndpoint::<Assets>::new("src/gateway/index.html")
                         .with(cache_bust()),
                 )
+                // Inside the request log, so refused requests are logged too.
+                // The scope runs first: a route not served on this host is a
+                // 404 whatever its origin.
+                .with(OriginCheckMiddleware)
+                .with(ManagementScopeMiddleware)
                 .around({
                     let services = services;
                     move |ep, req| {

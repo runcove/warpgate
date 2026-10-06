@@ -17,7 +17,7 @@ pub static MFA_SETUP_REQUIRED_HEADER: HeaderName =
 const MFA_GATE_PASSED_SESSION_KEY: &str = "mfa_gate_passed";
 /// The path relative to the Warpgate app surface, or `None` for proxied
 /// target paths.
-fn warpgate_surface_path(path: &str) -> Option<&str> {
+pub(super) fn warpgate_surface_path(path: &str) -> Option<&str> {
     path.strip_prefix("/@warpgate")
         .or_else(|| path.strip_prefix("/_warpgate"))
 }
