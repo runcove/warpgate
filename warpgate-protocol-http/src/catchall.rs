@@ -279,6 +279,19 @@ fn target_served_on_host(target: &Target, request_host: Option<&str>) -> bool {
     served_on_host(external_host, request_host)
 }
 
+/// Whether `target` is bound to `request_host`: it has a binding, and
+/// [`served_on_host`] serves it there. With `get_target_by_hostname` this is
+/// how the management scope tells a bound host, so it and the catchall agree
+/// on which hosts are bound.
+pub(crate) fn bound_to_host(target: &Target, request_host: &str) -> bool {
+    let bound = match &target.options {
+        TargetOptions::Http(options) => options.external_host.as_deref(),
+        _ => None,
+    };
+    bound.is_some_and(|bound| !bound.is_empty())
+        && target_served_on_host(target, Some(request_host))
+}
+
 fn is_http_authorization(
     authorization: TargetAuthorization,
 ) -> Option<TargetAuthorization<TargetHTTPOptions>> {
