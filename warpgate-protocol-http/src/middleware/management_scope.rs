@@ -118,7 +118,6 @@ impl<E: Endpoint> Endpoint for ManagementScopeEndpoint<E> {
 #[cfg(test)]
 mod tests {
     use poem::endpoint::make_sync;
-    use poem::test::TestClient;
     use poem::{EndpointExt, Route};
     use sea_orm::ActiveValue::Set;
     use sea_orm::{ConnectionTrait, DatabaseConnection, EntityTrait};
@@ -249,7 +248,7 @@ mod tests {
 
     /// Both management mounts behind the scope, over a database with one HTTP
     /// target bound to [`TARGET_HOST`].
-    async fn client(trust_x_forwarded: bool) -> (TestClient<impl Endpoint>, DatabaseConnection) {
+    async fn client(trust_x_forwarded: bool) -> (impl Endpoint, DatabaseConnection) {
         let db = crate::test_db::memory_db().await;
         bind_target(&db, TARGET_HOST).await;
         let services = crate::test_db::services(db.clone()).await;
@@ -260,7 +259,7 @@ mod tests {
             .nest("/@warpgate", mount())
             .nest("/_warpgate", mount())
             .data(ctx);
-        (TestClient::new(app), db)
+        (app, db)
     }
 
     const ADMIN_API: [(Method, &str); 3] = [
@@ -289,17 +288,34 @@ mod tests {
         (Method::POST, "/@warpgate/api/sso/return"),
     ];
 
+    /// Sends a request as the server builds it. poem's `TestClient` leaves
+    /// `original_uri` at `/` whatever the URI, and the scope reads
+    /// `original_uri`.
     async fn status(
-        cli: &TestClient<impl Endpoint>,
+        app: &impl Endpoint,
         method: &Method,
         path: &str,
         headers: &[(&str, &str)],
     ) -> StatusCode {
-        let mut req = cli.request(method.clone(), path);
+        let mut builder = poem::http::Request::builder()
+            .method(method.clone())
+            .uri(path);
         for (name, value) in headers {
-            req = req.header(*name, *value);
+            builder = builder.header(*name, *value);
         }
-        req.send().await.0.status()
+        let (parts, ()) = builder.body(()).unwrap().into_parts();
+        let req = Request::from_parts(
+            poem::RequestParts::from((
+                parts,
+                poem::web::LocalAddr::default(),
+                poem::web::RemoteAddr::default(),
+                poem::http::uri::Scheme::HTTP,
+            )),
+            poem::Body::empty(),
+        );
+        // Positive control: the path under test is the one the scope reads.
+        assert_eq!(req.original_uri().path(), path);
+        app.get_response(req).await.status()
     }
 
     #[tokio::test]
@@ -377,7 +393,7 @@ mod tests {
                 make_sync(|_| "served").with(ManagementScopeMiddleware),
             )
             .data(ctx);
-        let cli = TestClient::new(app);
+        let cli = app;
         let peer = [
             ("host", TARGET_HOST),
             (X_WARPGATE_CLUSTER_TOKEN.as_str(), token.as_str()),
