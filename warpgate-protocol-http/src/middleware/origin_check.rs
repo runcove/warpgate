@@ -55,9 +55,13 @@ impl OriginCheckRequest<'_> {
     /// SSO return route (bound to the login by its OAuth `state`) and a
     /// cluster peer's forwarded request.
     pub fn is_checked(&self) -> bool {
-        // As yet no request is checked.
-        let _ = (self, warpgate_surface_path);
-        false
+        let safe = matches!(self.method, Method::GET | Method::HEAD | Method::OPTIONS);
+        if self.cluster_peer || (safe && !self.websocket_upgrade) {
+            return false;
+        }
+        let sso_form_post = self.method == Method::POST
+            && warpgate_surface_path(self.path) == Some("/api/sso/return");
+        !sso_form_post
     }
 
     /// Whether a checked request may proceed. Without `Origin` it is a
