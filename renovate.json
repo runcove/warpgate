@@ -35,8 +35,7 @@
       ],
       "matchUpdateTypes": [
         "patch",
-        "pin",
-        "digest"
+        "pin"
       ],
       "groupName": "Rust patch updates",
       "description": "One weekly bundle per ecosystem and update type: patch bundles can be merged on green CI, minor bundles wait for review."
@@ -56,8 +55,7 @@
       ],
       "matchUpdateTypes": [
         "patch",
-        "pin",
-        "digest"
+        "pin"
       ],
       "groupName": "web patch updates"
     },
@@ -76,8 +74,7 @@
       ],
       "matchUpdateTypes": [
         "patch",
-        "pin",
-        "digest"
+        "pin"
       ],
       "groupName": "container image patch updates"
     },
@@ -91,6 +88,13 @@
       "groupName": "container image minor updates"
     },
     {
+      "description": "Digest updates name an exact image or commit with no version to judge, so they always wait for review.",
+      "matchUpdateTypes": [
+        "digest"
+      ],
+      "groupName": "digest updates"
+    },
+    {
       "description": "Majors get their own PR, so a big jump never hides in a weekly bundle.",
       "matchUpdateTypes": [
         "major"
@@ -99,17 +103,17 @@
       "groupSlug": null
     },
     {
-      "description": "Patch updates wait 3 days after release as a supply-chain guard, and are marked for the CI check's merge step. Renovate itself never automerges.",
+      "description": "Patch updates wait 3 days after release (a release with no readable timestamp waits too) and are marked for the CI check's merge step. Renovate itself never automerges.",
       "matchUpdateTypes": [
         "patch",
-        "pin",
-        "digest"
+        "pin"
       ],
       "minimumReleaseAge": "3 days",
       "addLabels": [
         "patch-bundle"
       ],
-      "automerge": false
+      "automerge": false,
+      "minimumReleaseAgeBehaviour": "timestamp-required"
     }
   ],
   "vulnerabilityAlerts": {
@@ -123,5 +127,6 @@
       "security"
     ]
   },
-  "osvVulnerabilityAlerts": true
+  "osvVulnerabilityAlerts": true,
+  "internalChecksFilter": "strict"
 }
