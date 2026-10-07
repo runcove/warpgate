@@ -1,0 +1,49 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": "Our work lives on the cove-patches line, not on main (a stale upstream mirror). A new version-line changes baseBranches.",
+  "baseBranches": ["cove-patches-v0.29.1"],
+  "enabledManagers": ["cargo", "npm", "dockerfile"],
+  "ignorePaths": ["**/vendor/**", "**/tests/**", "docker/Dockerfile", "helm/**", "**/node_modules/**"],
+  "timezone": "Europe/Paris",
+  "schedule": ["* 0-5 * * 1"],
+  "prConcurrentLimit": 2,
+  "branchConcurrentLimit": 2,
+  "prHourlyLimit": 2,
+  "rebaseWhen": "conflicted",
+  "dependencyDashboard": true,
+  "labels": ["renovate"],
+  "packageRules": [
+    {
+      "description": "One weekly bundle per ecosystem.",
+      "matchManagers": ["cargo"],
+      "groupName": "Rust dependencies"
+    },
+    {
+      "matchManagers": ["npm"],
+      "groupName": "web dependencies"
+    },
+    {
+      "matchManagers": ["dockerfile"],
+      "groupName": "container images"
+    },
+    {
+      "description": "Majors get their own PR per ecosystem, so a big jump never hides in the weekly bundle.",
+      "matchUpdateTypes": ["major"],
+      "groupName": null,
+      "groupSlug": null
+    },
+    {
+      "description": "Patch updates may merge on green CI once the fork's PR check exists (automerge is off until then). They wait 3 days after release as a supply-chain guard.",
+      "matchUpdateTypes": ["patch", "pin", "digest"],
+      "minimumReleaseAge": "3 days",
+      "automerge": false
+    }
+  ],
+  "vulnerabilityAlerts": {
+    "enabled": true,
+    "schedule": ["at any time"],
+    "minimumReleaseAge": null,
+    "labels": ["renovate", "security"]
+  },
+  "osvVulnerabilityAlerts": true
+}
