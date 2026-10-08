@@ -3,7 +3,8 @@ use poem_openapi::param::Path;
 use poem_openapi::payload::Json;
 use poem_openapi::{ApiResponse, Object, OpenApi};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, EntityTrait, ModelTrait, QueryFilter, QueryOrder, Set,
+    ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, EntityTrait, ModelTrait,
+    QueryFilter, QueryOrder, QuerySelect, QueryTrait, Set, TransactionTrait,
 };
 use time::OffsetDateTime;
 use tracing::warn;
@@ -16,7 +17,8 @@ use warpgate_common_http::errors::{bad_request, invalid_field};
 use warpgate_core::State;
 use warpgate_core::logging::{AuditEvent, format_related_ids};
 use warpgate_db_entities::{
-    AdminRole, Role, User, UserAdminRoleAssignment, UserRoleAssignment, UserSession,
+    AdminRole, Role, Ticket, TicketRequest, User, UserAdminRoleAssignment, UserRoleAssignment,
+    UserSession,
 };
 
 use super::{AdminContext, ClusterOrAdminContext};
@@ -182,6 +184,58 @@ async fn username_taken(
     Ok(query.one(db).await?.is_some())
 }
 
+/// Deletes `user` and every row that references it through a foreign key
+/// without `ON DELETE CASCADE`, in one transaction, so the delete either
+/// succeeds whole or leaves the user untouched.
+///
+/// Tickets and ticket requests are among those rows: with ticket self-service
+/// in use, a user who ever requested a ticket could otherwise never be
+/// deleted. The target delete handler clears the same two tables for a target.
+/// A ticket request is removed both by its own `user_id` and by the ticket it
+/// produced, since `ticket_requests.ticket_id` also references `tickets`.
+async fn delete_user_records(
+    db: &DatabaseConnection,
+    user: User::Model,
+) -> Result<(), WarpgateError> {
+    let txn = db.begin().await?;
+
+    UserRoleAssignment::Entity::delete_many()
+        .filter(UserRoleAssignment::Column::UserId.eq(user.id))
+        .exec(&txn)
+        .await?;
+
+    UserAdminRoleAssignment::Entity::delete_many()
+        .filter(UserAdminRoleAssignment::Column::UserId.eq(user.id))
+        .exec(&txn)
+        .await?;
+
+    TicketRequest::Entity::delete_many()
+        .filter(
+            Condition::any()
+                .add(TicketRequest::Column::UserId.eq(user.id))
+                .add(
+                    TicketRequest::Column::TicketId.in_subquery(
+                        Ticket::Entity::find()
+                            .select_only()
+                            .column(Ticket::Column::Id)
+                            .filter(Ticket::Column::UserId.eq(user.id))
+                            .into_query(),
+                    ),
+                ),
+        )
+        .exec(&txn)
+        .await?;
+
+    Ticket::Entity::delete_many()
+        .filter(Ticket::Column::UserId.eq(user.id))
+        .exec(&txn)
+        .await?;
+
+    user.delete(&txn).await?;
+    txn.commit().await?;
+    Ok(())
+}
+
 #[derive(ApiResponse)]
 enum DeleteUserResponse {
     #[oai(status = 204)]
@@ -317,24 +371,15 @@ impl DetailApi {
         UserSession::revoke_all_for_user(db, user.id).await?;
         close_live_sessions.await;
 
-        UserRoleAssignment::Entity::delete_many()
-            .filter(UserRoleAssignment::Column::UserId.eq(user.id))
-            .exec(db)
-            .await?;
-
-        UserAdminRoleAssignment::Entity::delete_many()
-            .filter(UserAdminRoleAssignment::Column::UserId.eq(user.id))
-            .exec(db)
-            .await?;
+        let (user_id, username) = (user.id, user.username.clone());
+        delete_user_records(db, user).await?;
 
         AuditEvent::UserDeleted {
-            user_id: user.id,
-            username: user.username.clone(),
+            user_id,
+            username,
             actor_user_id: admin.auth.user_id(),
         }
         .emit();
-
-        user.delete(db).await?;
 
         for (node, status) in fan_out_to_peers_expecting(&admin, req, StatusCode::NO_CONTENT).await
         {
@@ -903,5 +948,211 @@ impl RolesApi {
         .emit();
 
         Ok(DeleteUserAdminRoleResponse::Deleted)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sea_orm::Database;
+    use warpgate_db_entities::Parameters::{ConfigMigrationValues, set_config_migration_values};
+    use warpgate_db_entities::Target::{self, TargetKind};
+    use warpgate_db_entities::TicketRequest::TicketRequestStatus;
+    use warpgate_db_migrations::migrate_database;
+
+    use super::*;
+
+    async fn setup_db() -> DatabaseConnection {
+        set_config_migration_values(ConfigMigrationValues::default());
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        migrate_database(&db).await.unwrap();
+        db
+    }
+
+    async fn insert_user(db: &DatabaseConnection, username: &str) -> User::Model {
+        User::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            username: Set(username.into()),
+            description: Set(String::new()),
+            credential_policy: Set(serde_json::json!({})),
+            rate_limit_bytes_per_second: Set(None),
+            ldap_server_id: Set(None),
+            ldap_object_uuid: Set(None),
+            allowed_ip_ranges: Set(serde_json::Value::Null),
+        }
+        .insert(db)
+        .await
+        .unwrap()
+    }
+
+    async fn insert_target(db: &DatabaseConnection) -> Uuid {
+        let id = Uuid::new_v4();
+        Target::ActiveModel {
+            id: Set(id),
+            name: Set("web".into()),
+            description: Set(String::new()),
+            kind: Set(TargetKind::Http),
+            options: Set(serde_json::json!({})),
+            rate_limit_bytes_per_second: Set(None),
+            group_id: Set(None),
+            ticket_max_duration_seconds: Set(None),
+            ticket_requests_disabled: Set(false),
+            ticket_require_approval: Set(false),
+            ticket_max_uses: Set(None),
+            require_approval: Set(false),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        id
+    }
+
+    async fn insert_ticket(db: &DatabaseConnection, user_id: Uuid, target_id: Uuid) -> Uuid {
+        let id = Uuid::new_v4();
+        Ticket::ActiveModel {
+            id: Set(id),
+            secret_hash: Set("not-a-real-hash".into()),
+            user_id: Set(user_id),
+            description: Set(String::new()),
+            target_id: Set(target_id),
+            uses_left: Set(None),
+            self_service: Set(true),
+            expiry: Set(None),
+            created: Set(OffsetDateTime::now_utc()),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        id
+    }
+
+    async fn insert_request(
+        db: &DatabaseConnection,
+        user_id: Uuid,
+        target_id: Uuid,
+        status: TicketRequestStatus,
+        ticket_id: Option<Uuid>,
+        resolved_by_user_id: Option<Uuid>,
+    ) -> Uuid {
+        let id = Uuid::new_v4();
+        TicketRequest::ActiveModel {
+            id: Set(id),
+            user_id: Set(user_id),
+            target_id: Set(target_id),
+            requested_duration_seconds: Set(None),
+            description: Set(String::new()),
+            status: Set(status),
+            resolved_by_user_id: Set(resolved_by_user_id),
+            ticket_id: Set(ticket_id),
+            created: Set(OffsetDateTime::now_utc()),
+            resolved_at: Set(None),
+            deny_reason: Set(None),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        id
+    }
+
+    /// A user who has used ticket self-service (an approved request with its
+    /// ticket, a pending one, a denied one) can be deleted, and the delete
+    /// takes exactly that user's tickets and ticket requests with it.
+    #[tokio::test]
+    async fn deleting_a_user_removes_their_tickets_and_ticket_requests() {
+        let db = setup_db().await;
+        let target_id = insert_target(&db).await;
+        let alice = insert_user(&db, "alice").await;
+        let bob = insert_user(&db, "bob").await;
+
+        let alice_ticket = insert_ticket(&db, alice.id, target_id).await;
+        let mut alice_requests = vec![
+            insert_request(
+                &db,
+                alice.id,
+                target_id,
+                TicketRequestStatus::Approved,
+                Some(alice_ticket),
+                None,
+            )
+            .await,
+        ];
+        for status in [TicketRequestStatus::Pending, TicketRequestStatus::Denied] {
+            alice_requests.push(insert_request(&db, alice.id, target_id, status, None, None).await);
+        }
+
+        // Bob's rows survive, including a request that alice resolved:
+        // `resolved_by_user_id` is a record, not a reference that blocks.
+        let bob_ticket = insert_ticket(&db, bob.id, target_id).await;
+        let bob_request = insert_request(
+            &db,
+            bob.id,
+            target_id,
+            TicketRequestStatus::Approved,
+            Some(bob_ticket),
+            Some(alice.id),
+        )
+        .await;
+
+        // A request that points at one of alice's tickets goes too, whoever
+        // filed it: `ticket_requests.ticket_id` references `tickets`.
+        alice_requests.push(
+            insert_request(
+                &db,
+                bob.id,
+                target_id,
+                TicketRequestStatus::Approved,
+                Some(alice_ticket),
+                None,
+            )
+            .await,
+        );
+
+        let alice_id = alice.id;
+        delete_user_records(&db, alice).await.unwrap();
+
+        assert!(
+            User::Entity::find_by_id(alice_id)
+                .one(&db)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            Ticket::Entity::find_by_id(alice_ticket)
+                .one(&db)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        for id in alice_requests {
+            assert!(
+                TicketRequest::Entity::find_by_id(id)
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        assert!(
+            User::Entity::find_by_id(bob.id)
+                .one(&db)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            Ticket::Entity::find_by_id(bob_ticket)
+                .one(&db)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            TicketRequest::Entity::find_by_id(bob_request)
+                .one(&db)
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 }
