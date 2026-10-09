@@ -1,7 +1,8 @@
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use futures::future::join_all;
 use futures::{SinkExt, StreamExt};
@@ -25,6 +26,75 @@ use warpgate_tls::configure_cluster_tls_connector;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const REAP_INTERVAL: Duration = Duration::from_secs(15);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A node whose last successful heartbeat is older than this can no longer
+/// write its own database. The liveness endpoint reports it as stale, so the
+/// orchestrator restarts the node instead of leaving it serving errors. A
+/// node with no successful heartbeat yet counts its age from startup, which
+/// makes this the startup grace too.
+pub const HEARTBEAT_STALE_AFTER: Duration = Duration::from_secs(90);
+
+/// The age of this node's last successful heartbeat, read from memory only:
+/// a database that is locked must not make the liveness check hang.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeartbeatHealth {
+    pub age_seconds: u64,
+    pub stale: bool,
+}
+
+pub(crate) fn heartbeat_health_at(
+    last_success: Option<Instant>,
+    started: Instant,
+    now: Instant,
+) -> HeartbeatHealth {
+    let age = now.saturating_duration_since(last_success.unwrap_or(started));
+    HeartbeatHealth {
+        age_seconds: age.as_secs(),
+        stale: age > HEARTBEAT_STALE_AFTER,
+    }
+}
+
+/// An interval for a periodic database task. A run that overruns its period
+/// delays the next one instead of triggering a burst of catch-up runs: with
+/// tokio's default, a task slower than its period runs back to back and can
+/// hold SQLite's write lock almost continuously.
+pub(crate) fn db_task_interval(period: Duration) -> tokio::time::Interval {
+    let mut interval = tokio::time::interval(period);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval
+}
+
+/// When this node last wrote its heartbeat, kept in an atomic so the
+/// liveness check never waits on a lock or the database.
+pub(crate) struct HeartbeatClock {
+    started: Instant,
+    /// Milliseconds after `started` of the last success, or `NEVER`.
+    last_success_ms: AtomicU64,
+}
+
+impl HeartbeatClock {
+    const NEVER: u64 = u64::MAX;
+
+    pub(crate) fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            last_success_ms: AtomicU64::new(Self::NEVER),
+        }
+    }
+
+    pub(crate) fn record_success(&self) {
+        let ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(Self::NEVER - 1);
+        self.last_success_ms.store(ms, Ordering::Relaxed);
+    }
+
+    pub(crate) fn health(&self) -> HeartbeatHealth {
+        let last = match self.last_success_ms.load(Ordering::Relaxed) {
+            Self::NEVER => None,
+            ms => Some(self.started + Duration::from_millis(ms)),
+        };
+        heartbeat_health_at(last, self.started, Instant::now())
+    }
+}
 
 pub const NOTIFICATION_TIMEOUT: Duration = Duration::from_secs(10);
 pub const NOTIFICATIONS_ROUTE: &str = "/cluster/notifications";
@@ -83,6 +153,7 @@ pub struct Cluster {
     /// cached warpgate root CA
     ca_certificate_pem: String,
     notifications: broadcast::Sender<ClusterNotification>,
+    heartbeat_clock: HeartbeatClock,
 }
 
 impl Cluster {
@@ -99,6 +170,7 @@ impl Cluster {
             hostname: std::net::hostname()?.to_string_lossy().to_string(),
             ca_certificate_pem: params.ca_certificate_pem,
             notifications: broadcast::channel(256).0,
+            heartbeat_clock: HeartbeatClock::new(),
             db,
         })
     }
@@ -255,7 +327,7 @@ impl Cluster {
         tokio::spawn({
             let this = Arc::clone(self);
             async move {
-                let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
+                let mut interval = db_task_interval(HEARTBEAT_INTERVAL);
                 loop {
                     interval.tick().await;
                     if let Err(error) = this.heartbeat().await {
@@ -268,7 +340,7 @@ impl Cluster {
         tokio::spawn({
             let db = self.db.clone();
             async move {
-                let mut interval = tokio::time::interval(REAP_INTERVAL);
+                let mut interval = db_task_interval(REAP_INTERVAL);
                 loop {
                     interval.tick().await;
                     if let Err(error) = reap(&db).await {
@@ -310,7 +382,14 @@ impl Cluster {
             )
             .exec_without_returning(&self.db)
             .await?;
+        self.heartbeat_clock.record_success();
         Ok(())
+    }
+
+    /// How long ago this node last wrote its heartbeat. Lock-free and
+    /// database-free, for the liveness endpoint.
+    pub fn heartbeat_health(&self) -> HeartbeatHealth {
+        self.heartbeat_clock.health()
     }
 
     /// Graceful shutdown: end this node's still-open sessions and drop its row, so
@@ -644,6 +723,80 @@ mod tests {
         assert_eq!(plain, r#"{"type":"sessions_changed"}"#);
         let back: ClusterNotification = serde_json::from_str(&plain).unwrap();
         assert!(matches!(back, ClusterNotification::SessionsChanged));
+    }
+
+    #[test]
+    fn heartbeat_health_is_fresh_right_after_a_success() {
+        let started = Instant::now();
+        let now = started + Duration::from_secs(300);
+        let health = heartbeat_health_at(Some(now - Duration::from_secs(4)), started, now);
+        assert_eq!(
+            health,
+            HeartbeatHealth {
+                age_seconds: 4,
+                stale: false
+            }
+        );
+    }
+
+    #[test]
+    fn heartbeat_health_goes_stale_past_the_threshold() {
+        let started = Instant::now();
+        let now = started + Duration::from_secs(600);
+        let at_limit = heartbeat_health_at(Some(now - HEARTBEAT_STALE_AFTER), started, now);
+        assert!(!at_limit.stale, "exactly at the threshold is still fresh");
+        let past = heartbeat_health_at(Some(now - Duration::from_secs(91)), started, now);
+        assert_eq!(
+            past,
+            HeartbeatHealth {
+                age_seconds: 91,
+                stale: true
+            }
+        );
+    }
+
+    #[test]
+    fn heartbeat_health_without_a_success_counts_from_startup() {
+        let started = Instant::now();
+        let in_grace = heartbeat_health_at(None, started, started + Duration::from_secs(30));
+        assert_eq!(
+            in_grace,
+            HeartbeatHealth {
+                age_seconds: 30,
+                stale: false
+            }
+        );
+        let after_grace = heartbeat_health_at(None, started, started + Duration::from_secs(120));
+        assert_eq!(
+            after_grace,
+            HeartbeatHealth {
+                age_seconds: 120,
+                stale: true
+            }
+        );
+    }
+
+    #[test]
+    fn the_clock_reports_a_recorded_success_as_fresh() {
+        let clock = HeartbeatClock::new();
+        assert_eq!(
+            clock.health().age_seconds,
+            0,
+            "no success yet: age counts from startup"
+        );
+        clock.record_success();
+        let health = clock.health();
+        assert!(!health.stale);
+        assert_eq!(health.age_seconds, 0);
+    }
+
+    #[tokio::test]
+    async fn db_task_intervals_never_run_back_to_back() {
+        let interval = db_task_interval(Duration::from_secs(15));
+        assert_eq!(
+            interval.missed_tick_behavior(),
+            tokio::time::MissedTickBehavior::Delay
+        );
     }
 
     #[tokio::test]

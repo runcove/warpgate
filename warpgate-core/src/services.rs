@@ -103,7 +103,7 @@ impl Services {
         {
             let login_protection = login_protection.clone();
             tokio::spawn(async move {
-                let mut interval = tokio::time::interval(Duration::from_secs(3600));
+                let mut interval = crate::cluster::db_task_interval(Duration::from_secs(3600));
                 loop {
                     interval.tick().await;
                     if let Err(e) = login_protection.cleanup_expired().await {
@@ -150,7 +150,7 @@ impl Services {
         {
             let services = services.clone();
             tokio::spawn(async move {
-                let mut interval = tokio::time::interval(APPROVAL_SWEEP_INTERVAL);
+                let mut interval = crate::cluster::db_task_interval(APPROVAL_SWEEP_INTERVAL);
                 loop {
                     interval.tick().await;
                     if let Err(error) = services.apply_decided_user_approvals().await {

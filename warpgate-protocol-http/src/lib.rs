@@ -3,6 +3,7 @@ mod approval_gate;
 mod catchall;
 mod client_cache;
 mod common;
+mod health;
 mod middleware;
 pub mod proxy;
 mod session;
@@ -254,6 +255,8 @@ impl ProtocolServer for HTTPProtocolServer {
                             Ok(resp)
                         }),
                 )
+                // Liveness, from memory only; see health.rs.
+                .at("/api/health", health::health_endpoint)
                 .at(
                     "/api/auth/web-auth-requests/stream",
                     endpoint_auth(api::auth::api_get_web_auth_requests_stream),

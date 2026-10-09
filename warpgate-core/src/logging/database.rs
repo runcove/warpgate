@@ -23,11 +23,25 @@ where
     let _ = LOG_SENDER.set(tokio::sync::broadcast::channel(1024).0);
     ValuesLogLayer::new(|values, target| {
         if let Some(sender) = LOG_SENDER.get()
+            && is_stored_in_database(&target, values.get("message").map_or("", String::as_str))
             && let Some(entry) = values_to_log_entry_data(values, target)
         {
             let _ = sender.send(entry);
         }
     })
+}
+
+/// Whether a log event is also written to the database's log table.
+///
+/// The MySQL proxy logs every statement a client sends ("SQL", with the
+/// statement as a field). A busy client turns that into one database write
+/// per statement: on one deployment it made the log table about 85% of the
+/// database and added constant write load to SQLite. Those lines still reach
+/// stdout; only this one per-statement event is kept out of the table,
+/// matched by target and message, so every other MySQL session line (login,
+/// target, end) is still stored and searchable per session.
+fn is_stored_in_database(target: &str, message: &str) -> bool {
+    !(target == "warpgate_protocol_mysql::session" && message == "SQL")
 }
 
 pub fn install_database_logger(database: DatabaseConnection) {
@@ -83,4 +97,34 @@ fn values_to_log_entry_data(
         related_admin_roles: Set(related_admin_roles),
         timestamp: Set(OffsetDateTime::now_utc()),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn per_query_mysql_lines_are_not_stored() {
+        assert!(!is_stored_in_database(
+            "warpgate_protocol_mysql::session",
+            "SQL"
+        ));
+    }
+
+    #[test]
+    fn other_mysql_and_session_lines_are_still_stored() {
+        assert!(is_stored_in_database(
+            "warpgate_protocol_mysql::session",
+            "Selected database: x"
+        ));
+        assert!(is_stored_in_database(
+            "warpgate_protocol_mysql",
+            "Session ended"
+        ));
+        assert!(is_stored_in_database(
+            "warpgate_protocol_postgres::session",
+            "SQL"
+        ));
+        assert!(is_stored_in_database("audit", "SQL"));
+    }
 }
