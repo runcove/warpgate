@@ -213,6 +213,13 @@ VOLUME /data
 
 ENV WARPGATE_CONFIG=/data/warpgate.yaml
 ENV DOCKER=1
+# Every password check runs Argon2 with a 19 MiB working buffer. glibc serves
+# the first from mmap, then raises its dynamic mmap threshold to that size, so
+# later buffers come from the heap arenas, which rarely shrink: under a few
+# logins a second RSS climbed to the container limit (586 MiB at 1 writer).
+# A fixed threshold switches the dynamic one off, so every such buffer is
+# mmap'd and handed back on free (30 MiB under the same load, Oct 2026).
+ENV MALLOC_MMAP_THRESHOLD_=131072
 
 HEALTHCHECK CMD warpgate healthcheck
 
