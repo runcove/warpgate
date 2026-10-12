@@ -507,25 +507,37 @@ async fn end_sessions_without_cookie(db: &DatabaseConnection) -> Result<(), Warp
 /// Safety net: no target access may read as open past its parent. The normal
 /// end paths close children with their parent in one statement; this catches
 /// whatever a crash left behind.
+///
+/// Written as `EXISTS` on the parent rather than `IN (SELECT id FROM
+/// user_sessions WHERE ended IS NOT NULL)`: SQLite planned the `IN` form as a
+/// scan of every ended user session, all of history, inside an UPDATE that
+/// holds the write lock, every 15 s. This form walks only the open target
+/// sessions (m00089's partial index) and looks each parent up by primary key.
 async fn end_children_of_ended_parents(db: &DatabaseConnection) -> Result<(), WarpgateError> {
+    end_children_of_ended_parents_query().exec(db).await?;
+    Ok(())
+}
+
+fn end_children_of_ended_parents_query() -> sea_orm::UpdateMany<TargetSession::Entity> {
     TargetSession::Entity::update_many()
         .col_expr(
             TargetSession::Column::Ended,
             Expr::value(OffsetDateTime::now_utc()),
         )
         .filter(TargetSession::Column::Ended.is_null())
-        .filter(
-            TargetSession::Column::UserSessionId.in_subquery(
-                sea_orm::sea_query::Query::select()
-                    .column(UserSession::Column::Id)
-                    .from(UserSession::Entity)
-                    .and_where(Expr::col(UserSession::Column::Ended).is_not_null())
-                    .to_owned(),
-            ),
-        )
-        .exec(db)
-        .await?;
-    Ok(())
+        .filter(Expr::exists(
+            sea_orm::sea_query::Query::select()
+                .expr(Expr::val(1))
+                .from(UserSession::Entity)
+                .and_where(
+                    Expr::col((UserSession::Entity, UserSession::Column::Id))
+                        .equals((TargetSession::Entity, TargetSession::Column::UserSessionId)),
+                )
+                .and_where(
+                    Expr::col((UserSession::Entity, UserSession::Column::Ended)).is_not_null(),
+                )
+                .to_owned(),
+        ))
 }
 
 pub async fn alive_nodes(db: &DatabaseConnection) -> Result<Vec<Node::Model>, WarpgateError> {
@@ -979,5 +991,87 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(by_id, vec![UserSessionId(under_live)]);
+    }
+
+    /// The safety net closes a child whose parent ended without it (a crash
+    /// between the two writes) and leaves the children of open parents alone.
+    #[tokio::test]
+    async fn unit_safety_net_closes_only_children_of_ended_parents() {
+        let db = migrated_db().await;
+        let ended_parent = user_session(&db, None, Protocol::MySql).await;
+        let leftover = target_session(&db, ended_parent, None).await;
+        UserSession::Entity::update_many()
+            .col_expr(
+                UserSession::Column::Ended,
+                Expr::value(OffsetDateTime::now_utc()),
+            )
+            .filter(UserSession::Column::Id.eq(warpgate_common::UserSessionId(ended_parent)))
+            .exec(&db)
+            .await
+            .unwrap();
+        let open_parent = user_session(&db, None, Protocol::MySql).await;
+        let live = target_session(&db, open_parent, None).await;
+
+        end_children_of_ended_parents(&db).await.unwrap();
+
+        assert!(!is_open(&db, leftover).await);
+        assert!(is_open(&db, live).await);
+    }
+
+    /// The reaper's two sweeps run every 15 s as UPDATEs, holding SQLite's
+    /// write lock for as long as they read. They must reach only open sessions
+    /// through m00089's partial indexes, never scan the session history: the
+    /// `IN (SELECT id FROM user_sessions ...)` form did, and on the lobby
+    /// (35k sessions, Oct 2026) held the lock past every writer's busy timeout.
+    #[tokio::test]
+    async fn unit_reaper_sweeps_read_only_open_sessions() {
+        use sea_orm::{ConnectionTrait, QueryTrait, Statement};
+
+        let db = migrated_db().await;
+        let plan = |sql: String| {
+            let db = &db;
+            async move {
+                db.query_all(Statement::from_string(
+                    DbBackend::Sqlite,
+                    format!("EXPLAIN QUERY PLAN {sql}"),
+                ))
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| row.try_get_by_index::<String>(3).unwrap())
+                .collect::<Vec<_>>()
+            }
+        };
+
+        let children = plan(
+            end_children_of_ended_parents_query()
+                .build(DbBackend::Sqlite)
+                .to_string(),
+        )
+        .await;
+        assert!(
+            children
+                .iter()
+                .any(|step| step.contains("idx_target_sessions_open_by_user_session")),
+            "{children:?}"
+        );
+        assert!(
+            !children.iter().any(|step| step.starts_with("SCAN")
+                && !step.contains("USING INDEX idx_target_sessions_open_by_user_session")),
+            "{children:?}"
+        );
+
+        let sweep = plan(
+            "UPDATE user_sessions SET ended = 1 WHERE protocol = 'HTTP' AND node_id IS NULL \
+             AND ended IS NULL AND started < 0"
+                .into(),
+        )
+        .await;
+        assert!(
+            sweep
+                .iter()
+                .any(|step| step.contains("idx_user_sessions_open_by_node")),
+            "{sweep:?}"
+        );
     }
 }
