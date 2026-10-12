@@ -112,6 +112,8 @@ mod m00059_sso_auto_redirect;
 // Addresses exempt from the per-address login block (the per-username limit
 // still applies). `cove` in the name keeps it clear of any upstream m00080.
 mod m00080_cove_lp_ip_exempt_cidrs;
+// Indexes on open sessions for the cluster reaper's two 15 s sweeps.
+mod m00089_cove_open_session_indexes;
 
 pub(crate) mod helpers;
 
@@ -215,6 +217,7 @@ impl MigratorTrait for Migrator {
             Box::new(m00042_credentials_certificate_last_sso_at::Migration),
             Box::new(m00059_sso_auto_redirect::Migration),
             Box::new(m00080_cove_lp_ip_exempt_cidrs::Migration),
+            Box::new(m00089_cove_open_session_indexes::Migration),
         ]
     }
 }
