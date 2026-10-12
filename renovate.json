@@ -24,6 +24,9 @@
   "branchConcurrentLimit": 2,
   "prHourlyLimit": 2,
   "rebaseWhen": "conflicted",
+  "env": {
+    "RUSTC_BOOTSTRAP": "1"
+  },
   "dependencyDashboard": true,
   "labels": [
     "renovate"
