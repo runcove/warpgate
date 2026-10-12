@@ -615,7 +615,7 @@ fn non_empty_env(key: &str) -> Option<String> {
 #[cfg(all(test, feature = "sqlite"))]
 mod tests {
     use sea_orm::ActiveValue::NotSet;
-    use sea_orm::Database;
+    use sea_orm::{Database, DbBackend};
     use warpgate_common::Protocol;
     use warpgate_db_entities::Parameters::{ConfigMigrationValues, set_config_migration_values};
     use warpgate_db_migrations::migrate_database;
