@@ -1,4 +1,4 @@
-use sea_orm::{ConnectionTrait, DbBackend};
+use sea_orm::{ConnectionTrait, DbBackend, Statement};
 use sea_orm_migration::prelude::*;
 
 /// Indexes only the open sessions, which the cluster reaper reads every 15 s.
@@ -21,21 +21,51 @@ const USER_INDEX: &str = "idx_user_sessions_open_by_node";
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        // Safe to re-run. Only PostgreSQL wraps a migration in a transaction, so
+        // on SQLite and MySQL a crash between the two statements leaves one
+        // index in place and the migration unrecorded; the next start must not
+        // fail on "index already exists".
         let db = manager.get_connection();
-        let statements: [String; 2] = match manager.get_database_backend() {
-            DbBackend::MySql => [
-                format!("CREATE INDEX {TARGET_INDEX} ON target_sessions (ended, user_session_id)"),
-                format!("CREATE INDEX {USER_INDEX} ON user_sessions (ended, node_id)"),
-            ],
-            DbBackend::Postgres | DbBackend::Sqlite => [
-                format!(
-                    "CREATE INDEX {TARGET_INDEX} ON target_sessions (user_session_id) WHERE ended IS NULL"
-                ),
-                format!("CREATE INDEX {USER_INDEX} ON user_sessions (node_id) WHERE ended IS NULL"),
-            ],
-        };
-        for statement in statements {
-            db.execute_unprepared(&statement).await?;
+        match manager.get_database_backend() {
+            DbBackend::MySql => {
+                for (name, sql) in [
+                    (
+                        TARGET_INDEX,
+                        format!(
+                            "CREATE INDEX {TARGET_INDEX} ON target_sessions (ended, user_session_id)"
+                        ),
+                    ),
+                    (
+                        USER_INDEX,
+                        format!("CREATE INDEX {USER_INDEX} ON user_sessions (ended, node_id)"),
+                    ),
+                ] {
+                    let exists = db
+                        .query_one(Statement::from_sql_and_values(
+                            DbBackend::MySql,
+                            "SELECT 1 FROM information_schema.statistics \
+                             WHERE table_schema = DATABASE() AND index_name = ? LIMIT 1",
+                            [name.into()],
+                        ))
+                        .await?
+                        .is_some();
+                    if !exists {
+                        db.execute_unprepared(&sql).await?;
+                    }
+                }
+            }
+            DbBackend::Postgres | DbBackend::Sqlite => {
+                db.execute_unprepared(&format!(
+                    "CREATE INDEX IF NOT EXISTS {TARGET_INDEX} ON target_sessions (user_session_id) \
+                     WHERE ended IS NULL"
+                ))
+                .await?;
+                db.execute_unprepared(&format!(
+                    "CREATE INDEX IF NOT EXISTS {USER_INDEX} ON user_sessions (node_id) \
+                     WHERE ended IS NULL"
+                ))
+                .await?;
+            }
         }
         Ok(())
     }

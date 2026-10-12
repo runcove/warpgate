@@ -477,6 +477,15 @@ async fn end_connection_bound_sessions(
     db: &DatabaseConnection,
     node_filter: impl IntoCondition,
 ) -> Result<(), WarpgateError> {
+    end_connection_bound_sessions_query(node_filter)
+        .exec(db)
+        .await?;
+    Ok(())
+}
+
+fn end_connection_bound_sessions_query(
+    node_filter: impl IntoCondition,
+) -> sea_orm::UpdateMany<UserSession::Entity> {
     UserSession::Entity::update_many()
         .col_expr(
             UserSession::Column::Ended,
@@ -485,14 +494,16 @@ async fn end_connection_bound_sessions(
         .filter(node_filter)
         .filter(UserSession::Column::NodeId.is_not_null())
         .filter(UserSession::Column::Ended.is_null())
-        .exec(db)
-        .await?;
-    Ok(())
 }
 
 /// End unowned (HTTP browser) sessions whose backing is gone: they are kept
 /// alive by their stored cookie sessions, not by any node.
 async fn end_sessions_without_cookie(db: &DatabaseConnection) -> Result<(), WarpgateError> {
+    end_sessions_without_cookie_query().exec(db).await?;
+    Ok(())
+}
+
+fn end_sessions_without_cookie_query() -> sea_orm::UpdateMany<UserSession::Entity> {
     let grace_cutoff = OffsetDateTime::now_utc() - SHARED_SESSION_ORPHAN_GRACE;
     UserSession::Entity::update_many()
         .col_expr(
@@ -512,9 +523,6 @@ async fn end_sessions_without_cookie(db: &DatabaseConnection) -> Result<(), Warp
                     .to_owned(),
             ),
         )
-        .exec(db)
-        .await?;
-    Ok(())
 }
 
 /// Safety net: no target access may read as open past its parent. The normal
@@ -991,17 +999,48 @@ mod tests {
             "{children:?}"
         );
 
-        let sweep = plan(
-            "UPDATE user_sessions SET ended = 1 WHERE protocol = 'HTTP' AND node_id IS NULL \
-             AND ended IS NULL AND started < 0"
-                .into(),
+        for (name, sql) in [
+            (
+                "cookie sweep",
+                end_sessions_without_cookie_query()
+                    .build(DbBackend::Sqlite)
+                    .to_string(),
+            ),
+            (
+                "connection-bound sweep",
+                end_connection_bound_sessions_query(
+                    UserSession::Column::NodeId.is_not_in([NodeId(Uuid::new_v4())]),
+                )
+                .build(DbBackend::Sqlite)
+                .to_string(),
+            ),
+        ] {
+            let steps = plan(sql).await;
+            assert!(
+                steps
+                    .iter()
+                    .any(|step| step.contains("idx_user_sessions_open_by_node")),
+                "{name}: {steps:?}"
+            );
+        }
+    }
+
+    /// m00089 must survive a crash between its two statements: on SQLite no
+    /// transaction covers a migration, so a restart re-runs it with one index
+    /// already present.
+    #[tokio::test]
+    async fn unit_open_session_index_migration_reruns_cleanly() {
+        use sea_orm::ConnectionTrait;
+
+        let db = migrated_db().await;
+        db.execute_unprepared(
+            "DELETE FROM seaql_migrations WHERE version = 'm00089_cove_open_session_indexes'",
         )
-        .await;
-        assert!(
-            sweep
-                .iter()
-                .any(|step| step.contains("idx_user_sessions_open_by_node")),
-            "{sweep:?}"
-        );
+        .await
+        .unwrap();
+        db.execute_unprepared("DROP INDEX idx_user_sessions_open_by_node")
+            .await
+            .unwrap();
+        migrate_database(&db).await.unwrap();
     }
 }
