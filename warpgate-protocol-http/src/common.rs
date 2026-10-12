@@ -836,12 +836,7 @@ pub async fn authorize_session(
                 let mut store = session_middleware.lock().await;
                 store.remove_session(session);
             }
-            ctx.services()
-                .state
-                .lock()
-                .await
-                .remove_session(old_id)
-                .await;
+            warpgate_core::State::remove_session(&ctx.services().state, old_id).await;
             session.clear();
             server_handle = session_middleware
                 .lock()
