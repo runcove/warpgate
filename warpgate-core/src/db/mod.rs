@@ -64,7 +64,7 @@ pub async fn connect_to_db(
 
 /// SQLite connections in the pool; see `connect_to_sqlite`.
 #[cfg(feature = "sqlite")]
-const SQLITE_MAX_CONNECTIONS: u32 = 8;
+const SQLITE_MAX_CONNECTIONS: u32 = 24;
 
 /// WAL mode required to allow multiple concurrent writes to wait for each other
 /// instead of failing
@@ -86,8 +86,10 @@ async fn connect_to_sqlite(url: &str) -> Result<DatabaseConnection> {
         .synchronous(SqliteSynchronous::Normal)
         .busy_timeout(Duration::from_secs(30));
 
-    // Sized for SQLite, which has one writer at a time: more connections only
-    // queue on its lock. Each sqlx-sqlite connection is its own OS thread with
+    // Sized for SQLite, which has one writer at a time: past a point more
+    // connections only queue on its lock. Enough are kept that writers waiting
+    // out a stalled lock (each holds a connection for up to the busy timeout)
+    // leave room for WAL readers such as login lookups. Each sqlx-sqlite connection is its own OS thread with
     // its own page and statement caches, so the old 100 connections recycled
     // every 8 s meant up to 100 threads churning constantly; under a burst of
     // sessions the lobby's memory climbed to its limit (glibc arenas fragment
@@ -343,14 +345,13 @@ mod tests {
 
 #[cfg(all(test, feature = "sqlite"))]
 mod sqlite_pool_tests {
-    use sea_orm::{ConnectionTrait, Statement};
+    use std::time::Duration;
+
+    use sea_orm::{ConnectionTrait, Statement, TransactionTrait};
 
     use super::*;
 
-    /// Many more concurrent writers than pool connections all complete: they
-    /// queue for a connection and then for the write lock, and none fails.
-    #[tokio::test]
-    async fn unit_a_small_sqlite_pool_serves_a_burst_of_writers() {
+    async fn file_db() -> (DatabaseConnection, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("wg-pool-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let url = format!("sqlite:{}?mode=rwc", dir.join("db.sqlite3").display());
@@ -358,35 +359,68 @@ mod sqlite_pool_tests {
         db.execute_unprepared("CREATE TABLE t (n INTEGER NOT NULL)")
             .await
             .unwrap();
+        (db, dir)
+    }
 
-        let writers = (0..(SQLITE_MAX_CONNECTIONS as i64 * 8)).map(|n| {
-            let db = db.clone();
-            tokio::spawn(async move {
-                db.execute(Statement::from_sql_and_values(
-                    db.get_database_backend(),
-                    "INSERT INTO t (n) VALUES (?)",
-                    [n.into()],
-                ))
-                .await
+    fn insert(n: i64) -> Statement {
+        Statement::from_sql_and_values(
+            sea_orm::DbBackend::Sqlite,
+            "INSERT INTO t (n) VALUES (?)",
+            [n.into()],
+        )
+    }
+
+    /// While one transaction holds the write lock and most of the pool is
+    /// writers waiting it out, a read still gets a connection and answers:
+    /// a stalled write must not turn into a failed login lookup.
+    #[tokio::test]
+    async fn unit_reads_get_through_while_writers_wait_out_a_held_lock() {
+        let (db, dir) = file_db().await;
+
+        let holder = db.begin().await.unwrap();
+        holder.execute(insert(-1)).await.unwrap();
+
+        let stalled = SQLITE_MAX_CONNECTIONS as i64 - 2;
+        let writers = (0..stalled)
+            .map(|n| {
+                let db = db.clone();
+                tokio::spawn(async move { db.execute(insert(n)).await })
             })
-        });
-        for writer in writers.collect::<Vec<_>>() {
+            .collect::<Vec<_>>();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let read = tokio::time::timeout(
+            Duration::from_secs(5),
+            db.query_one(Statement::from_string(
+                sea_orm::DbBackend::Sqlite,
+                "SELECT COUNT(*) AS c FROM t",
+            )),
+        )
+        .await
+        .expect("a read waited behind stalled writers")
+        .unwrap()
+        .unwrap();
+        assert_eq!(row_count(&read), 0);
+
+        holder.commit().await.unwrap();
+        for writer in writers {
             writer.await.unwrap().unwrap();
         }
-
-        let row = db
+        let after = db
             .query_one(Statement::from_string(
-                db.get_database_backend(),
+                sea_orm::DbBackend::Sqlite,
                 "SELECT COUNT(*) AS c FROM t",
             ))
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(
-            row.try_get::<i64>("", "c").unwrap(),
-            SQLITE_MAX_CONNECTIONS as i64 * 8
-        );
+        assert_eq!(row_count(&after), stalled + 1);
+
         drop(db);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn row_count(row: &sea_orm::QueryResult) -> i64 {
+        row.try_get::<i64>("", "c").unwrap()
     }
 }
