@@ -315,7 +315,7 @@ impl Drop for WarpgateServerHandle {
         let end_user_session_on_drop = self.node_owned;
         tokio::spawn(async move {
             if provisional {
-                state.lock().await.discard_session(id).await;
+                State::discard_session(&state, id).await;
                 return;
             }
             if !end_user_session_on_drop {
@@ -333,7 +333,7 @@ impl Drop for WarpgateServerHandle {
                 .as_ref()
                 .map_or_else(String::new, |x| x.username.clone());
             let span = info_span!("Teardown", protocol=protocol.name(), session=%id, session_username=%username);
-            state.lock().await.remove_session(id).instrument(span).await;
+            State::remove_session(&state, id).instrument(span).await;
         });
     }
 }
