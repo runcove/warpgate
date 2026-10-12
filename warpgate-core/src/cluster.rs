@@ -472,36 +472,40 @@ async fn end_connection_bound_sessions(
     db: &DatabaseConnection,
     node_filter: impl IntoCondition,
 ) -> Result<(), WarpgateError> {
-    UserSession::revoke_open_matching(
-        db,
-        Condition::all()
-            .add(node_filter.into_condition())
-            .add(UserSession::Column::NodeId.is_not_null()),
-    )
-    .await
+    UserSession::revoke_open_matching(db, connection_bound_sessions_condition(node_filter)).await
+}
+
+/// Which open sessions [`end_connection_bound_sessions`] ends, shared with
+/// the query-plan test.
+fn connection_bound_sessions_condition(node_filter: impl IntoCondition) -> Condition {
+    Condition::all()
+        .add(node_filter.into_condition())
+        .add(UserSession::Column::NodeId.is_not_null())
 }
 
 /// End unowned (HTTP browser) sessions whose backing is gone: they are kept
 /// alive by their stored cookie sessions, not by any node.
 async fn end_sessions_without_cookie(db: &DatabaseConnection) -> Result<(), WarpgateError> {
+    UserSession::revoke_open_matching(db, sessions_without_cookie_condition()).await
+}
+
+/// Which open sessions [`end_sessions_without_cookie`] ends, shared with the
+/// query-plan test.
+fn sessions_without_cookie_condition() -> Condition {
     let grace_cutoff = OffsetDateTime::now_utc() - SHARED_SESSION_ORPHAN_GRACE;
-    UserSession::revoke_open_matching(
-        db,
-        Condition::all()
-            .add(UserSession::Column::Protocol.eq(Protocol::Http.name()))
-            .add(UserSession::Column::NodeId.is_null())
-            .add(UserSession::Column::Started.lt(grace_cutoff))
-            .add(
-                UserSession::Column::Id.not_in_subquery(
-                    sea_orm::sea_query::Query::select()
-                        .column(HttpSession::Column::UserSessionId)
-                        .from(HttpSession::Entity)
-                        .and_where(Expr::col(HttpSession::Column::UserSessionId).is_not_null())
-                        .to_owned(),
-                ),
+    Condition::all()
+        .add(UserSession::Column::Protocol.eq(Protocol::Http.name()))
+        .add(UserSession::Column::NodeId.is_null())
+        .add(UserSession::Column::Started.lt(grace_cutoff))
+        .add(
+            UserSession::Column::Id.not_in_subquery(
+                sea_orm::sea_query::Query::select()
+                    .column(HttpSession::Column::UserSessionId)
+                    .from(HttpSession::Entity)
+                    .and_where(Expr::col(HttpSession::Column::UserSessionId).is_not_null())
+                    .to_owned(),
             ),
-    )
-    .await
+        )
 }
 
 /// Safety net: no target access may read as open past its parent. The normal
@@ -1061,17 +1065,49 @@ mod tests {
             "{children:?}"
         );
 
-        let sweep = plan(
-            "UPDATE user_sessions SET ended = 1 WHERE protocol = 'HTTP' AND node_id IS NULL \
-             AND ended IS NULL AND started < 0"
-                .into(),
+        for (name, condition) in [
+            ("cookie sweep", sessions_without_cookie_condition()),
+            (
+                "connection-bound sweep",
+                connection_bound_sessions_condition(
+                    UserSession::Column::NodeId.is_not_in([NodeId(Uuid::new_v4())]),
+                ),
+            ),
+        ] {
+            // The read `UserSession::revoke_open_matching` runs for the sweep.
+            let sql = UserSession::Entity::find()
+                .filter(UserSession::Column::Ended.is_null())
+                .filter(condition)
+                .select_only()
+                .column(UserSession::Column::Id)
+                .build(DbBackend::Sqlite)
+                .to_string();
+            let steps = plan(sql).await;
+            assert!(
+                steps
+                    .iter()
+                    .any(|step| step.contains("idx_user_sessions_open_by_node")),
+                "{name}: {steps:?}"
+            );
+        }
+    }
+
+    /// m00089 must survive a crash between its two statements: on SQLite no
+    /// transaction covers a migration, so a restart re-runs it with one index
+    /// already present.
+    #[tokio::test]
+    async fn unit_open_session_index_migration_reruns_cleanly() {
+        use sea_orm::ConnectionTrait;
+
+        let db = migrated_db().await;
+        db.execute_unprepared(
+            "DELETE FROM seaql_migrations WHERE version = 'm00089_cove_open_session_indexes'",
         )
-        .await;
-        assert!(
-            sweep
-                .iter()
-                .any(|step| step.contains("idx_user_sessions_open_by_node")),
-            "{sweep:?}"
-        );
+        .await
+        .unwrap();
+        db.execute_unprepared("DROP INDEX idx_user_sessions_open_by_node")
+            .await
+            .unwrap();
+        migrate_database(&db).await.unwrap();
     }
 }
