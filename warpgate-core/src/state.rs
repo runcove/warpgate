@@ -70,7 +70,13 @@ impl State {
         node_owned: bool,
         state: UserSessionStateInit,
     ) -> Result<Arc<Mutex<WarpgateServerHandle>>, WarpgateError> {
-        let mut self_ = this.lock().await;
+        // The global state lock is held only to read what the insert needs and
+        // then to install the session, never across the database write; see
+        // `remove_session`.
+        let (db, node_id, change_sender) = {
+            let self_ = this.lock().await;
+            (self_.db.clone(), self_.node_id, self_.change_sender.clone())
+        };
         let id = UserSessionId(Uuid::new_v4());
 
         // Read before the state is shared: locking a `UserSessionState` while
@@ -80,10 +86,7 @@ impl State {
         let remote_address = state
             .remote_address
             .map_or_else(String::new, |address| address.to_string());
-        let state = Arc::new(Mutex::new(UserSessionState::new(
-            state,
-            self_.change_sender.clone(),
-        )));
+        let state = Arc::new(Mutex::new(UserSessionState::new(state, change_sender)));
 
         {
             use sea_orm::ActiveValue::Set;
@@ -95,19 +98,21 @@ impl State {
                 protocol: Set(protocol.to_string()),
                 // An unowned session is served by any node; recording an owner
                 // would make the reaper end it when this node goes away.
-                node_id: Set(node_owned.then_some(self_.node_id)),
+                node_id: Set(node_owned.then_some(node_id)),
                 ..Default::default()
             };
 
-            let db = &self_.db;
             values
-                .insert(db)
+                .insert(&db)
                 .await
                 .context("Error inserting session")
                 .map_err(WarpgateError::from)?;
         }
 
-        Ok(self_.install_user_session(this, id, state, protocol, node_owned))
+        Ok(this
+            .lock()
+            .await
+            .install_user_session(this, id, state, protocol, node_owned))
     }
 
     /// Registers a user session and wraps its raw connection stream with the
@@ -224,23 +229,30 @@ impl State {
     /// [`WarpgateServerHandle::mark_provisional`]. Target sessions started
     /// while still provisional (Kubernetes confirms only after admission) are
     /// part of the attempt and are discarded with it.
-    pub async fn discard_session(&mut self, id: UserSessionId) {
-        self.user_sessions.remove(&id);
+    ///
+    /// The global state lock is held only to take the entry out of the map,
+    /// never across the database writes: see [`Self::remove_session`].
+    pub async fn discard_session(this: &Arc<Mutex<Self>>, id: UserSessionId) {
+        let (db, change_sender) = {
+            let mut this = this.lock().await;
+            this.user_sessions.remove(&id);
+            (this.db.clone(), this.change_sender.clone())
+        };
 
         if let Err(error) = TargetSession::Entity::delete_many()
             .filter(TargetSession::Column::UserSessionId.eq(id))
-            .exec(&self.db)
+            .exec(&db)
             .await
         {
             error!(%error, %id, "Could not delete the session's target sessions from the DB");
         }
-        if let Err(error) = UserSession::Entity::delete_by_id(id).exec(&self.db).await {
+        if let Err(error) = UserSession::Entity::delete_by_id(id).exec(&db).await {
             error!(%error, %id, "Could not delete user session from the DB");
         }
 
-        self.abandon_session_approvals(id).await;
+        abandon_session_approvals(&db, id).await;
 
-        let _ = self.change_sender.send(());
+        let _ = change_sender.send(());
     }
 
     pub fn detach_user_session(
@@ -257,26 +269,38 @@ impl State {
         }
     }
 
-    async fn abandon_session_approvals(&self, id: UserSessionId) {
-        if let Err(error) = SessionApprovalRequest::abandon_requests_for_session(&self.db, id).await
-        {
-            error!(%error, %id, "Could not close the session's approval requests");
-        }
-    }
-
-    pub async fn remove_session(&mut self, id: UserSessionId) {
+    /// Ends a session: takes it out of this node's map and marks its row and
+    /// its target sessions ended.
+    ///
+    /// The global state lock is held only to take the entry out of the map.
+    /// Holding it across the database writes, as before, serialized every
+    /// session's teardown and registration behind the slowest write: at a few
+    /// sessions a second the teardown tasks queued without bound, each keeping
+    /// its session state alive, and the lobby's memory climbed until it was
+    /// killed (Oct 2026).
+    pub async fn remove_session(this: &Arc<Mutex<Self>>, id: UserSessionId) {
         // The row is ended whether or not this node still holds the state: a
         // handle dropped just before this call detaches the entry without
         // ending anything, and ending the row is the whole point of the call.
-        self.user_sessions.remove(&id);
+        let (db, change_sender) = {
+            let mut this = this.lock().await;
+            this.user_sessions.remove(&id);
+            (this.db.clone(), this.change_sender.clone())
+        };
 
-        if let Err(error) = UserSession::mark_ended_including_target_sessions(&self.db, id).await {
+        if let Err(error) = UserSession::mark_ended_including_target_sessions(&db, id).await {
             error!(%error, %id, "Could not end user session in the DB");
         }
 
-        self.abandon_session_approvals(id).await;
+        abandon_session_approvals(&db, id).await;
 
-        let _ = self.change_sender.send(());
+        let _ = change_sender.send(());
+    }
+}
+
+async fn abandon_session_approvals(db: &DatabaseConnection, id: UserSessionId) {
+    if let Err(error) = SessionApprovalRequest::abandon_requests_for_session(db, id).await {
+        error!(%error, %id, "Could not close the session's approval requests");
     }
 }
 
