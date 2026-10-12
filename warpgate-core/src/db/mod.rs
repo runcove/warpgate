@@ -73,11 +73,17 @@ async fn connect_to_sqlite(url: &str) -> Result<DatabaseConnection> {
     use std::str::FromStr;
 
     use sea_orm::SqlxSqliteConnector;
-    use sea_orm::sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+    use sea_orm::sqlx::sqlite::{
+        SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous,
+    };
 
+    // NORMAL is durable in WAL mode against an application crash and costs one
+    // fsync per checkpoint instead of one per commit; a power loss can lose the
+    // last commits but never corrupts the database.
     let connect_options = SqliteConnectOptions::from_str(url)?
         .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
+        .synchronous(SqliteSynchronous::Normal)
         .busy_timeout(Duration::from_secs(30));
 
     let pool = SqlitePoolOptions::new()
