@@ -5346,7 +5346,7 @@
           },
           "client_ip": {
             "type": "string",
-            "description": "The client IP after applying the X-Forwarded-For trust setting."
+            "description": "The client IP as Warpgate records it: the `client_ip_header` if one is\nconfigured, else the peer. X-Forwarded-For is shown but never used."
           }
         }
       },
