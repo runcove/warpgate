@@ -3,7 +3,7 @@ use std::net::IpAddr;
 use poem::Request;
 use poem::http::header::HOST;
 use poem::http::uri::Scheme;
-use warpgate_common::http_headers::{X_FORWARDED_FOR, X_FORWARDED_HOST, X_FORWARDED_PROTO};
+use warpgate_common::http_headers::{X_FORWARDED_HOST, X_FORWARDED_PROTO};
 
 use crate::{X_WARPGATE_CLUSTER_CLIENT_IP, is_cluster_peer_request};
 
@@ -76,6 +76,7 @@ mod tests {
     use poem::http::header::HOST;
     use uuid::Uuid;
     use warpgate_common::NodeId;
+    use warpgate_common::http_headers::X_FORWARDED_FOR;
 
     use super::*;
     use crate::ClusterPeer;
