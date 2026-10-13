@@ -44,11 +44,15 @@ pub fn trusted_proto(should_trust_x_forwarded: bool, req: &Request) -> Scheme {
     }
 }
 
+/// The client address for a web request: a cluster peer's word (it holds the
+/// cluster token), else the header the operator named in `client_ip_header`,
+/// else the socket peer. `X-Forwarded-For` is never read here: the caller writes
+/// it, so it cannot say who the caller is. A proxy in front of Warpgate names
+/// the header it sets itself (e.g. `CF-Connecting-IP`, `X-Real-IP`).
 pub fn trusted_client_ip(
     req: &Request,
     cluster_token: &Secret<String>,
     remote_ip: Option<String>,
-    trust_x_forwarded: bool,
     client_ip_header: Option<&str>,
 ) -> Option<String> {
     if is_cluster_peer_request(req, cluster_token)
@@ -60,12 +64,6 @@ pub fn trusted_client_ip(
             .and_then(|value| value.trim().parse::<std::net::IpAddr>().ok())
             .map(|ip| ip.to_string())
             .or(remote_ip)
-    } else if trust_x_forwarded
-        && let Some(ip) = req
-            .header(&X_FORWARDED_FOR)
-            .and_then(first_forwarded_header_value)
-    {
-        Some(ip.to_string())
     } else {
         remote_ip
     }
@@ -147,7 +145,7 @@ mod tests {
     }
 
     #[test]
-    fn trusted_client_ip_uses_first_forwarded_for_value() {
+    fn client_ip_never_comes_from_forwarded_for() {
         let req = Request::builder()
             .header(&X_FORWARDED_FOR, "203.0.113.10, 10.0.0.2")
             .finish();
@@ -157,10 +155,9 @@ mod tests {
                 &req,
                 &Secret::new("".into()),
                 Some("10.0.0.1".to_string()),
-                true,
                 None
             ),
-            Some("203.0.113.10".to_string())
+            Some("10.0.0.1".to_string())
         );
     }
 
@@ -173,7 +170,6 @@ mod tests {
                 &req,
                 &Secret::new("".into()),
                 Some("10.0.0.1".to_string()),
-                true,
                 None
             ),
             Some("10.0.0.1".to_string())
@@ -191,7 +187,6 @@ mod tests {
                 &req,
                 &Secret::new("".into()),
                 Some("10.0.0.1".to_string()),
-                false,
                 None
             ),
             Some("10.0.0.1".to_string())
@@ -210,7 +205,6 @@ mod tests {
                 &req,
                 &Secret::new("s3cret".into()),
                 Some("10.0.0.1".to_string()),
-                false,
                 None
             ),
             Some("203.0.113.10".to_string())
@@ -229,7 +223,6 @@ mod tests {
                 &req,
                 &Secret::new("s3cret".into()),
                 Some("10.0.0.1".to_string()),
-                false,
                 None
             ),
             Some("10.0.0.1".to_string())
@@ -248,7 +241,6 @@ mod tests {
                 &req,
                 &Secret::new("".into()),
                 Some("10.244.1.5".to_string()),
-                false,
                 Some("CF-Connecting-IP")
             ),
             Some("203.0.113.10".to_string())
@@ -266,7 +258,6 @@ mod tests {
                 &req,
                 &Secret::new("".into()),
                 Some("10.244.1.5".to_string()),
-                true,
                 Some("CF-Connecting-IP")
             ),
             Some("10.244.1.5".to_string())
@@ -284,7 +275,6 @@ mod tests {
                 &req,
                 &Secret::new("".into()),
                 Some("10.244.1.5".to_string()),
-                false,
                 Some("CF-Connecting-IP")
             ),
             Some("10.244.1.5".to_string())
@@ -302,7 +292,6 @@ mod tests {
                 &req,
                 &Secret::new("".into()),
                 None,
-                false,
                 Some("CF-Connecting-IP")
             ),
             Some("2001:db8::7".to_string())

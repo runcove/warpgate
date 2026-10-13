@@ -22,7 +22,8 @@ struct IpEchoInfo {
     peer_ip: Option<String>,
     x_forwarded_for: Option<String>,
     trust_x_forwarded_headers: bool,
-    /// The client IP after applying the X-Forwarded-For trust setting.
+    /// The client IP as Warpgate records it: the `client_ip_header` if one is
+    /// configured, else the peer. X-Forwarded-For is shown but never used.
     client_ip: Option<String>,
 }
 
