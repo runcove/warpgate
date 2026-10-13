@@ -548,6 +548,9 @@ pub struct HttpConfig {
     #[serde(default)]
     pub key: String,
 
+    /// Read `X-Forwarded-Host` and `X-Forwarded-Proto` for the URLs Warpgate
+    /// builds. The client address never comes from `X-Forwarded-For`: set
+    /// `client_ip_header` to the header your proxy writes it into.
     #[serde(default)]
     pub trust_x_forwarded_headers: bool,
 
