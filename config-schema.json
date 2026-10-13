@@ -209,6 +209,7 @@
           }
         },
         "trust_x_forwarded_headers": {
+          "description": "Read `X-Forwarded-Host` and `X-Forwarded-Proto` for the URLs Warpgate\nbuilds. The client address never comes from `X-Forwarded-For`: set\n`client_ip_header` to the header your proxy writes it into.",
           "type": "boolean",
           "default": false
         }
