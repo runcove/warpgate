@@ -2,7 +2,7 @@ use poem::Request;
 use poem::http::header::HOST;
 use poem::http::uri::Scheme;
 use warpgate_common::Secret;
-use warpgate_common::http_headers::{X_FORWARDED_FOR, X_FORWARDED_HOST, X_FORWARDED_PROTO};
+use warpgate_common::http_headers::{X_FORWARDED_HOST, X_FORWARDED_PROTO};
 
 use crate::{X_WARPGATE_CLUSTER_CLIENT_IP, is_cluster_peer_request};
 
@@ -73,6 +73,7 @@ pub fn trusted_client_ip(
 mod tests {
     use poem::Request;
     use poem::http::header::HOST;
+    use warpgate_common::http_headers::X_FORWARDED_FOR;
 
     use super::*;
     use crate::X_WARPGATE_CLUSTER_TOKEN;
