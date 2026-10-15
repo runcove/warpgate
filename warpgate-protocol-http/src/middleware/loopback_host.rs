@@ -10,7 +10,9 @@ use crate::common::is_localhost_host;
 
 /// On a plain-HTTP loopback listener (`http.plain_http_on_loopback`), answers
 /// 421 to a request whose `Host` is not a loopback name for this listener.
-/// Installed outermost, so such a request reaches nothing else.
+/// Installed outermost, so such a request reaches nothing else. Only the raw
+/// `Host` header is read, never `X-Forwarded-Host`: a local proxy in front
+/// must pass the original `Host` through.
 #[derive(Clone)]
 pub struct LoopbackHostMiddleware {
     listen_port: u16,

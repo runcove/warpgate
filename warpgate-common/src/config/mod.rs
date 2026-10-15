@@ -578,6 +578,9 @@ pub struct HttpConfig {
     /// Cookies are not scoped by port, so other services on localhost share the
     /// browser's cookies with Warpgate. A local reverse proxy in front of
     /// Warpgate should terminate TLS itself rather than rely on this mode.
+    /// Requests must name a loopback host, the listening port included; only
+    /// the raw `Host` header is read, never `X-Forwarded-Host`, so a local
+    /// proxy in front must pass the original `Host` through.
     #[serde(default)]
     pub plain_http_on_loopback: bool,
 
