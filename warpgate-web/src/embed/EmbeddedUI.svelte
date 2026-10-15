@@ -72,7 +72,7 @@
 
     function goHome() {
         if (externalHost) {
-            location.href = `https://${externalHost}/@warpgate`
+            location.href = `${location.protocol}//${externalHost}/@warpgate`
         } else {
             location.href = '/@warpgate'
         }
