@@ -101,11 +101,17 @@ impl ListenEndpoint {
     /// (`::ffff:127.0.0.1`). A wildcard (`0.0.0.0`, `[::]`) is not: it also
     /// listens on every other interface.
     pub fn is_loopback(&self) -> bool {
-        match self.0.ip() {
-            IpAddr::V4(ip) => ip.is_loopback(),
-            IpAddr::V6(ip) => {
-                ip.is_loopback() || ip.to_ipv4_mapped().is_some_and(|ip| ip.is_loopback())
-            }
+        is_loopback_ip(self.0.ip())
+    }
+}
+
+/// Whether an address is a loopback one: 127.0.0.0/8, `::1`, or 127.0.0.0/8
+/// in IPv4-mapped form (`::ffff:127.0.0.1`).
+pub fn is_loopback_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => ip.is_loopback(),
+        IpAddr::V6(ip) => {
+            ip.is_loopback() || ip.to_ipv4_mapped().is_some_and(|ip| ip.is_loopback())
         }
     }
 }

@@ -83,10 +83,7 @@ pub fn storage_session_id(jar: &CookieJar) -> Option<String> {
     session_cookie_config().get_cookie_value(jar)
 }
 
-/// Check if a host is localhost or 127.x.x.x (for development/testing scenarios)
-pub fn is_localhost_host(host: &str) -> bool {
-    host == "localhost" || host == "127.0.0.1" || host.starts_with("127.")
-}
+pub use warpgate_common_http::auth::is_localhost_host;
 
 pub fn host_is_subdomain_of_or_equal(host: &str, base_domain: &str) -> bool {
     let base = base_domain.trim_start_matches('.');
