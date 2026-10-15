@@ -563,6 +563,9 @@ pub struct HttpConfig {
     /// (127.0.0.0/8 or `::1`): Warpgate refuses to start otherwise. The session
     /// cookie is then `warpgate-loopback-session`: host-only, `HttpOnly`,
     /// `SameSite=Strict`, not `Secure`, kept for `cookie_max_age` up to 12 hours.
+    /// Cookies are not scoped by port, so other services on localhost share the
+    /// browser's cookies with Warpgate. A local reverse proxy in front of
+    /// Warpgate should terminate TLS itself rather than rely on this mode.
     #[serde(default)]
     pub plain_http_on_loopback: bool,
 
