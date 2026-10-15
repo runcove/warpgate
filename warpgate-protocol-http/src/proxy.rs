@@ -33,7 +33,10 @@ use warpgate_tls::{TlsMode, configure_tls_connector};
 use warpgate_web::lookup_built_file;
 
 use crate::client_cache::{HttpClientCache, build_client};
-use crate::common::{SESSION_COOKIE_NAME, SessionExt, is_public_session_authorization};
+use crate::common::{
+    SESSION_COOKIE_NAME, SessionExt, is_public_session_authorization,
+    is_warpgate_session_cookie_name,
+};
 
 static X_WARPGATE_USERNAME: HeaderName = HeaderName::from_static("x-warpgate-username");
 static X_WARPGATE_AUTHENTICATION_TYPE: HeaderName =
@@ -255,6 +258,21 @@ fn rewrite_response(
         }
     }
 
+    // Warpgate's own session cookies are never set by a target.
+    let set_cookies: Vec<HeaderValue> = headers
+        .get_all(http::header::SET_COOKIE)
+        .iter()
+        .cloned()
+        .collect();
+    if set_cookies.iter().any(set_cookie_names_warpgate_session) {
+        headers.remove(http::header::SET_COOKIE);
+        for value in set_cookies {
+            if !set_cookie_names_warpgate_session(&value) {
+                headers.append(http::header::SET_COOKIE, value);
+            }
+        }
+    }
+
     if let http::header::Entry::Occupied(mut entry) = headers.entry(http::header::SET_COOKIE) {
         for value in entry.iter_mut() {
             try_block!({
@@ -278,6 +296,15 @@ fn rewrite_response(
     }
 
     Ok(())
+}
+
+/// Whether a `Set-Cookie` value names one of Warpgate's session cookies,
+/// compared decoded as poem reads cookie names back.
+fn set_cookie_names_warpgate_session(value: &HeaderValue) -> bool {
+    let value = String::from_utf8_lossy(value.as_bytes());
+    let pair = value.split(';').next().unwrap_or_default();
+    let name = pair.split_once('=').map_or(pair, |(name, _)| name);
+    is_warpgate_session_cookie_name(name)
 }
 
 fn cookie_header_for_target(req: &Request) -> Result<Option<String>> {
@@ -1422,6 +1449,41 @@ mod tests {
             .collect();
         assert_eq!(cookie_headers.len(), 1);
         Cookie::parse(cookie_headers[0].clone()).unwrap()
+    }
+
+    #[test]
+    fn rewrite_response_drops_warpgate_session_cookies() {
+        let mut resp = poem::Response::builder()
+            .header(http::header::SET_COOKIE, "app=1; Path=/")
+            .header(http::header::SET_COOKIE, "warpgate-http-session=x; Path=/")
+            .header(
+                http::header::SET_COOKIE,
+                "warpgate-loopback-session=x; Path=/",
+            )
+            .header(
+                http::header::SET_COOKIE,
+                "warpgate%2Dhttp%2Dsession=x; Path=/",
+            )
+            .header(http::header::SET_COOKIE, " warpgate-loopback-session =x")
+            .header(http::header::SET_COOKIE, "other=2; Path=/")
+            .body(());
+        let options = make_options("https://100.0.0.1:7080");
+        let source_uri = Uri::try_from("https://100.0.0.1:7080/index.php").unwrap();
+
+        rewrite_response(&mut resp, &options, &source_uri).unwrap();
+
+        let names: Vec<String> = resp
+            .headers()
+            .get_all(http::header::SET_COOKIE)
+            .iter()
+            .map(|v| {
+                Cookie::parse(v.to_str().unwrap().to_owned())
+                    .unwrap()
+                    .name()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(names, ["app", "other"]);
     }
 
     #[test]

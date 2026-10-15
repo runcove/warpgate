@@ -85,6 +85,13 @@ pub fn decoded_cookie_name(raw: &str) -> Cow<'_, str> {
     percent_decode_str(raw.trim()).decode_utf8_lossy()
 }
 
+/// Whether a raw cookie name reads, once decoded, as one of Warpgate's
+/// session cookies ([`SESSION_COOKIE_NAME`], [`LOOPBACK_SESSION_COOKIE_NAME`]).
+pub fn is_warpgate_session_cookie_name(raw: &str) -> bool {
+    let name = decoded_cookie_name(raw);
+    name == SESSION_COOKIE_NAME || name == LOOPBACK_SESSION_COOKIE_NAME
+}
+
 /// The browser session's storage id from the request's cookie — poem keeps it
 /// only there, never inside the session entries.
 pub fn storage_session_id(jar: &CookieJar) -> Option<String> {
