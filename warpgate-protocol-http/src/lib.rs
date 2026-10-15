@@ -348,6 +348,9 @@ impl ProtocolServer for HTTPProtocolServer {
 
                 ep.call(req).instrument(span).await
             })
+            // Each `with_if` wraps a boxed endpoint: its `EitherEndpoint` holds
+            // the stack twice, which otherwise nests too deep to compile.
+            .boxed()
             // No HSTS from a listener that serves no TLS.
             .with_if(
                 !plain_http,
@@ -361,6 +364,7 @@ impl ProtocolServer for HTTPProtocolServer {
             ))
             .with(CookieHostMiddleware::new(base_cookie_domain))
             .with(cluster_peer_extension())
+            .boxed()
             .with_if(
                 plain_http,
                 LoopbackSessionCookieMiddleware::new(session_cookie_max_age),
@@ -374,12 +378,14 @@ impl ProtocolServer for HTTPProtocolServer {
             // Outermost on purpose: session loading and header parsing run
             // before routing and fail the same way a handler does.
             .around(render_errors)
+            .boxed()
             // Outside even that: on a plain-HTTP loopback listener, a request
             // for any other host is answered 421 before anything else runs.
             .with_if(
                 plain_http,
                 LoopbackHostMiddleware::new(address.port(), self.services.config.clone()),
-            );
+            )
+            .boxed();
 
         tokio::spawn(async move {
             loop {
