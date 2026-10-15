@@ -1,6 +1,6 @@
 use std::fmt::Debug;
 use std::io::ErrorKind;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 
 use futures::stream::{FuturesUnordered, iter};
@@ -95,6 +95,19 @@ impl ListenEndpoint {
     pub const fn port(&self) -> u16 {
         self.0.port()
     }
+
+    /// Whether every address this endpoint listens on is a loopback one:
+    /// 127.0.0.0/8, `::1`, or 127.0.0.0/8 in IPv4-mapped form
+    /// (`::ffff:127.0.0.1`). A wildcard (`0.0.0.0`, `[::]`) is not: it also
+    /// listens on every other interface.
+    pub fn is_loopback(&self) -> bool {
+        match self.0.ip() {
+            IpAddr::V4(ip) => ip.is_loopback(),
+            IpAddr::V6(ip) => {
+                ip.is_loopback() || ip.to_ipv4_mapped().is_some_and(|ip| ip.is_loopback())
+            }
+        }
+    }
 }
 
 impl From<SocketAddr> for ListenEndpoint {
@@ -136,5 +149,43 @@ impl Serialize for ListenEndpoint {
 impl Debug for ListenEndpoint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(f)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+
+    use super::ListenEndpoint;
+
+    fn endpoint(address: &str) -> ListenEndpoint {
+        ListenEndpoint::from(address.parse::<SocketAddr>().unwrap())
+    }
+
+    #[test]
+    fn unit_loopback_addresses_are_loopback() {
+        for address in [
+            "127.0.0.1:8888",
+            "127.1.2.3:8888",
+            "[::1]:8888",
+            "[::ffff:127.0.0.1]:8888",
+        ] {
+            assert!(endpoint(address).is_loopback(), "{address}");
+        }
+    }
+
+    #[test]
+    fn unit_wildcard_and_other_addresses_are_not_loopback() {
+        for address in [
+            "0.0.0.0:8888",
+            "[::]:8888",
+            "192.168.1.10:8888",
+            "10.0.0.1:8888",
+            "[2001:db8::1]:8888",
+            "[::ffff:192.168.1.10]:8888",
+            "[::ffff:0.0.0.0]:8888",
+        ] {
+            assert!(!endpoint(address).is_loopback(), "{address}");
+        }
     }
 }

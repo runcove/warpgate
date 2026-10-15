@@ -558,6 +558,19 @@ pub struct HttpConfig {
 
     #[serde(default)]
     pub sni_certificates: Vec<SniCertificateConfig>,
+
+    /// Serve HTTP without TLS. Only allowed when `listen` is a loopback address
+    /// (127.0.0.0/8 or `::1`): Warpgate refuses to start otherwise. The session
+    /// cookie is then `warpgate-loopback-session`: host-only, `HttpOnly`,
+    /// `SameSite=Strict`, not `Secure`, kept for `cookie_max_age` up to 12 hours.
+    #[serde(default)]
+    pub plain_http_on_loopback: bool,
+
+    /// Plain text shown to a browser that opens a target without a Warpgate
+    /// session, on a page in place of the redirect to the login form. API and
+    /// websocket requests still get a 401.
+    #[serde(default)]
+    pub unauthenticated_message: Option<String>,
 }
 
 impl Default for HttpConfig {
@@ -574,6 +587,8 @@ impl Default for HttpConfig {
             session_max_age: _default_session_max_age(),
             cookie_max_age: _default_cookie_max_age(),
             sni_certificates: vec![],
+            plain_http_on_loopback: false,
+            unauthenticated_message: None,
         }
     }
 }
@@ -585,6 +600,19 @@ impl HttpConfig {
 
     pub fn external_host(&self) -> Option<String> {
         self.external_host.clone()
+    }
+
+    /// Refuses `plain_http_on_loopback` on a listen address that is not a
+    /// loopback one, wildcards included: plain HTTP is never served off the
+    /// loopback interface.
+    pub fn check_plain_http_on_loopback(&self) -> anyhow::Result<()> {
+        if self.plain_http_on_loopback && !self.listen.is_loopback() {
+            anyhow::bail!(
+                "`http.plain_http_on_loopback` is set, but `http.listen` ({:?}) is not a loopback address (127.0.0.0/8 or ::1); refusing to serve plain HTTP",
+                self.listen
+            );
+        }
+        Ok(())
     }
 }
 
@@ -1099,7 +1127,7 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        MAX_WEB_AUTH_WAIT_TIMEOUT, SshConfig, StepUpIntervalConfig, WarpgateConfig,
+        HttpConfig, MAX_WEB_AUTH_WAIT_TIMEOUT, SshConfig, StepUpIntervalConfig, WarpgateConfig,
         WarpgateConfigStore,
     };
 
@@ -1276,5 +1304,86 @@ ssh:
                 "{secs}s must not be clamped"
             );
         }
+    }
+
+    fn http_config(yaml: &str) -> HttpConfig {
+        serde_yaml::from_str(yaml).unwrap()
+    }
+
+    #[test]
+    fn unit_plain_http_on_loopback_defaults_off() {
+        let config = HttpConfig::default();
+        assert!(!config.plain_http_on_loopback);
+        assert!(config.unauthenticated_message.is_none());
+        let parsed = http_config("listen: \"127.0.0.1:8888\"");
+        assert!(!parsed.plain_http_on_loopback);
+        assert!(parsed.unauthenticated_message.is_none());
+    }
+
+    #[test]
+    fn unit_plain_http_on_loopback_accepts_loopback_listeners() {
+        for listen in ["127.0.0.1:8888", "127.0.0.2:8888", "[::1]:8888"] {
+            let config = http_config(&format!(
+                "listen: \"{listen}\"\nplain_http_on_loopback: true"
+            ));
+            assert!(config.plain_http_on_loopback);
+            assert!(
+                config.check_plain_http_on_loopback().is_ok(),
+                "{listen} must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn unit_plain_http_on_loopback_refuses_non_loopback_listeners() {
+        for listen in ["192.168.1.10:8888", "10.0.0.1:8888", "[2001:db8::1]:8888"] {
+            let config = http_config(&format!(
+                "listen: \"{listen}\"\nplain_http_on_loopback: true"
+            ));
+            let error = config
+                .check_plain_http_on_loopback()
+                .expect_err("a non-loopback listener must be refused");
+            assert!(
+                error.to_string().contains("plain_http_on_loopback"),
+                "{error}"
+            );
+        }
+    }
+
+    /// A wildcard listens on loopback and on every other interface at once:
+    /// a mixed listener, refused like any non-loopback one.
+    #[test]
+    fn unit_plain_http_on_loopback_refuses_mixed_listeners() {
+        for listen in ["0.0.0.0:8888", "[::]:8888"] {
+            let config = http_config(&format!(
+                "listen: \"{listen}\"\nplain_http_on_loopback: true"
+            ));
+            assert!(
+                config.check_plain_http_on_loopback().is_err(),
+                "{listen} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn unit_plain_http_on_loopback_off_accepts_any_listener() {
+        for listen in [
+            "127.0.0.1:8888",
+            "0.0.0.0:8888",
+            "[::]:8888",
+            "192.168.1.10:8888",
+        ] {
+            let config = http_config(&format!("listen: \"{listen}\""));
+            assert!(config.check_plain_http_on_loopback().is_ok(), "{listen}");
+        }
+    }
+
+    #[test]
+    fn unit_unauthenticated_message_parses() {
+        let config = http_config("unauthenticated_message: Open the Mac app to sign in.");
+        assert_eq!(
+            config.unauthenticated_message.as_deref(),
+            Some("Open the Mac app to sign in.")
+        );
     }
 }

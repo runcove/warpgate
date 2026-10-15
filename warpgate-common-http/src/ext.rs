@@ -35,7 +35,12 @@ pub async fn construct_external_url(
     } else {
         config.external_host_name().map(|external_host| {
             (
-                Some(Scheme::HTTPS),
+                // The listener's own scheme: plain HTTP only when it serves no TLS.
+                Some(if config.store.http.plain_http_on_loopback {
+                    Scheme::HTTP
+                } else {
+                    Scheme::HTTPS
+                }),
                 Some(external_host),
                 config
                     .store
@@ -103,5 +108,17 @@ mod tests {
             .expect("external url");
 
         assert_eq!(url.as_str(), "https://config.example:8888/");
+    }
+
+    #[tokio::test]
+    async fn construct_external_url_is_http_on_a_plain_http_listener() {
+        let mut config = test_config(Some("localhost"));
+        config.store.http.plain_http_on_loopback = true;
+
+        let url = construct_external_url(None, &config, None)
+            .await
+            .expect("external url");
+
+        assert_eq!(url.as_str(), "http://localhost:8888/");
     }
 }

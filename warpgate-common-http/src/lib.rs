@@ -12,6 +12,7 @@ pub mod ticket_query;
 pub use auth::{AuthenticatedRequestContext, RequestAuthorization, SessionAuthorization};
 pub use keepalive::{SessionKeepalive, SessionKeepaliveGuard};
 use poem::Request;
+pub use request::PlainHttpListener;
 use subtle::ConstantTimeEq;
 use warpgate_common::Secret;
 pub use warpgate_common::http_headers::{

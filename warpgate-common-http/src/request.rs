@@ -28,6 +28,11 @@ pub fn trusted_host_header(should_trust_x_forwarded: bool, req: &Request) -> Opt
     })
 }
 
+/// Request data from the HTTP listener: whether it serves plain HTTP
+/// (`http.plain_http_on_loopback`). A request without it came over TLS.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PlainHttpListener(pub bool);
+
 pub fn trusted_proto(should_trust_x_forwarded: bool, req: &Request) -> Scheme {
     if should_trust_x_forwarded
         && let Some(proto) = req
@@ -37,10 +42,16 @@ pub fn trusted_proto(should_trust_x_forwarded: bool, req: &Request) -> Scheme {
     {
         s
     } else {
-        req.original_uri()
-            .scheme()
-            .cloned()
-            .unwrap_or(Scheme::HTTPS)
+        req.original_uri().scheme().cloned().unwrap_or_else(|| {
+            if req
+                .data::<PlainHttpListener>()
+                .is_some_and(|listener| listener.0)
+            {
+                Scheme::HTTP
+            } else {
+                Scheme::HTTPS
+            }
+        })
     }
 }
 
@@ -127,6 +138,27 @@ mod tests {
             trusted_host_header(true, &req),
             Some("fallback.example".to_string())
         );
+    }
+
+    #[test]
+    fn trusted_proto_is_https_by_default() {
+        for listener in [None, Some(PlainHttpListener(false))] {
+            let mut builder = Request::builder().header(HOST, "warpgate.example");
+            if let Some(listener) = listener {
+                builder = builder.extension(listener);
+            }
+            assert_eq!(trusted_proto(false, &builder.finish()), Scheme::HTTPS);
+        }
+    }
+
+    #[test]
+    fn trusted_proto_is_http_on_a_plain_http_listener() {
+        let req = Request::builder()
+            .header(HOST, "localhost:8888")
+            .extension(PlainHttpListener(true))
+            .finish();
+
+        assert_eq!(trusted_proto(false, &req), Scheme::HTTP);
     }
 
     #[test]

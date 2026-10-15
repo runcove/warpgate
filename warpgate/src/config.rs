@@ -54,6 +54,9 @@ pub fn load_config(params: &GlobalParams, secure: bool) -> Result<WarpgateConfig
     // `validate` may correct values that parse but cannot take effect (see
     // `MAX_WEB_AUTH_WAIT_TIMEOUT`), so it runs before the config is handed out.
     config.validate();
+    // An error, not a warning: refused at start-up, and a reload that sets it
+    // keeps the running config.
+    config.store.http.check_plain_http_on_loopback()?;
     Ok(config)
 }
 

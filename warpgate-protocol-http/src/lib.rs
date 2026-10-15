@@ -13,6 +13,7 @@ mod sso_request_store;
 mod step_up;
 #[cfg(test)]
 mod test_db;
+mod unauthenticated_page;
 
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -42,7 +43,7 @@ use warpgate_common_http::ext::construct_external_url;
 use warpgate_common_http::logging::{
     get_client_ip, log_request_error, log_request_result, span_for_request,
 };
-use warpgate_common_http::warpgate_csp_with_connect_src;
+use warpgate_common_http::{PlainHttpListener, warpgate_csp_with_connect_src};
 use warpgate_core::{ProtocolServer, Services};
 use warpgate_db_entities::Parameters::RecordingsStorageConfig;
 use warpgate_tls::{TlsCertificateAndPrivateKey, TlsCertificateBundle, TlsPrivateKey};
@@ -56,8 +57,9 @@ use crate::api::common::forward_ws_to_session_owner;
 use crate::client_cache::{HTTP_CLIENT_CACHE_VACUUM_INTERVAL, HttpClientCache};
 use crate::common::{endpoint_auth, page_auth};
 use crate::middleware::{
-    ContentSecurityPolicyMiddleware, CookieHostMiddleware, ManagementScopeMiddleware,
-    OriginCheckMiddleware, TicketMiddleware, WARPGATE_PLAYGROUND_CSP,
+    ContentSecurityPolicyMiddleware, CookieHostMiddleware, LOOPBACK_SESSION_COOKIE_MAX_AGE_CAP,
+    LoopbackSessionCookieMiddleware, ManagementScopeMiddleware, OriginCheckMiddleware,
+    TicketMiddleware, WARPGATE_PLAYGROUND_CSP,
 };
 use crate::session::SessionStore;
 use crate::session_handle::warpgate_server_handle_for_request;
@@ -114,8 +116,24 @@ impl ProtocolServer for HTTPProtocolServer {
         proxy_protocol: bool,
         mut tls: Vec<TlsCertificateAndPrivateKey>,
     ) -> Result<BoxFuture<'static, Result<()>>> {
+        let plain_http = self
+            .services
+            .config
+            .lock()
+            .await
+            .store
+            .http
+            .plain_http_on_loopback;
+        // The config check refuses this already; checked again on the address
+        // actually bound, so plain HTTP is never served off loopback.
+        if plain_http && !address.is_loopback() {
+            anyhow::bail!(
+                "`http.plain_http_on_loopback` is set, but {address:?} is not a loopback address; refusing to serve plain HTTP"
+            );
+        }
+
         // Present the cluster identity certificate along other SNI certs
-        if !tls.is_empty() {
+        if !plain_http && !tls.is_empty() {
             // catch the weird case of no cert at all
             let identity = &self.services.cluster.tls_identity;
             tls.push(TlsCertificateAndPrivateKey {
@@ -154,6 +172,12 @@ impl ProtocolServer for HTTPProtocolServer {
                 config.store.http.cookie_max_age,
                 config.store.http.session_max_age,
             )
+        };
+        // The session cookie's lifetime: capped on a plain-HTTP loopback listener.
+        let session_cookie_max_age = if plain_http {
+            cookie_max_age.min(LOOPBACK_SESSION_COOKIE_MAX_AGE_CAP)
+        } else {
+            cookie_max_age
         };
 
         // Set cookie domain to base host (e.g., ".warp.tavahealth.com") so it works for
@@ -341,10 +365,15 @@ impl ProtocolServer for HTTPProtocolServer {
             )
             .with(TicketMiddleware::new())
             .with(ServerSession::new(
-                crate::common::session_cookie_config().max_age(cookie_max_age),
+                crate::common::session_cookie_config().max_age(session_cookie_max_age),
                 session_storage.clone(),
             ))
             .with(CookieHostMiddleware::new(base_cookie_domain))
+            .with_if(
+                plain_http,
+                LoopbackSessionCookieMiddleware::new(session_cookie_max_age),
+            )
+            .data(PlainHttpListener(plain_http))
             .data(UnauthenticatedRequestContext::new(self.services.clone()).await)
             .data(http_client_cache.clone())
             .data(session_store.clone())
@@ -374,6 +403,20 @@ impl ProtocolServer for HTTPProtocolServer {
                 tokio::time::sleep(HTTP_CLIENT_CACHE_VACUUM_INTERVAL).await;
             }
         });
+
+        if plain_http {
+            let acceptor = address.poem_listener()?.into_acceptor().await?;
+            let acceptor = MaybeProxyProtocolAcceptor::new(acceptor, proxy_protocol);
+            warn!(
+                ?address,
+                "Serving HTTP without TLS (`http.plain_http_on_loopback`)"
+            );
+            return Ok(async move {
+                Server::new_with_acceptor(acceptor).run(app).await?;
+                Ok(())
+            }
+            .boxed());
+        }
 
         let rustls_config = make_rustls_config(tls).context("rustls setup")?;
 
