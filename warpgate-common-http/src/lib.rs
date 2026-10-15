@@ -16,6 +16,7 @@ pub use cluster_tls::{ClusterPeer, cluster_peer, cluster_peer_extension, is_clus
 pub use keepalive::{SessionKeepalive, SessionKeepaliveGuard};
 use poem::Request;
 use poem::http::{HeaderMap, HeaderName, HeaderValue, header};
+pub use request::PlainHttpListener;
 pub use warpgate_common::http_headers::{
     X_WARPGATE_CLUSTER_CLIENT_IP, X_WARPGATE_CLUSTER_IDENTITY, X_WARPGATE_CLUSTER_NODE,
     X_WARPGATE_TOKEN,
