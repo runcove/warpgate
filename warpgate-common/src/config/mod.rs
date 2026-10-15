@@ -1336,7 +1336,7 @@ ssh:
 
     #[test]
     fn unit_plain_http_on_loopback_refuses_non_loopback_listeners() {
-        for listen in ["192.168.1.10:8888", "10.0.0.1:8888", "[2001:db8::1]:8888"] {
+        for listen in ["203.0.113.10:8888", "198.51.100.7:8888", "[2001:db8::1]:8888"] {
             let config = http_config(&format!(
                 "listen: \"{listen}\"\nplain_http_on_loopback: true"
             ));
@@ -1371,7 +1371,7 @@ ssh:
             "127.0.0.1:8888",
             "0.0.0.0:8888",
             "[::]:8888",
-            "192.168.1.10:8888",
+            "203.0.113.10:8888",
         ] {
             let config = http_config(&format!("listen: \"{listen}\""));
             assert!(config.check_plain_http_on_loopback().is_ok(), "{listen}");
