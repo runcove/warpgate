@@ -298,12 +298,17 @@ fn rewrite_response(
     Ok(())
 }
 
-/// Whether a `Set-Cookie` value names one of Warpgate's session cookies,
-/// compared decoded as poem reads cookie names back.
+/// Whether a `Set-Cookie` value names one of Warpgate's session cookies. The
+/// name is read as the browser stores it (RFC 6265: the text before the
+/// first `=` of the first `;`-separated part, trimmed; with no `=` the cookie
+/// is nameless) and compared the way poem reads it back: percent-decoded,
+/// exact and case-sensitive, through the same helper as the request side.
 fn set_cookie_names_warpgate_session(value: &HeaderValue) -> bool {
     let value = String::from_utf8_lossy(value.as_bytes());
     let pair = value.split(';').next().unwrap_or_default();
-    let name = pair.split_once('=').map_or(pair, |(name, _)| name);
+    let Some((name, _)) = pair.split_once('=') else {
+        return false;
+    };
     is_warpgate_session_cookie_name(name)
 }
 
@@ -1484,6 +1489,37 @@ mod tests {
             })
             .collect();
         assert_eq!(names, ["app", "other"]);
+    }
+
+    #[test]
+    fn set_cookie_session_name_check_reads_names_as_browser_and_poem_do() {
+        let names_session =
+            |value: &str| set_cookie_names_warpgate_session(&HeaderValue::from_str(value).unwrap());
+
+        for value in [
+            "warpgate-http-session=x",
+            "warpgate-loopback-session=x; Path=/",
+            "warpgate%2Dhttp%2Dsession=x",
+            "warpgate%2dloopback%2dsession=x",
+            "%77arpgate-http-session=x",
+            " warpgate-http-session =x",
+            "\twarpgate-loopback-session\t=x; HttpOnly",
+            "  warpgate%2Dhttp%2Dsession  =x",
+        ] {
+            assert!(names_session(value), "{value:?} must be dropped");
+        }
+        for value in [
+            "app=1",
+            "Warpgate-Http-Session=x",
+            "warpgate-http-session-extra=x",
+            "warpgate-http-session%20=x",
+            "warpgate-http-session",
+            "warpgate-http-session; Path=/",
+            "app=warpgate-http-session=x",
+            "",
+        ] {
+            assert!(!names_session(value), "{value:?} must be kept");
+        }
     }
 
     #[test]
