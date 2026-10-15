@@ -4,7 +4,7 @@ use cookie::{Cookie, SameSite};
 use http::{HeaderValue, header};
 use poem::{Endpoint, IntoResponse, Middleware, Request, Response};
 
-use crate::common::{LOOPBACK_SESSION_COOKIE_NAME, SESSION_COOKIE_NAME};
+use crate::common::{LOOPBACK_SESSION_COOKIE_NAME, SESSION_COOKIE_NAME, decoded_cookie_name};
 
 /// The longest a loopback session cookie is kept, whatever `cookie_max_age` says.
 pub const LOOPBACK_SESSION_COOKIE_MAX_AGE_CAP: Duration = Duration::from_hours(12);
@@ -55,11 +55,12 @@ impl<E: Endpoint> Endpoint for LoopbackSessionCookieEndpoint<E> {
     type Output = Response;
 
     async fn call(&self, mut req: Request) -> poem::Result<Self::Output> {
+        // Values that are not text are skipped, as poem's cookie jar skips them.
         let translated = request_cookie_header(
             req.headers()
                 .get_all(header::COOKIE)
                 .iter()
-                .map(|value| String::from_utf8_lossy(value.as_bytes())),
+                .filter_map(|value| value.to_str().ok()),
         );
         if let Some(cookies) = translated {
             let headers = req.headers_mut();
@@ -90,8 +91,9 @@ impl<E: Endpoint> Endpoint for LoopbackSessionCookieEndpoint<E> {
 
 /// The request's `Cookie` header as Warpgate reads it on a loopback listener:
 /// the loopback cookie under the session cookie's name, and any cookie sent
-/// under the session cookie's own name dropped. Every other pair is kept as
-/// sent. `None` when there is nothing to change.
+/// under the session cookie's own name dropped. Names are compared decoded,
+/// as poem decodes them. Every other pair is kept as sent. `None` when there
+/// is nothing to change.
 fn request_cookie_header<S: AsRef<str>>(values: impl IntoIterator<Item = S>) -> Option<String> {
     let mut changed = false;
     let mut pairs = Vec::new();
@@ -102,7 +104,7 @@ fn request_cookie_header<S: AsRef<str>>(values: impl IntoIterator<Item = S>) -> 
                 continue;
             }
             let (name, cookie_value) = pair.split_once('=').unwrap_or((pair, ""));
-            let name = name.trim();
+            let name = decoded_cookie_name(name);
             if name == SESSION_COOKIE_NAME {
                 changed = true;
             } else if name == LOOPBACK_SESSION_COOKIE_NAME {
@@ -297,6 +299,32 @@ mod tests {
             super::request_cookie_header([format!("{SESSION_COOKIE_NAME}=forged")]),
             Some(String::new())
         );
+    }
+
+    #[test]
+    fn unit_loopback_request_cookie_header_compares_decoded_names() {
+        assert_eq!(
+            super::request_cookie_header([
+                "warpgate%2Dhttp%2Dsession=forged; warpgate%2dloopback%2dsession=abc; app=1"
+            ]),
+            Some(format!("{SESSION_COOKIE_NAME}=abc; app=1"))
+        );
+        assert_eq!(
+            super::request_cookie_header([" warpgate-http-%73ession =forged"]),
+            Some(String::new())
+        );
+    }
+
+    #[tokio::test]
+    async fn unit_loopback_request_drops_an_encoded_session_cookie_name() {
+        let cli = TestClient::new(app(true, Duration::from_hours(24)));
+        let resp = cli
+            .get("/echo")
+            .header("cookie", "warpgate%2Dhttp%2Dsession=forged; app=1")
+            .send()
+            .await;
+
+        resp.assert_text("app=1").await;
     }
 
     #[test]
