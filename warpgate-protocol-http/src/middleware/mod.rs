@@ -1,5 +1,6 @@
 mod cookie_host;
 mod loopback_cookie;
+mod loopback_host;
 mod management_scope;
 mod mfa_enforcement;
 mod origin_check;
@@ -8,6 +9,7 @@ pub(crate) mod ticket;
 
 pub use cookie_host::*;
 pub use loopback_cookie::*;
+pub use loopback_host::*;
 pub use management_scope::*;
 pub use mfa_enforcement::*;
 pub use origin_check::*;
