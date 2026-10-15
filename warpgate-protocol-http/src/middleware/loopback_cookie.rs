@@ -250,13 +250,13 @@ mod tests {
     #[tokio::test]
     async fn unit_loopback_session_cookie_is_read_back_and_removed() {
         let cli = TestClient::new(app(true, Duration::from_hours(24)));
-        let login = only_set_cookie(&cli.get("/login").send().await);
+        let login_cookie = only_set_cookie(&cli.get("/login").send().await);
 
         let resp = cli
             .get("/logout")
             .header(
                 "cookie",
-                format!("{LOOPBACK_SESSION_COOKIE_NAME}={}", login.value()),
+                format!("{LOOPBACK_SESSION_COOKIE_NAME}={}", login_cookie.value()),
             )
             .send()
             .await;
