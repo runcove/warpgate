@@ -33,10 +33,7 @@ use warpgate_tls::{TlsMode, configure_tls_connector};
 use warpgate_web::lookup_built_file;
 
 use crate::client_cache::{HttpClientCache, build_client};
-use crate::common::{
-    SESSION_COOKIE_NAME, SessionExt, is_public_session_authorization,
-    is_warpgate_session_cookie_name,
-};
+use crate::common::{SessionExt, is_public_session_authorization, is_warpgate_session_cookie_name};
 
 static X_WARPGATE_USERNAME: HeaderName = HeaderName::from_static("x-warpgate-username");
 static X_WARPGATE_AUTHENTICATION_TYPE: HeaderName =
@@ -318,7 +315,7 @@ fn cookie_header_for_target(req: &Request) -> Result<Option<String>> {
     for value in req.headers().get_all(http::header::COOKIE) {
         for cookie in Cookie::split_parse(value.to_str()?) {
             let cookie = cookie?;
-            if cookie.name() != SESSION_COOKIE_NAME {
+            if !is_warpgate_session_cookie_name(cookie.name()) {
                 cookies.push(cookie.stripped().to_string());
             }
         }
@@ -1327,6 +1324,18 @@ mod tests {
                 "target-session=one; warpgate-http-session-extra=two; Warpgate-Http-Session=three"
                     .to_string()
             )
+        );
+    }
+
+    #[test]
+    fn request_cookie_header_omits_session_cookies_by_decoded_name() {
+        assert_eq!(
+            forwarded_cookie_header(&[
+                "warpgate%2Dhttp%2Dsession=a; warpgate%2dloopback%2dsession=b; app=1",
+                " warpgate-loopback-session =c;\twarpgate-http-session\t=d; %77arpgate-http-session=e",
+                "warpgate-http-session%20=f; Warpgate%2DHttp%2DSession=g",
+            ]),
+            Some("app=1; warpgate-http-session%20=f; Warpgate%2DHttp%2DSession=g".to_string())
         );
     }
 
