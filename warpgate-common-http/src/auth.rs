@@ -1,3 +1,4 @@
+use std::net::{IpAddr, Ipv6Addr};
 use std::ops::Deref;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -9,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::OnceCell;
 use uuid::Uuid;
 use warpgate_common::auth::AuthStateUserInfo;
-use warpgate_common::{Protocol, WarpgateError};
+use warpgate_common::{Protocol, WarpgateError, is_loopback_ip};
 use warpgate_core::AuthorizedIdentity;
 use warpgate_db_entities::Parameters;
 
@@ -271,16 +272,21 @@ impl RequestAuthorization {
     }
 }
 
-/// Whether `host` is `localhost` or a loopback IP literal (for development/testing
-/// scenarios). Parsed rather than prefix-matched: `127.example.org` is a DNS name
-/// anyone can register.
+/// Whether a hostname (no port) is exactly `localhost` or a loopback IP
+/// literal: 127.0.0.0/8, `::1` (bracketed or not) or 127.0.0.0/8 in
+/// IPv4-mapped form. A name that merely starts with `127.` is not.
 pub fn is_localhost_host(host: &str) -> bool {
-    host.eq_ignore_ascii_case("localhost")
-        || host
-            .trim_start_matches('[')
-            .trim_end_matches(']')
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback())
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    let ip = match host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+    {
+        Some(v6) => v6.parse::<Ipv6Addr>().map(IpAddr::V6),
+        None => host.parse::<IpAddr>(),
+    };
+    ip.is_ok_and(is_loopback_ip)
 }
 
 #[cfg(test)]
@@ -311,7 +317,40 @@ mod tests {
 
     use uuid::Uuid;
 
-    use super::{RequestAuthorization, SessionAuthorization};
+    use super::{RequestAuthorization, SessionAuthorization, is_localhost_host};
+
+    #[test]
+    fn unit_is_localhost_host_accepts_localhost_and_loopback_literals() {
+        for host in [
+            "localhost",
+            "127.0.0.1",
+            "127.1.2.3",
+            "[::1]",
+            "::1",
+            "[::ffff:127.0.0.1]",
+        ] {
+            assert!(is_localhost_host(host), "{host}");
+        }
+    }
+
+    #[test]
+    fn unit_is_localhost_host_refuses_names_that_only_look_local() {
+        for host in [
+            "127.evil.com",
+            "127.0.0.1.evil.com",
+            "localhost.evil.com",
+            "evil.example",
+            "127.1",
+            "0.0.0.0",
+            "[::]",
+            "203.0.113.10",
+            "[::ffff:203.0.113.10]",
+            "[127.0.0.1]",
+            "",
+        ] {
+            assert!(!is_localhost_host(host), "{host}");
+        }
+    }
 
     #[test]
     fn only_full_accounts_are_full_users() {
