@@ -60,8 +60,9 @@ use crate::api::common::forward_ws_to_session_owner;
 use crate::client_cache::HttpClientCache;
 use crate::common::{endpoint_auth, page_auth};
 use crate::middleware::{
-    CookieHostMiddleware, LOOPBACK_SESSION_COOKIE_MAX_AGE_CAP, LoopbackSessionCookieMiddleware,
-    ManagementScopeMiddleware, OriginCheckMiddleware, SecurityHeadersMiddleware, TicketMiddleware,
+    CookieHostMiddleware, LOOPBACK_SESSION_COOKIE_MAX_AGE_CAP, LoopbackHostMiddleware,
+    LoopbackSessionCookieMiddleware, ManagementScopeMiddleware, OriginCheckMiddleware,
+    SecurityHeadersMiddleware, TicketMiddleware,
 };
 use crate::session::SessionStore;
 use crate::session_handle::warpgate_server_handle_for_request;
@@ -370,7 +371,13 @@ impl ProtocolServer for HTTPProtocolServer {
             .data(session_storage.clone())
             // Outermost on purpose: session loading and header parsing run
             // before routing and fail the same way a handler does.
-            .around(render_errors);
+            .around(render_errors)
+            // Outside even that: on a plain-HTTP loopback listener, a request
+            // for any other host is answered 421 before anything else runs.
+            .with_if(
+                plain_http,
+                LoopbackHostMiddleware::new(address.port(), self.services.config.clone()),
+            );
 
         tokio::spawn(async move {
             loop {
