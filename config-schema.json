@@ -195,7 +195,7 @@
           "default": "[::]:8888"
         },
         "plain_http_on_loopback": {
-          "description": "Serve HTTP without TLS. Only allowed when `listen` is a loopback address\n(127.0.0.0/8 or `::1`): Warpgate refuses to start otherwise. The session\ncookie is then `warpgate-loopback-session`: host-only, `HttpOnly`,\n`SameSite=Strict`, not `Secure`, kept for `cookie_max_age` up to 12 hours.\nCookies are not scoped by port, so other services on localhost share the\nbrowser's cookies with Warpgate. A local reverse proxy in front of\nWarpgate should terminate TLS itself rather than rely on this mode.",
+          "description": "Serve HTTP without TLS. Only allowed when `listen` is a loopback address\n(127.0.0.0/8 or `::1`): Warpgate refuses to start otherwise. The session\ncookie is then `warpgate-loopback-session`: host-only, `HttpOnly`,\n`SameSite=Strict`, not `Secure`, kept for `cookie_max_age` up to 12 hours.\nCookies are not scoped by port, so other services on localhost share the\nbrowser's cookies with Warpgate. A local reverse proxy in front of\nWarpgate should terminate TLS itself rather than rely on this mode.\nRequests must name a loopback host, the listening port included; only\nthe raw `Host` header is read, never `X-Forwarded-Host`, so a local\nproxy in front must pass the original `Host` through.",
           "type": "boolean",
           "default": false
         },
