@@ -43,7 +43,7 @@ async fn spawn_supervisor(
 ) -> Result<JoinHandle<()>> {
     let params = selector(&config_rx.borrow());
     if params.enabled {
-        if requires_tls && params.tls.is_empty() {
+        if requires_tls && !params.plaintext && params.tls.is_empty() {
             anyhow::bail!("{name} listener: no TLS certificate/key configured");
         }
         validate_tls(&params.tls)
@@ -143,15 +143,19 @@ pub async fn command(params: &GlobalParams, enable_admin_token: bool) -> Result<
         });
         let base = base.clone();
         let selector: ConfigSelector<WarpgateConfig> = Arc::new(move |c: &WarpgateConfig| {
+            // Plain HTTP serves no certificate, so none is loaded or watched.
+            let plaintext = c.store.http.plain_http_on_loopback;
             let mut tls = Vec::new();
-            if let Some(pair) =
-                TlsPathPair::new(&base, &c.store.http.certificate, &c.store.http.key)
-            {
-                tls.push(pair);
-            }
-            for sni in &c.store.http.sni_certificates {
-                if let Some(pair) = TlsPathPair::new(&base, &sni.certificate, &sni.key) {
+            if !plaintext {
+                if let Some(pair) =
+                    TlsPathPair::new(&base, &c.store.http.certificate, &c.store.http.key)
+                {
                     tls.push(pair);
+                }
+                for sni in &c.store.http.sni_certificates {
+                    if let Some(pair) = TlsPathPair::new(&base, &sni.certificate, &sni.key) {
+                        tls.push(pair);
+                    }
                 }
             }
             ListenerParams {
@@ -159,6 +163,7 @@ pub async fn command(params: &GlobalParams, enable_admin_token: bool) -> Result<
                 endpoint: c.store.http.listen.clone(),
                 proxy_protocol: c.store.http.proxy_protocol,
                 tls,
+                plaintext,
             }
         });
         supervisors.push(
@@ -183,6 +188,7 @@ pub async fn command(params: &GlobalParams, enable_admin_token: bool) -> Result<
                 endpoint: c.store.ssh.listen.clone(),
                 proxy_protocol: c.store.ssh.proxy_protocol,
                 tls: Vec::new(),
+                plaintext: false,
             });
         supervisors.push(
             spawn_supervisor("SSH", false, factory, selector, &config_rx, status_registry).await?,
@@ -213,6 +219,7 @@ pub async fn command(params: &GlobalParams, enable_admin_token: bool) -> Result<
                     tls: TlsPathPair::new(&base, &c.store.$cfg.certificate, &c.store.$cfg.key)
                         .into_iter()
                         .collect(),
+                    plaintext: false,
                 });
             spawn_supervisor($name, true, factory, selector, &config_rx, status_registry).await?
         }};

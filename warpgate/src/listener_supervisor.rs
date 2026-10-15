@@ -42,6 +42,9 @@ pub struct ListenerParams {
     pub proxy_protocol: bool,
     /// TLS pairs the listener serves (main + SNI). Empty for non-TLS protocols.
     pub tls: Vec<TlsPathPair>,
+    /// A TLS protocol serving without TLS: HTTP with `plain_http_on_loopback`.
+    /// Part of the params so that switching it restarts the listener.
+    pub plaintext: bool,
 }
 
 /// Builds the protocol server on the given endpoint, handed the pre-loaded and
@@ -400,6 +403,7 @@ mod tests {
             endpoint: endpoint(port),
             proxy_protocol: false,
             tls: vec![],
+            plaintext: false,
         }
     }
 
@@ -594,6 +598,7 @@ mod tests {
                 certificate: "/etc/warpgate/tls.crt".into(),
                 key: "/etc/warpgate/tls.key".into(),
             }],
+            plaintext: false,
         };
 
         let hit = notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Any))

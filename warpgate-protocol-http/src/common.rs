@@ -41,12 +41,16 @@ use crate::middleware::ticket::TemporaryTicketSession;
 use crate::session::SessionStore;
 use crate::session_storage::SharedSessionStorage;
 use crate::step_up::{StepUpSessionExt, is_session_step_up_stale};
+use crate::unauthenticated_page::unauthenticated_page;
 
 pub const PROTOCOL_NAME: Protocol = Protocol::Http;
 static TARGET_SESSION_KEY: &str = "target_name";
 static AUTH_SESSION_KEY: &str = "auth";
 static AUTH_SSO_LOGIN_STATE: &str = "auth_sso_login_state";
 pub static SESSION_COOKIE_NAME: &str = "warpgate-http-session";
+/// The session cookie's name in the browser on a plain-HTTP loopback listener
+/// (`http.plain_http_on_loopback`); see `LoopbackSessionCookieMiddleware`.
+pub static LOOPBACK_SESSION_COOKIE_NAME: &str = "warpgate-loopback-session";
 
 /// The session cookie's shape — name and (absence of) signing — defined once:
 /// the `ServerSession` middleware writes the cookie through this config, and
@@ -63,6 +67,11 @@ pub static SESSION_COOKIE_NAME: &str = "warpgate-http-session";
 /// header and a base domain is set); on any other host, and on plain HTTP,
 /// the cookie carries no attribute, which browsers treat as `Lax` or `None`.
 /// Both are sent there.
+///
+/// The one exception is a plain-HTTP loopback listener, which the operator
+/// opts into: there `LoopbackSessionCookieMiddleware` makes the browser's
+/// cookie `SameSite=Strict`, so a ticket link opened from another site lands
+/// unauthenticated.
 pub fn session_cookie_config() -> CookieConfig {
     CookieConfig::default()
         .secure(false)
@@ -380,6 +389,24 @@ pub fn page_auth<E: Endpoint + 'static>(e: E) -> impl Endpoint {
         match _inner_auth(ep, req).await? {
             Ok(output) => Ok(output.into_response()),
             Err(req) => {
+                // With `http.unauthenticated_message` set, a browser gets that
+                // message instead of any login redirect; API and websocket
+                // requests fall through to their 401.
+                let message = match req.data::<UnauthenticatedRequestContext>() {
+                    Some(ctx) => ctx
+                        .services()
+                        .config
+                        .lock()
+                        .await
+                        .store
+                        .http
+                        .unauthenticated_message
+                        .clone(),
+                    None => None,
+                };
+                if let Some(resp) = unauthenticated_page(&req, message.as_deref()) {
+                    return Ok(resp);
+                }
                 // Unauthenticated navigation. If the operator has opted into
                 // single-provider SSO auto-redirect, jump straight to the IdP
                 // authorize URL (preserving the original path) instead of

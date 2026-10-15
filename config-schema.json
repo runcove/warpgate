@@ -23,10 +23,12 @@
         "external_port": null,
         "key": "",
         "listen": "[::]:8888",
+        "plain_http_on_loopback": false,
         "proxy_protocol": false,
         "session_max_age": "30m",
         "sni_certificates": [],
-        "trust_x_forwarded_headers": false
+        "trust_x_forwarded_headers": false,
+        "unauthenticated_message": null
       }
     },
     "kubernetes": {
@@ -170,6 +172,11 @@
           "$ref": "#/$defs/ListenEndpoint",
           "default": "[::]:8888"
         },
+        "plain_http_on_loopback": {
+          "description": "Serve HTTP without TLS. Only allowed when `listen` is a loopback address\n(127.0.0.0/8 or `::1`): Warpgate refuses to start otherwise. The session\ncookie is then `warpgate-loopback-session`: host-only, `HttpOnly`,\n`SameSite=Strict`, not `Secure`, kept for `cookie_max_age` up to 12 hours.",
+          "type": "boolean",
+          "default": false
+        },
         "proxy_protocol": {
           "description": "Accept HAProxy PROXY protocol v1/v2 headers from the listener's peer.",
           "type": "boolean",
@@ -189,6 +196,14 @@
         "trust_x_forwarded_headers": {
           "type": "boolean",
           "default": false
+        },
+        "unauthenticated_message": {
+          "description": "Plain text shown to a browser that opens a target without a Warpgate\nsession, on a page in place of the redirect to the login form. API and\nwebsocket requests still get a 401.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
         }
       }
     },
