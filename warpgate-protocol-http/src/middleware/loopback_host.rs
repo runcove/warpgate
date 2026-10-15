@@ -76,7 +76,8 @@ fn request_host(req: &Request) -> Option<String> {
 
 /// Whether a plain-HTTP loopback listener serves a request for `host`: it
 /// must carry the listening port (or none, on port 80) and name `localhost`,
-/// a loopback IP literal, or the configured `external_host`.
+/// a loopback IP literal, or the configured `external_host`. Names compare
+/// without regard to ASCII case; IP literals are compared as parsed.
 pub(crate) fn loopback_listener_accepts_host(
     host: Option<&str>,
     listen_port: u16,
@@ -99,7 +100,9 @@ pub(crate) fn loopback_listener_accepts_host(
         return false;
     }
     let name = authority.host();
-    is_localhost_host(name) || external_host.is_some_and(|external| name == external)
+    name.eq_ignore_ascii_case("localhost")
+        || is_localhost_host(name)
+        || external_host.is_some_and(|external| name.eq_ignore_ascii_case(external))
 }
 
 #[cfg(test)]
@@ -133,6 +136,35 @@ mod tests {
             Some("warpgate.local:8888"),
             8888,
             None
+        ));
+    }
+
+    #[test]
+    fn unit_loopback_host_ignores_case() {
+        for host in [
+            "LOCALHOST:8888",
+            "LocalHost:8888",
+            "[::FFFF:127.0.0.1]:8888",
+        ] {
+            assert!(
+                loopback_listener_accepts_host(Some(host), 8888, None),
+                "{host}"
+            );
+        }
+        assert!(loopback_listener_accepts_host(
+            Some("warpgate.local:8888"),
+            8888,
+            Some("WarpGate.Local")
+        ));
+        assert!(loopback_listener_accepts_host(
+            Some("WARPGATE.local:8888"),
+            8888,
+            Some("warpgate.LOCAL")
+        ));
+        assert!(!loopback_listener_accepts_host(
+            Some("LOCALHOST.evil.com:8888"),
+            8888,
+            Some("WarpGate.Local")
         ));
     }
 
