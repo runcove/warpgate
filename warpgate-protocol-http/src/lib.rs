@@ -359,7 +359,9 @@ impl ProtocolServer for HTTPProtocolServer {
 
                 ep.call(req).instrument(span).await
             })
-            .with(
+            // No HSTS from a listener that serves no TLS.
+            .with_if(
+                !plain_http,
                 SetHeader::new()
                     .overriding(http::header::STRICT_TRANSPORT_SECURITY, "max-age=31536000"),
             )
