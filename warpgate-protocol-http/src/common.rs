@@ -1,10 +1,11 @@
 use core::str;
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use anyhow::Context;
 use http::StatusCode;
-use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
+use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use poem::error::InternalServerError;
 use poem::session::{CookieConfig, Session};
 use poem::web::cookie::CookieJar;
@@ -75,6 +76,12 @@ pub fn session_cookie_config() -> CookieConfig {
     CookieConfig::default()
         .secure(false)
         .name(SESSION_COOKIE_NAME)
+}
+
+/// A cookie name as poem reads it from a `Cookie` header: trimmed and
+/// percent-decoded.
+pub fn decoded_cookie_name(raw: &str) -> Cow<'_, str> {
+    percent_decode_str(raw.trim()).decode_utf8_lossy()
 }
 
 /// The browser session's storage id from the request's cookie — poem keeps it
