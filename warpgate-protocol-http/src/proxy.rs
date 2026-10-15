@@ -255,16 +255,17 @@ fn rewrite_response(
         }
     }
 
-    // Warpgate's own session cookies are never set by a target.
+    // Warpgate's own session cookies, and nameless cookies (which browsers
+    // send back as their bare value), are never set by a target.
     let set_cookies: Vec<HeaderValue> = headers
         .get_all(http::header::SET_COOKIE)
         .iter()
         .cloned()
         .collect();
-    if set_cookies.iter().any(set_cookie_names_warpgate_session) {
+    if set_cookies.iter().any(target_set_cookie_is_dropped) {
         headers.remove(http::header::SET_COOKIE);
         for value in set_cookies {
-            if !set_cookie_names_warpgate_session(&value) {
+            if !target_set_cookie_is_dropped(&value) {
                 headers.append(http::header::SET_COOKIE, value);
             }
         }
@@ -295,18 +296,17 @@ fn rewrite_response(
     Ok(())
 }
 
-/// Whether a `Set-Cookie` value names one of Warpgate's session cookies. The
-/// name is read as the browser stores it (RFC 6265: the text before the
-/// first `=` of the first `;`-separated part, trimmed; with no `=` the cookie
-/// is nameless) and compared the way poem reads it back: percent-decoded,
-/// exact and case-sensitive, through the same helper as the request side.
-fn set_cookie_names_warpgate_session(value: &HeaderValue) -> bool {
+/// Whether a target's `Set-Cookie` value is dropped: it is nameless, or names
+/// one of Warpgate's session cookies. The name is read as the browser stores
+/// it (RFC 6265: the text before the first `=` of the first `;`-separated
+/// part, trimmed; with no `=` the cookie is nameless) and compared the way
+/// poem reads it back: percent-decoded, exact and case-sensitive, through the
+/// same helper as the request side.
+fn target_set_cookie_is_dropped(value: &HeaderValue) -> bool {
     let value = String::from_utf8_lossy(value.as_bytes());
     let pair = value.split(';').next().unwrap_or_default();
-    let Some((name, _)) = pair.split_once('=') else {
-        return false;
-    };
-    is_warpgate_session_cookie_name(name)
+    let name = pair.split_once('=').map_or("", |(name, _)| name);
+    name.trim().is_empty() || is_warpgate_session_cookie_name(name)
 }
 
 fn cookie_header_for_target(req: &Request) -> Result<Option<String>> {
@@ -1501,9 +1501,9 @@ mod tests {
     }
 
     #[test]
-    fn set_cookie_session_name_check_reads_names_as_browser_and_poem_do() {
-        let names_session =
-            |value: &str| set_cookie_names_warpgate_session(&HeaderValue::from_str(value).unwrap());
+    fn target_set_cookie_check_reads_names_as_browser_and_poem_do() {
+        let is_dropped =
+            |value: &str| target_set_cookie_is_dropped(&HeaderValue::from_str(value).unwrap());
 
         for value in [
             "warpgate-http-session=x",
@@ -1514,20 +1514,22 @@ mod tests {
             " warpgate-http-session =x",
             "\twarpgate-loopback-session\t=x; HttpOnly",
             "  warpgate%2Dhttp%2Dsession  =x",
+            "=warpgate-http-session=x",
+            " =warpgate%2Dhttp%2Dsession=x",
+            "warpgate-http-session",
+            "warpgate-http-session; Path=/",
+            "",
         ] {
-            assert!(names_session(value), "{value:?} must be dropped");
+            assert!(is_dropped(value), "{value:?} must be dropped");
         }
         for value in [
             "app=1",
             "Warpgate-Http-Session=x",
             "warpgate-http-session-extra=x",
             "warpgate-http-session%20=x",
-            "warpgate-http-session",
-            "warpgate-http-session; Path=/",
             "app=warpgate-http-session=x",
-            "",
         ] {
-            assert!(!names_session(value), "{value:?} must be kept");
+            assert!(!is_dropped(value), "{value:?} must be kept");
         }
     }
 
