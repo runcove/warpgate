@@ -1258,7 +1258,7 @@ async fn session_teardown_gives_held_uses_back() {
 }
 
 /// Every audit event this test binary emits, so an assertion can pick out
-/// its own by session id. Shared with login_protection's tests (runcove-q2cuy):
+/// its own by session id. Shared with login_protection's tests:
 /// the one global subscriber a test binary can install.
 ///
 /// Installed once and globally rather than per-test with `set_default`:

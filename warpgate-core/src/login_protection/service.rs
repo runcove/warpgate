@@ -625,7 +625,7 @@ impl LoginProtectionService {
     }
 
     /// List all currently blocked IPs, flagging any row whose address is on
-    /// the exempt list (runcove-ljvj.24). `check_ip_blocked` already ignores
+    /// the exempt list. `check_ip_blocked` already ignores
     /// such a row when deciding whether to enforce a block; this reuses that
     /// exact decision (`config.is_ip_exempt`) rather than a second copy of
     /// it, so the admin listing can never disagree with what is enforced.
@@ -818,7 +818,7 @@ mod tests {
             .unwrap()
     }
 
-    /// runcove-q2cuy: every caller drops the result, so an attempt that
+    /// Every caller drops the result, so an attempt that
     /// cannot be recorded must say so in the log -- once, from here -- and
     /// the error still reaches the caller.
     #[cfg(feature = "sqlite")]
@@ -830,7 +830,7 @@ mod tests {
         // The attempts table is gone, so the insert fails as a database
         // error would in production.
         db.execute_unprepared("DROP TABLE failed_login_attempts").await.unwrap();
-        let username = format!("q2cuy-{}", Uuid::new_v4());
+        let username = format!("unrecorded-{}", Uuid::new_v4());
 
         let result = service
             .record_failed_attempt(FailedAttemptInfo {
@@ -956,7 +956,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_blocked_ips_flags_the_exempt_row_and_not_the_other() {
-        // runcove-ljvj.24: the admin listing must flag a row whose address
+        // The admin listing must flag a row whose address
         // is exempt, and must not flag one that is not.
         let db = setup_db(&[]).await;
         let service = LoginProtectionService::new(db.clone()).await.unwrap();

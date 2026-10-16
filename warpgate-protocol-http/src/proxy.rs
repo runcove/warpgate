@@ -197,7 +197,7 @@ fn rewrite_request<B: SomeRequestBuilder>(mut req: B, options: &TargetHTTPOption
 /// upstream Authorization header, if the URL carries any -- the LAST header
 /// step both proxy paths run, after the caller's forwarded headers and the
 /// target's configured ones, so nothing earlier can survive under the same
-/// name (runcove-ljvj.27).
+/// name.
 ///
 /// `set_header` REPLACES rather than appends: a caller must never be able
 /// to substitute their own Authorization for the one the target's URL
@@ -935,7 +935,7 @@ mod tests {
     /// A target URL's embedded credentials replace, rather than append to, a
     /// caller's own Authorization header, whatever the caller sends under
     /// that name: on the reqwest builder of the plain (and streamed) path and
-    /// on the `http` builder of the websocket path (runcove-ljvj.27). Without
+    /// on the `http` builder of the websocket path. Without
     /// the fix, upstream would see the caller's value ahead of the URL's (the
     /// old plain-path order) or the caller's appended after it (the old
     /// websocket-path order) -- either way, more than exactly the URL's.
