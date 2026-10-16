@@ -512,8 +512,8 @@ class Test:
     ):
         # The target runs a command that never reads its stdin, so once its
         # own window fills, every further byte the client sends can only wait
-        # somewhere in Warpgate. Warpgate must stop granting the client window
-        # instead, so the client is held back to about what the windows and
+        # somewhere in Warpgate. Warpgate must stop reading the connection
+        # instead, so TCP holds the client back to about what the windows and
         # the per-channel budget hold (a few MiB), not the whole upload.
         user, ssh_target = setup_user_and_target(
             processes, shared_wg, wg_c_ed25519_pubkey
