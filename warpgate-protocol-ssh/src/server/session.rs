@@ -2637,7 +2637,10 @@ impl ServerSession {
         if has_pty {
             let _ = self
                 .event_sender
-                .try_send_once(Event::ConsoleInput(data.clone()))
+                // A copy, not a clone: `data` holds its share of the
+                // channel's input budget until dropped, and an idle event
+                // subscriber must not keep that share.
+                .try_send_once(Event::ConsoleInput(Bytes::copy_from_slice(&data)))
                 .await;
 
             // While a host-key trust prompt is waiting for 'y'/'n', do not forward
