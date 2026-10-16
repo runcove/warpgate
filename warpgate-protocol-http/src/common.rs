@@ -1744,13 +1744,13 @@ mod public_session_tests {
     #[tokio::test]
     async fn an_anonymous_caller_cannot_claim_a_username_upstream() {
         for headers in [
-            &[("X-Warpgate-Username", "jeremy")][..],
-            &[("x-WARPGATE-username", "jeremy")],
+            &[("X-Warpgate-Username", "mallory")][..],
+            &[("x-WARPGATE-username", "mallory")],
             &[
-                ("X-Warpgate-Username", "jeremy"),
+                ("X-Warpgate-Username", "mallory"),
                 ("x-warpgate-username", "admin"),
             ],
-            &[("X-Warpgate-Username", "jeremy, admin")],
+            &[("X-Warpgate-Username", "mallory, admin")],
         ] {
             let upstream = upstream_for(None, headers).await;
             assert_eq!(
@@ -1774,7 +1774,7 @@ mod public_session_tests {
             ],
             &[("X-Warpgate-Authentication-Type", "user, ticket")],
             &[
-                ("X-Warpgate-Username", "jeremy"),
+                ("X-Warpgate-Username", "mallory"),
                 ("X-Warpgate-Authentication-Type", "user"),
             ],
         ] {
@@ -1800,7 +1800,7 @@ mod public_session_tests {
             Some(alice),
             &[
                 ("X-Warpgate-Username", "bob"),
-                ("x-WARPGATE-username", "jeremy"),
+                ("x-WARPGATE-username", "mallory"),
                 ("X-Warpgate-Authentication-Type", "ticket"),
             ],
         )
