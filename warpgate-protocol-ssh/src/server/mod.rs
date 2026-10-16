@@ -107,7 +107,10 @@ async fn _handle_connection(
             .map(|text| format!("{}\r\n", text.replace("\r\n", "\n").replace('\n', "\r\n")))
     };
 
-    let handler = ServerHandler { event_tx, banner };
+    // Input waiting on a stalled target ends the connection after the same
+    // quiet period as an idle one.
+    let input_wait_limit = services.config.lock().await.store.ssh.inactivity_timeout;
+    let handler = ServerHandler::new(event_tx, banner, input_wait_limit);
 
     let session = match ServerSession::start(
         remote_address,
