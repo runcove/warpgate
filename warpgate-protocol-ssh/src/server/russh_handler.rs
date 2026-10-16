@@ -105,16 +105,24 @@ impl ServerHandlerEvent {
 }
 
 /// How much of one channel's input may be on its way to the target at once
-/// (OpenSSH's default channel window). Past it the client waits: the input
-/// is held until the target has taken it, so a slow or stalled target slows
-/// the upload down instead of piling it up in memory.
+/// (OpenSSH's default channel window). Past it Warpgate stops reading the
+/// connection until the target has taken earlier input, so a slow or stalled
+/// target slows the upload down (TCP holds the client back) instead of
+/// piling it up in memory.
 pub const CHANNEL_INPUT_BUDGET: usize = 2 * 1024 * 1024;
 
-/// Input bytes that keep their share of the channel's budget until the last
-/// copy of them is dropped, which is after they were written to the target.
+/// How much input all of one connection's channels together may have on its
+/// way to targets at once. Without it, input spread over many channels would
+/// add up past any single channel's budget.
+pub const CONNECTION_INPUT_BUDGET: usize = 16 * 1024 * 1024;
+
+/// Input bytes that keep their share of the channel's and the connection's
+/// budgets until the last copy of them is dropped, which is after they were
+/// written to the target.
 struct HeldInput {
     data: Vec<u8>,
-    _permit: OwnedSemaphorePermit,
+    _channel_permit: OwnedSemaphorePermit,
+    _connection_permit: OwnedSemaphorePermit,
 }
 
 impl AsRef<[u8]> for HeldInput {
@@ -123,22 +131,30 @@ impl AsRef<[u8]> for HeldInput {
     }
 }
 
-/// Waits until `budget` has room for `data`, then returns it as bytes that
-/// hold that room until their last copy is dropped.
+/// Waits until both the channel's and the connection's budgets have room
+/// for `data`, then returns it as bytes that hold that room until their last
+/// copy is dropped. The channel's share is taken first; one wait limit covers
+/// both.
 async fn hold_input(
-    budget: Arc<Semaphore>,
+    channel_budget: Arc<Semaphore>,
+    connection_budget: Arc<Semaphore>,
     data: &[u8],
     wait_limit: Duration,
 ) -> anyhow::Result<Bytes> {
     let wanted =
         u32::try_from(data.len().min(CHANNEL_INPUT_BUDGET)).context("channel input budget")?;
-    let permit = tokio::time::timeout(wait_limit, budget.acquire_many_owned(wanted))
-        .await
-        .context("the target did not take the channel's input in time")?
-        .context("channel input budget closed")?;
+    let (channel_permit, connection_permit) = tokio::time::timeout(wait_limit, async {
+        let channel_permit = channel_budget.acquire_many_owned(wanted).await?;
+        let connection_permit = connection_budget.acquire_many_owned(wanted).await?;
+        Ok::<_, tokio::sync::AcquireError>((channel_permit, connection_permit))
+    })
+    .await
+    .context("the target did not take the input in time")?
+    .context("input budget closed")?;
     Ok(Bytes::from_owner(HeldInput {
         data: data.to_vec(),
-        _permit: permit,
+        _channel_permit: channel_permit,
+        _connection_permit: connection_permit,
     }))
 }
 
@@ -148,6 +164,8 @@ pub struct ServerHandler {
     pub banner: Option<String>,
     /// Per channel, the input budget still free (see [`CHANNEL_INPUT_BUDGET`]).
     pub input_budgets: HashMap<ChannelId, Arc<Semaphore>>,
+    /// The whole connection's input budget still free (see [`CONNECTION_INPUT_BUDGET`]).
+    pub connection_input_budget: Arc<Semaphore>,
     /// How long input may wait for budget before the connection is dropped.
     pub input_wait_limit: Duration,
 }
@@ -168,19 +186,27 @@ impl ServerHandler {
             event_tx,
             banner,
             input_budgets: HashMap::new(),
+            connection_input_budget: Arc::new(Semaphore::new(CONNECTION_INPUT_BUDGET)),
             input_wait_limit,
         }
     }
 
-    /// Waits until the channel's budget has room for `data`, then returns
-    /// it as bytes that hold that room until they are dropped.
+    /// Waits until the channel's and the connection's budgets have room for
+    /// `data`, then returns it as bytes that hold that room until they are
+    /// dropped.
     async fn hold_input(&mut self, channel: ChannelId, data: &[u8]) -> anyhow::Result<Bytes> {
         let budget = self
             .input_budgets
             .entry(channel)
             .or_insert_with(|| Arc::new(Semaphore::new(CHANNEL_INPUT_BUDGET)))
             .clone();
-        hold_input(budget, data, self.input_wait_limit).await
+        hold_input(
+            budget,
+            self.connection_input_budget.clone(),
+            data,
+            self.input_wait_limit,
+        )
+        .await
     }
 
     fn send_event(&self, event: ServerHandlerEvent) -> Result<(), ServerHandlerError> {
@@ -695,20 +721,29 @@ mod tests {
 
     const WAIT: Duration = Duration::from_millis(200);
 
+    fn connection() -> Arc<Semaphore> {
+        Arc::new(Semaphore::new(CONNECTION_INPUT_BUDGET))
+    }
+
     /// Input up to the budget goes straight through; past it the next input
     /// waits until earlier input is dropped (written to the target), and it
     /// gets the same bytes either way.
     #[tokio::test]
     async fn channel_input_past_its_budget_waits_for_the_target() {
         let budget = Arc::new(Semaphore::new(CHANNEL_INPUT_BUDGET));
-        let first = hold_input(budget.clone(), &vec![1; CHANNEL_INPUT_BUDGET], WAIT)
-            .await
-            .unwrap();
+        let first = hold_input(
+            budget.clone(),
+            connection(),
+            &vec![1; CHANNEL_INPUT_BUDGET],
+            WAIT,
+        )
+        .await
+        .unwrap();
         assert_eq!(budget.available_permits(), 0);
 
         let next = tokio::spawn({
             let budget = budget.clone();
-            async move { hold_input(budget, b"more", Duration::from_secs(5)).await }
+            async move { hold_input(budget, connection(), b"more", Duration::from_secs(5)).await }
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!next.is_finished(), "input past the budget must wait");
@@ -733,10 +768,15 @@ mod tests {
     #[tokio::test]
     async fn channel_input_gives_up_when_the_target_never_takes_it() {
         let budget = Arc::new(Semaphore::new(CHANNEL_INPUT_BUDGET));
-        let _held = hold_input(budget.clone(), &vec![0; CHANNEL_INPUT_BUDGET], WAIT)
-            .await
-            .unwrap();
-        assert!(hold_input(budget, b"x", WAIT).await.is_err());
+        let _held = hold_input(
+            budget.clone(),
+            connection(),
+            &vec![0; CHANNEL_INPUT_BUDGET],
+            WAIT,
+        )
+        .await
+        .unwrap();
+        assert!(hold_input(budget, connection(), b"x", WAIT).await.is_err());
     }
 
     /// One packet larger than the whole budget still goes through on an
@@ -745,7 +785,77 @@ mod tests {
     async fn channel_input_larger_than_the_budget_still_passes() {
         let budget = Arc::new(Semaphore::new(CHANNEL_INPUT_BUDGET));
         let big = vec![7; CHANNEL_INPUT_BUDGET + 1];
-        let held = hold_input(budget, &big, WAIT).await.unwrap();
+        let held = hold_input(budget, connection(), &big, WAIT).await.unwrap();
         assert_eq!(held.len(), big.len());
+    }
+
+    /// Input spread over many channels, each under its own budget, still
+    /// stops at the connection's budget: the channel that would go past it
+    /// waits, and goes through once earlier input has been written.
+    #[tokio::test]
+    async fn input_over_many_channels_stops_at_the_connection_budget() {
+        let connection = connection();
+        let per_channel = CHANNEL_INPUT_BUDGET - 1;
+        let fits = CONNECTION_INPUT_BUDGET / per_channel;
+        let mut held = Vec::new();
+        for _ in 0..fits {
+            let channel = Arc::new(Semaphore::new(CHANNEL_INPUT_BUDGET));
+            held.push(
+                hold_input(channel, connection.clone(), &vec![3; per_channel], WAIT)
+                    .await
+                    .unwrap(),
+            );
+        }
+        assert!(connection.available_permits() < per_channel);
+
+        let one_more = tokio::spawn({
+            let connection = connection.clone();
+            async move {
+                let channel = Arc::new(Semaphore::new(CHANNEL_INPUT_BUDGET));
+                hold_input(
+                    channel,
+                    connection,
+                    &vec![4; per_channel],
+                    Duration::from_secs(5),
+                )
+                .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !one_more.is_finished(),
+            "a further channel must wait for the connection's budget"
+        );
+
+        held.clear();
+        let late = one_more.await.unwrap().unwrap();
+        assert_eq!(late.len(), per_channel);
+        drop(late);
+        assert_eq!(connection.available_permits(), CONNECTION_INPUT_BUDGET);
+    }
+
+    /// The connection's budget alone also ends a wait that never gets room.
+    #[tokio::test]
+    async fn input_gives_up_when_the_connection_budget_never_frees() {
+        let connection = Arc::new(Semaphore::new(CHANNEL_INPUT_BUDGET));
+        let _held = hold_input(
+            Arc::new(Semaphore::new(CHANNEL_INPUT_BUDGET)),
+            connection.clone(),
+            &vec![0; CHANNEL_INPUT_BUDGET],
+            WAIT,
+        )
+        .await
+        .unwrap();
+        let other_channel = Arc::new(Semaphore::new(CHANNEL_INPUT_BUDGET));
+        assert!(
+            hold_input(other_channel.clone(), connection, b"x", WAIT)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            other_channel.available_permits(),
+            CHANNEL_INPUT_BUDGET,
+            "a wait that gave up keeps no share of the channel's budget"
+        );
     }
 }
