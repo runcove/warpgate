@@ -504,6 +504,45 @@ class Test:
         finally:
             transport.close()
 
+    def test_input_waits_for_a_target_that_does_not_read(
+        self,
+        processes: ProcessManager,
+        wg_c_ed25519_pubkey,
+        shared_wg: WarpgateProcess,
+    ):
+        # The target runs a command that never reads its stdin, so once its
+        # own window fills, every further byte the client sends can only wait
+        # somewhere in Warpgate. Warpgate must stop granting the client window
+        # instead, so the client is held back to about what the windows and
+        # the per-channel budget hold (a few MiB), not the whole upload.
+        user, ssh_target = setup_user_and_target(
+            processes, shared_wg, wg_c_ed25519_pubkey
+        )
+
+        transport = paramiko.Transport(("localhost", shared_wg.ssh_port))
+        try:
+            transport.connect(
+                username=f"{user.username}:{ssh_target.name}", password="123"
+            )
+            channel = transport.open_session()
+            channel.exec_command("sleep 60")
+            channel.settimeout(0.5)
+
+            chunk = b"x" * 32768
+            sent = 0
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline and sent < 256 * 1024 * 1024:
+                try:
+                    sent += channel.send(chunk)
+                except socket.timeout:
+                    pass
+
+            assert sent < 32 * 1024 * 1024, (
+                f"the client sent {sent} bytes to a target that reads none"
+            )
+        finally:
+            transport.close()
+
     # https://github.com/warp-tech/warpgate/issues/2498
     def test_direct_tcpip_stuck_open_does_not_block_siblings(
         self,
