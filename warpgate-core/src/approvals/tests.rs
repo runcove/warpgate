@@ -1791,6 +1791,7 @@ mod polled_gate {
                 headers: Default::default(),
                 external_host: None,
                 public: false,
+                unix_socket: None,
             }),
             rate_limit_bytes_per_second: None,
             group_id: None,

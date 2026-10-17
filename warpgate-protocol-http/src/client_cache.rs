@@ -45,5 +45,16 @@ pub fn build_client(options: &TargetHTTPOptions) -> Result<reqwest::Client> {
         client = client.danger_accept_invalid_certs(true);
     }
 
+    if let Some(path) = &options.unix_socket {
+        #[cfg(unix)]
+        {
+            client = client.unix_socket(std::path::PathBuf::from(path));
+        }
+        #[cfg(not(unix))]
+        {
+            anyhow::bail!("Unix socket {path} is not supported on this platform");
+        }
+    }
+
     client.build().context("Could not build HTTP target client")
 }

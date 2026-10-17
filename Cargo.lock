@@ -9379,6 +9379,7 @@ dependencies = [
  "futures",
  "html-escape",
  "http",
+ "libc",
  "percent-encoding",
  "poem",
  "poem-openapi",

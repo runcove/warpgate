@@ -51,6 +51,24 @@ async fn other_ssh_targets_use_host_port(
     Ok(false)
 }
 
+/// Why an HTTP target's `unix_socket` cannot be served by this Warpgate, if
+/// it cannot.
+async fn unix_socket_refusal(admin: &AdminContext, options: &TargetOptions) -> Option<String> {
+    let TargetOptions::Http(options) = options else {
+        return None;
+    };
+    options.unix_socket.as_ref()?;
+    let loopback = admin
+        .services()
+        .config
+        .lock()
+        .await
+        .store
+        .http
+        .plain_http_on_loopback;
+    options.check_unix_socket(loopback).err()
+}
+
 /// Encrypt and serialize options
 fn serialize_options_for_storage(
     mut options: TargetOptions,
@@ -152,6 +170,13 @@ impl ListApi {
             return Ok(CreateTargetResponse::BadRequest(invalid_field(
                 "name",
                 "target name is empty",
+            )));
+        }
+
+        if let Some(reason) = unix_socket_refusal(&admin, &body.options).await {
+            return Ok(CreateTargetResponse::BadRequest(invalid_field(
+                "unix_socket",
+                &reason,
             )));
         }
 
@@ -262,6 +287,11 @@ impl DetailApi {
 
         if body.name.is_empty() {
             warn!("Rejecting request: target name is empty");
+            return Ok(UpdateTargetResponse::BadRequest);
+        }
+
+        if let Some(reason) = unix_socket_refusal(&admin, &body.options).await {
+            warn!("Rejecting request: {reason}");
             return Ok(UpdateTargetResponse::BadRequest);
         }
 

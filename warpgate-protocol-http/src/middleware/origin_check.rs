@@ -5,11 +5,12 @@ use tracing::warn;
 use url::{Origin, Url};
 use warpgate_common_http::auth::UnauthenticatedRequestContext;
 use warpgate_common_http::ext::construct_external_url;
-use warpgate_common_http::is_cluster_peer_request;
+use warpgate_common_http::{PlainHttpListener, is_cluster_peer_request};
 
+use super::loopback_host::request_host;
 use super::management_scope::is_login_flow_route;
 use super::mfa_enforcement::warpgate_surface_path;
-use crate::common::is_localhost_host;
+use crate::common::{is_localhost_host, is_warpgate_session_cookie_name};
 
 static SEC_FETCH_SITE: HeaderName = HeaderName::from_static("sec-fetch-site");
 
@@ -85,6 +86,78 @@ impl OriginCheckRequest<'_> {
         accepted.own.as_ref() == Some(&origin)
             && (accepted.own_for_all_routes || is_login_flow_route(&self.method, self.path))
     }
+
+    /// Whether a checked request may proceed on a plain-HTTP loopback
+    /// listener, where other local services share the browser's cookies:
+    /// `Origin` must be exactly the listener's own origin (`own`: scheme, host
+    /// and port). Without `Origin`, Fetch Metadata must say `same-origin` or
+    /// `none` (typed by the user); `same-site`, `cross-site` or no header at
+    /// all are refused.
+    pub fn is_same_origin_on_loopback(&self, own: Option<&Origin>) -> bool {
+        match self.origin {
+            Some(origin) => {
+                let Some(own) = own else {
+                    return false;
+                };
+                Url::parse(origin)
+                    .map(|url| url.origin())
+                    .is_ok_and(|origin| origin.is_tuple() && &origin == own)
+            }
+            None => matches!(self.sec_fetch_site, Some("same-origin" | "none")),
+        }
+    }
+}
+
+/// The origin a plain-HTTP loopback listener serves this request on: `http`
+/// and the raw `Host` header, which `LoopbackHostMiddleware` has already
+/// held to a loopback name and the listening port.
+fn loopback_own_origin(req: &Request) -> Option<Origin> {
+    let host = request_host(req)?;
+    Url::parse(&format!("http://{host}"))
+        .ok()
+        .map(|url| url.origin())
+}
+
+/// Whether any `Cookie` header names one of Warpgate's session cookies, read
+/// as the session layer reads names (trimmed, percent-decoded). Leniently:
+/// an empty, invalid or valueless session cookie still counts, and so does a
+/// header that is not valid UTF-8.
+fn carries_session_cookie(req: &Request) -> bool {
+    req.headers().get_all(header::COOKIE).iter().any(|value| {
+        String::from_utf8_lossy(value.as_bytes())
+            .split(';')
+            .any(|pair| {
+                let name = pair.split_once('=').map_or(pair, |(name, _)| name);
+                is_warpgate_session_cookie_name(name)
+            })
+    })
+}
+
+/// On a plain-HTTP loopback listener, whether a checked request may proceed:
+/// one that carries no session cookie cannot act on the user's session (a
+/// token client, a ticket link), so only requests with a session cookie are
+/// held to [`OriginCheckRequest::is_same_origin_on_loopback`].
+fn loopback_request_allowed(req: &Request, check: &OriginCheckRequest<'_>) -> bool {
+    !carries_session_cookie(req)
+        || check.is_same_origin_on_loopback(loopback_own_origin(req).as_ref())
+}
+
+fn is_plain_http_loopback(req: &Request) -> bool {
+    req.data::<PlainHttpListener>()
+        .is_some_and(|listener| listener.0)
+}
+
+fn origin_check_request(req: &Request, cluster_peer: bool) -> OriginCheckRequest<'_> {
+    OriginCheckRequest {
+        method: req.method().clone(),
+        path: req.original_uri().path(),
+        websocket_upgrade: req
+            .header(header::UPGRADE)
+            .is_some_and(|value| value.eq_ignore_ascii_case("websocket")),
+        cluster_peer,
+        origin: req.header(header::ORIGIN),
+        sec_fetch_site: req.header(&SEC_FETCH_SITE),
+    }
 }
 
 async fn accepted_origins(req: &Request) -> poem::Result<AcceptedOrigins> {
@@ -102,6 +175,10 @@ async fn accepted_origins(req: &Request) -> poem::Result<AcceptedOrigins> {
 /// Refuses state-changing management requests (and websocket upgrades) whose
 /// `Origin` is not the main host's, or the request's own on a login-flow
 /// route, with 403. Requests without browser headers are not affected.
+///
+/// On a plain-HTTP loopback listener the stricter
+/// [`OriginCheckRequest::is_same_origin_on_loopback`] rule applies instead,
+/// to requests that carry a Warpgate session cookie.
 #[derive(Clone)]
 pub struct OriginCheckMiddleware;
 
@@ -122,25 +199,76 @@ impl<E: Endpoint> Endpoint for OriginCheckEndpoint<E> {
 
     async fn call(&self, req: Request) -> poem::Result<Self::Output> {
         let ctx = Data::<&UnauthenticatedRequestContext>::from_request_without_body(&req).await?;
-        let check = OriginCheckRequest {
-            method: req.method().clone(),
-            path: req.original_uri().path(),
-            websocket_upgrade: req
-                .header(header::UPGRADE)
-                .is_some_and(|value| value.eq_ignore_ascii_case("websocket")),
-            cluster_peer: is_cluster_peer_request(&req, &ctx.services().cluster.cluster_token),
-            origin: req.header(header::ORIGIN),
-            sec_fetch_site: req.header(&SEC_FETCH_SITE),
-        };
-        if check.is_checked() && !check.is_allowed(&accepted_origins(&req).await?) {
-            warn!(
-                method = %check.method,
-                path = check.path,
-                origin = ?check.origin,
-                sec_fetch_site = ?check.sec_fetch_site,
-                "Refused a management request from another origin"
-            );
-            return Err(poem::Error::from_status(StatusCode::FORBIDDEN));
+        let check = origin_check_request(
+            &req,
+            is_cluster_peer_request(&req, &ctx.services().cluster.cluster_token),
+        );
+        if check.is_checked() {
+            let loopback = is_plain_http_loopback(&req);
+            let allowed = if loopback {
+                loopback_request_allowed(&req, &check)
+            } else {
+                check.is_allowed(&accepted_origins(&req).await?)
+            };
+            if !allowed {
+                warn!(
+                    method = %check.method,
+                    path = check.path,
+                    origin = ?check.origin,
+                    sec_fetch_site = ?check.sec_fetch_site,
+                    loopback,
+                    "Refused a management request from another origin"
+                );
+                return Err(poem::Error::from_status(StatusCode::FORBIDDEN));
+            }
+        }
+        Ok(self.inner.call(req).await?.into_response())
+    }
+}
+
+/// On a plain-HTTP loopback listener, refuses with 403 a state-changing
+/// request (or websocket upgrade) proxied to a target that carries a Warpgate
+/// session cookie unless it comes from Warpgate's own origin, by the same
+/// rule as Warpgate's own routes
+/// ([`OriginCheckRequest::is_same_origin_on_loopback`]). Other listeners are
+/// not affected.
+#[derive(Clone)]
+pub struct TargetOriginCheckMiddleware;
+
+impl<E: Endpoint> Middleware<E> for TargetOriginCheckMiddleware {
+    type Output = TargetOriginCheckEndpoint<E>;
+
+    fn transform(&self, inner: E) -> Self::Output {
+        TargetOriginCheckEndpoint { inner }
+    }
+}
+
+pub struct TargetOriginCheckEndpoint<E: Endpoint> {
+    inner: E,
+}
+
+impl<E: Endpoint> Endpoint for TargetOriginCheckEndpoint<E> {
+    type Output = Response;
+
+    async fn call(&self, req: Request) -> poem::Result<Self::Output> {
+        if is_plain_http_loopback(&req) {
+            let cluster_peer =
+                match Data::<&UnauthenticatedRequestContext>::from_request_without_body(&req).await
+                {
+                    Ok(ctx) => is_cluster_peer_request(&req, &ctx.services().cluster.cluster_token),
+                    Err(_) => false,
+                };
+            let check = origin_check_request(&req, cluster_peer);
+            if check.is_checked() && !loopback_request_allowed(&req, &check) {
+                warn!(
+                    method = %check.method,
+                    path = check.path,
+                    origin = ?check.origin,
+                    sec_fetch_site = ?check.sec_fetch_site,
+                    "Refused a request to a target from another origin"
+                );
+                return Err(poem::Error::from_status(StatusCode::FORBIDDEN));
+            }
         }
         Ok(self.inner.call(req).await?.into_response())
     }
@@ -149,7 +277,7 @@ impl<E: Endpoint> Endpoint for OriginCheckEndpoint<E> {
 #[cfg(test)]
 mod tests {
     use poem::endpoint::make_sync;
-    use poem::test::TestClient;
+    use poem::test::{TestClient, TestRequestBuilder};
     use poem::{EndpointExt, Route};
 
     use super::*;
@@ -381,5 +509,299 @@ mod tests {
         }
         let req = cli.get(ADMIN_API).header("host", host);
         req.header("origin", FOREIGN).send().await.assert_status_is_ok();
+    }
+
+    // Loopback mode: Warpgate on http://127.0.0.1:8888 (port P), another local
+    // service on port 9999 (port Q).
+    const LOOPBACK_HOST: &str = "127.0.0.1:8888";
+    const LOOPBACK_OWN: &str = "http://127.0.0.1:8888";
+    const LOOPBACK_OTHER_PORT: &str = "http://127.0.0.1:9999";
+
+    const SESSION_COOKIE: &str = "warpgate-loopback-session=abc";
+
+    fn loopback_own() -> Origin {
+        url(LOOPBACK_OWN).origin()
+    }
+
+    #[test]
+    fn loopback_allows_only_its_own_origin() {
+        let own = loopback_own();
+        for origin in [
+            LOOPBACK_OWN,
+            "http://127.0.0.1:8888/",
+            "HTTP://127.0.0.1:8888",
+        ] {
+            let check = post("/vms/new", Some(origin));
+            assert!(check.is_same_origin_on_loopback(Some(&own)), "{origin}");
+        }
+        for origin in [
+            LOOPBACK_OTHER_PORT,
+            "http://localhost:8888",
+            "https://127.0.0.1:8888",
+            "http://127.0.0.1",
+            "http://127.0.0.2:8888",
+            "null",
+            "",
+            FOREIGN,
+        ] {
+            let check = post("/vms/new", Some(origin));
+            assert!(!check.is_same_origin_on_loopback(Some(&own)), "{origin:?}");
+        }
+        // Without a known own origin, no Origin header can match.
+        assert!(!post("/vms/new", Some(LOOPBACK_OWN)).is_same_origin_on_loopback(None));
+    }
+
+    #[test]
+    fn loopback_without_origin_needs_same_origin_fetch_metadata() {
+        let own = loopback_own();
+        let without_origin = |site| OriginCheckRequest {
+            sec_fetch_site: site,
+            ..post("/vms/new", None)
+        };
+        for site in ["same-origin", "none"] {
+            assert!(
+                without_origin(Some(site)).is_same_origin_on_loopback(Some(&own)),
+                "{site}"
+            );
+        }
+        for site in [Some("same-site"), Some("cross-site"), Some("bogus"), None] {
+            assert!(
+                !without_origin(site).is_same_origin_on_loopback(Some(&own)),
+                "{site:?}"
+            );
+        }
+    }
+
+    /// The headers the web UI behind Warpgate sends, as a browser does.
+    #[derive(Clone, Copy)]
+    enum Sender {
+        /// From Warpgate's own origin, as the web UI sends it.
+        OwnOrigin,
+        /// From another local port.
+        OtherPort,
+        /// No `Origin`, `Sec-Fetch-Site: same-site`.
+        SameSiteWithoutOrigin,
+        /// Neither header.
+        NoBrowserHeaders,
+    }
+
+    fn browser_headers<'a, E: Endpoint>(
+        req: TestRequestBuilder<'a, E>,
+        sender: Sender,
+        fetch_mode: &str,
+    ) -> TestRequestBuilder<'a, E> {
+        let req = req
+            .header("host", LOOPBACK_HOST)
+            .header("cookie", SESSION_COOKIE);
+        match sender {
+            Sender::OwnOrigin => req
+                .header("origin", LOOPBACK_OWN)
+                .header("sec-fetch-site", "same-origin")
+                .header("sec-fetch-mode", fetch_mode)
+                .header("sec-fetch-dest", "empty"),
+            Sender::OtherPort => req
+                .header("origin", LOOPBACK_OTHER_PORT)
+                .header("sec-fetch-site", "same-site")
+                .header("sec-fetch-mode", fetch_mode)
+                .header("sec-fetch-dest", "empty"),
+            Sender::SameSiteWithoutOrigin => req
+                .header("sec-fetch-site", "same-site")
+                .header("sec-fetch-mode", fetch_mode)
+                .header("sec-fetch-dest", "empty"),
+            Sender::NoBrowserHeaders => req,
+        }
+    }
+
+    fn htmx_headers<'a, E: Endpoint>(
+        req: TestRequestBuilder<'a, E>,
+        target: Option<&str>,
+    ) -> TestRequestBuilder<'a, E> {
+        let req = req
+            .header("hx-request", "true")
+            .header("hx-current-url", "http://127.0.0.1:8888/");
+        match target {
+            Some(target) => req.header("hx-target", target.to_owned()),
+            None => req,
+        }
+    }
+
+    /// The requests the web UI behind Warpgate makes through the proxied
+    /// route, each sent as `sender` would; returns their statuses.
+    async fn web_ui_requests<E: Endpoint>(cli: &TestClient<E>, sender: Sender) -> Vec<StatusCode> {
+        let form = "name=somevm&image=ubuntu";
+        let create = htmx_headers(
+            browser_headers(cli.post("/vms/new"), sender, "cors"),
+            Some("modal-container"),
+        )
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(form);
+        let pause = htmx_headers(
+            browser_headers(cli.post("/vms/somevm/pause"), sender, "cors"),
+            None,
+        );
+        let start = browser_headers(cli.post("/vms/somevm/start"), sender, "cors");
+        let terminal = browser_headers(cli.get("/terminal/somevm/ws"), sender, "websocket")
+            .header("upgrade", "websocket")
+            .header("connection", "Upgrade");
+        let delete = htmx_headers(
+            browser_headers(cli.delete("/vms/somevm"), sender, "cors"),
+            Some("modal-container"),
+        )
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(form);
+
+        let mut statuses = Vec::new();
+        statuses.push(create.send().await.0.status());
+        statuses.push(pause.send().await.0.status());
+        statuses.push(start.send().await.0.status());
+        statuses.push(terminal.send().await.0.status());
+        statuses.push(delete.send().await.0.status());
+        statuses
+    }
+
+    fn proxied_route(loopback: bool) -> impl Endpoint {
+        Route::new()
+            .nest_no_strip(
+                "/",
+                make_sync(|_| "proxied").with(TargetOriginCheckMiddleware),
+            )
+            .data(PlainHttpListener(loopback))
+    }
+
+    #[tokio::test]
+    async fn loopback_target_route_serves_the_web_ui_from_its_own_origin() {
+        let cli = TestClient::new(proxied_route(true));
+        assert_eq!(
+            web_ui_requests(&cli, Sender::OwnOrigin).await,
+            [StatusCode::OK; 5]
+        );
+        // Reading is not checked, from anywhere.
+        let read = browser_headers(cli.get("/vms"), Sender::OtherPort, "cors");
+        read.send().await.assert_status_is_ok();
+    }
+
+    #[tokio::test]
+    async fn loopback_target_route_refuses_the_web_ui_requests_from_elsewhere() {
+        let cli = TestClient::new(proxied_route(true));
+        for sender in [
+            Sender::OtherPort,
+            Sender::SameSiteWithoutOrigin,
+            Sender::NoBrowserHeaders,
+        ] {
+            assert_eq!(
+                web_ui_requests(&cli, sender).await,
+                [StatusCode::FORBIDDEN; 5]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn target_route_is_unchecked_off_loopback() {
+        let cli = TestClient::new(proxied_route(false));
+        for sender in [
+            Sender::OwnOrigin,
+            Sender::OtherPort,
+            Sender::NoBrowserHeaders,
+        ] {
+            assert_eq!(web_ui_requests(&cli, sender).await, [StatusCode::OK; 5]);
+        }
+    }
+
+    #[test]
+    fn session_cookie_is_recognised_by_its_decoded_name() {
+        let carries = |cookies: &[&str]| {
+            let mut req = Request::builder();
+            for cookie in cookies {
+                req = req.header("cookie", *cookie);
+            }
+            carries_session_cookie(&req.finish())
+        };
+        for cookies in [
+            &["warpgate-loopback-session=abc"][..],
+            &["warpgate-http-session=abc"],
+            &["other=1; warpgate-loopback-session=abc"],
+            &["other=1", "warpgate-loopback-session=abc"],
+            &["warpgate-loopback-session="],
+            &["warpgate-loopback-session"],
+            &[" warpgate-loopback-session =not a valid value"],
+            &["warpgate%2Dloopback%2Dsession=abc"],
+        ] {
+            assert!(carries(cookies), "{cookies:?}");
+        }
+        for cookies in [
+            &[][..],
+            &["other=1"],
+            &["other=warpgate-loopback-session"],
+            &["warpgate-loopback-session-x=1"],
+        ] {
+            assert!(!carries(cookies), "{cookies:?}");
+        }
+    }
+
+    /// A target request without a session cookie cannot act on the user's
+    /// session, so it passes with any headers; with one, it is refused.
+    #[tokio::test]
+    async fn loopback_target_route_checks_only_requests_with_a_session_cookie() {
+        let cli = TestClient::new(proxied_route(true));
+        for origin in [None, Some(LOOPBACK_OTHER_PORT)] {
+            let mut req = cli.post("/vms/somevm/start").header("host", LOOPBACK_HOST);
+            if let Some(origin) = origin {
+                req = req.header("origin", origin);
+            }
+            req.send().await.assert_status_is_ok();
+        }
+        let req = cli
+            .post("/vms/somevm/start")
+            .header("host", LOOPBACK_HOST)
+            .header("cookie", "warpgate-loopback-session=");
+        req.send().await.assert_status(StatusCode::FORBIDDEN);
+    }
+
+    /// Warpgate's own admin API on a loopback listener.
+    #[tokio::test]
+    async fn loopback_admin_api_allows_only_its_own_origin() {
+        let services = crate::test_db::services(crate::test_db::memory_db().await).await;
+        {
+            let mut config = services.config.lock().await;
+            config.store.http.plain_http_on_loopback = true;
+        }
+        let ctx = UnauthenticatedRequestContext::new(services).await;
+        let app = Route::new()
+            .nest(
+                "/@warpgate",
+                make_sync(|_| "served").with(OriginCheckMiddleware),
+            )
+            .data(ctx)
+            .data(PlainHttpListener(true));
+        let cli = TestClient::new(app);
+
+        for (sender, expected) in [
+            (Sender::OwnOrigin, StatusCode::OK),
+            (Sender::OtherPort, StatusCode::FORBIDDEN),
+            (Sender::SameSiteWithoutOrigin, StatusCode::FORBIDDEN),
+            (Sender::NoBrowserHeaders, StatusCode::FORBIDDEN),
+        ] {
+            let req = browser_headers(cli.post(ADMIN_API), sender, "cors");
+            assert_eq!(req.send().await.0.status(), expected);
+        }
+        let req = browser_headers(cli.get(ADMIN_API), Sender::OtherPort, "cors");
+        req.send().await.assert_status_is_ok();
+
+        // A token client sends no cookie and no browser headers: allowed.
+        let token = cli
+            .post(ADMIN_API)
+            .header("host", LOOPBACK_HOST)
+            .header("x-warpgate-token", "token-value");
+        token.send().await.assert_status_is_ok();
+        // The same request with the session cookie: refused.
+        let with_cookie = cli
+            .post(ADMIN_API)
+            .header("host", LOOPBACK_HOST)
+            .header("x-warpgate-token", "token-value")
+            .header("cookie", SESSION_COOKIE);
+        with_cookie
+            .send()
+            .await
+            .assert_status(StatusCode::FORBIDDEN);
     }
 }
