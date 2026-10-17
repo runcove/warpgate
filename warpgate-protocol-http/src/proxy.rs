@@ -1,4 +1,5 @@
 use std::fmt::Write;
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -14,8 +15,13 @@ use poem::session::Session;
 use poem::web::Data;
 use poem::web::websocket::WebSocket;
 use poem::{Body, FromRequest, IntoResponse, Request, Response};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::broadcast;
-use tokio_tungstenite::{Connector, connect_async_tls_with_config, tungstenite};
+#[cfg(unix)]
+use tokio_tungstenite::client_async_tls_with_config;
+use tokio_tungstenite::{
+    Connector, MaybeTlsStream, WebSocketStream, connect_async_tls_with_config, tungstenite,
+};
 use tracing::{Instrument, debug, error, warn};
 use url::{Url, form_urlencoded};
 use warpgate_common::helpers::websocket::pump_websocket;
@@ -34,6 +40,7 @@ use warpgate_web::lookup_built_file;
 
 use crate::client_cache::{HttpClientCache, build_client};
 use crate::common::{SessionExt, is_public_session_authorization, is_warpgate_session_cookie_name};
+use crate::unix_socket::checked_unix_socket;
 
 static X_WARPGATE_USERNAME: HeaderName = HeaderName::from_static("x-warpgate-username");
 static X_WARPGATE_AUTHENTICATION_TYPE: HeaderName =
@@ -493,6 +500,8 @@ pub async fn proxy_normal_request(
 ) -> poem::Result<Response> {
     let options = admitted.specific_target().options().clone();
     let uri = construct_uri(req, &options, false)?;
+    // The client connects through the socket itself; checked on each request.
+    checked_unix_socket(req, &options)?;
 
     tracing::debug!("URI: {:?}", uri);
 
@@ -693,6 +702,7 @@ async fn proxy_ws_inner(
     options: TargetHTTPOptions,
     mut close_rx: broadcast::Receiver<()>,
 ) -> poem::Result<impl IntoResponse> {
+    let unix_socket = checked_unix_socket(req, &options)?;
     let keepalive_guard = Data::<&SessionKeepalive>::from_request_without_body(req)
         .await
         .ok()
@@ -728,13 +738,12 @@ async fn proxy_ws_inner(
         .map_err(poem::error::InternalServerError)?;
     let connector = Connector::Rustls(Arc::new(tls_config));
 
-    let connect = connect_async_tls_with_config(
+    let connect = connect_upstream_websocket(
         client_request
             .body(())
             .map_err(poem::error::InternalServerError)?,
-        None,
-        true,
-        Some(connector),
+        unix_socket,
+        connector,
     );
     let (client, client_response) = tokio::select! {
         result = connect => result.map_err(poem::error::BadGateway)?,
@@ -749,89 +758,148 @@ async fn proxy_ws_inner(
     // request span is carried over explicitly; the database log layer keeps
     // only events that fall under a session span.
     let span = tracing::Span::current();
-    let mut response = ws
-        .on_upgrade(|socket| {
-            async move {
-                let (client_sink, client_source) = client.split();
-                let (server_sink, server_source) = socket.split();
-
-                if let Err(error) = {
-                    let mut server_to_client = tokio::spawn(pump_websocket(
-                        server_source,
-                        client_sink,
-                        |msg| {
-                            Box::pin(async {
-                                tracing::debug!("Server: {:?}", msg);
-                                anyhow::Ok(msg)
-                            })
-                        },
-                        "browser_to_backend",
-                    ));
-
-                    let mut client_to_server = tokio::spawn(pump_websocket(
-                        client_source,
-                        server_sink,
-                        |msg| {
-                            Box::pin(async {
-                                tracing::debug!("Client: {:?}", msg);
-                                anyhow::Ok(msg)
-                            })
-                        },
-                        "backend_to_browser",
-                    ));
-
-                    let (server_finished, pump_result): (
-                        bool,
-                        Option<Result<anyhow::Result<()>, tokio::task::JoinError>>,
-                    ) = tokio::select! {
-                        result = &mut server_to_client => {
-                            (true, Some(result))
-                        }
-                        result = &mut client_to_server => {
-                            (false, Some(result))
-                        }
-                        _ = close_rx.recv() => {
-                            (false, None)
-                        }
-                    };
-
-                    match pump_result {
-                        Some(result) if server_finished => {
-                            client_to_server.abort();
-                            let _ = client_to_server.await;
-                            result.context("server-to-client WebSocket pump task failed")??;
-                        }
-                        Some(result) => {
-                            server_to_client.abort();
-                            let _ = server_to_client.await;
-                            result.context("client-to-server WebSocket pump task failed")??;
-                        }
-                        None => {
-                            debug!("Closing WebSocket stream after HTTP session ended");
-                            server_to_client.abort();
-                            client_to_server.abort();
-                            let _ = server_to_client.await;
-                            let _ = client_to_server.await;
-                        }
-                    }
-                    debug!("Closing Websocket stream");
-
-                    Ok::<_, anyhow::Error>(())
-                } {
-                    error!(?error, "Websocket stream error");
-                }
-
-                drop(keepalive_guard);
-
-                Ok::<_, anyhow::Error>(())
-            }
-            .instrument(span)
-        })
-        .into_response();
+    let mut response = match client {
+        UpstreamWebSocket::Tcp(client) => {
+            pump_upgraded_websocket(ws, client, close_rx, keepalive_guard, span)
+        }
+        #[cfg(unix)]
+        UpstreamWebSocket::Unix(client) => {
+            pump_upgraded_websocket(ws, client, close_rx, keepalive_guard, span)
+        }
+    };
 
     copy_client_response(&client_response, &mut response);
     rewrite_response(&mut response, &options, &uri)?;
     Ok(response)
+}
+
+/// The upstream end of a proxied WebSocket: over TCP to the target's host, or
+/// over the target's Unix socket.
+pub(crate) enum UpstreamWebSocket {
+    Tcp(WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>),
+    #[cfg(unix)]
+    Unix(WebSocketStream<MaybeTlsStream<tokio::net::UnixStream>>),
+}
+
+/// Opens the upstream WebSocket for `request`: through `unix_socket` when the
+/// target has one (already checked), otherwise to the host in the request URI.
+pub(crate) async fn connect_upstream_websocket(
+    request: http::Request<()>,
+    unix_socket: Option<PathBuf>,
+    connector: Connector,
+) -> Result<(UpstreamWebSocket, tungstenite::handshake::client::Response), tungstenite::Error> {
+    match unix_socket {
+        None => {
+            let (client, response) =
+                connect_async_tls_with_config(request, None, true, Some(connector)).await?;
+            Ok((UpstreamWebSocket::Tcp(client), response))
+        }
+        #[cfg(unix)]
+        Some(path) => {
+            let stream = tokio::net::UnixStream::connect(&path)
+                .await
+                .map_err(tungstenite::Error::Io)?;
+            let (client, response) =
+                client_async_tls_with_config(request, stream, None, Some(connector)).await?;
+            Ok((UpstreamWebSocket::Unix(client), response))
+        }
+        #[cfg(not(unix))]
+        Some(_) => Err(tungstenite::Error::Io(std::io::Error::other(
+            "Unix sockets are not supported on this platform",
+        ))),
+    }
+}
+
+/// Accepts the browser's upgrade and pumps messages both ways between it and
+/// the upstream `client` until either side closes or the session ends.
+fn pump_upgraded_websocket<S>(
+    ws: WebSocket,
+    client: WebSocketStream<S>,
+    mut close_rx: broadcast::Receiver<()>,
+    keepalive_guard: Option<SessionKeepaliveGuard>,
+    span: tracing::Span,
+) -> Response
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static,
+{
+    ws.on_upgrade(|socket| {
+        async move {
+            let (client_sink, client_source) = client.split();
+            let (server_sink, server_source) = socket.split();
+
+            if let Err(error) = {
+                let mut server_to_client = tokio::spawn(pump_websocket(
+                    server_source,
+                    client_sink,
+                    |msg| {
+                        Box::pin(async {
+                            tracing::debug!("Server: {:?}", msg);
+                            anyhow::Ok(msg)
+                        })
+                    },
+                    "browser_to_backend",
+                ));
+
+                let mut client_to_server = tokio::spawn(pump_websocket(
+                    client_source,
+                    server_sink,
+                    |msg| {
+                        Box::pin(async {
+                            tracing::debug!("Client: {:?}", msg);
+                            anyhow::Ok(msg)
+                        })
+                    },
+                    "backend_to_browser",
+                ));
+
+                let (server_finished, pump_result): (
+                    bool,
+                    Option<Result<anyhow::Result<()>, tokio::task::JoinError>>,
+                ) = tokio::select! {
+                    result = &mut server_to_client => {
+                        (true, Some(result))
+                    }
+                    result = &mut client_to_server => {
+                        (false, Some(result))
+                    }
+                    _ = close_rx.recv() => {
+                        (false, None)
+                    }
+                };
+
+                match pump_result {
+                    Some(result) if server_finished => {
+                        client_to_server.abort();
+                        let _ = client_to_server.await;
+                        result.context("server-to-client WebSocket pump task failed")??;
+                    }
+                    Some(result) => {
+                        server_to_client.abort();
+                        let _ = server_to_client.await;
+                        result.context("client-to-server WebSocket pump task failed")??;
+                    }
+                    None => {
+                        debug!("Closing WebSocket stream after HTTP session ended");
+                        server_to_client.abort();
+                        client_to_server.abort();
+                        let _ = server_to_client.await;
+                        let _ = client_to_server.await;
+                    }
+                }
+                debug!("Closing Websocket stream");
+
+                Ok::<_, anyhow::Error>(())
+            } {
+                error!(?error, "Websocket stream error");
+            }
+
+            drop(keepalive_guard);
+
+            Ok::<_, anyhow::Error>(())
+        }
+        .instrument(span)
+    })
+    .into_response()
 }
 
 #[cfg(test)]
@@ -1364,6 +1432,7 @@ mod tests {
             headers: Default::default(),
             external_host: None,
             public: false,
+            unix_socket: None,
         }
     }
 

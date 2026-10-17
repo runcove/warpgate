@@ -16,6 +16,24 @@ use warpgate_db_entities::{KnownHost, Role, Target, TargetGroup};
 
 use super::AdminContext;
 
+/// Why an HTTP target's `unix_socket` cannot be served by this Warpgate, if
+/// it cannot.
+async fn unix_socket_refusal(admin: &AdminContext, options: &TargetOptions) -> Option<String> {
+    let TargetOptions::Http(options) = options else {
+        return None;
+    };
+    options.unix_socket.as_ref()?;
+    let loopback = admin
+        .services()
+        .config
+        .lock()
+        .await
+        .store
+        .http
+        .plain_http_on_loopback;
+    options.check_unix_socket(loopback).err()
+}
+
 pub(crate) fn maybe_redacted_target(
     admin: &AdminContext,
     model: Target::Model,
@@ -86,6 +104,13 @@ impl ListApi {
         body: Json<TargetDataRequest>,
     ) -> Result<CreateTargetResponse, WarpgateError> {
         admin.require(AdminPermission::TargetsCreate)?;
+
+        if let Some(reason) = unix_socket_refusal(&admin, &body.options).await {
+            return Ok(CreateTargetResponse::BadRequest(invalid_field(
+                "unix_socket",
+                &reason,
+            )));
+        }
 
         match store::create(&admin.services().db, &body).await {
             Ok(target) => Ok(CreateTargetResponse::Created(Json(maybe_redacted_target(
@@ -175,6 +200,11 @@ impl DetailApi {
         id: Path<Uuid>,
     ) -> Result<UpdateTargetResponse, WarpgateError> {
         admin.require(AdminPermission::TargetsEdit)?;
+
+        if let Some(reason) = unix_socket_refusal(&admin, &body.options).await {
+            warn!("Rejecting request: {reason}");
+            return Ok(UpdateTargetResponse::BadRequest);
+        }
 
         let services = admin.services();
         let target = match store::update(&services.db, id.0, &body).await {

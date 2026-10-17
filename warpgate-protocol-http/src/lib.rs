@@ -4,6 +4,7 @@ mod catchall;
 mod client_cache;
 mod common;
 mod health;
+mod loopback_owner;
 mod middleware;
 pub mod proxy;
 mod session;
@@ -14,6 +15,7 @@ mod step_up;
 #[cfg(test)]
 mod test_db;
 mod unauthenticated_page;
+mod unix_socket;
 
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -62,7 +64,7 @@ use crate::common::{endpoint_auth, page_auth};
 use crate::middleware::{
     CookieHostMiddleware, LOOPBACK_SESSION_COOKIE_MAX_AGE_CAP, LoopbackHostMiddleware,
     LoopbackSessionCookieMiddleware, ManagementScopeMiddleware, OriginCheckMiddleware,
-    SecurityHeadersMiddleware, TicketMiddleware,
+    SecurityHeadersMiddleware, TargetOriginCheckMiddleware, TicketMiddleware,
 };
 use crate::session::SessionStore;
 use crate::session_handle::warpgate_server_handle_for_request;
@@ -325,7 +327,11 @@ impl ProtocolServer for HTTPProtocolServer {
             .nest("/_warpgate", at_warpgate_endpoints())
             .nest_no_strip(
                 "/",
-                page_auth(catchall::catchall_endpoint).around(render_errors),
+                // On a loopback listener, a state-changing request to a target
+                // must come from Warpgate's own origin; refused before auth.
+                page_auth(catchall::catchall_endpoint)
+                    .with(TargetOriginCheckMiddleware)
+                    .around(render_errors),
             )
             .around(inject_request_authorization)
             .around(move |ep, req| async move {
@@ -408,7 +414,17 @@ impl ProtocolServer for HTTPProtocolServer {
         });
 
         let Some(tls_configs) = tls_configs else {
+            // Other OS accounts on this machine can reach loopback too: only
+            // connections opened by this process's account are served. Wrapped
+            // inside the PROXY protocol reader, so the owner checked is the
+            // one of the actual TCP peer.
+            let our_uid = loopback_owner::effective_uid()?;
             let acceptor = address.poem_acceptor().await?;
+            let acceptor = loopback_owner::same_account_acceptor(
+                acceptor,
+                Arc::new(loopback_owner::KernelSocketTable),
+                our_uid,
+            );
             let acceptor = MaybeProxyProtocolAcceptor::new(acceptor, proxy_protocol);
             warn!(
                 ?address,
