@@ -1,5 +1,16 @@
 //! HTTP targets reached through a Unix socket (`unix_socket`), served only on
 //! a plain-HTTP loopback listener (`http.plain_http_on_loopback`).
+//!
+//! What holds on each path:
+//! - Before every request (HTTP and WebSocket), [`check_socket_ownership`]
+//!   checks the socket, its directory and every ancestor up to `/` with
+//!   `lstat`. The directory is ours and 0700, and no ancestor can be renamed
+//!   or replaced by anyone but us or root, so no other account can swap what
+//!   the path names between that check and the connect.
+//! - WebSocket: Warpgate connects the socket itself and then also requires
+//!   the listening process to run as our account ([`check_peer_uid`]).
+//! - HTTP: reqwest connects the socket internally and offers no hook onto
+//!   the connected stream, so the path checks above are the boundary there.
 
 use std::path::{Path, PathBuf};
 
@@ -42,8 +53,12 @@ pub(crate) fn checked_unix_socket(
 
 /// Whether the socket at `path` may be connected to: the socket and its
 /// directory are owned by `our_uid`, neither is a symlink, the directory has
-/// no group or other permission bits, and the socket is a socket. Looked at
-/// with `lstat`, so a symlink is seen as one rather than followed.
+/// no group or other permission bits, and the socket is a socket; and every
+/// ancestor of the directory up to `/` is a real directory owned by root or
+/// `our_uid`, writable by group or others only when it is root-owned and
+/// sticky (as `/tmp` is). Looked at with `lstat`, so a symlink is seen as one
+/// rather than followed: the path must not go through any symlink (on macOS,
+/// name `/private/var/...`, not `/var/...`).
 #[cfg(unix)]
 pub(crate) fn check_socket_ownership(path: &Path, our_uid: u32) -> Result<(), String> {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
@@ -82,6 +97,60 @@ pub(crate) fn check_socket_ownership(path: &Path, our_uid: u32) -> Result<(), St
     if socket_meta.uid() != our_uid {
         return Err("the socket is owned by another account".into());
     }
+
+    for ancestor in directory.ancestors().skip(1) {
+        check_ancestor(ancestor, our_uid)?;
+    }
+    Ok(())
+}
+
+/// One ancestor of the socket's directory: a real directory that only root
+/// or `our_uid` can rename entries in, so the path below it stays ours.
+#[cfg(unix)]
+fn check_ancestor(ancestor: &Path, our_uid: u32) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+
+    const STICKY: u32 = 0o1000;
+    let shown = ancestor.display();
+    let meta = std::fs::symlink_metadata(ancestor)
+        .map_err(|error| format!("cannot read ancestor directory {shown}: {error}"))?;
+    if meta.file_type().is_symlink() {
+        return Err(format!("ancestor directory {shown} is a symlink"));
+    }
+    if !meta.is_dir() {
+        return Err(format!("ancestor {shown} is not a directory"));
+    }
+    let owner = meta.uid();
+    if owner != 0 && owner != our_uid {
+        return Err(format!(
+            "ancestor directory {shown} is owned by another account"
+        ));
+    }
+    let writable_by_others = meta.mode() & 0o022 != 0;
+    if writable_by_others && !(owner == 0 && meta.mode() & STICKY != 0) {
+        return Err(format!(
+            "ancestor directory {shown} is writable by group or others (mode {:o}) without being a root-owned sticky directory",
+            meta.mode() & 0o7777
+        ));
+    }
+    Ok(())
+}
+
+/// Refuses a connected socket whose listening process does not run as
+/// `our_uid`, by the kernel's peer credentials.
+#[cfg(unix)]
+pub(crate) fn check_peer_uid(stream: &tokio::net::UnixStream, our_uid: u32) -> std::io::Result<()> {
+    let peer_uid = stream.peer_cred()?.uid();
+    if peer_uid != our_uid {
+        warn!(
+            peer_uid,
+            "Refused a target's Unix socket served by another account"
+        );
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "the target's Unix socket is served by another account",
+        ));
+    }
     Ok(())
 }
 
@@ -111,7 +180,9 @@ mod tests {
 
     impl TempDir {
         fn new(mode: u32) -> Self {
-            let path = std::env::temp_dir().join(format!(
+            // Canonical, so the chain has no symlink in it (macOS `/var`).
+            let base = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+            let path = base.join(format!(
                 "wg-uds-{}-{}",
                 std::process::id(),
                 uuid::Uuid::new_v4().simple()
@@ -208,6 +279,72 @@ mod tests {
         std::fs::write(&file, b"").unwrap();
         let error = check_socket_ownership(&file, our_uid()).unwrap_err();
         assert!(error.contains("not a socket"), "{error}");
+    }
+
+    /// A private directory for the socket, inside `outer/<name>`.
+    fn socket_below(outer: &TempDir, name: &str, mode: u32) -> PathBuf {
+        let middle = outer.join(name);
+        std::fs::create_dir(&middle).unwrap();
+        std::fs::set_permissions(&middle, std::fs::Permissions::from_mode(mode)).unwrap();
+        let private = middle.join("private");
+        std::fs::create_dir(&private).unwrap();
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).unwrap();
+        private.join("app.sock")
+    }
+
+    #[test]
+    fn accepts_a_chain_through_the_system_temp_dir() {
+        // The temp dir itself is typically root-owned and sticky (`/tmp`).
+        let outer = TempDir::new(0o755);
+        let socket = socket_below(&outer, "apps", 0o755);
+        let _listener = bind_socket(&socket);
+        assert_eq!(check_socket_ownership(&socket, our_uid()), Ok(()));
+    }
+
+    #[test]
+    fn refuses_an_ancestor_writable_by_others() {
+        let outer = TempDir::new(0o700);
+        for mode in [0o777, 0o775, 0o757] {
+            let socket = socket_below(&outer, &format!("open-{mode:o}"), mode);
+            let _listener = bind_socket(&socket);
+            let error = check_socket_ownership(&socket, our_uid()).unwrap_err();
+            assert!(
+                error.contains("writable by group or others"),
+                "{mode:o}: {error}"
+            );
+        }
+        // Sticky is not enough unless root owns it; these tests do not run
+        // as root.
+        if our_uid() != 0 {
+            let socket = socket_below(&outer, "sticky", 0o1777);
+            let _listener = bind_socket(&socket);
+            let error = check_socket_ownership(&socket, our_uid()).unwrap_err();
+            assert!(error.contains("root-owned sticky"), "{error}");
+        }
+    }
+
+    #[test]
+    fn refuses_a_symlinked_ancestor() {
+        let outer = TempDir::new(0o700);
+        let socket = socket_below(&outer, "real", 0o700);
+        let _listener = bind_socket(&socket);
+        std::os::unix::fs::symlink(outer.join("real"), outer.join("link")).unwrap();
+        let through_link = outer.join("link").join("private").join("app.sock");
+        let error = check_socket_ownership(&through_link, our_uid()).unwrap_err();
+        assert!(error.contains("is a symlink"), "{error}");
+        assert!(error.contains("ancestor"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn peer_credentials_must_be_our_account() {
+        let dir = TempDir::new(0o700);
+        let socket = dir.join("app.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+        let _accepted = listener.accept().await.unwrap();
+        assert!(check_peer_uid(&stream, our_uid()).is_ok());
+        let error = check_peer_uid(&stream, our_uid().wrapping_add(1)).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
     }
 
     #[test]

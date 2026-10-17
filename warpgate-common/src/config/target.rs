@@ -174,7 +174,12 @@ pub struct TargetHTTPOptions {
     /// header and the scheme. Only served when `http.plain_http_on_loopback`
     /// is on. At each connection the socket and its directory must be owned
     /// by the account Warpgate runs as, the directory must not be accessible
-    /// to group or others (mode 0700), and neither may be a symlink.
+    /// to group or others (mode 0700), and neither may be a symlink. Every
+    /// directory above it must be a real directory (the path may not go
+    /// through a symlink) owned by root or that account, and writable by
+    /// group or others only when root-owned and sticky, as `/tmp` is. For
+    /// WebSocket requests the process serving the socket must also run as
+    /// that account.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unix_socket: Option<String>,
 }
