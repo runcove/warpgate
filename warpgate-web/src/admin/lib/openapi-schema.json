@@ -7116,7 +7116,7 @@
           },
           "unix_socket": {
             "type": "string",
-            "description": "Absolute path of a Unix socket to reach the target through, in place\nof a TCP connection to the host in `url`, which still gives the `Host`\nheader and the scheme. Only served when `http.plain_http_on_loopback`\nis on. At each connection the socket and its directory must be owned\nby the account Warpgate runs as, the directory must not be accessible\nto group or others (mode 0700), and neither may be a symlink."
+            "description": "Absolute path of a Unix socket to reach the target through, in place\nof a TCP connection to the host in `url`, which still gives the `Host`\nheader and the scheme. Only served when `http.plain_http_on_loopback`\nis on. At each connection the socket and its directory must be owned\nby the account Warpgate runs as, the directory must not be accessible\nto group or others (mode 0700), and neither may be a symlink. Every\ndirectory above it must be a real directory (the path may not go\nthrough a symlink) owned by root or that account, and writable by\ngroup or others only when root-owned and sticky, as `/tmp` is. For\nWebSocket requests the process serving the socket must also run as\nthat account."
           }
         }
       },
