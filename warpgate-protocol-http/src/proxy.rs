@@ -761,7 +761,9 @@ pub(crate) enum UpstreamWebSocket {
 }
 
 /// Opens the upstream WebSocket for `request`: through `unix_socket` when the
-/// target has one (already checked), otherwise to the host in the request URI.
+/// target has one (its path already checked), refusing a socket whose
+/// listening process is not our account; otherwise to the host in the request
+/// URI.
 pub(crate) async fn connect_upstream_websocket(
     request: http::Request<()>,
     unix_socket: Option<PathBuf>,
@@ -778,6 +780,11 @@ pub(crate) async fn connect_upstream_websocket(
             let stream = tokio::net::UnixStream::connect(&path)
                 .await
                 .map_err(tungstenite::Error::Io)?;
+            // Connected by us, so the listening process can be checked too.
+            let our_uid = crate::loopback_owner::effective_uid().map_err(|error| {
+                tungstenite::Error::Io(std::io::Error::other(format!("{error:#}")))
+            })?;
+            crate::unix_socket::check_peer_uid(&stream, our_uid).map_err(tungstenite::Error::Io)?;
             let (client, response) =
                 client_async_tls_with_config(request, stream, None, Some(connector)).await?;
             Ok((UpstreamWebSocket::Unix(client), response))
