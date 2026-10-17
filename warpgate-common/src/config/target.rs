@@ -137,6 +137,107 @@ pub struct TargetHTTPOptions {
     #[serde(default)]
     #[oai(default)]
     pub public: bool,
+
+    /// Absolute path of a Unix socket to reach the target through, in place
+    /// of a TCP connection to the host in `url`, which still gives the `Host`
+    /// header and the scheme. Only served when `http.plain_http_on_loopback`
+    /// is on. At each connection the socket and its directory must be owned
+    /// by the account Warpgate runs as, the directory must not be accessible
+    /// to group or others (mode 0700), and neither may be a symlink.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unix_socket: Option<String>,
+}
+
+impl TargetHTTPOptions {
+    /// Refuses a `unix_socket` that cannot be served: when the HTTP listener
+    /// is not in loopback mode, or when the path is not absolute or has `..`
+    /// in it. The socket file itself is checked at each connection.
+    pub fn check_unix_socket(&self, plain_http_on_loopback: bool) -> Result<(), String> {
+        let Some(path) = &self.unix_socket else {
+            return Ok(());
+        };
+        if !plain_http_on_loopback {
+            return Err(
+                "`unix_socket` is only served when `http.plain_http_on_loopback` is on".into(),
+            );
+        }
+        check_unix_socket_path(path)
+    }
+}
+
+/// A Unix socket path must be absolute and free of `..`, so the directory
+/// that is checked is the one the socket is reached through.
+pub fn check_unix_socket_path(path: &str) -> Result<(), String> {
+    let path = std::path::Path::new(path);
+    if !path.is_absolute() {
+        return Err("`unix_socket` must be an absolute path".into());
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err("`unix_socket` must not contain `..`".into());
+    }
+    if path.file_name().is_none() {
+        return Err("`unix_socket` must name a socket file".into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod unix_socket_tests {
+    use super::*;
+
+    fn options(unix_socket: Option<&str>) -> TargetHTTPOptions {
+        let mut json = serde_json::json!({"url": "http://app.local"});
+        if let Some(path) = unix_socket {
+            json["unix_socket"] = path.into();
+        }
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn unix_socket_defaults_to_none_and_round_trips() {
+        assert_eq!(options(None).unix_socket, None);
+        let serialized = serde_json::to_value(options(None)).unwrap();
+        assert!(serialized.get("unix_socket").is_none());
+
+        let with_socket = options(Some("/run/app/app.sock"));
+        let round_tripped: TargetHTTPOptions =
+            serde_json::from_value(serde_json::to_value(&with_socket).unwrap()).unwrap();
+        assert_eq!(round_tripped, with_socket);
+        assert_eq!(
+            round_tripped.unix_socket.as_deref(),
+            Some("/run/app/app.sock")
+        );
+    }
+
+    #[test]
+    fn unix_socket_is_refused_outside_loopback_mode() {
+        let with_socket = options(Some("/run/app/app.sock"));
+        assert!(with_socket.check_unix_socket(true).is_ok());
+        let error = with_socket.check_unix_socket(false).unwrap_err();
+        assert!(error.contains("plain_http_on_loopback"), "{error}");
+        // Without a socket, nothing to refuse.
+        assert!(options(None).check_unix_socket(false).is_ok());
+    }
+
+    #[test]
+    fn unix_socket_path_must_be_absolute_without_parent_components() {
+        for path in ["/run/app/app.sock", "/tmp/a b/x.sock"] {
+            assert!(check_unix_socket_path(path).is_ok(), "{path}");
+        }
+        for path in [
+            "",
+            "app.sock",
+            "./app.sock",
+            "run/app.sock",
+            "/run/../tmp/app.sock",
+            "/",
+        ] {
+            assert!(check_unix_socket_path(path).is_err(), "{path:?}");
+        }
+    }
 }
 
 #[cfg(test)]

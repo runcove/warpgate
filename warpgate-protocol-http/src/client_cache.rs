@@ -19,6 +19,9 @@ struct ClientConfiguration {
     url: String,
     tls_mode: TlsMode,
     tls_verify: bool,
+    /// Part of the configuration, so a client built for one socket is never
+    /// reused for another.
+    unix_socket: Option<String>,
 }
 
 impl From<&TargetHTTPOptions> for ClientConfiguration {
@@ -27,6 +30,7 @@ impl From<&TargetHTTPOptions> for ClientConfiguration {
             url: options.url.clone(),
             tls_mode: options.tls.mode,
             tls_verify: options.tls.verify,
+            unix_socket: options.unix_socket.clone(),
         }
     }
 }
@@ -138,6 +142,17 @@ fn build_client(configuration: &ClientConfiguration) -> Result<reqwest::Client> 
         client = client.danger_accept_invalid_certs(true);
     }
 
+    if let Some(path) = &configuration.unix_socket {
+        #[cfg(unix)]
+        {
+            client = client.unix_socket(std::path::PathBuf::from(path));
+        }
+        #[cfg(not(unix))]
+        {
+            anyhow::bail!("Unix socket {path} is not supported on this platform");
+        }
+    }
+
     client.build().context("Could not build HTTP target client")
 }
 
@@ -156,6 +171,7 @@ mod tests {
             headers: Default::default(),
             external_host: None,
             public: false,
+            unix_socket: None,
         }
     }
 
@@ -191,6 +207,30 @@ mod tests {
         assert_eq!(
             cache.build_count.load(std::sync::atomic::Ordering::Relaxed),
             2
+        );
+    }
+
+    #[tokio::test]
+    async fn rebuilds_client_when_unix_socket_changes() {
+        install_crypto_provider();
+        let cache = HttpClientCache::default();
+        let with_socket = |path: Option<&str>| TargetHTTPOptions {
+            unix_socket: path.map(str::to_owned),
+            ..make_options("http://app.local")
+        };
+
+        for options in [
+            with_socket(None),
+            with_socket(Some("/run/a/app.sock")),
+            with_socket(Some("/run/a/app.sock")),
+            with_socket(Some("/run/b/app.sock")),
+        ] {
+            cache.client_for("target", &options).await.unwrap();
+        }
+
+        assert_eq!(
+            cache.build_count.load(std::sync::atomic::Ordering::Relaxed),
+            3
         );
     }
 

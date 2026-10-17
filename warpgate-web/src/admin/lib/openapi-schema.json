@@ -7113,6 +7113,10 @@
             "type": "boolean",
             "description": "When `true`, the catchall HTTP proxy serves this target without\nrequiring a Warpgate login. Anonymous and session-authed clients pass\nthrough on a throwaway session that is never stored; admin, user and\ncluster tokens hit a public target -> 401 (tokens are not proxy-scoped).\nA target that requires admin approval is never bypassed. Default\n`false` preserves existing behaviour; serde-default backfills existing\nJSON-column rows so no DB migration is required.\n\n`#[oai(default)]` is NOT a duplicate of `#[serde(default)]`. serde's\ngoverns JSON deserialisation; poem-openapi's `Object` derive is a\nseparate generator and marks every non-`Option` field REQUIRED in the\nemitted schema unless it carries its own default. Without it the admin\nAPI's OpenAPI document would tell clients they must send `public` on\nPOST /targets and PUT /targets/{id}.",
             "default": false
+          },
+          "unix_socket": {
+            "type": "string",
+            "description": "Absolute path of a Unix socket to reach the target through, in place\nof a TCP connection to the host in `url`, which still gives the `Host`\nheader and the scheme. Only served when `http.plain_http_on_loopback`\nis on. At each connection the socket and its directory must be owned\nby the account Warpgate runs as, the directory must not be accessible\nto group or others (mode 0700), and neither may be a symlink."
           }
         }
       },
