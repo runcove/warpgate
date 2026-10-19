@@ -1379,6 +1379,7 @@ pub(crate) mod delivery {
             global_params: Arc::new(params),
             listener_status: Default::default(),
             secret_backends,
+            live_streams: Default::default(),
         }
     }
 

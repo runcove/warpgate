@@ -112,6 +112,9 @@ pub enum ClusterNotification {
         session_id: UserSessionId,
         user_id: Uuid,
     },
+    /// Access was revoked somewhere: every node re-checks its live proxied
+    /// HTTP requests ([`crate::Services::reauthorize_live_streams`]).
+    LiveStreamsReauthorize,
 }
 
 pub struct RemoteNode {
