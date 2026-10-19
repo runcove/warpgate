@@ -113,9 +113,9 @@
         "keepalive_interval": null,
         "listen": "[::]:2222",
         "proxy_protocol": false,
+        "target_handshake_timeout": "30s",
         "web_auth_auto_continue": false,
-        "web_auth_wait_timeout": "2m",
-        "target_handshake_timeout": "30s"
+        "web_auth_wait_timeout": "2m"
       }
     },
     "sso_providers": {
@@ -552,6 +552,11 @@
           "type": "boolean",
           "default": false
         },
+        "target_handshake_timeout": {
+          "description": "Deadline for a target to accept the connection and complete key exchange.\nCovers the TCP connect (or the direct-tcpip hop through a jump host) and the\nSSH handshake, but not authentication. Set to `0s` to wait forever.",
+          "type": "string",
+          "default": "30s"
+        },
         "web_auth_auto_continue": {
           "description": "Complete the SSH browser-approval round without a `Press Enter` prompt,\nby polling the auth state across zero-prompt keyboard-interactive rounds.",
           "type": "boolean",
@@ -561,11 +566,6 @@
           "description": "How long one connection may keep polling for a browser approval before\nthe attempt is rejected.",
           "type": "string",
           "default": "2m"
-        },
-        "target_handshake_timeout": {
-          "description": "Deadline for a target to accept the connection and complete key exchange.\nCovers the TCP connect (or the direct-tcpip hop through a jump host) and the\nSSH handshake, but not authentication. Set to `0s` to wait forever.",
-          "type": "string",
-          "default": "30s"
         }
       }
     },
