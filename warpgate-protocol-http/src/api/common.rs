@@ -294,6 +294,10 @@ mod logout_tests {
             token: WarpgateIdToken::from_str(&token).unwrap(),
             provider: "removed".into(),
             supports_single_logout: true,
+            // As the SSO return sets them: the token's `sub`, and no `sid`
+            // claim in this token.
+            subject: Some("alice".into()),
+            sid: None,
         });
     }
 
@@ -546,6 +550,7 @@ mod logout_tests {
             data: Set("{}".into()),
             updated: Set(OffsetDateTime::now_utc()),
             user_session_id: Set(Some(login.id)),
+            ..Default::default()
         })
         .exec(&db)
         .await
