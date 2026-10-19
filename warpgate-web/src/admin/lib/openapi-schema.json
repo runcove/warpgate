@@ -5300,7 +5300,8 @@
             "type": "string"
           },
           "is_exempt": {
-            "type": "boolean"
+            "type": "boolean",
+            "description": "True when this address is currently on the exempt list, in which\ncase the block is NOT enforced (a stale row can outlive the address\nbeing exempted, or the exempt list changing after it was written)."
           }
         }
       },
@@ -5656,6 +5657,11 @@
             "type": "string",
             "format": "date-time"
           },
+          "last_sso_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Timestamp of the last step-up SSO refresh that stamped this credential.\n`None` if the credential has never been gated on a fresh SSO - either\nstep-up is disabled, the user hasn't reconnected since the feature\nshipped, or the feature is disabled globally."
+          },
           "openssh_public_key": {
             "type": "string"
           }
@@ -5818,7 +5824,7 @@
           },
           "client_ip": {
             "type": "string",
-            "description": "The client IP after applying the X-Forwarded-For trust setting."
+            "description": "The client IP as Warpgate records it: the `client_ip_header` if one is\nconfigured, else the peer. X-Forwarded-For is shown but never used."
           }
         }
       },
@@ -6316,6 +6322,9 @@
           "password_login_mode": {
             "$ref": "#/components/schemas/PasswordLoginMode"
           },
+          "sso_auto_redirect": {
+            "type": "boolean"
+          },
           "mfa_enforcement": {
             "$ref": "#/components/schemas/MfaEnforcement"
           },
@@ -6492,6 +6501,7 @@
           "ssh_client_auth_keyboard_interactive",
           "ssh_host_key_verification",
           "password_login_mode",
+          "sso_auto_redirect",
           "mfa_enforcement",
           "mfa_policy_exempt_sso_users",
           "default_credential_policy",
@@ -6548,6 +6558,9 @@
           },
           "password_login_mode": {
             "$ref": "#/components/schemas/PasswordLoginMode"
+          },
+          "sso_auto_redirect": {
+            "type": "boolean"
           },
           "mfa_enforcement": {
             "$ref": "#/components/schemas/MfaEnforcement"
@@ -7967,6 +7980,15 @@
           },
           "external_host": {
             "type": "string"
+          },
+          "public": {
+            "type": "boolean",
+            "description": "When `true`, the catchall HTTP proxy serves this target without\nrequiring a Warpgate login. Anonymous and session-authed clients pass\nthrough on a throwaway session that is never stored; admin, user and\ncluster tokens hit a public target -> 401 (tokens are not proxy-scoped).\nA target that requires admin approval is never bypassed. Default\n`false` preserves existing behaviour; serde-default backfills existing\nJSON-column rows so no DB migration is required.\n\n`#[oai(default)]` is NOT a duplicate of `#[serde(default)]`. serde's\ngoverns JSON deserialisation; poem-openapi's `Object` derive is a\nseparate generator and marks every non-`Option` field REQUIRED in the\nemitted schema unless it carries its own default. Without it the admin\nAPI's OpenAPI document would tell clients they must send `public` on\nPOST /targets and PUT /targets/{id}.",
+            "default": false
+          },
+          "unix_socket": {
+            "type": "string",
+            "description": "Absolute path of a Unix socket to reach the target through, in place\nof a TCP connection to the host in `url`, which still gives the `Host`\nheader and the scheme. Only served when `http.plain_http_on_loopback`\nis on. At each connection the socket and its directory must be owned\nby the account Warpgate runs as, the directory must not be accessible\nto group or others (mode 0700), and neither may be a symlink. Every\ndirectory above it must be a real directory (the path may not go\nthrough a symlink) owned by root or that account, and writable by\ngroup or others only when root-owned and sticky, as `/tmp` is. For\nWebSocket requests the process serving the socket must also run as\nthat account."
           }
         }
       },
@@ -8339,6 +8361,13 @@
           "jump_host": {
             "type": "string",
             "format": "uuid"
+          },
+          "env": {
+            "type": "object",
+            "description": "Custom environment variables to inject into downstream SSH sessions",
+            "additionalProperties": {
+              "type": "string"
+            }
           }
         }
       },
