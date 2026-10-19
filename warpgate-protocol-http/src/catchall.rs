@@ -5,8 +5,9 @@ use poem::web::websocket::WebSocket;
 use poem::web::{Data, FromRequest, Redirect};
 use poem::{Body, IntoResponse, Request, Response, handler};
 use serde::Deserialize;
-use tokio::sync::Mutex;
-use tracing::{Instrument, debug, info_span};
+use tokio::sync::{Mutex, broadcast};
+use tracing::{Instrument, debug, info_span, warn};
+use uuid::Uuid;
 use warpgate_common::auth::AuthStateUserInfo;
 use warpgate_common::{Target, TargetHTTPOptions, TargetOptions, WarpgateError};
 use warpgate_common_http::auth::UnauthenticatedRequestContext;
@@ -14,7 +15,7 @@ use warpgate_common_http::{
     AuthenticatedRequestContext, RequestAuthorization, SessionAuthorization, SessionKeepalive,
 };
 use warpgate_core::{
-    ConfigProvider, TargetAuthorization, TargetSessionStart, authorize_for_target,
+    ConfigProvider, Services, TargetAuthorization, TargetSessionStart, authorize_for_target,
 };
 
 use crate::approval_gate::resolve_admin_approval;
@@ -95,10 +96,9 @@ pub async fn catchall_endpoint(
     // is still running (a websocket, a streamed body) without closing the
     // browser session. Ticket and public requests are not role-based.
     let close_rx = match &ctx.auth {
-        RequestAuthorization::Session(SessionAuthorization::User { user_id, .. }) => ctx
-            .services()
-            .live_streams
-            .watch(close_rx, *user_id, admitted.target().id),
+        RequestAuthorization::Session(SessionAuthorization::User { user_id, .. }) => {
+            watch_live_stream(ctx.services(), close_rx, *user_id, admitted.target().id).await?
+        }
         _ => close_rx,
     };
     let keepalive_guard = Data::<&SessionKeepalive>::from_request_without_body(req)
@@ -448,6 +448,86 @@ async fn get_target_for_request(
     }
 
     Ok(None)
+}
+
+/// Registers a request with [`warpgate_core::live_streams::LiveStreams`], then
+/// checks the user's access to the target again. A revocation either finds
+/// the registration when it re-checks live streams, or was written before this
+/// check and refuses the request here: none slips between the first check and
+/// the registration. Fails closed: a check that errors refuses the request.
+async fn watch_live_stream(
+    services: &Services,
+    close_rx: broadcast::Receiver<()>,
+    user_id: Uuid,
+    target_id: Uuid,
+) -> poem::Result<broadcast::Receiver<()>> {
+    let close_rx = services.live_streams.watch(close_rx, user_id, target_id);
+    match services
+        .config_provider
+        .authorize_target_by_id(user_id, target_id)
+        .await
+    {
+        Ok(true) => Ok(close_rx),
+        Ok(false) => Err(poem::Error::from_status(poem::http::StatusCode::FORBIDDEN)),
+        Err(error) => {
+            warn!(%error, %user_id, %target_id, "Could not re-check access to the target; refusing");
+            Err(poem::Error::from_status(poem::http::StatusCode::FORBIDDEN))
+        }
+    }
+}
+
+#[cfg(test)]
+mod live_stream_tests {
+    //! A proxied request is registered for revocation before its access is
+    //! checked again, and refused if that check fails or errors.
+
+    use sea_orm::ConnectionTrait;
+    use uuid::Uuid;
+
+    use super::watch_live_stream;
+    use crate::test_db::{memory_db, services};
+
+    async fn deregistered(services: &warpgate_core::Services) -> bool {
+        for _ in 0..100 {
+            if services.live_streams.in_use().is_empty() {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn access_gone_by_registration_refuses_the_request() {
+        let services = services(memory_db().await).await;
+        let (_session, close_rx) = tokio::sync::broadcast::channel(1);
+
+        let watched = watch_live_stream(&services, close_rx, Uuid::new_v4(), Uuid::new_v4()).await;
+
+        assert_eq!(
+            watched.err().map(|e| e.status()),
+            Some(poem::http::StatusCode::FORBIDDEN)
+        );
+        assert!(deregistered(&services).await);
+    }
+
+    #[tokio::test]
+    async fn a_failing_access_check_refuses_the_request() {
+        let db = memory_db().await;
+        let services = services(db.clone()).await;
+        db.execute_unprepared("DROP TABLE user_roles")
+            .await
+            .unwrap();
+        let (_session, close_rx) = tokio::sync::broadcast::channel(1);
+
+        let watched = watch_live_stream(&services, close_rx, Uuid::new_v4(), Uuid::new_v4()).await;
+
+        assert_eq!(
+            watched.err().map(|e| e.status()),
+            Some(poem::http::StatusCode::FORBIDDEN)
+        );
+        assert!(deregistered(&services).await);
+    }
 }
 
 #[cfg(test)]
