@@ -9,9 +9,10 @@ use tracing::{info, warn};
 use uuid::Uuid;
 use warpgate_common::{Protocol, UserSessionId, WarpgateError};
 use warpgate_db_entities::{TargetSession, User, UserRoleAssignment, UserSession};
+use warpgate_sso::{SsoLoginResponse, SsoProviderConfig};
 
 use crate::cluster::ClusterNotification;
-use crate::{ConfigProvider, Services, SessionsFilter};
+use crate::{ConfigProvider, Services, SessionsFilter, apply_sso_mappings, resolve_sso_username};
 
 /// Whose live sessions an access change can affect.
 #[derive(Debug, Clone)]
@@ -99,6 +100,28 @@ impl Services {
             self.pending_revocations.push(change);
         }
         Ok(())
+    }
+
+    /// Resolve the Warpgate user for a verified SSO response and apply its
+    /// role mappings. If the mappings took a role away, or failed partway (a
+    /// role may already be gone), the user's sessions and live streams are
+    /// re-checked; that re-check cannot be lost (see
+    /// [`Self::close_sessions_no_longer_authorised`]).
+    pub async fn resolve_and_map_sso_user(
+        &self,
+        provider_config: &SsoProviderConfig,
+        response: &SsoLoginResponse,
+    ) -> Result<Option<String>, WarpgateError> {
+        let cp = self.config_provider.as_ref();
+        let Some(username) = resolve_sso_username(cp, provider_config, response).await? else {
+            return Ok(None);
+        };
+        let mapped = apply_sso_mappings(cp, provider_config, response, &username).await;
+        if !matches!(mapped, Ok(false)) {
+            self.close_sessions_no_longer_authorised(AccessChange::Username(username.clone()))
+                .await?;
+        }
+        mapped.map(|_| Some(username))
     }
 
     /// Runs the access changes whose re-check failed earlier; one that fails

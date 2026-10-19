@@ -336,38 +336,20 @@ async fn authenticate(req: &Request, services: &Services) -> poem::Result<Option
                 }
             };
 
-            let Some(mapping) = warpgate_core::resolve_and_map_sso_user(
-                services.config_provider.as_ref(),
-                provider_config,
-                &response,
-            )
-            .await
-            .map_err(|e| {
-                poem::Error::from_string(
-                    format!("SSO user resolution failed: {e}"),
-                    poem::http::StatusCode::INTERNAL_SERVER_ERROR,
-                )
-            })?
+            // Also ends whatever access the role sync took away; that re-check
+            // runs only when a role went, as this runs on every request.
+            let Some(username) = services
+                .resolve_and_map_sso_user(provider_config, &response)
+                .await
+                .map_err(|e| {
+                    poem::Error::from_string(
+                        format!("SSO user resolution failed: {e}"),
+                        poem::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    )
+                })?
             else {
                 continue;
             };
-
-            let username = mapping.username;
-            // Only when the role sync took roles away, and maybe targets with
-            // them: this runs on every token-authenticated request.
-            if mapping.roles_removed {
-                services
-                    .close_sessions_no_longer_authorised(warpgate_core::AccessChange::Username(
-                        username.clone(),
-                    ))
-                    .await
-                    .map_err(|e| {
-                        poem::Error::from_string(
-                            format!("Closing sessions after the role sync failed: {e}"),
-                            poem::http::StatusCode::INTERNAL_SERVER_ERROR,
-                        )
-                    })?;
-            }
 
             // The verified OIDC token is the identity; it is not re-checked against
             // the stored-SSO-linkage `validate_credential` arm, which would deny

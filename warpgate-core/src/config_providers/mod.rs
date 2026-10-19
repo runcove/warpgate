@@ -8,7 +8,7 @@ mod sso_user;
 pub use db::DatabaseConfigProvider;
 use enum_dispatch::enum_dispatch;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
-pub use sso_user::{SsoUserMapping, resolve_and_map_sso_user};
+pub use sso_user::{apply_sso_mappings, resolve_sso_username};
 use time::OffsetDateTime;
 use tracing::warn;
 use uuid::Uuid;
