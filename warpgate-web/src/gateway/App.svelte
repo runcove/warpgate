@@ -33,7 +33,7 @@
         try {
             webAuthRequests = await api.getWebAuthRequests()
         } catch {
-            // Not served on a host bound to a target (approving other
+            // Refused on a host bound to a target (approving other
             // logins is only offered on the main host): show none.
             webAuthRequests = []
         }

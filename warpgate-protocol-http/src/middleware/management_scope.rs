@@ -1,7 +1,5 @@
-use poem::error::NotFoundError;
-use poem::http::{Method, StatusCode};
-use poem::web::Data;
-use poem::{Endpoint, FromRequest, IntoResponse, Middleware, Request, Response};
+use poem::Request;
+use poem::http::Method;
 use tracing::warn;
 use warpgate_common_http::auth::UnauthenticatedRequestContext;
 use warpgate_common_http::is_cluster_peer_request;
@@ -10,14 +8,14 @@ use warpgate_core::ConfigProvider;
 use super::mfa_enforcement::warpgate_surface_path;
 use crate::catchall::bound_to_host;
 
-/// Whether `method` and `path` are part of signing in or out: the routes a
-/// host bound to an HTTP target still serves under `/@warpgate` and
-/// `/_warpgate`. That covers the gateway shell and its assets (the login page
+/// Whether `method` and `path` are part of signing in or out: the routes
+/// under `/@warpgate` and `/_warpgate` on which a host bound to an HTTP target
+/// still honours a session or token ([`credentials_refused_on_bound_host`]). That covers the gateway shell and its assets (the login page
 /// is a route inside the shell), the login steps, the browser's own login
 /// state, SSO start, return and logout, `info` for the login page and the
 /// embedded session bar, and the custom logo the login page shows. Everything
 /// else, including the admin API, the rest of the user API and forced MFA
-/// enrolment, is only served on other hosts.
+/// enrolment, is only usable on other hosts.
 ///
 /// Paths are matched exactly; a dot or empty segment, or an escape in an
 /// asset path, is never part of the login flow.
@@ -63,65 +61,52 @@ pub(crate) fn is_login_flow_route(method: &Method, path: &str) -> bool {
 /// Whether the request's host is bound to an HTTP target, resolved as the
 /// catchall resolves it: the trusted Host (or X-Forwarded-Host), port
 /// included, looked up with `get_target_by_hostname` and compared with
-/// [`bound_to_host`]. A cluster peer's forwarded request was scoped on the
-/// node the client reached.
-async fn is_target_bound(req: &Request) -> poem::Result<bool> {
-    let ctx = Data::<&UnauthenticatedRequestContext>::from_request_without_body(req).await?;
-    if is_cluster_peer_request(req) {
-        return Ok(false);
-    }
+/// [`bound_to_host`]. A failed lookup counts as bound: the answer decides
+/// whether credentials count, so it must not fail open.
+async fn is_target_bound(ctx: &UnauthenticatedRequestContext, req: &Request) -> bool {
     let Some(host) = ctx.trusted_host_header(req) else {
-        return Ok(false);
+        return false;
     };
-    let target = ctx
+    match ctx
         .services()
         .config_provider
         .get_target_by_hostname(&host)
-        .await?;
-    Ok(target.is_some_and(|target| bound_to_host(&target, &host)))
-}
-
-/// Serves only the login flow ([`is_login_flow_route`]) on hosts bound to an
-/// HTTP target; every other management route answers 404 there, as if it
-/// were not mounted. If the host cannot be resolved, those routes answer 503
-/// rather than being served.
-#[derive(Clone)]
-pub struct ManagementScopeMiddleware;
-
-impl<E: Endpoint> Middleware<E> for ManagementScopeMiddleware {
-    type Output = ManagementScopeEndpoint<E>;
-
-    fn transform(&self, inner: E) -> Self::Output {
-        ManagementScopeEndpoint { inner }
-    }
-}
-
-pub struct ManagementScopeEndpoint<E: Endpoint> {
-    inner: E,
-}
-
-impl<E: Endpoint> Endpoint for ManagementScopeEndpoint<E> {
-    type Output = Response;
-
-    async fn call(&self, req: Request) -> poem::Result<Self::Output> {
-        if !is_login_flow_route(req.method(), req.original_uri().path()) {
-            match is_target_bound(&req).await {
-                Ok(false) => {}
-                Ok(true) => return Err(NotFoundError.into()),
-                Err(error) => {
-                    warn!(%error, "Could not resolve the request host to a target; refusing a management route");
-                    return Err(poem::Error::from_status(StatusCode::SERVICE_UNAVAILABLE));
-                }
-            }
+        .await
+    {
+        Ok(target) => target.is_some_and(|target| bound_to_host(&target, &host)),
+        Err(error) => {
+            warn!(%error, "Could not resolve the request host to a target; treating it as bound");
+            true
         }
-        Ok(self.inner.call(req).await?.into_response())
     }
+}
+
+/// Whether the session or token a request to Warpgate's own routes carries
+/// must not count, because its host is bound to an HTTP target and the route
+/// is not part of the login flow ([`is_login_flow_route`]).
+///
+/// This is upstream's session restriction on hosts other than the control
+/// plane (`inject_request_authorization`), extended: a bound host serves the
+/// target's own pages, which share its origin, so there it applies with or
+/// without `external_host`, and to API tokens as well as the session. A
+/// cluster peer's forwarded request was scoped on the node the client
+/// reached.
+pub async fn credentials_refused_on_bound_host(
+    ctx: &UnauthenticatedRequestContext,
+    req: &Request,
+) -> bool {
+    let path = req.original_uri().path();
+    if is_cluster_peer_request(req)
+        || warpgate_surface_path(path).is_none()
+        || is_login_flow_route(req.method(), path)
+    {
+        return false;
+    }
+    is_target_bound(ctx, req).await
 }
 
 #[cfg(test)]
 mod tests {
-    use poem::endpoint::make_sync;
-    use poem::{EndpointExt, Route};
     use sea_orm::ActiveValue::Set;
     use sea_orm::{ConnectionTrait, DatabaseConnection, EntityTrait};
     use uuid::Uuid;
@@ -255,9 +240,11 @@ mod tests {
         .unwrap();
     }
 
-    /// Both management mounts behind the scope, over a database with one HTTP
-    /// target bound to [`TARGET_HOST`].
-    async fn client(trust_x_forwarded: bool) -> (impl Endpoint, DatabaseConnection) {
+    /// A request context over a database with one HTTP target bound to
+    /// [`TARGET_HOST`].
+    async fn context(
+        trust_x_forwarded: bool,
+    ) -> (UnauthenticatedRequestContext, DatabaseConnection) {
         let db = crate::test_db::memory_db().await;
         bind_target(&db, TARGET_HOST).await;
         let services = crate::test_db::services(db.clone()).await;
@@ -268,13 +255,7 @@ mod tests {
             .store
             .http
             .trust_x_forwarded_headers = trust_x_forwarded;
-        let ctx = UnauthenticatedRequestContext::new(services).await;
-        let mount = || make_sync(|_| "served").with(ManagementScopeMiddleware);
-        let app = Route::new()
-            .nest("/@warpgate", mount())
-            .nest("/_warpgate", mount())
-            .data(ctx);
-        (app, db)
+        (UnauthenticatedRequestContext::new(services).await, db)
     }
 
     const ADMIN_API: [(Method, &str); 3] = [
@@ -303,15 +284,15 @@ mod tests {
         (Method::POST, "/@warpgate/api/sso/return"),
     ];
 
-    /// Sends a request as the server builds it. poem's `TestClient` leaves
-    /// `original_uri` at `/` whatever the URI, and the scope reads
-    /// `original_uri`.
-    async fn status(
-        app: &impl Endpoint,
+    /// Builds a request as the server does (poem's `TestClient` leaves
+    /// `original_uri` at `/` whatever the URI, and the rule reads
+    /// `original_uri`) and asks whether its credentials are refused.
+    async fn refused(
+        ctx: &UnauthenticatedRequestContext,
         method: &Method,
         path: &str,
         headers: &[(&str, &str)],
-    ) -> StatusCode {
+    ) -> bool {
         let mut builder = poem::http::Request::builder()
             .method(method.clone())
             .uri(path);
@@ -328,71 +309,50 @@ mod tests {
             )),
             poem::Body::empty(),
         );
-        // Positive control: the path under test is the one the scope reads.
+        // Positive control: the path under test is the one the rule reads.
         assert_eq!(req.original_uri().path(), path);
-        app.get_response(req).await.status()
+        credentials_refused_on_bound_host(ctx, &req).await
     }
 
     #[tokio::test]
-    async fn target_host_refuses_admin_api() {
-        let (cli, _db) = client(false).await;
-        for (method, path) in ADMIN_API {
-            assert_eq!(
-                status(&cli, &method, path, &[("host", TARGET_HOST)]).await,
-                StatusCode::NOT_FOUND,
+    async fn target_host_refuses_credentials_on_admin_and_user_api() {
+        let (ctx, _db) = context(false).await;
+        for (method, path) in ADMIN_API.into_iter().chain(USER_API) {
+            assert!(
+                refused(&ctx, &method, path, &[("host", TARGET_HOST)]).await,
                 "{method} {path}"
             );
         }
     }
 
     #[tokio::test]
-    async fn target_host_refuses_user_api() {
-        let (cli, _db) = client(false).await;
-        for (method, path) in USER_API {
-            assert_eq!(
-                status(&cli, &method, path, &[("host", TARGET_HOST)]).await,
-                StatusCode::NOT_FOUND,
-                "{method} {path}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn target_host_serves_login_flow() {
-        let (cli, _db) = client(false).await;
+    async fn target_host_accepts_credentials_on_login_flow() {
+        let (ctx, _db) = context(false).await;
         for (method, path) in LOGIN_FLOW {
-            assert_eq!(
-                status(&cli, &method, path, &[("host", TARGET_HOST)]).await,
-                StatusCode::OK,
+            assert!(
+                !refused(&ctx, &method, path, &[("host", TARGET_HOST)]).await,
                 "{method} {path}"
             );
         }
     }
 
     #[tokio::test]
-    async fn main_host_serves_every_route() {
-        let (cli, _db) = client(false).await;
-        for (method, path) in ADMIN_API.into_iter().chain(USER_API).chain(LOGIN_FLOW) {
-            assert_eq!(
-                status(&cli, &method, path, &[("host", MAIN_HOST)]).await,
-                StatusCode::OK,
-                "{method} {path}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn other_host_serves_every_route() {
-        let (cli, _db) = client(false).await;
-        for host in [OTHER_HOST, "localhost:8888", "127.0.0.1"] {
-            for (method, path) in ADMIN_API.into_iter().chain(USER_API) {
-                assert_eq!(
-                    status(&cli, &method, path, &[("host", host)]).await,
-                    StatusCode::OK,
+    async fn other_hosts_accept_credentials_on_every_route() {
+        let (ctx, _db) = context(false).await;
+        for host in [MAIN_HOST, OTHER_HOST, "localhost:8888", "127.0.0.1"] {
+            for (method, path) in ADMIN_API.into_iter().chain(USER_API).chain(LOGIN_FLOW) {
+                assert!(
+                    !refused(&ctx, &method, path, &[("host", host)]).await,
                     "{method} {path} on {host}"
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn proxied_paths_are_not_warpgate_routes() {
+        let (ctx, _db) = context(false).await;
+        assert!(!refused(&ctx, &Method::POST, "/api/users", &[("host", TARGET_HOST)]).await);
     }
 
     /// A cluster peer, identified by the acceptor's mTLS check (the
@@ -400,16 +360,7 @@ mod tests {
     /// reached has already scoped; a plain request on the same host is scoped.
     #[tokio::test]
     async fn cluster_peer_is_not_scoped() {
-        let db = crate::test_db::memory_db().await;
-        bind_target(&db, TARGET_HOST).await;
-        let services = crate::test_db::services(db).await;
-        let ctx = UnauthenticatedRequestContext::new(services).await;
-        let app = Route::new()
-            .nest(
-                "/@warpgate",
-                make_sync(|_| "served").with(ManagementScopeMiddleware),
-            )
-            .data(ctx);
+        let (ctx, _db) = context(false).await;
         let request = |from_peer: bool| {
             let mut req = Request::builder()
                 .method(Method::GET)
@@ -423,79 +374,61 @@ mod tests {
             }
             req
         };
-        assert_eq!(
-            app.get_response(request(true)).await.status(),
-            StatusCode::OK
-        );
-        assert_eq!(
-            app.get_response(request(false)).await.status(),
-            StatusCode::NOT_FOUND
-        );
+        assert!(!credentials_refused_on_bound_host(&ctx, &request(true)).await);
+        assert!(credentials_refused_on_bound_host(&ctx, &request(false)).await);
     }
 
     #[tokio::test]
     async fn target_lookup_error_fails_closed() {
-        let (cli, db) = client(false).await;
+        let (ctx, db) = context(false).await;
         db.execute_unprepared("DROP TABLE targets").await.unwrap();
         let admin = "/@warpgate/admin/api/users";
         let login = "/@warpgate/api/auth/login";
         for host in [TARGET_HOST, MAIN_HOST] {
-            assert_eq!(
-                status(&cli, &Method::GET, admin, &[("host", host)]).await,
-                StatusCode::SERVICE_UNAVAILABLE,
+            assert!(
+                refused(&ctx, &Method::GET, admin, &[("host", host)]).await,
                 "{host}"
             );
             // The login flow does not depend on the lookup.
-            assert_eq!(
-                status(&cli, &Method::POST, login, &[("host", host)]).await,
-                StatusCode::OK,
+            assert!(
+                !refused(&ctx, &Method::POST, login, &[("host", host)]).await,
                 "{host}"
             );
         }
     }
 
     #[tokio::test]
-    async fn scope_matches_catchall_host_resolution() {
+    async fn binding_matches_catchall_host_resolution() {
         let admin = "/@warpgate/admin/api/users";
         let forwarded_to_target = [("host", MAIN_HOST), ("x-forwarded-host", TARGET_HOST)];
         let forwarded_to_main = [("host", TARGET_HOST), ("x-forwarded-host", MAIN_HOST)];
 
         // The port is part of the binding, as in the catchall.
-        let (cli, _db) = client(false).await;
+        let (ctx, _db) = context(false).await;
         for (host, expected) in [
-            ("vm.example.test", StatusCode::OK),
-            ("vm.example.test:9443", StatusCode::OK),
-            (TARGET_HOST, StatusCode::NOT_FOUND),
+            ("vm.example.test", false),
+            ("vm.example.test:9443", false),
+            (TARGET_HOST, true),
         ] {
-            let headers = [("host", host)];
             assert_eq!(
-                status(&cli, &Method::GET, admin, &headers).await,
+                refused(&ctx, &Method::GET, admin, &[("host", host)]).await,
                 expected,
                 "{host}"
             );
         }
         // X-Forwarded-Host is ignored unless it is trusted ...
-        assert_eq!(
-            status(&cli, &Method::GET, admin, &forwarded_to_target).await,
-            StatusCode::OK
-        );
+        assert!(!refused(&ctx, &Method::GET, admin, &forwarded_to_target).await);
 
         // ... and takes precedence over Host when it is.
-        let (cli, _db) = client(true).await;
-        assert_eq!(
-            status(&cli, &Method::GET, admin, &forwarded_to_target).await,
-            StatusCode::NOT_FOUND
-        );
-        assert_eq!(
-            status(&cli, &Method::GET, admin, &forwarded_to_main).await,
-            StatusCode::OK
-        );
+        let (ctx, _db) = context(true).await;
+        assert!(refused(&ctx, &Method::GET, admin, &forwarded_to_target).await);
+        assert!(!refused(&ctx, &Method::GET, admin, &forwarded_to_main).await);
     }
 
     #[tokio::test]
     async fn binding_agrees_with_served_on_host() {
         // A host is bound exactly where the catchall serves the bound target.
-        let (cli, _db) = client(false).await;
+        let (ctx, _db) = context(false).await;
         let admin = "/@warpgate/admin/api/users";
         for host in [
             TARGET_HOST,
@@ -504,15 +437,9 @@ mod tests {
             "VM.example.test:8443",
             "vm.example.test:8443.",
         ] {
-            let expected = if served_on_host(Some(TARGET_HOST), Some(host)) {
-                StatusCode::NOT_FOUND
-            } else {
-                StatusCode::OK
-            };
-            let headers = [("host", host)];
             assert_eq!(
-                status(&cli, &Method::GET, admin, &headers).await,
-                expected,
+                refused(&ctx, &Method::GET, admin, &[("host", host)]).await,
+                served_on_host(Some(TARGET_HOST), Some(host)),
                 "{host}"
             );
         }
@@ -520,16 +447,15 @@ mod tests {
 
     #[tokio::test]
     async fn underscore_prefix_is_scoped_too() {
-        let (cli, _db) = client(false).await;
-        let (ok, not_found) = (StatusCode::OK, StatusCode::NOT_FOUND);
+        let (ctx, _db) = context(false).await;
         for (method, path, expected) in [
-            (Method::GET, "/_warpgate/admin/api/users", not_found),
-            (Method::GET, "/_warpgate/api/targets", not_found),
-            (Method::GET, "/_warpgate/api/info", ok),
-            (Method::POST, "/_warpgate/api/auth/login", ok),
+            (Method::GET, "/_warpgate/admin/api/users", true),
+            (Method::GET, "/_warpgate/api/targets", true),
+            (Method::GET, "/_warpgate/api/info", false),
+            (Method::POST, "/_warpgate/api/auth/login", false),
         ] {
             assert_eq!(
-                status(&cli, &method, path, &[("host", TARGET_HOST)]).await,
+                refused(&ctx, &method, path, &[("host", TARGET_HOST)]).await,
                 expected,
                 "{method} {path}"
             );
