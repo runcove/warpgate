@@ -4,11 +4,13 @@
 use std::collections::HashMap;
 
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect};
+use time::OffsetDateTime;
 use tracing::info;
 use uuid::Uuid;
 use warpgate_common::{Protocol, UserSessionId, WarpgateError};
-use warpgate_db_entities::{TargetSession, User, UserSession};
+use warpgate_db_entities::{TargetSession, User, UserRoleAssignment, UserSession};
 
+use crate::cluster::ClusterNotification;
 use crate::{ConfigProvider, Services, SessionsFilter};
 
 /// Whose live sessions an access change can affect.
@@ -41,6 +43,10 @@ impl Services {
     ///   (`catchall::get_target_for_request` calls `authorize_for_target`), so
     ///   a revoked target is refused on the next request, and one browser
     ///   session spans several targets, which cutting it would take away too.
+    ///   Requests still running to a revoked target (websockets, streamed
+    ///   bodies) are ended instead, on every node, through
+    ///   [`ClusterNotification::LiveStreamsReauthorize`] and
+    ///   [`Self::reauthorize_live_streams`]; the browser session stays.
     pub async fn close_sessions_no_longer_authorised(
         &self,
         change: AccessChange,
@@ -99,14 +105,69 @@ impl Services {
         }
         ids.sort();
         ids.dedup();
-        if ids.is_empty() {
+        if !ids.is_empty() {
+            info!(
+                sessions = ids.len(),
+                "Closing sessions whose user may no longer reach their target"
+            );
+            self.close_sessions(SessionsFilter::Sessions { ids })
+                .await?;
+        }
+        // Long-lived proxied HTTP requests, on this node and the others.
+        self.cluster
+            .notify_global(ClusterNotification::LiveStreamsReauthorize);
+        Ok(())
+    }
+
+    /// Ends this node's live proxied HTTP requests whose user may no longer
+    /// reach their target, by the same check as
+    /// [`Self::close_sessions_no_longer_authorised`]. The browser session that
+    /// carries them, and its requests to other targets, stay.
+    pub async fn reauthorize_live_streams(&self) -> Result<(), WarpgateError> {
+        for (user_id, target_id) in self.live_streams.in_use() {
+            if !self
+                .config_provider
+                .authorize_target_by_id(user_id, target_id)
+                .await?
+            {
+                let ended = self.live_streams.cancel(user_id, target_id);
+                info!(
+                    %user_id,
+                    %target_id,
+                    ended,
+                    "Ended live proxied requests to a target the user may no longer reach"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Closes the sessions of users whose role assignment expired after
+    /// `since` (every expired one, if `None`) and no later than `now`, as an
+    /// admin's revocation would. Run on the ticket-expiry sweep.
+    pub async fn close_sessions_of_expired_role_assignments(
+        &self,
+        since: Option<OffsetDateTime>,
+        now: OffsetDateTime,
+    ) -> Result<(), WarpgateError> {
+        let mut query = UserRoleAssignment::Entity::find()
+            .filter(UserRoleAssignment::Column::RevokedAt.is_null())
+            .filter(UserRoleAssignment::Column::ExpiresAt.lte(now));
+        if let Some(since) = since {
+            query = query.filter(UserRoleAssignment::Column::ExpiresAt.gt(since));
+        }
+        let users: Vec<Uuid> = query
+            .select_only()
+            .column(UserRoleAssignment::Column::UserId)
+            .distinct()
+            .into_tuple()
+            .all(&self.db)
+            .await?;
+        if users.is_empty() {
             return Ok(());
         }
-        info!(
-            sessions = ids.len(),
-            "Closing sessions whose user may no longer reach their target"
-        );
-        self.close_sessions(SessionsFilter::Sessions { ids }).await
+        self.close_sessions_no_longer_authorised(AccessChange::Users(users))
+            .await
     }
 }
 
@@ -369,5 +430,98 @@ mod tests {
 
         assert!(ended(&db, ssh).await);
         assert!(!ended(&db, http).await);
+    }
+
+    /// A role assignment whose expiry passes is swept like a revocation: the
+    /// session to the target only it granted ends, the other stays; a sweep
+    /// window that ends before the expiry leaves both.
+    #[tokio::test]
+    async fn an_expired_role_assignment_ends_the_sessions_it_granted() {
+        let db = migrated_db().await;
+        let services = test_services(&db).await;
+        let (alice, expiring, kept) = (user(&db).await, role(&db).await, role(&db).await);
+        let (lost_target, kept_target) = (target(&db).await, target(&db).await);
+        grant_user(&db, alice, expiring).await;
+        grant_user(&db, alice, kept).await;
+        grant_target(&db, lost_target, expiring).await;
+        grant_target(&db, kept_target, kept).await;
+        let to_lost = session(&db, alice, lost_target).await;
+        let to_kept = session(&db, alice, kept_target).await;
+
+        let expired_at = OffsetDateTime::now_utc() - time::Duration::seconds(1);
+        let mut assignment: UserRoleAssignment::ActiveModel =
+            UserRoleAssignment::Entity::find_by_id((alice, expiring))
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap()
+                .into();
+        assignment.expires_at = Set(Some(expired_at));
+        assignment.update(&db).await.unwrap();
+
+        // Already swept past this expiry: nothing to do.
+        services
+            .close_sessions_of_expired_role_assignments(
+                Some(OffsetDateTime::now_utc()),
+                OffsetDateTime::now_utc(),
+            )
+            .await
+            .unwrap();
+        assert!(!ended(&db, to_lost).await);
+
+        services
+            .close_sessions_of_expired_role_assignments(
+                Some(expired_at - time::Duration::seconds(5)),
+                OffsetDateTime::now_utc(),
+            )
+            .await
+            .unwrap();
+        assert!(ended(&db, to_lost).await);
+        assert!(!ended(&db, to_kept).await);
+    }
+
+    async fn fired(rx: &mut tokio::sync::broadcast::Receiver<()>) -> bool {
+        tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+            .await
+            .is_ok()
+    }
+
+    /// A revocation ends the live proxied HTTP requests to the target the
+    /// user lost and keeps those to a target they still reach, without
+    /// closing the browser session; every node is told to re-check.
+    #[tokio::test]
+    async fn a_revocation_ends_live_http_requests_to_the_lost_target_only() {
+        let db = migrated_db().await;
+        let services = test_services(&db).await;
+        let (alice, lost, kept) = (user(&db).await, role(&db).await, role(&db).await);
+        let (lost_target, kept_target) = (target(&db).await, target(&db).await);
+        grant_user(&db, alice, lost).await;
+        grant_user(&db, alice, kept).await;
+        grant_target(&db, lost_target, lost).await;
+        grant_target(&db, kept_target, kept).await;
+
+        let (_browser_session, browser_close) = tokio::sync::broadcast::channel(1);
+        let mut to_lost =
+            services
+                .live_streams
+                .watch(browser_close.resubscribe(), alice, lost_target);
+        let mut to_kept = services
+            .live_streams
+            .watch(browser_close, alice, kept_target);
+        let mut notifications = services.cluster.subscribe();
+
+        revoke_user_role(&db, alice, lost).await;
+        services
+            .close_sessions_no_longer_authorised(AccessChange::Users(vec![alice]))
+            .await
+            .unwrap();
+        assert!(matches!(
+            notifications.recv().await,
+            Ok(ClusterNotification::LiveStreamsReauthorize)
+        ));
+        services.reauthorize_live_streams().await.unwrap();
+
+        assert!(fired(&mut to_lost).await);
+        assert!(!fired(&mut to_kept).await);
     }
 }

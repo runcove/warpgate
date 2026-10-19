@@ -91,6 +91,16 @@ pub async fn catchall_endpoint(
             }
         }
     };
+    // A revocation of this user's access to the target ends the request if it
+    // is still running (a websocket, a streamed body) without closing the
+    // browser session. Ticket and public requests are not role-based.
+    let close_rx = match &ctx.auth {
+        RequestAuthorization::Session(SessionAuthorization::User { user_id, .. }) => ctx
+            .services()
+            .live_streams
+            .watch(close_rx, *user_id, admitted.target().id),
+        _ => close_rx,
+    };
     let keepalive_guard = Data::<&SessionKeepalive>::from_request_without_body(req)
         .await
         .ok()

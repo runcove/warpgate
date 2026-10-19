@@ -113,5 +113,6 @@ pub async fn services(db: DatabaseConnection) -> Services {
         global_params: Arc::new(params),
         listener_status: Default::default(),
         secret_backends: Arc::new(SecretBackendRegistry::new(db.clone())),
+        live_streams: Default::default(),
     }
 }

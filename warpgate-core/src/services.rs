@@ -24,6 +24,7 @@ use crate::auth_state_store::ApprovalRequestSink;
 use crate::cluster::{Cluster, ClusterNotification};
 use crate::db::connect_to_db_and_migrate;
 use crate::helpers::i64_seconds_to_duration;
+use crate::live_streams::LiveStreams;
 use crate::login_protection::LoginProtectionService;
 use crate::rate_limiting::RateLimiterRegistry;
 use crate::recordings::SessionRecordings;
@@ -48,6 +49,9 @@ pub struct Services {
     pub global_params: Arc<GlobalParams>,
     pub listener_status: ListenerStatusRegistry,
     pub secret_backends: Arc<SecretBackendRegistry>,
+    /// Live proxied HTTP requests by user and target, so a revocation can end
+    /// them ([`Services::close_sessions_no_longer_authorised`]).
+    pub live_streams: LiveStreams,
 }
 
 /// How often a node picks up self approvals decided elsewhere. One query per
@@ -188,6 +192,7 @@ impl Services {
             global_params: Arc::new(params),
             listener_status: Arc::default(),
             secret_backends,
+            live_streams: LiveStreams::default(),
         };
 
         {
@@ -211,10 +216,43 @@ impl Services {
             let services = services.clone();
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(TICKET_EXPIRY_SWEEP_INTERVAL);
+                // Role assignments that expired after this point are handled
+                // on the next tick; `None` takes every expired one first.
+                let mut role_expiry_swept_until = None;
                 loop {
                     interval.tick().await;
                     if let Err(error) = services.close_sessions_of_expired_tickets().await {
                         warn!("Failed to close sessions of expired tickets: {error}");
+                    }
+                    let now = OffsetDateTime::now_utc();
+                    match services
+                        .close_sessions_of_expired_role_assignments(role_expiry_swept_until, now)
+                        .await
+                    {
+                        Ok(()) => role_expiry_swept_until = Some(now),
+                        Err(error) => {
+                            warn!("Failed to close sessions of expired role assignments: {error}");
+                        }
+                    }
+                }
+            });
+        }
+
+        // Any node's revocation re-checks this node's live proxied requests.
+        {
+            let services = services.clone();
+            let mut rx = services.cluster.subscribe();
+            tokio::spawn(async move {
+                loop {
+                    match rx.recv().await {
+                        Ok(ClusterNotification::LiveStreamsReauthorize)
+                        | Err(broadcast::error::RecvError::Lagged(_)) => {
+                            if let Err(error) = services.reauthorize_live_streams().await {
+                                warn!("Failed to re-check live proxied requests: {error}");
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(broadcast::error::RecvError::Closed) => break,
                     }
                 }
             });
