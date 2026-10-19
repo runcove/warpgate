@@ -4,13 +4,12 @@ use poem::{Endpoint, FromRequest, IntoResponse, Middleware, Request, Response};
 use tracing::warn;
 use url::{Origin, Url};
 use warpgate_common_http::auth::UnauthenticatedRequestContext;
-use warpgate_common_http::ext::construct_external_url;
 use warpgate_common_http::{PlainHttpListener, is_cluster_peer_request};
 
 use super::loopback_host::request_host;
 use super::management_scope::is_login_flow_route;
 use super::mfa_enforcement::warpgate_surface_path;
-use crate::common::{is_localhost_host, is_warpgate_session_cookie_name};
+use crate::common::{is_cross_origin_request, is_warpgate_session_cookie_name};
 
 static SEC_FETCH_SITE: HeaderName = HeaderName::from_static("sec-fetch-site");
 
@@ -23,31 +22,6 @@ pub(crate) struct OriginCheckRequest<'a> {
     pub cluster_peer: bool,
     pub origin: Option<&'a str>,
     pub sec_fetch_site: Option<&'a str>,
-}
-
-/// The origins a state-changing request may come from.
-#[derive(Debug)]
-pub(crate) struct AcceptedOrigins {
-    /// The main host's, from `external_host`. Without one configured, the
-    /// request's own origin stands in for it, as it does for every external
-    /// URL Warpgate builds.
-    main: Option<Origin>,
-    /// The request's own, accepted for login-flow routes on any host.
-    own: Option<Origin>,
-    /// Whether the request's own origin is accepted for every route: on
-    /// localhost, which may carry the main host's session too.
-    own_for_all_routes: bool,
-}
-
-impl AcceptedOrigins {
-    pub fn new(main: Option<&Url>, own: Option<&Url>, own_hostname: Option<&str>) -> Self {
-        let own = own.map(Url::origin);
-        Self {
-            main: main.map(Url::origin).or_else(|| own.clone()),
-            own,
-            own_for_all_routes: own_hostname.is_some_and(is_localhost_host),
-        }
-    }
 }
 
 impl OriginCheckRequest<'_> {
@@ -63,28 +37,6 @@ impl OriginCheckRequest<'_> {
         let sso_form_post = self.method == Method::POST
             && warpgate_surface_path(self.path) == Some("/api/sso/return");
         !sso_form_post
-    }
-
-    /// Whether a checked request may proceed. Without `Origin` it is a
-    /// non-browser client unless Fetch Metadata says the browser sent it from
-    /// another site. With `Origin` it must be the main host's, or the
-    /// request's own on a login-flow route; `null` and anything unparseable
-    /// are refused.
-    pub fn is_allowed(&self, accepted: &AcceptedOrigins) -> bool {
-        let Some(origin) = self.origin else {
-            return self.sec_fetch_site != Some("cross-site");
-        };
-        let Ok(origin) = Url::parse(origin).map(|url| url.origin()) else {
-            return false;
-        };
-        if !origin.is_tuple() {
-            return false;
-        }
-        if accepted.main.as_ref() == Some(&origin) {
-            return true;
-        }
-        accepted.own.as_ref() == Some(&origin)
-            && (accepted.own_for_all_routes || is_login_flow_route(&self.method, self.path))
     }
 
     /// Whether a checked request may proceed on a plain-HTTP loopback
@@ -142,6 +94,17 @@ fn loopback_request_allowed(req: &Request, check: &OriginCheckRequest<'_>) -> bo
         || check.is_same_origin_on_loopback(loopback_own_origin(req).as_ref())
 }
 
+/// Off loopback, whether a checked request may proceed: one to a login-flow
+/// route must not come from another origin ([`is_cross_origin_request`]);
+/// anything else is left to upstream, which ignores the session on it.
+fn login_flow_request_allowed(
+    req: &Request,
+    check: &OriginCheckRequest<'_>,
+    request_host: Option<&str>,
+) -> bool {
+    !is_login_flow_route(&check.method, check.path) || !is_cross_origin_request(req, request_host)
+}
+
 fn is_plain_http_loopback(req: &Request) -> bool {
     req.data::<PlainHttpListener>()
         .is_some_and(|listener| listener.0)
@@ -160,25 +123,21 @@ fn origin_check_request(req: &Request, cluster_peer: bool) -> OriginCheckRequest
     }
 }
 
-async fn accepted_origins(req: &Request) -> poem::Result<AcceptedOrigins> {
-    let ctx = Data::<&UnauthenticatedRequestContext>::from_request_without_body(req).await?;
-    let config = ctx.services().config.lock().await;
-    let main = construct_external_url(None, &config, None).await.ok();
-    let own = construct_external_url(Some(req), &config, None).await.ok();
-    Ok(AcceptedOrigins::new(
-        main.as_ref(),
-        own.as_ref(),
-        ctx.trusted_hostname(req).as_deref(),
-    ))
-}
-
-/// Refuses state-changing management requests (and websocket upgrades) whose
-/// `Origin` is not the main host's, or the request's own on a login-flow
-/// route, with 403. Requests without browser headers are not affected.
+/// Refuses with 403 a state-changing request (or websocket upgrade) to a
+/// login-flow route that comes from another origin, by upstream's test
+/// ([`is_cross_origin_request`]: the `Origin`, else `Referer`, host must be
+/// the request's own, and `Sec-Fetch-Site` must not be `cross-site` or
+/// `same-site`).
+///
+/// Upstream only ignores the session on such a request
+/// (`inject_request_authorization`), which refuses every route that needs a
+/// login; the login flow acts without one, so a page elsewhere could still
+/// log the browser in or out. Requests without browser headers are not
+/// affected.
 ///
 /// On a plain-HTTP loopback listener the stricter
 /// [`OriginCheckRequest::is_same_origin_on_loopback`] rule applies instead,
-/// to requests that carry a Warpgate session cookie.
+/// to every route, for requests that carry a Warpgate session cookie.
 #[derive(Clone)]
 pub struct OriginCheckMiddleware;
 
@@ -204,7 +163,9 @@ impl<E: Endpoint> Endpoint for OriginCheckEndpoint<E> {
             let allowed = if loopback {
                 loopback_request_allowed(&req, &check)
             } else {
-                check.is_allowed(&accepted_origins(&req).await?)
+                let ctx =
+                    Data::<&UnauthenticatedRequestContext>::from_request_without_body(&req).await?;
+                login_flow_request_allowed(&req, &check, ctx.trusted_hostname(&req).as_deref())
             };
             if !allowed {
                 warn!(
@@ -273,7 +234,9 @@ mod tests {
     use super::*;
 
     const MAIN: &str = "https://warpgate.example.test";
+    const MAIN_HOST: &str = "warpgate.example.test";
     const TARGET: &str = "https://vm.warpgate.example.test:8443";
+    const TARGET_HOST: &str = "vm.warpgate.example.test";
     const FOREIGN: &str = "https://elsewhere.example";
 
     const ADMIN_API: &str = "/@warpgate/admin/api/targets";
@@ -284,13 +247,6 @@ mod tests {
 
     fn url(s: &str) -> Url {
         Url::parse(s).unwrap()
-    }
-
-    /// Origins accepted for a request to `own`, with the main host at
-    /// [`MAIN`].
-    fn accepted(own: &str) -> AcceptedOrigins {
-        let own = url(own);
-        AcceptedOrigins::new(Some(&url(MAIN)), Some(&own), own.host_str())
     }
 
     const fn post<'a>(path: &'a str, origin: Option<&'a str>) -> OriginCheckRequest<'a> {
@@ -304,111 +260,121 @@ mod tests {
         }
     }
 
-    fn allows(check: &OriginCheckRequest<'_>, accepted: &AcceptedOrigins) -> bool {
-        !check.is_checked() || check.is_allowed(accepted)
+    /// A request built as the server builds it (poem's `TestClient` leaves
+    /// `original_uri` at `/`, and the check reads `original_uri`).
+    fn request(method: Method, path: &str, headers: &[(&str, &str)]) -> Request {
+        let mut builder = poem::http::Request::builder().method(method).uri(path);
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let (parts, ()) = builder.body(()).unwrap().into_parts();
+        Request::from_parts(
+            poem::RequestParts::from((
+                parts,
+                poem::web::LocalAddr::default(),
+                poem::web::RemoteAddr::default(),
+                poem::http::uri::Scheme::HTTPS,
+            )),
+            poem::Body::empty(),
+        )
+    }
+
+    /// Whether the check off loopback lets `req` to `host` through.
+    fn allows(req: &Request, host: &str) -> bool {
+        let check = origin_check_request(req, is_cluster_peer_request(req));
+        !check.is_checked() || login_flow_request_allowed(req, &check, Some(host))
+    }
+
+    fn post_from(path: &str, origin: &str) -> Request {
+        request(Method::POST, path, &[("origin", origin)])
     }
 
     #[test]
-    fn allows_main_host_origin() {
-        let on_main = accepted(MAIN);
-        for path in [ADMIN_API, USER_API, LOGIN, "/_warpgate/admin/api/targets"] {
-            assert!(allows(&post(path, Some(MAIN)), &on_main), "{path}");
-        }
-        // The default port spelled out.
-        let explicit = "https://warpgate.example.test:443";
-        assert!(allows(&post(ADMIN_API, Some(explicit)), &on_main));
-        // The main host's page calling Warpgate under another name.
-        assert!(allows(&post(ADMIN_API, Some(MAIN)), &accepted(TARGET)));
-    }
-
-    #[test]
-    fn refuses_foreign_origin_on_admin_api() {
-        let on_main = accepted(MAIN);
-        for origin in [FOREIGN, "http://warpgate.example.test", TARGET] {
-            let check = post(ADMIN_API, Some(origin));
-            assert!(!allows(&check, &on_main), "{origin}");
-        }
-    }
-
-    #[test]
-    fn refuses_foreign_origin_on_user_api() {
-        let on_main = accepted(MAIN);
-        for origin in [FOREIGN, TARGET] {
-            let check = post(USER_API, Some(origin));
-            assert!(!allows(&check, &on_main), "{origin}");
-        }
-    }
-
-    #[test]
-    fn allows_own_origin_for_login_flow_on_target_host() {
-        let on_target = accepted(TARGET);
-        for path in [LOGIN, "/@warpgate/api/auth/otp", LOGOUT] {
-            assert!(allows(&post(path, Some(TARGET)), &on_target), "{path}");
-        }
-        let cancel = OriginCheckRequest {
-            method: Method::DELETE,
-            path: "/@warpgate/api/auth/state",
-            ..post(LOGIN, Some(TARGET))
+    fn login_flow_refuses_another_origin() {
+        let cancel = |origin| {
+            request(
+                Method::DELETE,
+                "/@warpgate/api/auth/state",
+                &[("origin", origin)],
+            )
         };
-        assert!(allows(&cancel, &on_target));
-        // Not another host's origin, even on a login route.
-        assert!(!allows(&post(LOGIN, Some(FOREIGN)), &on_target));
+        for path in [
+            LOGIN,
+            "/@warpgate/api/auth/otp",
+            LOGOUT,
+            "/_warpgate/api/auth/login",
+        ] {
+            assert!(!allows(&post_from(path, FOREIGN), MAIN_HOST), "{path}");
+            // A target's page under the main host is another origin too ...
+            assert!(!allows(&post_from(path, TARGET), MAIN_HOST), "{path}");
+            // ... and so is the main host's page, on a target's host.
+            assert!(!allows(&post_from(path, MAIN), TARGET_HOST), "{path}");
+        }
+        assert!(!allows(&cancel(FOREIGN), MAIN_HOST));
     }
 
     #[test]
-    fn refuses_own_origin_for_non_login_route_on_target_host() {
-        let on_target = accepted(TARGET);
-        for path in [ADMIN_API, USER_API, "/@warpgate/api/auth/state/x/approve"] {
-            assert!(!allows(&post(path, Some(TARGET)), &on_target), "{path}");
+    fn login_flow_allows_its_own_origin() {
+        for (origin, host) in [
+            (MAIN, MAIN_HOST),
+            ("https://warpgate.example.test:443", MAIN_HOST),
+            (TARGET, TARGET_HOST),
+            ("https://localhost:8888", "localhost"),
+        ] {
+            for path in [LOGIN, LOGOUT] {
+                assert!(allows(&post_from(path, origin), host), "{origin} {path}");
+            }
         }
     }
 
     #[test]
-    fn allows_own_origin_on_localhost() {
-        let own = "https://localhost:8888";
-        assert!(allows(&post(ADMIN_API, Some(own)), &accepted(own)));
-        assert!(!allows(&post(ADMIN_API, Some(FOREIGN)), &accepted(own)));
+    fn login_flow_refuses_null_and_unparseable_origins() {
+        for origin in ["null", "", "not a url", "data:text/plain,x"] {
+            assert!(!allows(&post_from(LOGIN, origin), MAIN_HOST), "{origin:?}");
+        }
     }
 
     #[test]
-    fn falls_back_to_own_origin_without_external_host() {
-        let own = url("https://node.example.test:8888");
-        let accepted = AcceptedOrigins::new(None, Some(&own), own.host_str());
-        let origin = "https://node.example.test:8888";
-        assert!(allows(&post(ADMIN_API, Some(origin)), &accepted));
-        assert!(!allows(&post(ADMIN_API, Some(FOREIGN)), &accepted));
+    fn login_flow_reads_referer_and_fetch_metadata_without_origin() {
+        let referer = request(
+            Method::POST,
+            LOGIN,
+            &[("referer", "https://elsewhere.example/page")],
+        );
+        assert!(!allows(&referer, MAIN_HOST));
+        for site in ["cross-site", "same-site"] {
+            let req = request(Method::POST, LOGIN, &[("sec-fetch-site", site)]);
+            assert!(!allows(&req, MAIN_HOST), "{site}");
+        }
+        for site in ["same-origin", "none"] {
+            let req = request(Method::POST, LOGIN, &[("sec-fetch-site", site)]);
+            assert!(allows(&req, MAIN_HOST), "{site}");
+        }
     }
 
     #[test]
     fn allows_request_without_browser_headers() {
         for path in [ADMIN_API, USER_API, LOGIN] {
-            assert!(allows(&post(path, None), &accepted(MAIN)), "{path}");
-            assert!(allows(&post(path, None), &accepted(TARGET)), "{path}");
-        }
-        for site in ["same-origin", "same-site", "none"] {
-            let check = OriginCheckRequest {
-                sec_fetch_site: Some(site),
-                ..post(ADMIN_API, None)
-            };
-            assert!(allows(&check, &accepted(MAIN)), "{site}");
+            assert!(
+                allows(&request(Method::POST, path, &[]), MAIN_HOST),
+                "{path}"
+            );
         }
     }
 
+    /// Routes that need a login are left to upstream, which ignores the
+    /// session on a cross-origin request to them.
     #[test]
-    fn refuses_null_origin() {
-        for origin in ["null", "", "not a url", "data:text/plain,x"] {
-            let check = post(LOGIN, Some(origin));
-            assert!(!allows(&check, &accepted(MAIN)), "{origin:?}");
+    fn leaves_other_routes_to_upstream() {
+        for path in [ADMIN_API, USER_API, "/@warpgate/api/auth/state/x/approve"] {
+            assert!(allows(&post_from(path, FOREIGN), MAIN_HOST), "{path}");
         }
-    }
-
-    #[test]
-    fn refuses_cross_site_fetch_metadata_without_origin() {
-        let check = OriginCheckRequest {
-            sec_fetch_site: Some("cross-site"),
-            ..post(ADMIN_API, None)
-        };
-        assert!(!allows(&check, &accepted(MAIN)));
+        let stream = request(
+            Method::GET,
+            "/@warpgate/api/web-ssh/sessions/x/stream",
+            &[("upgrade", "websocket"), ("origin", FOREIGN)],
+        );
+        assert!(allows(&stream, MAIN_HOST));
     }
 
     #[test]
@@ -416,66 +382,43 @@ mod tests {
         for method in [Method::GET, Method::HEAD, Method::OPTIONS] {
             let check = OriginCheckRequest {
                 method: method.clone(),
-                ..post(ADMIN_API, Some(FOREIGN))
+                ..post(LOGIN, Some(FOREIGN))
             };
             assert!(!check.is_checked(), "{method}");
         }
-        for method in [Method::PUT, Method::PATCH, Method::DELETE] {
-            let check = OriginCheckRequest {
-                method: method.clone(),
-                ..post(ADMIN_API, Some(FOREIGN))
-            };
-            assert!(!allows(&check, &accepted(MAIN)), "{method}");
-        }
-    }
-
-    #[test]
-    fn checks_websocket_upgrades() {
-        let stream = "/@warpgate/api/web-ssh/sessions/x/stream";
-        let upgrade = |origin| OriginCheckRequest {
-            method: Method::GET,
-            websocket_upgrade: true,
-            ..post(stream, origin)
-        };
-        assert!(!allows(&upgrade(Some(FOREIGN)), &accepted(MAIN)));
-        assert!(allows(&upgrade(Some(MAIN)), &accepted(MAIN)));
-        assert!(allows(&upgrade(None), &accepted(MAIN)));
+        // A websocket upgrade is checked whatever its method.
+        let upgrade = request(
+            Method::GET,
+            "/@warpgate/api/info",
+            &[("upgrade", "websocket"), ("origin", FOREIGN)],
+        );
+        assert!(!allows(&upgrade, MAIN_HOST));
     }
 
     #[test]
     fn exempts_sso_return_post() {
-        let idp = Some("https://idp.example");
+        let idp = "https://idp.example";
         for path in [SSO_RETURN, "/_warpgate/api/sso/return"] {
-            assert!(allows(&post(path, idp), &accepted(MAIN)), "{path}");
+            assert!(allows(&post_from(path, idp), MAIN_HOST), "{path}");
         }
-        // Only that route and method.
-        let logout = "/@warpgate/api/sso/logout";
-        assert!(!allows(&post(logout, idp), &accepted(MAIN)));
-        let delete = OriginCheckRequest {
-            method: Method::DELETE,
-            ..post(SSO_RETURN, idp)
-        };
-        assert!(!allows(&delete, &accepted(MAIN)));
+        // Only that route.
+        assert!(!allows(&post_from(LOGOUT, idp), MAIN_HOST));
     }
 
     #[test]
     fn exempts_cluster_peer() {
-        let check = OriginCheckRequest {
-            cluster_peer: true,
-            ..post(ADMIN_API, Some(FOREIGN))
-        };
-        assert!(allows(&check, &accepted(MAIN)));
+        let mut req = post_from(LOGIN, FOREIGN);
+        req.extensions_mut()
+            .insert(warpgate_common_http::ClusterPeer {
+                node_id: warpgate_common::NodeId(uuid::Uuid::new_v4()),
+            });
+        assert!(allows(&req, MAIN_HOST));
     }
 
-    /// The middleware over a configured main host, end to end.
+    /// The middleware, end to end, under the `/@warpgate` mount.
     #[tokio::test]
-    async fn middleware_refuses_foreign_origin() {
+    async fn middleware_refuses_a_cross_origin_login() {
         let services = crate::test_db::services(crate::test_db::memory_db().await).await;
-        {
-            let mut config = services.config.lock().await;
-            config.store.external_host = Some("warpgate.example.test".into());
-            config.store.http.external_port = Some(443);
-        }
         let ctx = UnauthenticatedRequestContext::new(services).await;
         let app = Route::new()
             .nest(
@@ -483,25 +426,24 @@ mod tests {
                 make_sync(|_| "served").with(OriginCheckMiddleware),
             )
             .data(ctx);
-        let cli = TestClient::new(app);
-        let host = "warpgate.example.test";
 
-        for (origin, expected) in [
-            (Some(MAIN), StatusCode::OK),
-            (Some(FOREIGN), StatusCode::FORBIDDEN),
-            (None, StatusCode::OK),
+        for (path, origin, expected) in [
+            (LOGIN, Some(MAIN), StatusCode::OK),
+            (LOGIN, Some(FOREIGN), StatusCode::FORBIDDEN),
+            (LOGIN, None, StatusCode::OK),
+            (ADMIN_API, Some(FOREIGN), StatusCode::OK),
         ] {
-            let mut req = cli.post(ADMIN_API).header("host", host);
+            let mut headers = vec![("host", MAIN_HOST)];
             if let Some(origin) = origin {
-                req = req.header("origin", origin);
+                headers.push(("origin", origin));
             }
-            assert_eq!(req.send().await.0.status(), expected, "{origin:?}");
+            let req = request(Method::POST, path, &headers);
+            assert_eq!(
+                app.get_response(req).await.status(),
+                expected,
+                "{path} {origin:?}"
+            );
         }
-        let req = cli.get(ADMIN_API).header("host", host);
-        req.header("origin", FOREIGN)
-            .send()
-            .await
-            .assert_status_is_ok();
     }
 
     // Loopback mode: Warpgate on http://127.0.0.1:8888 (port P), another local
