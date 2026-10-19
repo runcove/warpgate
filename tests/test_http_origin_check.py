@@ -1,10 +1,13 @@
 """The Origin check on state-changing management requests.
 
 A state-changing request under `/@warpgate` or `/_warpgate` (and a websocket
-upgrade there) that carries an `Origin` must come from the main host's
-origin, or from the request's own origin on a login-flow route. Clients that
-send no browser headers - the SDK, the CLI, cove - are not affected, and the
-IdP's form_post to the SSO return route is exempt.
+upgrade there) from another origin - by upstream's test: the `Origin`, else
+`Referer`, host is not the request's own, or `Sec-Fetch-Site` is
+`cross-site` or `same-site` - gets no use of the session (upstream), so a
+route that needs a login answers 401; a login-flow route, which acts without
+one, refuses it with 403 (ours). Clients that send no browser headers - the
+SDK, the CLI, cove - are not affected, and the IdP's form_post to the SSO
+return route is exempt.
 """
 
 import ssl
@@ -105,16 +108,13 @@ def _cookie_header(session):
 
 class TestHTTPOriginCheck:
     def test_state_change_with_foreign_origin_is_refused(self, setup):
-        response = setup.create_role(origin=FOREIGN_ORIGIN)
-        assert response.status_code == 403, response.status_code
-
         session, response = setup.login(setup.main_url)
         assert response.status_code // 100 == 2, response.text
-        for method, path in [
-            ("POST", "/@warpgate/api/auth/logout"),
-            ("POST", "/_warpgate/api/auth/logout"),
-            ("DELETE", "/@warpgate/api/auth/state"),
-            ("POST", "/@warpgate/api/profile/api-tokens"),
+        for method, path, status in [
+            ("POST", "/@warpgate/api/auth/logout", 403),
+            ("POST", "/_warpgate/api/auth/logout", 403),
+            ("DELETE", "/@warpgate/api/auth/state", 403),
+            ("POST", "/@warpgate/api/profile/api-tokens", 401),
         ]:
             response = session.request(
                 method,
@@ -122,7 +122,7 @@ class TestHTTPOriginCheck:
                 headers={"Origin": FOREIGN_ORIGIN},
                 json={},
             )
-            assert response.status_code == 403, (
+            assert response.status_code == status, (
                 f"{method} {path}: {response.status_code}"
             )
 
@@ -188,7 +188,7 @@ class TestHTTPOriginCheck:
             create_connection(
                 url, cookie=cookie, origin=FOREIGN_ORIGIN, sslopt=sslopt
             )
-        assert refused.value.status_code == 403
+        assert refused.value.status_code == 401
 
         ws = create_connection(
             url, cookie=cookie, origin=setup.main_origin, sslopt=sslopt

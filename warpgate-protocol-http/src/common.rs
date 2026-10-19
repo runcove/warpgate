@@ -163,11 +163,17 @@ fn session_host_is_authorized(request_host: Option<&str>, base_host: &str) -> bo
 /// adds nothing, and the port is routinely stripped or rewritten by reverse
 /// proxies while Warpgate serves nothing on another port of the same host.
 fn is_cross_origin_api_request(req: &Request, request_host: Option<&str>) -> bool {
-    let headers = req.headers();
-
     if warpgate_surface_path(req.uri().path()).is_none() {
         return false;
     }
+    is_cross_origin_request(req, request_host)
+}
+
+/// [`is_cross_origin_api_request`] without the path test, for a caller that
+/// has already decided the route is one of Warpgate's own (the origin check,
+/// which runs under the `/@warpgate` mount and sees its path stripped).
+pub(crate) fn is_cross_origin_request(req: &Request, request_host: Option<&str>) -> bool {
+    let headers = req.headers();
 
     let is_websocket = headers
         .get(http::header::UPGRADE)
