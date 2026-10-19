@@ -710,6 +710,15 @@ impl TargetSecrets for TargetSSHOptions {
     }
 }
 
+impl TargetSSHOptions {
+    fn redact_credentials(&mut self) {
+        // the injected environment can carry secrets/tokens, as HTTP headers can
+        if let Some(env) = &mut self.env {
+            env.values_mut().for_each(String::clear);
+        }
+    }
+}
+
 impl TargetSecrets for TargetHTTPOptions {
     fn secrets_mut(&mut self) -> Vec<&mut MaybeSecretRef> {
         vec![]
@@ -813,8 +822,10 @@ impl StoredSecrets for TargetOptions {
         for secret in self.stored_secrets_mut() {
             *secret = StoredSecret::default();
         }
-        if let Self::Http(options) = self {
-            options.redact_credentials();
+        match self {
+            Self::Http(options) => options.redact_credentials(),
+            Self::Ssh(options) => options.redact_credentials(),
+            _ => {}
         }
     }
 }
@@ -1184,6 +1195,23 @@ mod tests {
             assert_eq!(http["url"], "https://upstream.example:8443/base?q=1");
             assert_eq!(http["headers"]["Authorization"], "", "{snapshot}");
         }
+    }
+
+    /// An SSH target's `env` is injected into its sessions and can carry
+    /// tokens like an HTTP header: its values are blanked, its names kept.
+    #[test]
+    fn redaction_blanks_ssh_env_values() {
+        let options: TargetSSHOptions = serde_json::from_value(serde_json::json!({
+            "host": "h",
+            "env": {"API_TOKEN": "s3cr3t-env", "REGION": "eu"},
+        }))
+        .unwrap();
+
+        let snapshot = serde_json::to_value(TargetOptions::Ssh(options).redacted()).unwrap();
+        let ssh = snapshot.get("ssh").unwrap();
+        assert_eq!(ssh["env"]["API_TOKEN"], "", "{snapshot}");
+        assert_eq!(ssh["env"]["REGION"], "", "{snapshot}");
+        assert!(!snapshot.to_string().contains("s3cr3t-env"), "{snapshot}");
     }
 
     #[test]
