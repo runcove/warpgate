@@ -12,10 +12,22 @@
 //!
 //! Limits of the check:
 //! - TCP carries no peer credentials: the owner is looked up by address and
-//!   port after the connection is accepted.
+//!   port after the connection is accepted. Each accept costs a lookup (a
+//!   walk of the process table on macOS, a read of `/proc/net/tcp` on Linux)
+//!   bounded at 2 seconds; one that fails or runs over refuses, so
+//!   another account can slow the listener down but not get through.
+//! - On Linux a socket belongs to the account that created it, wherever its
+//!   descriptor is passed. On macOS it belongs to the account when one of
+//!   the account's processes other than Warpgate holds it, which includes a
+//!   descriptor another account passed into such a process, and a
+//!   descriptor the account handed to another account's process while one
+//!   of its own still holds it. A socket held only by processes Warpgate
+//!   cannot inspect (root's or another account's) is never found there.
 //! - Every process of the account is trusted, relays included: an `ssh -R`
-//!   forward, a proxy the account runs, a target pointing back at this
-//!   listener. Whoever reaches such a relay is served as the account.
+//!   forward, a proxy the account runs. Whoever reaches such a relay is
+//!   served as the account. A target pointing back at this listener is
+//!   served on Linux; on macOS its client socket is in Warpgate's own
+//!   process, which is skipped, so it is refused.
 //! - A reverse proxy in front of the listener running as another account is
 //!   refused like any other account.
 //! - Only the HTTP listener is checked; the SSH listener is not, even on a
@@ -85,16 +97,11 @@ pub(crate) fn effective_uid() -> anyhow::Result<u32> {
     }
 }
 
-/// The uid a plain-HTTP loopback listener serves: this process's effective
-/// uid, refused when it is root's.
-pub(crate) fn listener_uid() -> anyhow::Result<u32> {
-    serving_uid(effective_uid()?)
-}
-
-/// `uid`, unless it is root's: root owns system services' sockets as well,
+/// The uid a plain-HTTP loopback listener serves, given this process's
+/// effective uid: `uid`, unless it is root's: root owns system services' sockets as well,
 /// and the kernel lists sockets with no process behind them under uid 0, so
 /// serving root's connections would not tell them apart.
-fn serving_uid(uid: u32) -> anyhow::Result<u32> {
+pub(crate) fn serving_uid(uid: u32) -> anyhow::Result<u32> {
     if uid == 0 {
         bail!(
             "`http.plain_http_on_loopback` is set, but Warpgate runs as root; run it as the OS account whose connections it should serve"
@@ -293,7 +300,8 @@ mod linux {
 /// both ports), which no two live TCP sockets share; `soi_so` is a scrambled
 /// kernel pointer and is not used. A socket can be open in several processes
 /// (an inherited or passed descriptor): every holder found must have the same
-/// uid. This process's own sockets are skipped.
+/// uid. A socket counts only in ESTABLISHED, CLOSE_WAIT, FIN_WAIT_1 or
+/// FIN_WAIT_2. This process's own sockets are skipped.
 ///
 /// Layouts follow `sys/proc_info.h`; `libc` declares `proc_fdinfo` and
 /// `proc_bsdinfo` but not `socket_fdinfo`, which is read as bytes at the
@@ -311,7 +319,7 @@ mod macos {
     pub(super) const SOI_KIND: usize = 24 + 232;
     /// `psi.soi_proto`: for `SOCKINFO_TCP`, a `struct tcp_sockinfo`, which
     /// starts with a `struct in_sockinfo`.
-    const SOI_PROTO: usize = 24 + 240;
+    pub(super) const SOI_PROTO: usize = 24 + 240;
     // `struct in_sockinfo`. The ports are `int`s holding the network-order
     // `u_short`.
     pub(super) const INSI_FPORT: usize = SOI_PROTO;
@@ -319,22 +327,50 @@ mod macos {
     pub(super) const INSI_VFLAG: usize = SOI_PROTO + 24;
     pub(super) const INSI_FADDR: usize = SOI_PROTO + 32;
     pub(super) const INSI_LADDR: usize = SOI_PROTO + 48;
+    /// `struct tcp_sockinfo`'s `tcpsi_state`, after its `in_sockinfo`.
+    pub(super) const TCPSI_STATE: usize = SOI_PROTO + 80;
     /// Within an address union, where an IPv4 address sits (`ina_46`).
     pub(super) const IN_ADDR_4IN6_OFFSET: usize = 12;
     pub(super) const SOCKINFO_TCP: i32 = 2;
     pub(super) const INI_IPV4: u8 = 0x1;
     pub(super) const INI_IPV6: u8 = 0x2;
+    // The `TSI_S_*` (`TCPS_*`) states in which a socket counts as holding a
+    // connection. Every other state (CLOSED, LISTEN, SYN_SENT, SYN_RECEIVED,
+    // CLOSING, LAST_ACK, TIME_WAIT) does not, and its process is no holder.
+    pub(super) const TSI_S_ESTABLISHED: i32 = 4;
+    pub(super) const TSI_S_CLOSE_WAIT: i32 = 5;
+    pub(super) const TSI_S_FIN_WAIT_1: i32 = 6;
+    pub(super) const TSI_S_FIN_WAIT_2: i32 = 9;
+
+    /// A TCP socket's endpoints and state, from its `struct socket_fdinfo`.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) struct TcpSocket {
+        pub local: SocketAddr,
+        pub remote: SocketAddr,
+        pub state: i32,
+    }
+
+    impl TcpSocket {
+        /// Whether the socket holds a live connection; only then is its
+        /// process a holder.
+        fn is_connected(&self) -> bool {
+            matches!(
+                self.state,
+                TSI_S_ESTABLISHED | TSI_S_CLOSE_WAIT | TSI_S_FIN_WAIT_1 | TSI_S_FIN_WAIT_2
+            )
+        }
+    }
 
     /// A TCP socket open in a process.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(super) struct ProcessSocket {
         pub pid: i32,
-        pub local: SocketAddr,
-        pub remote: SocketAddr,
+        pub socket: TcpSocket,
     }
 
     /// The owner of the socket with these endpoints among `sockets`: the one
-    /// uid of every process holding it, other than `own_pid`. `uid_of` gives
+    /// uid of every process holding it connected, other than `own_pid`; a
+    /// socket in any other state is not a holder. `uid_of` gives
     /// a holder's uid, or `None` when it has exited since (it is passed over).
     /// Holders with different uids are an error.
     pub(super) fn find_owner(
@@ -348,8 +384,9 @@ mod macos {
             .iter()
             .filter(|socket| {
                 socket.pid != own_pid
-                    && same_endpoint(socket.local, local)
-                    && same_endpoint(socket.remote, remote)
+                    && socket.socket.is_connected()
+                    && same_endpoint(socket.socket.local, local)
+                    && same_endpoint(socket.socket.remote, remote)
             })
             .map(|socket| socket.pid)
             .collect::<Vec<_>>();
@@ -400,12 +437,10 @@ mod macos {
         }
     }
 
-    /// A `struct socket_fdinfo`'s (local, remote) endpoints when it is a TCP
+    /// A `struct socket_fdinfo`'s endpoints and state when it is a TCP
     /// socket; `None` for any other socket. A record of any other size is an
     /// error: the layout is not the one this reads.
-    pub(super) fn parse_socket_fdinfo(
-        record: &[u8],
-    ) -> anyhow::Result<Option<(SocketAddr, SocketAddr)>> {
+    pub(super) fn parse_socket_fdinfo(record: &[u8]) -> anyhow::Result<Option<TcpSocket>> {
         if record.len() != SOCKET_FDINFO_LEN {
             anyhow::bail!(
                 "socket info is {} bytes, expected {SOCKET_FDINFO_LEN}",
@@ -415,11 +450,11 @@ mod macos {
         if read_i32(record, SOI_KIND) != Some(SOCKINFO_TCP) {
             return Ok(None);
         }
-        Ok(tcp_endpoints(record))
+        Ok(tcp_socket(record))
     }
 
-    /// A TCP socket's `struct in_sockinfo` endpoints: (local, remote).
-    fn tcp_endpoints(record: &[u8]) -> Option<(SocketAddr, SocketAddr)> {
+    /// A TCP socket's `struct in_sockinfo` endpoints and its state.
+    fn tcp_socket(record: &[u8]) -> Option<TcpSocket> {
         let vflag = *record.get(INSI_VFLAG)?;
         let local = SocketAddr::new(
             read_address(record, INSI_LADDR, vflag)?,
@@ -429,7 +464,11 @@ mod macos {
             read_address(record, INSI_FADDR, vflag)?,
             read_port(record, INSI_FPORT)?,
         );
-        Some((local, remote))
+        Some(TcpSocket {
+            local,
+            remote,
+            state: read_i32(record, TCPSI_STATE)?,
+        })
     }
 
     #[cfg(target_os = "macos")]
@@ -444,7 +483,8 @@ mod macos {
         use anyhow::{Context, bail};
 
         use super::{
-            ProcessSocket, SOCKET_FDINFO_LEN, find_owner, is_out_of_reach, parse_socket_fdinfo,
+            ProcessSocket, SOCKET_FDINFO_LEN, TcpSocket, find_owner, is_out_of_reach,
+            parse_socket_fdinfo,
         };
 
         /// `PROC_ALL_PIDS` and `PROC_PIDFDSOCKETINFO` in `sys/proc_info.h`;
@@ -488,13 +528,8 @@ mod macos {
                     if Instant::now() > deadline {
                         bail!("the socket lookup ran past its deadline");
                     }
-                    if let Some((socket_local, socket_remote)) = socket_endpoints(pid, fd.proc_fd)?
-                    {
-                        sockets.push(ProcessSocket {
-                            pid,
-                            local: socket_local,
-                            remote: socket_remote,
-                        });
+                    if let Some(socket) = tcp_socket(pid, fd.proc_fd)? {
+                        sockets.push(ProcessSocket { pid, socket });
                     }
                 }
                 if Instant::now() > deadline {
@@ -580,9 +615,9 @@ mod macos {
             Ok(Some(fds))
         }
 
-        /// The TCP endpoints of `pid`'s descriptor `fd`, or `None` when it is
-        /// not a TCP socket or is out of reach.
-        fn socket_endpoints(pid: i32, fd: i32) -> anyhow::Result<Option<(SocketAddr, SocketAddr)>> {
+        /// The TCP socket behind `pid`'s descriptor `fd`, or `None` when it
+        /// is not a TCP socket or is out of reach.
+        fn tcp_socket(pid: i32, fd: i32) -> anyhow::Result<Option<TcpSocket>> {
             let mut info = SocketFdInfo([0; SOCKET_FDINFO_LEN]);
             clear_errno();
             // SAFETY: `info` is writable for `SOCKET_FDINFO_LEN` bytes.
@@ -985,13 +1020,16 @@ mod tests {
         }
     }
 
-    /// Builds a `struct socket_fdinfo` the way the kernel fills it in.
+    /// Builds an established TCP socket's `struct socket_fdinfo` through the
+    /// parser's own offsets (pinned on their own by
+    /// `socket_fdinfo_layout_matches_the_header`).
     fn socket_fdinfo(kind: i32, local: SocketAddr, remote: SocketAddr) -> Vec<u8> {
         let mut record = vec![0u8; macos::SOCKET_FDINFO_LEN];
         let mut put = |offset: usize, bytes: &[u8]| {
             record[offset..offset + bytes.len()].copy_from_slice(bytes);
         };
         put(macos::SOI_KIND, &kind.to_ne_bytes());
+        put(macos::TCPSI_STATE, &macos::TSI_S_ESTABLISHED.to_ne_bytes());
         // An `int` holding the network-order `u_short`.
         let port = |port: u16| i32::from(port.to_be()).to_ne_bytes();
         put(macos::INSI_LPORT, &port(local.port()));
@@ -1025,12 +1063,111 @@ mod tests {
             let record = socket_fdinfo(macos::SOCKINFO_TCP, addr(local), addr(remote));
             assert_eq!(
                 macos::parse_socket_fdinfo(&record).unwrap(),
-                Some((addr(local), addr(remote)))
+                Some(macos::TcpSocket {
+                    local: addr(local),
+                    remote: addr(remote),
+                    state: macos::TSI_S_ESTABLISHED,
+                })
             );
         }
         // Not a TCP socket (`SOCKINFO_IN`: UDP).
         let udp = socket_fdinfo(1, addr("127.0.0.1:53"), addr("127.0.0.1:50043"));
         assert_eq!(macos::parse_socket_fdinfo(&udp).unwrap(), None);
+    }
+
+    /// The layout and constants, as literal numbers: `offsetof`, `sizeof`
+    /// and the `#define`s of `sys/proc_info.h` in the MacOSX14.0 SDK,
+    /// measured for arm64 and x86_64 alike.
+    #[test]
+    fn socket_fdinfo_layout_matches_the_header() {
+        assert_eq!(macos::SOCKET_FDINFO_LEN, 792);
+        assert_eq!(macos::SOI_KIND, 256);
+        assert_eq!(macos::SOI_PROTO, 264);
+        assert_eq!(macos::INSI_FPORT, 264);
+        assert_eq!(macos::INSI_LPORT, 268);
+        assert_eq!(macos::INSI_VFLAG, 288);
+        assert_eq!(macos::INSI_FADDR, 296);
+        assert_eq!(macos::INSI_LADDR, 312);
+        assert_eq!(macos::IN_ADDR_4IN6_OFFSET, 12);
+        assert_eq!(macos::TCPSI_STATE, 344);
+        assert_eq!(macos::SOCKINFO_TCP, 2);
+        assert_eq!(macos::INI_IPV4, 1);
+        assert_eq!(macos::INI_IPV6, 2);
+        assert_eq!(macos::TSI_S_ESTABLISHED, 4);
+        assert_eq!(macos::TSI_S_CLOSE_WAIT, 5);
+        assert_eq!(macos::TSI_S_FIN_WAIT_1, 6);
+        assert_eq!(macos::TSI_S_FIN_WAIT_2, 9);
+    }
+
+    /// An established TCP socket 50043 -> 8888, written byte by byte at the
+    /// header's offsets without the parser's constants.
+    fn handwritten_socket_fdinfo(vflag: u8, laddr: [u8; 16], faddr: [u8; 16]) -> Vec<u8> {
+        // An `int` holding the network-order `u_short`.
+        let port = |port: u16| i32::from(port.to_be()).to_ne_bytes();
+        let mut record = vec![0u8; 792];
+        record[256..260].copy_from_slice(&2i32.to_ne_bytes()); // soi_kind: SOCKINFO_TCP
+        record[264..268].copy_from_slice(&port(8888)); // insi_fport
+        record[268..272].copy_from_slice(&port(50043)); // insi_lport
+        record[288] = vflag; // insi_vflag
+        record[296..312].copy_from_slice(&faddr); // insi_faddr
+        record[312..328].copy_from_slice(&laddr); // insi_laddr
+        record[344..348].copy_from_slice(&4i32.to_ne_bytes()); // tcpsi_state: ESTABLISHED
+        record
+    }
+
+    /// An IPv4 address in a `struct in4in6_addr`: after 12 bytes of padding.
+    fn in4in6(ip: [u8; 4]) -> [u8; 16] {
+        let mut union = [0u8; 16];
+        union[12..].copy_from_slice(&ip);
+        union
+    }
+
+    #[test]
+    fn handwritten_ipv4_socket_fdinfo_parses() {
+        let local = in4in6([127, 0, 0, 1]);
+        let remote = in4in6([127, 0, 0, 2]);
+        // INI_IPV4, then both flags (an IPv6 socket talking IPv4): the
+        // addresses are read as IPv4 either way.
+        for vflag in [0x1, 0x3] {
+            let record = handwritten_socket_fdinfo(vflag, local, remote);
+            let socket = macos::parse_socket_fdinfo(&record).unwrap().unwrap();
+            assert_eq!(socket.local, addr("127.0.0.1:50043"), "{vflag}");
+            assert_eq!(socket.remote, addr("127.0.0.2:8888"), "{vflag}");
+            assert!(socket.local.is_ipv4() && socket.remote.is_ipv4());
+            assert_eq!(socket.state, 4);
+        }
+    }
+
+    #[test]
+    fn handwritten_ipv6_socket_fdinfo_parses() {
+        let local = "::1".parse::<std::net::Ipv6Addr>().unwrap().octets();
+        let remote = "::2".parse::<std::net::Ipv6Addr>().unwrap().octets();
+        let record = handwritten_socket_fdinfo(0x2, local, remote);
+        let socket = macos::parse_socket_fdinfo(&record).unwrap().unwrap();
+        assert_eq!(socket.local, addr("[::1]:50043"));
+        assert_eq!(socket.remote, addr("[::2]:8888"));
+        assert_eq!(socket.state, 4);
+    }
+
+    /// A `struct socket_fdinfo` captured on a real Mac, as hex (whitespace
+    /// ignored), with the socket it describes: (hex, local, remote, state).
+    /// `None` until a capture is pasted in; the test below then checks it.
+    const CAPTURED_SOCKET_FDINFO: Option<(&str, &str, &str, i32)> = None;
+
+    #[test]
+    fn captured_socket_fdinfo_parses() {
+        let Some((hex, local, remote, state)) = CAPTURED_SOCKET_FDINFO else {
+            return;
+        };
+        let hex = hex.split_whitespace().collect::<String>();
+        let record = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect::<Vec<_>>();
+        let socket = macos::parse_socket_fdinfo(&record).unwrap().unwrap();
+        assert_eq!(socket.local, addr(local));
+        assert_eq!(socket.remote, addr(remote));
+        assert_eq!(socket.state, state);
     }
 
     #[test]
@@ -1052,11 +1189,15 @@ mod tests {
 
     /// The sockets of a few processes; see `holder_uid` for their owners.
     fn process_sockets() -> Vec<macos::ProcessSocket> {
-        let socket = |pid, local, remote| macos::ProcessSocket {
+        let socket_in = |state, pid, local, remote| macos::ProcessSocket {
             pid,
-            local: addr(local),
-            remote: addr(remote),
+            socket: macos::TcpSocket {
+                local: addr(local),
+                remote: addr(remote),
+                state,
+            },
         };
+        let socket = |pid, local, remote| socket_in(macos::TSI_S_ESTABLISHED, pid, local, remote);
         vec![
             // A client of the listener, and Warpgate's accepted end of it.
             socket(100, "127.0.0.1:50043", LISTENER),
@@ -1077,12 +1218,14 @@ mod tests {
             socket(108, "127.0.0.1:50048", LISTENER),
             // The same port on another local address.
             socket(109, "127.0.0.2:50049", LISTENER),
+            // A socket of this account that is closed (`TSI_S_CLOSED`).
+            socket_in(0, 110, "127.0.0.1:50061", LISTENER),
         ]
     }
 
     fn holder_uid(pid: i32) -> anyhow::Result<Option<u32>> {
         Ok(match pid {
-            100..=105 | 107 => Some(501),
+            100..=105 | 107 | 110 => Some(501),
             106 => Some(502),
             108 => None,
             109 => Some(503),
@@ -1122,6 +1265,42 @@ mod tests {
         assert_eq!(find("127.0.0.1:50043", "127.0.0.2:8888"), None);
         assert_eq!(find("127.0.0.1:50049", LISTENER), None);
         assert_eq!(find("127.0.0.2:50049", LISTENER), Some(503));
+    }
+
+    #[test]
+    fn process_sockets_count_only_connected_sockets() {
+        // Established: found. Closed, its only holder ours: not found.
+        assert_eq!(
+            find_in_processes("127.0.0.1:50043", LISTENER).unwrap(),
+            Some(501)
+        );
+        assert_eq!(
+            find_in_processes("127.0.0.1:50061", LISTENER).unwrap(),
+            None
+        );
+        for state in 0..=11 {
+            let sockets = [macos::ProcessSocket {
+                pid: 100,
+                socket: macos::TcpSocket {
+                    local: addr("127.0.0.1:50043"),
+                    remote: addr(LISTENER),
+                    state,
+                },
+            }];
+            let owner = macos::find_owner(
+                &sockets,
+                OWN_PID,
+                addr("127.0.0.1:50043"),
+                addr(LISTENER),
+                holder_uid,
+            )
+            .unwrap();
+            // ESTABLISHED, CLOSE_WAIT, FIN_WAIT_1 and FIN_WAIT_2 hold a
+            // connection; CLOSED, LISTEN, SYN_SENT, SYN_RECEIVED, CLOSING,
+            // LAST_ACK, TIME_WAIT and anything else do not.
+            let connected = matches!(state, 4 | 5 | 6 | 9);
+            assert_eq!(owner, connected.then_some(501), "state {state}");
+        }
     }
 
     #[test]
