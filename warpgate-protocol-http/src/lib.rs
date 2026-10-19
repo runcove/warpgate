@@ -27,6 +27,7 @@ use futures::FutureExt;
 use futures::future::BoxFuture;
 use http::HeaderValue;
 use poem::endpoint::{EmbeddedFileEndpoint, EmbeddedFilesEndpoint};
+use poem::listener::BoxIo;
 use poem::middleware::SetHeader;
 use poem::session::ServerSession;
 use poem::web::Data;
@@ -36,6 +37,7 @@ use tokio::sync::Mutex;
 use tracing::{Instrument, warn};
 use warpgate_admin::admin_api_app;
 use warpgate_common::ListenEndpoint;
+use warpgate_common::helpers::concurrent_acceptor::ConcurrentAcceptor;
 use warpgate_common::helpers::proxy_protocol::MaybeProxyProtocolAcceptor;
 use warpgate_version::warpgate_version;
 use warpgate_common_http::auth::UnauthenticatedRequestContext;
@@ -96,6 +98,21 @@ async fn recordings_s3_browser_origin(ctx: &UnauthenticatedRequestContext) -> Op
         RecordingsStorageConfig::S3(s3) => s3.browser_origin(),
         RecordingsStorageConfig::Disk(_) => None,
     }
+}
+
+/// The acceptor of a plain-HTTP loopback listener on `address`: only
+/// connections whose client socket `lookup` finds owned by `our_uid` come out
+/// of it. Wrapped inside the PROXY protocol reader, so the owner checked is
+/// the one of the actual TCP peer.
+async fn loopback_acceptor(
+    address: &ListenEndpoint,
+    proxy_protocol: bool,
+    lookup: Arc<dyn loopback_owner::SocketOwnerLookup>,
+    our_uid: u32,
+) -> Result<MaybeProxyProtocolAcceptor<ConcurrentAcceptor<BoxIo>>> {
+    let acceptor = address.poem_acceptor().await?;
+    let acceptor = loopback_owner::same_account_acceptor(acceptor, lookup, our_uid);
+    Ok(MaybeProxyProtocolAcceptor::new(acceptor, proxy_protocol))
 }
 
 impl ProtocolServer for HTTPProtocolServer {
@@ -415,17 +432,15 @@ impl ProtocolServer for HTTPProtocolServer {
 
         let Some(tls_configs) = tls_configs else {
             // Other OS accounts on this machine can reach loopback too: only
-            // connections opened by this process's account are served. Wrapped
-            // inside the PROXY protocol reader, so the owner checked is the
-            // one of the actual TCP peer.
-            let our_uid = loopback_owner::effective_uid()?;
-            let acceptor = address.poem_acceptor().await?;
-            let acceptor = loopback_owner::same_account_acceptor(
-                acceptor,
+            // connections opened by this process's account are served.
+            let our_uid = loopback_owner::listener_uid()?;
+            let acceptor = loopback_acceptor(
+                &address,
+                proxy_protocol,
                 Arc::new(loopback_owner::KernelSocketTable),
                 our_uid,
-            );
-            let acceptor = MaybeProxyProtocolAcceptor::new(acceptor, proxy_protocol);
+            )
+            .await?;
             warn!(
                 ?address,
                 "Serving HTTP without TLS (`http.plain_http_on_loopback`)"
@@ -461,5 +476,71 @@ impl ProtocolServer for HTTPProtocolServer {
 impl Debug for HTTPProtocolServer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "HTTPProtocolServer")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+    use std::time::Duration;
+
+    use poem::listener::Acceptor;
+    use tokio::io::AsyncReadExt;
+
+    use super::*;
+    use crate::loopback_owner::SocketOwnerLookup;
+
+    /// A socket table in which every socket is owned by one uid.
+    struct OwnedBy(u32);
+
+    impl SocketOwnerLookup for OwnedBy {
+        fn owner_uid(
+            &self,
+            _local: SocketAddr,
+            _remote: SocketAddr,
+        ) -> anyhow::Result<Option<u32>> {
+            Ok(Some(self.0))
+        }
+    }
+
+    /// Connects once to a loopback listener built as `bind` builds it, for
+    /// Warpgate running as 501 and a client socket owned by `owner`: whether
+    /// the connection came out of the acceptor, and what the client read when
+    /// it did not.
+    async fn connect_to_loopback_listener(owner: u32) -> (bool, Vec<u8>) {
+        let address = ListenEndpoint::from("127.0.0.1:0".parse::<SocketAddr>().unwrap());
+        let mut acceptor = loopback_acceptor(&address, false, Arc::new(OwnedBy(owner)), 501)
+            .await
+            .unwrap();
+        let bound = *acceptor
+            .local_addr()
+            .first()
+            .unwrap()
+            .as_socket_addr()
+            .unwrap();
+
+        let mut client = tokio::net::TcpStream::connect(bound).await.unwrap();
+        let accepted = tokio::time::timeout(Duration::from_millis(500), acceptor.accept()).await;
+        let mut received = Vec::new();
+        if accepted.is_err() {
+            // Refused: the connection is closed without a byte.
+            let _ = tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut received))
+                .await
+                .unwrap();
+        }
+        (accepted.is_ok_and(|accepted| accepted.is_ok()), received)
+    }
+
+    #[tokio::test]
+    async fn loopback_listener_serves_its_own_account() {
+        let (accepted, _) = connect_to_loopback_listener(501).await;
+        assert!(accepted);
+    }
+
+    #[tokio::test]
+    async fn loopback_listener_closes_another_accounts_connections() {
+        let (accepted, received) = connect_to_loopback_listener(502).await;
+        assert!(!accepted);
+        assert!(received.is_empty());
     }
 }
