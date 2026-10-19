@@ -294,6 +294,20 @@ impl Encrypted {
         Ok(())
     }
 
+    /// The peer has closed `channel` (RFC 4254 §5.3): it takes no more data
+    /// on it and grants no more window, so data still waiting for window can
+    /// never be sent. Drop it and answer the close now. Keeping it would hold
+    /// the channel, and with it every channel's outbound queue (gated on
+    /// `has_any_pending_data`), for good. russh#789.
+    pub(crate) fn close_by_peer(&mut self, channel: ChannelId) -> Result<(), crate::Error> {
+        if let Some(params) = self.channels.get_mut(&channel) {
+            params.pending_data.clear();
+            params.pending_eof = false;
+            params.pending_close = false;
+        }
+        self.close(channel)
+    }
+
     pub fn sender_window_size(&self, channel: ChannelId) -> usize {
         if let Some(channel) = self.channels.get(&channel) {
             channel.sender_window_size as usize
@@ -967,6 +981,46 @@ mod tests {
             pending_eof,
             pending_close,
         }
+    }
+
+    // close_by_peer (the peer's CHANNEL_CLOSE)
+
+    /// russh#789: a channel whose data is waiting for window, which the peer
+    /// then closes, must not stay pending (it would gate every channel's
+    /// outbound queue for good).
+    #[test]
+    fn peer_close_drops_window_blocked_data_and_answers_at_once() {
+        let channel_id = ChannelId(7);
+        let mut encrypted = test_encrypted();
+        // Window 0: the pending "hello" can never be flushed.
+        encrypted.channels.insert(
+            channel_id,
+            test_channel_windowed(channel_id, 44, 0, false, false),
+        );
+        assert!(encrypted.has_any_pending_data());
+
+        encrypted.close_by_peer(channel_id).unwrap();
+
+        assert_eq!(packet_types(&encrypted.write), vec![msg::CHANNEL_CLOSE]);
+        assert!(!encrypted.channels.contains_key(&channel_id));
+        assert!(!encrypted.has_any_pending_data());
+    }
+
+    /// Our own close was deferred behind pending data; the peer's close
+    /// must still release it.
+    #[test]
+    fn peer_close_releases_a_close_deferred_behind_pending_data() {
+        let channel_id = ChannelId(8);
+        let mut encrypted = test_encrypted();
+        encrypted.channels.insert(
+            channel_id,
+            test_channel_windowed(channel_id, 45, 0, true, true),
+        );
+
+        encrypted.close_by_peer(channel_id).unwrap();
+
+        assert_eq!(packet_types(&encrypted.write), vec![msg::CHANNEL_CLOSE]);
+        assert!(!encrypted.channels.contains_key(&channel_id));
     }
 
     // flush_pending (single-channel path)
