@@ -170,9 +170,39 @@ impl TargetHTTPOptions {
     }
 }
 
+/// The longest Unix socket path the platform can connect to, in bytes:
+/// `sockaddr_un.sun_path` (104 on macOS and the BSDs, 108 on Linux) less its
+/// terminating NUL.
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+))]
+pub const UNIX_SOCKET_PATH_MAX: usize = 103;
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+)))]
+pub const UNIX_SOCKET_PATH_MAX: usize = 107;
+
 /// A Unix socket path must be absolute and free of `..`, so the directory
-/// that is checked is the one the socket is reached through.
+/// that is checked is the one the socket is reached through, and short
+/// enough to connect to ([`UNIX_SOCKET_PATH_MAX`]), so an over-long path is
+/// refused when the target is saved rather than at each connection.
 pub fn check_unix_socket_path(path: &str) -> Result<(), String> {
+    if path.len() > UNIX_SOCKET_PATH_MAX {
+        return Err(format!(
+            "`unix_socket` is {} bytes; socket paths here may be at most {UNIX_SOCKET_PATH_MAX}",
+            path.len()
+        ));
+    }
     let path = std::path::Path::new(path);
     if !path.is_absolute() {
         return Err("`unix_socket` must be an absolute path".into());
@@ -242,6 +272,15 @@ mod unix_socket_tests {
         ] {
             assert!(check_unix_socket_path(path).is_err(), "{path:?}");
         }
+    }
+
+    #[test]
+    fn unix_socket_path_must_fit_the_platform_socket_address() {
+        let longest = format!("/{}", "a".repeat(UNIX_SOCKET_PATH_MAX - 1));
+        assert_eq!(longest.len(), UNIX_SOCKET_PATH_MAX);
+        assert!(check_unix_socket_path(&longest).is_ok());
+        let error = check_unix_socket_path(&format!("{longest}a")).unwrap_err();
+        assert!(error.contains("at most"), "{error}");
     }
 }
 
