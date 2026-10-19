@@ -22,10 +22,28 @@ then closes it at once. Both `CHANNEL_CLOSE` handlers (`server/encrypted.rs`,
 covers both orders of close: the peer closing first, and our own close that had been deferred
 behind pending data. Two unit tests in `src/session.rs` cover them.
 
-`Cargo.toml` additionally sets `[lints.rust] warnings = { level = "allow", priority = 1 }`
-so this vendored path dependency's warnings don't surface in Warpgate's builds. This is not
-in `warpgate.patch` (which is source-only); re-apply it by hand on re-vendor.
+## Window credit counted twice on window adjust
 
-Drop this fork once russh publishes a release that fixes #789.
+Upstream pull request [russh#790][2] (also russh#789), applied as published against the commit
+0.64.1 was released from. On `CHANNEL_WINDOW_ADJUST` both sides *set* the writers' window
+credit (`WindowSizeRef`) to the session's remaining window. Writers take from that credit when
+they queue a chunk, before the session sends it, so the remaining window still counts every
+queued chunk and their share is handed out twice. Writers then queue past the peer's window and
+the excess lands in `pending_data`, which is what the fix above then has to clean up when the
+peer closes the channel. `WindowSizeRef::update(value)` becomes `grow(amount)`: the adjust
+handlers add the granted amount, and the channel-open paths add the initial window (the credit
+is 0 until then). `ChannelMsg::WindowAdjusted` and `Handler::window_adjusted` still report the
+new total. The PR's integration test is `tests/test_window_adjust.rs`, with a `[[test]]` entry
+added to `Cargo.toml` (the published manifest lists its tests explicitly).
+
+## Manifest
+
+`Cargo.toml` additionally sets `[lints.rust] warnings = { level = "allow", priority = 1 }`
+so this vendored path dependency's warnings don't surface in Warpgate's builds. Neither
+`Cargo.toml` change is in `warpgate.patch` (which covers `src/` and `tests/` only); re-apply
+them by hand on re-vendor.
+
+Drop this fork once russh publishes a release that fixes #789 (both parts).
 
 [1]: https://github.com/Eugeny/russh/issues/789
+[2]: https://github.com/Eugeny/russh/pull/790
