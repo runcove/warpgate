@@ -730,8 +730,8 @@ where
 
 /// [`on_login_owner`] once the owner is known: runs `step` against it - the
 /// forward to a peer, or the local login step - and after a forward adopts what
-/// the peer stored, rotating the cookie id if the step logged the browser in
-/// (the rotation itself lives in [`SharedSessionStorage::adopt_forwarded_login`]).
+/// the peer stored, rotating the cookie id with upstream's `SessionRotation`
+/// if the step logged the browser in ([`LoginSnapshot::login_changed_to`]).
 /// Separate from the owner lookup only so a test can drive it with a stand-in
 /// peer.
 async fn run_login_step<S, Fut, R>(
@@ -757,8 +757,14 @@ where
         let jar = <&CookieJar>::from_request_without_body(req).await?;
         let storage = Data::<&SharedSessionStorage>::from_request_without_body(req).await?;
         storage
-            .adopt_forwarded_login(crate::common::storage_session_id(jar), session, before_hop)
+            .adopt_stored(crate::common::storage_session_id(jar), session)
             .await?;
+
+        if before_hop.login_changed_to(&LoginSnapshot::of(session))
+            && let Some(rotation) = crate::common::SessionRotation::for_request(req).await?
+        {
+            rotation.apply(session).await?;
+        }
     }
 
     result
