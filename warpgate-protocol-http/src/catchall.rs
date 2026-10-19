@@ -194,7 +194,7 @@ pub(crate) fn decide_public_target_access(
         Some(
             RequestAuthorization::AdminToken
             | RequestAuthorization::UserToken { .. }
-            | RequestAuthorization::ClusterToken,
+            | RequestAuthorization::ClusterPeer,
         ) => PublicTargetDecision::Reject401,
     }
 }
@@ -645,7 +645,7 @@ mod public_target_tests {
     #[test]
     fn cluster_token_on_public_target_rejected_401() {
         let opts = http_opts(true, Some("vm.example.com:3000"));
-        let auth = RequestAuthorization::ClusterToken;
+        let auth = RequestAuthorization::ClusterPeer;
         assert_eq!(
             decide_public_target_access(Some(&opts), false, Some(&auth)),
             PublicTargetDecision::Reject401,
