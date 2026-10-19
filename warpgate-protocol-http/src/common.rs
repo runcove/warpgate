@@ -37,7 +37,10 @@ use crate::catchall::{
     PublicTargetDecision, is_warpgate_management_path, resolve_public_target_decision,
 };
 use crate::middleware::ticket::TemporaryTicketSession;
-use crate::middleware::{assert_mfa_setup_gate, is_session_bootstrap_path, warpgate_surface_path};
+use crate::middleware::{
+    assert_mfa_setup_gate, credentials_refused_on_bound_host, is_session_bootstrap_path,
+    warpgate_surface_path,
+};
 use crate::session::SessionStore;
 use crate::session_storage::SharedSessionStorage;
 use crate::step_up::{StepUpSessionExt, is_session_step_up_stale};
@@ -979,6 +982,12 @@ pub async fn inject_request_authorization<E: Endpoint + 'static>(
     let is_cluster_peer = is_cluster_peer_request(&req);
 
     let mut session_auth = session.get_auth();
+    // On a host bound to an HTTP target, outside the login flow, neither the
+    // session nor a token counts (see `credentials_refused_on_bound_host`).
+    // Looked up only for a request that carries either.
+    let refused_on_bound_host = (session_auth.is_some()
+        || req.headers().contains_key(&X_WARPGATE_TOKEN))
+        && credentials_refused_on_bound_host(&ctx, &req).await;
     // A forwarded request's Host is the cluster SNI name by construction, so the
     // origin check below would reject - and clear - a session that is fine.
     if session_auth.is_some() && !is_cluster_peer {
@@ -1002,6 +1011,13 @@ pub async fn inject_request_authorization<E: Endpoint + 'static>(
                 base_host
             );
             session.clear();
+            session_auth = None;
+        } else if refused_on_bound_host {
+            tracing::debug!(
+                "Session cookie ignored for {} {} on host {request_host:?}, which is bound to a target",
+                req.method(),
+                req.uri().path(),
+            );
             session_auth = None;
         } else if control_plane_host
             .as_deref()
@@ -1031,6 +1047,8 @@ pub async fn inject_request_authorization<E: Endpoint + 'static>(
         Some(RequestAuthorization::Session(auth))
     } else if is_cluster_peer {
         cluster_request_authorization(&ctx, &req).await?
+    } else if refused_on_bound_host {
+        None
     } else if let Some(token_from_header) = req.headers().get(&X_WARPGATE_TOKEN) {
         let token_from_header = token_from_header
             .to_str()
