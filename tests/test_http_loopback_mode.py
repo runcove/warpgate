@@ -144,7 +144,9 @@ class _Setup:
             f"/users/{self.user['id']}/credentials/passwords",
             {"password": "123"},
         )
-        self.admin("POST", f"/users/{self.user['id']}/roles/{self.role['id']}")
+        # The endpoint takes an optional JSON body (an expiry); without one
+        # it refuses the request for its missing Content-Type.
+        self.admin("POST", f"/users/{self.user['id']}/roles/{self.role['id']}", {})
 
     def admin(self, method, path, body=None, origin=True, expect_ok=True):
         headers = dict(ADMIN_TOKEN)
