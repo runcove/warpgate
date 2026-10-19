@@ -983,8 +983,16 @@ class ProcessManager:
         database_url=None,
         env=None,
         import_host_keys=True,
+        run_as: Optional[int] = None,
     ) -> WarpgateProcess:
+        """Starts Warpgate. With `run_as` (a uid, given only when the tests
+        run as root), setup still runs as root but the gateway itself runs as
+        that account, with that uid as its group and no supplementary groups,
+        and its data directory is handed to it."""
         args = args or ["run", "--enable-admin-token"]
+        if run_as is not None:
+            assert not share_with, "run_as is for a gateway with its own data directory"
+            assert os.geteuid() == 0, "only root can start Warpgate as another account"
 
         if share_with:
             import yaml
@@ -1037,7 +1045,12 @@ class ProcessManager:
 
             config_path = data_dir / "warpgate.yaml"
 
-        def run(args, env={}, stdout=stdout, stderr=stderr):
+        def run(args, env={}, stdout=stdout, stderr=stderr, account=None):
+            as_account = (
+                {"user": account, "group": account, "extra_groups": []}
+                if account is not None
+                else {}
+            )
             return self.start(
                 [
                     os.path.join(cargo_root, binary_path),
@@ -1058,6 +1071,7 @@ class ProcessManager:
                 stop_timeout=5,
                 stderr=stderr,
                 stdout=stdout,
+                **as_account,
             )
 
         if not share_with:
@@ -1126,6 +1140,22 @@ class ProcessManager:
             with config_path.open("w") as f:
                 yaml.safe_dump(config, f)
 
+        if run_as is not None:
+            # The session's temp directory is root's and 0700: let the account
+            # pass through it (not list it) to the data directory, which
+            # becomes its own, as it would be for a gateway installed under
+            # that account.
+            os.chmod(self.ctx.tmpdir, os.stat(self.ctx.tmpdir).st_mode | 0o011)
+            for root, dirs, files in os.walk(data_dir):
+                os.chown(root, run_as, run_as)
+                for name in dirs + files:
+                    os.chown(
+                        os.path.join(root, name),
+                        run_as,
+                        run_as,
+                        follow_symlinks=False,
+                    )
+
         log_path = None
         if stdout is None and stderr is None:
             log_path = self.ctx.tmpdir / f"wg-{uuid.uuid4()}.log"
@@ -1135,6 +1165,7 @@ class ProcessManager:
         p = run(
             args,
             env={"WARPGATE_PEER_ADDRESS": f"127.0.0.1:{http_port}", **(env or {})},
+            account=run_as,
             **(
                 {"stdout": subprocess.PIPE, "stderr": subprocess.STDOUT}
                 if log_path
