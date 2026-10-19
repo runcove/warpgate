@@ -158,10 +158,7 @@ mod log_line_tests {
             }));
         }
         for line in lines {
-            assert!(
-                line.contains("/app?a=1&warpgate-ticket=redacted"),
-                "{line}"
-            );
+            assert!(line.contains("/app?a=1&warpgate-ticket=redacted"), "{line}");
             assert!(!line.contains(SECRET), "{line}");
         }
     }

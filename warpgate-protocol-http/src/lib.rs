@@ -38,7 +38,6 @@ use tracing::{Instrument, warn};
 use warpgate_admin::admin_api_app;
 use warpgate_common::ListenEndpoint;
 use warpgate_common::helpers::proxy_protocol::MaybeProxyProtocolAcceptor;
-use warpgate_version::warpgate_version;
 use warpgate_common_http::auth::UnauthenticatedRequestContext;
 use warpgate_common_http::cluster_tls::{ClusterTlsConfigs, cluster_aware_tls_acceptor};
 use warpgate_common_http::errors::render_errors;
@@ -53,6 +52,7 @@ use warpgate_common_http::{
 use warpgate_core::{ProtocolServer, Services};
 use warpgate_db_entities::Parameters::RecordingsStorageConfig;
 use warpgate_tls::TlsCertificateAndPrivateKey;
+use warpgate_version::warpgate_version;
 use warpgate_web::Assets;
 use warpgate_web_desktop::WebDesktopClientManager;
 use warpgate_web_desktop::api::ws_handler as desktop_web_client_ws_handler;

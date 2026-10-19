@@ -923,9 +923,10 @@ mod tests {
     /// age and its host attributes (`CookieHostMiddleware`), which these tests
     /// neither add nor assert: they compare cookie values only.
     fn node(routes: Route, storage: SharedSessionStorage) -> impl Endpoint {
-        routes
-            .data(storage.clone())
-            .with(ServerSession::new(crate::common::session_cookie_config(), storage))
+        routes.data(storage.clone()).with(ServerSession::new(
+            crate::common::session_cookie_config(),
+            storage,
+        ))
     }
 
     fn cookie_pair(resp: &TestResponse) -> Option<String> {
@@ -969,7 +970,10 @@ mod tests {
             tls_spki_sha256: None,
         });
         run_login_step(req, session, owner, |owner| async move {
-            assert!(matches!(owner, Owner::Remote(_)), "the step was not forwarded");
+            assert!(
+                matches!(owner, Owner::Remote(_)),
+                "the step was not forwarded"
+            );
             let resp = peer.0.post("/step").header("cookie", cookie).send().await;
             resp.assert_status_is_ok();
             Ok(resp.0.into_body().into_string().await.unwrap())
@@ -982,7 +986,10 @@ mod tests {
     #[handler]
     async fn local_step(req: &Request, session: &Session) -> poem::Result<String> {
         run_login_step(req, session, Owner::Local, |owner| async move {
-            assert!(matches!(owner, Owner::Local), "the step was not served locally");
+            assert!(
+                matches!(owner, Owner::Local),
+                "the step was not served locally"
+            );
             session.set_auth(SessionAuthorization::User {
                 user_id: ALICE,
                 username: "alice".into(),
@@ -1047,7 +1054,10 @@ mod tests {
             .await
             .unwrap()
             .expect("the login's user session row is gone");
-        assert!(parent.ended.is_none(), "the rotation ended the login's user session");
+        assert!(
+            parent.ended.is_none(),
+            "the rotation ended the login's user session"
+        );
         let session = stored_session(&storage, &after).await;
         assert_eq!(session.get_auth().map(|auth| auth.user_id()), Some(ALICE));
         assert_eq!(session.get_session_id(), Some(user_session));

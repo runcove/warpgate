@@ -28,7 +28,13 @@ pub fn warpgate_version() -> &'static str {
 macro_rules! git_describe {
     () => {
         $crate::__git_version::git_version!(
-            args = ["--tags", "--always", "--dirty=-modified", "--match", "v[0-9]*"],
+            args = [
+                "--tags",
+                "--always",
+                "--dirty=-modified",
+                "--match",
+                "v[0-9]*"
+            ],
             fallback = "unknown"
         )
     };

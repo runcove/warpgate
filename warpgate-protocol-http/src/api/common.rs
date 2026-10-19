@@ -429,7 +429,11 @@ mod logout_tests {
         let cli = TestClient::new(app(db.clone(), SharedSessionStorage::new(db.clone())).await);
         let login = log_in_as_alice(&cli).await;
 
-        let resp = cli.post(LOGOUT).header("cookie", &login.cookie).send().await;
+        let resp = cli
+            .post(LOGOUT)
+            .header("cookie", &login.cookie)
+            .send()
+            .await;
         resp.assert_status(poem::http::StatusCode::CREATED);
 
         assert!(is_ended(&db, login.id).await, "the login was not ended");
@@ -437,7 +441,10 @@ mod logout_tests {
             !is_stored(&db, &login.storage_id).await,
             "the stored browser session survived the logout"
         );
-        assert!(clears_session_cookie(&resp), "the logout did not clear the cookie");
+        assert!(
+            clears_session_cookie(&resp),
+            "the logout did not clear the cookie"
+        );
     }
 
     /// A request that loaded the browser session before the logout and writes
@@ -455,14 +462,26 @@ mod logout_tests {
             .unwrap()
             .unwrap();
 
-        let resp = cli.post(LOGOUT).header("cookie", &login.cookie).send().await;
+        let resp = cli
+            .post(LOGOUT)
+            .header("cookie", &login.cookie)
+            .send()
+            .await;
         resp.assert_status(poem::http::StatusCode::CREATED);
         storage
-            .update_session(&login.storage_id, &in_flight, Some(Duration::from_secs(3600)))
+            .update_session(
+                &login.storage_id,
+                &in_flight,
+                Some(Duration::from_secs(3600)),
+            )
             .await
             .unwrap();
 
-        let resp = cli.get("/whoami").header("cookie", &login.cookie).send().await;
+        let resp = cli
+            .get("/whoami")
+            .header("cookie", &login.cookie)
+            .send()
+            .await;
         resp.assert_status_is_ok();
         resp.assert_text("nobody").await;
         assert!(is_ended(&db, login.id).await, "the login was not ended");
@@ -477,7 +496,11 @@ mod logout_tests {
         let login = log_in_as_alice(&cli).await;
 
         let writer = hold_write_lock(&db, Duration::from_millis(600)).await;
-        let resp = cli.post(LOGOUT).header("cookie", &login.cookie).send().await;
+        let resp = cli
+            .post(LOGOUT)
+            .header("cookie", &login.cookie)
+            .send()
+            .await;
         writer.await.unwrap();
 
         assert!(is_ended(&db, login.id).await, "the login was not ended");
@@ -499,7 +522,11 @@ mod logout_tests {
         let login = log_in_as_alice(&cli).await;
 
         let writer = hold_write_lock(&db, Duration::from_millis(1500)).await;
-        let resp = cli.post(LOGOUT).header("cookie", &login.cookie).send().await;
+        let resp = cli
+            .post(LOGOUT)
+            .header("cookie", &login.cookie)
+            .send()
+            .await;
         writer.await.unwrap();
 
         assert!(!resp.0.status().is_success(), "status {}", resp.0.status());
@@ -524,7 +551,11 @@ mod logout_tests {
         .await
         .unwrap();
 
-        let resp = cli.post(LOGOUT).header("cookie", &login.cookie).send().await;
+        let resp = cli
+            .post(LOGOUT)
+            .header("cookie", &login.cookie)
+            .send()
+            .await;
         resp.assert_status(poem::http::StatusCode::CREATED);
 
         assert!(is_ended(&db, login.id).await, "the login was not ended");
@@ -566,7 +597,11 @@ mod logout_tests {
         let cli = TestClient::new(app_with(services, storage.clone()).await);
         let login = log_in_as_alice(&cli).await;
 
-        let resp = cli.get("/gated").header("cookie", &login.cookie).send().await;
+        let resp = cli
+            .get("/gated")
+            .header("cookie", &login.cookie)
+            .send()
+            .await;
         resp.assert_status_is_ok();
         resp.assert_text("stepped up").await;
 

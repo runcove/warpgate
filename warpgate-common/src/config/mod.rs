@@ -1390,8 +1390,7 @@ ssh:
             config.store.ssh.web_auth_wait_timeout = Duration::from_secs(700);
             config.validate();
             assert_eq!(
-                config.store.ssh.web_auth_wait_timeout,
-                MAX_WEB_AUTH_WAIT_TIMEOUT,
+                config.store.ssh.web_auth_wait_timeout, MAX_WEB_AUTH_WAIT_TIMEOUT,
                 "external_host = {external_host:?}"
             );
         }
@@ -1448,7 +1447,11 @@ ssh:
 
     #[test]
     fn unit_plain_http_on_loopback_refuses_non_loopback_listeners() {
-        for listen in ["203.0.113.10:8888", "198.51.100.7:8888", "[2001:db8::1]:8888"] {
+        for listen in [
+            "203.0.113.10:8888",
+            "198.51.100.7:8888",
+            "[2001:db8::1]:8888",
+        ] {
             let config = http_config(&format!(
                 "listen: \"{listen}\"\nplain_http_on_loopback: true"
             ));

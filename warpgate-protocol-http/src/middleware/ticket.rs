@@ -120,10 +120,10 @@ fn with_no_referrer(mut response: Response) -> Response {
 /// arrives at the clean address already authenticated, and the ticket leaves
 /// its address bar, its history and the page the target serves.
 fn clean_address_redirect(req: &Request) -> Response {
-    let location = req
-        .original_uri()
-        .path_and_query()
-        .map_or_else(|| "/".to_owned(), |path| without_ticket_query_param(path.as_str()));
+    let location = req.original_uri().path_and_query().map_or_else(
+        || "/".to_owned(),
+        |path| without_ticket_query_param(path.as_str()),
+    );
     with_no_referrer(
         Response::builder()
             .status(StatusCode::SEE_OTHER)
@@ -330,7 +330,10 @@ mod tests {
         for (path, location) in [
             ("/%2Fevil.example/?warpgate-ticket=s", "/%2Fevil.example/"),
             ("/%5Cevil.example/?warpgate-ticket=s", "/%5Cevil.example/"),
-            ("/%2f%2fevil.example/?warpgate-ticket=s", "/%2f%2fevil.example/"),
+            (
+                "/%2f%2fevil.example/?warpgate-ticket=s",
+                "/%2f%2fevil.example/",
+            ),
         ] {
             let req = served_request(Method::GET, path, PAGE_LOAD);
             assert!(should_redirect_to_clean_address(&req), "{path}");
@@ -378,7 +381,10 @@ mod tests {
                     ("upgrade", "websocket"),
                 ],
             ),
-            (Method::GET, &[("sec-fetch-mode", "websocket"), ("upgrade", "websocket")]),
+            (
+                Method::GET,
+                &[("sec-fetch-mode", "websocket"), ("upgrade", "websocket")],
+            ),
         ] {
             let req = request(method.clone(), headers);
             assert!(
@@ -405,8 +411,7 @@ mod tests {
             "no-referrer"
         );
 
-        let only_ticket =
-            served_request(Method::GET, "/?warpgate-ticket=s3cr3t-ticket-value", &[]);
+        let only_ticket = served_request(Method::GET, "/?warpgate-ticket=s3cr3t-ticket-value", &[]);
         assert_eq!(
             clean_address_redirect(&only_ticket)
                 .headers()

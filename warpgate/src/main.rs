@@ -10,8 +10,8 @@ use anyhow::Result;
 use clap::{ArgAction, Parser};
 use logging::init_logging;
 use tracing::error;
-use warpgate_version::warpgate_version;
 use warpgate_common::{GlobalParams, LogFormat, Secret};
+use warpgate_version::warpgate_version;
 
 use crate::config::load_config;
 

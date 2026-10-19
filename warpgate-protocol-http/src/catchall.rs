@@ -387,7 +387,9 @@ async fn get_target_for_request(
     }
     let selected_target_name = select_target_name(
         params.warpgate_target.as_deref(),
-        host_based_target.as_ref().map(|target| target.name.as_str()),
+        host_based_target
+            .as_ref()
+            .map(|target| target.name.as_str()),
         session.get_target_name(),
     );
 
@@ -827,7 +829,10 @@ mod target_selection_tests {
     fn the_host_must_match_the_binding_exactly() {
         // As `get_target_by_hostname` matches it: the full Host header, port
         // included.
-        assert!(served_on_host(Some("c.example:8443"), Some("c.example:8443")));
+        assert!(served_on_host(
+            Some("c.example:8443"),
+            Some("c.example:8443")
+        ));
         assert!(!served_on_host(Some("c.example:8443"), Some("c.example")));
         assert!(!served_on_host(Some("v.example"), Some("v.example:8443")));
         assert!(!served_on_host(Some("v.example"), None));

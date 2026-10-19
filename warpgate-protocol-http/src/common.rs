@@ -36,8 +36,8 @@ use warpgate_sso::WarpgateIdToken;
 use crate::catchall::{
     PublicTargetDecision, is_warpgate_management_path, resolve_public_target_decision,
 };
-use crate::middleware::{assert_mfa_setup_gate, is_session_bootstrap_path, warpgate_surface_path};
 use crate::middleware::ticket::TemporaryTicketSession;
+use crate::middleware::{assert_mfa_setup_gate, is_session_bootstrap_path, warpgate_surface_path};
 use crate::session::SessionStore;
 use crate::session_storage::SharedSessionStorage;
 use crate::step_up::{StepUpSessionExt, is_session_step_up_stale};
@@ -1078,11 +1078,12 @@ pub async fn inject_request_authorization<E: Endpoint + 'static>(
 
 #[cfg(test)]
 mod tests {
+    use warpgate_common_http::ext::is_navigation_request;
+
     use super::{
         StatusCode, gateway_redirect, host_is_subdomain_of_or_equal, request_has_password_bypass,
         should_auto_sso_redirect,
     };
-    use warpgate_common_http::ext::is_navigation_request;
 
     const BROWSER_ACCEPT: &str = "text/html,application/xhtml+xml,*/*;q=0.8";
 
@@ -1954,8 +1955,18 @@ mod public_session_tests {
             .await;
         resp.assert_status_is_ok();
         let cookie = cookie_pair(&resp).expect("the ticket sets a cookie");
-        visit(&cli, &cookie, "alice/ticket on alice's own ticket session, visit 1").await;
-        visit(&cli, &cookie, "alice/ticket on alice's own ticket session, visit 2").await;
+        visit(
+            &cli,
+            &cookie,
+            "alice/ticket on alice's own ticket session, visit 1",
+        )
+        .await;
+        visit(
+            &cli,
+            &cookie,
+            "alice/ticket on alice's own ticket session, visit 2",
+        )
+        .await;
 
         let resp = cli
             .get(format!("/ticket-login/bob/{OTHER_TARGET}"))
