@@ -131,7 +131,7 @@ pub fn log_request_error(method: &Method, url: &Uri, client_ip: Option<&str>, er
 mod log_line_tests {
     use poem::http::{Method, StatusCode, Uri};
 
-    use super::{log_request_error, log_request_result};
+    use super::{log_request_error, log_request_result, redacted_uri};
     use crate::test_log::logged;
 
     const SECRET: &str = "s3cr3t-ticket-value";
@@ -160,6 +160,43 @@ mod log_line_tests {
         for line in lines {
             assert!(line.contains("/app?a=1&warpgate-ticket=redacted"), "{line}");
             assert!(!line.contains(SECRET), "{line}");
+        }
+    }
+
+    /// Kept from 1f4bb16e against upstream's `redacted_uri`: a logged address
+    /// never contains a ticket's value, wherever the parameter sits, however
+    /// its key is encoded and however often it appears, and still shows that
+    /// a ticket was presented.
+    #[test]
+    fn a_logged_uri_never_contains_the_ticket() {
+        for uri in [
+            format!("/?warpgate-ticket={SECRET}"),
+            format!("/app?a=1&warpgate-ticket={SECRET}&b=two%20words"),
+            format!("https://app.example:8443/x?warpgate%2Dticket={SECRET}"),
+            format!("/?warpgate-ticket={SECRET}&warpgate-ticket={SECRET}"),
+        ] {
+            let parsed: Uri = uri.parse().unwrap();
+            let logged = redacted_uri(&parsed);
+            assert!(!logged.contains(SECRET), "{uri} logged as {logged}");
+            assert!(
+                logged.contains("warpgate-ticket=redacted"),
+                "{uri} logged as {logged}"
+            );
+        }
+    }
+
+    /// An address without the parameter is logged exactly as it came in.
+    #[test]
+    fn a_uri_without_a_ticket_is_logged_unchanged() {
+        for uri in [
+            "/",
+            "/app?a=1&b=two%20words",
+            "/app?q=warpgate-ticket",
+            "/app?not-warpgate-ticket=1&warpgate-tickets=2",
+            "/app?warpgate-target=app",
+        ] {
+            let parsed: Uri = uri.parse().unwrap();
+            assert_eq!(redacted_uri(&parsed), uri);
         }
     }
 }
