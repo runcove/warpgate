@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use warpgate_common::{UserFacingReason, WarpgateError};
 
 use super::ConnectionError;
@@ -12,6 +14,9 @@ pub enum SshClientError {
     Connection(#[from] ConnectionError),
     #[error(transparent)]
     Warpgate(#[from] WarpgateError),
+    /// The target connection did not answer a command within the bound.
+    #[error("no reply from the target within {0:?}")]
+    NoReply(Duration),
 }
 
 impl UserFacingReason for SshClientError {
@@ -21,6 +26,7 @@ impl UserFacingReason for SshClientError {
             Self::Russh(_) => "SSH protocol error".into(),
             Self::Connection(e) => e.user_facing_reason(),
             Self::Warpgate(e) => e.user_facing_reason(),
+            Self::NoReply(_) => "The target did not respond".into(),
         }
     }
 }
