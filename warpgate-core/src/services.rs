@@ -29,6 +29,7 @@ use crate::login_protection::LoginProtectionService;
 use crate::rate_limiting::RateLimiterRegistry;
 use crate::recordings::SessionRecordings;
 use crate::resources::AdmittedSessions;
+use crate::revocation::PendingRevocations;
 use crate::{
     AuthStateStore, ConfigProviderEnum, DatabaseConfigProvider, ListenerStatusRegistry,
     SecretBackendRegistry, SessionsFilter, State,
@@ -52,6 +53,8 @@ pub struct Services {
     /// Live proxied HTTP requests by user and target, so a revocation can end
     /// them ([`Services::close_sessions_no_longer_authorised`]).
     pub live_streams: LiveStreams,
+    /// Access changes whose session re-check failed, retried every 5 s.
+    pub pending_revocations: PendingRevocations,
 }
 
 /// How often a node picks up self approvals decided elsewhere. One query per
@@ -193,6 +196,7 @@ impl Services {
             listener_status: Arc::default(),
             secret_backends,
             live_streams: LiveStreams::default(),
+            pending_revocations: PendingRevocations::default(),
         };
 
         {
@@ -224,6 +228,7 @@ impl Services {
                     if let Err(error) = services.close_sessions_of_expired_tickets().await {
                         warn!("Failed to close sessions of expired tickets: {error}");
                     }
+                    services.retry_pending_revocations().await;
                     let now = OffsetDateTime::now_utc();
                     match services
                         .close_sessions_of_expired_role_assignments(role_expiry_swept_until, now)

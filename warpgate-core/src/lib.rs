@@ -32,7 +32,7 @@ pub use data::*;
 pub use db_auth::*;
 pub use listener_status::*;
 pub use protocols::*;
-pub use revocation::AccessChange;
+pub use revocation::{AccessChange, PendingRevocations};
 pub use secret_backend_registry::SecretBackendRegistry;
 pub use services::*;
 pub use state::{

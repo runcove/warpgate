@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect};
 use time::OffsetDateTime;
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 use warpgate_common::{Protocol, UserSessionId, WarpgateError};
 use warpgate_db_entities::{TargetSession, User, UserRoleAssignment, UserSession};
@@ -24,6 +24,36 @@ pub enum AccessChange {
     Targets(Vec<Uuid>),
     /// A role went away: anyone may be affected.
     All,
+}
+
+/// Access changes whose re-check failed, retried by the expiry sweep.
+#[derive(Clone, Default)]
+pub struct PendingRevocations(std::sync::Arc<std::sync::Mutex<Vec<AccessChange>>>);
+
+impl PendingRevocations {
+    /// A panic elsewhere must not drop revocations: a poisoned lock is used
+    /// as is.
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<AccessChange>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn push(&self, change: AccessChange) {
+        self.lock().push(change);
+    }
+
+    fn take(&self) -> Vec<AccessChange> {
+        std::mem::take(&mut *self.lock())
+    }
+
+    pub fn len(&self) -> usize {
+        self.lock().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 impl Services {
@@ -47,7 +77,39 @@ impl Services {
     ///   bodies) are ended instead, on every node, through
     ///   [`ClusterNotification::LiveStreamsReauthorize`] and
     ///   [`Self::reauthorize_live_streams`]; the browser session stays.
+    ///
+    /// Fails closed and cannot lose a revocation: the cluster is told to
+    /// re-check live streams before anything that can fail; a session whose
+    /// check errors is closed; and if the work itself fails, `change` is
+    /// queued and retried by the 5 s expiry sweep
+    /// ([`Self::retry_pending_revocations`]). So this returns `Ok` once the
+    /// revocation is either done or queued.
     pub async fn close_sessions_no_longer_authorised(
+        &self,
+        change: AccessChange,
+    ) -> Result<(), WarpgateError> {
+        // Long-lived proxied HTTP requests, on this node and the others.
+        self.cluster
+            .notify_global(ClusterNotification::LiveStreamsReauthorize);
+        if let Err(error) = self
+            .try_close_sessions_no_longer_authorised(change.clone())
+            .await
+        {
+            warn!(%error, ?change, "Could not close sessions after an access change; retrying on the next sweep");
+            self.pending_revocations.push(change);
+        }
+        Ok(())
+    }
+
+    /// Runs the access changes whose re-check failed earlier; one that fails
+    /// again is queued again.
+    pub async fn retry_pending_revocations(&self) {
+        for change in self.pending_revocations.take() {
+            let _ = self.close_sessions_no_longer_authorised(change).await;
+        }
+    }
+
+    async fn try_close_sessions_no_longer_authorised(
         &self,
         change: AccessChange,
     ) -> Result<(), WarpgateError> {
@@ -91,10 +153,7 @@ impl Services {
             let authorized = match verdicts.get(&(user_id, target_id)) {
                 Some(authorized) => *authorized,
                 None => {
-                    let authorized = self
-                        .config_provider
-                        .authorize_target_by_id(user_id, target_id)
-                        .await?;
+                    let authorized = self.still_authorised(user_id, target_id).await;
                     verdicts.insert((user_id, target_id), authorized);
                     authorized
                 }
@@ -113,23 +172,33 @@ impl Services {
             self.close_sessions(SessionsFilter::Sessions { ids })
                 .await?;
         }
-        // Long-lived proxied HTTP requests, on this node and the others.
-        self.cluster
-            .notify_global(ClusterNotification::LiveStreamsReauthorize);
         Ok(())
+    }
+
+    /// [`ConfigProvider::authorize_target_by_id`], failing closed: a check that
+    /// errors counts as not authorised.
+    async fn still_authorised(&self, user_id: Uuid, target_id: Uuid) -> bool {
+        match self
+            .config_provider
+            .authorize_target_by_id(user_id, target_id)
+            .await
+        {
+            Ok(authorized) => authorized,
+            Err(error) => {
+                warn!(%error, %user_id, %target_id, "Could not re-check access; treating it as revoked");
+                false
+            }
+        }
     }
 
     /// Ends this node's live proxied HTTP requests whose user may no longer
     /// reach their target, by the same check as
     /// [`Self::close_sessions_no_longer_authorised`]. The browser session that
     /// carries them, and its requests to other targets, stay.
+    /// A pair whose check errors is ended too (fail closed).
     pub async fn reauthorize_live_streams(&self) -> Result<(), WarpgateError> {
         for (user_id, target_id) in self.live_streams.in_use() {
-            if !self
-                .config_provider
-                .authorize_target_by_id(user_id, target_id)
-                .await?
-            {
+            if !self.still_authorised(user_id, target_id).await {
                 let ended = self.live_streams.cancel(user_id, target_id);
                 info!(
                     %user_id,
@@ -523,5 +592,88 @@ mod tests {
 
         assert!(fired(&mut to_lost).await);
         assert!(!fired(&mut to_kept).await);
+    }
+
+    /// A re-check that errors ends the stream (fail closed), and the loop
+    /// goes on to the next pair instead of stopping.
+    #[tokio::test]
+    async fn an_authorisation_error_ends_the_live_stream() {
+        use sea_orm::ConnectionTrait;
+
+        let db = migrated_db().await;
+        let services = test_services(&db).await;
+        let (alice, bob, granting) = (user(&db).await, user(&db).await, role(&db).await);
+        let target_id = target(&db).await;
+        grant_user(&db, alice, granting).await;
+        grant_user(&db, bob, granting).await;
+        grant_target(&db, target_id, granting).await;
+        let (_browser_session, browser_close) = tokio::sync::broadcast::channel(1);
+        let mut first = services
+            .live_streams
+            .watch(browser_close.resubscribe(), alice, target_id);
+        let mut second = services.live_streams.watch(browser_close, bob, target_id);
+
+        db.execute_unprepared("DROP TABLE user_roles")
+            .await
+            .unwrap();
+        services.reauthorize_live_streams().await.unwrap();
+
+        assert!(fired(&mut first).await);
+        assert!(fired(&mut second).await);
+    }
+
+    /// A session whose re-check errors is closed (fail closed).
+    #[tokio::test]
+    async fn an_authorisation_error_closes_the_session() {
+        use sea_orm::ConnectionTrait;
+
+        let db = migrated_db().await;
+        let services = test_services(&db).await;
+        let (alice, granting) = (user(&db).await, role(&db).await);
+        let target_id = target(&db).await;
+        grant_user(&db, alice, granting).await;
+        grant_target(&db, target_id, granting).await;
+        let open = session(&db, alice, target_id).await;
+
+        db.execute_unprepared("DROP TABLE target_roles")
+            .await
+            .unwrap();
+        services
+            .close_sessions_no_longer_authorised(AccessChange::Users(vec![alice]))
+            .await
+            .unwrap();
+
+        assert!(ended(&db, open).await);
+        assert!(services.pending_revocations.is_empty());
+    }
+
+    /// A re-check that cannot run at all is queued for the sweep, not lost,
+    /// and the cluster is still told to re-check its streams.
+    #[tokio::test]
+    async fn a_failed_recheck_is_queued_and_streams_are_still_rechecked() {
+        use sea_orm::ConnectionTrait;
+
+        let db = migrated_db().await;
+        let services = test_services(&db).await;
+        let alice = user(&db).await;
+        let mut notifications = services.cluster.subscribe();
+
+        db.execute_unprepared("DROP TABLE target_sessions")
+            .await
+            .unwrap();
+        services
+            .close_sessions_no_longer_authorised(AccessChange::Users(vec![alice]))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            notifications.recv().await,
+            Ok(ClusterNotification::LiveStreamsReauthorize)
+        ));
+        assert_eq!(services.pending_revocations.len(), 1);
+
+        // Still failing: it stays queued.
+        services.retry_pending_revocations().await;
+        assert_eq!(services.pending_revocations.len(), 1);
     }
 }
