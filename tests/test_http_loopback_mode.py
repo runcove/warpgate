@@ -8,9 +8,14 @@ the session cookie must come from Warpgate's own origin: an `Origin` equal to
 reached through a Unix socket in a private directory.
 
 Connections are also checked to come from the OS account Warpgate runs as;
-these tests run as that account, so every connection here passes that check.
+these tests talk to Warpgate as that account, so every connection here passes
+that check. Loopback mode refuses to run as root, so when the tests run as
+root (as in CI) this Warpgate runs as an unprivileged account
+(`SERVING_UID`) and each test switches its own effective uid to that account
+while it talks to it.
 """
 
+import contextlib
 import http.server
 import json
 import os
@@ -30,12 +35,43 @@ from .util import alloc_port, wait_port
 
 ADMIN_TOKEN = {"X-Warpgate-Token": "token-value"}
 
+# The account this Warpgate runs as when the tests run as root: `nobody`.
+# Without root the tests and Warpgate share the tests' own account.
+SERVING_UID = 65534 if os.geteuid() == 0 else None
+
+
+@contextlib.contextmanager
+def _as_serving_account():
+    """Runs the block with the effective uid and gid of `SERVING_UID`, so the
+    sockets and files it creates belong to the account Warpgate serves; a
+    no-op when the tests do not run as root. The real uid stays root's, so
+    root is restored afterwards."""
+    if SERVING_UID is None:
+        yield
+        return
+    os.setegid(SERVING_UID)
+    try:
+        os.seteuid(SERVING_UID)
+        try:
+            yield
+        finally:
+            os.seteuid(0)
+    finally:
+        os.setegid(0)
+
+
+def _give_to_serving_account(path):
+    """Hands `path` to `SERVING_UID` when it was created as root."""
+    if SERVING_UID is not None and os.geteuid() == 0:
+        os.chown(path, SERVING_UID, SERVING_UID)
+
 
 @pytest.fixture(scope="module")
 def loopback_wg(processes: ProcessManager):
     port = alloc_port()
     wg = processes.start_wg(
         http_port=port,
+        run_as=SERVING_UID,
         config_patch={
             "http": {
                 "listen": f"127.0.0.1:{port}",
@@ -43,6 +79,8 @@ def loopback_wg(processes: ProcessManager):
             }
         },
     )
+    # Connecting is enough here: the kernel completes the handshake before
+    # Warpgate looks at the connection's owner.
     wait_port(port, for_process=wg.process, recv=False)
     yield wg
 
@@ -71,11 +109,14 @@ class _UnixHandler(http.server.BaseHTTPRequestHandler):
 
 @pytest.fixture
 def unix_app():
-    """A tiny HTTP app on a Unix socket in a fresh 0700 directory."""
+    """A tiny HTTP app on a Unix socket in a fresh 0700 directory, both
+    owned by the account Warpgate runs as."""
     directory = tempfile.mkdtemp(prefix="wg-uds-")
     os.chmod(directory, 0o700)
+    _give_to_serving_account(directory)
     path = os.path.join(directory, "app.sock")
     server = _UnixHTTPServer(path, _UnixHandler)
+    _give_to_serving_account(path)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -153,7 +194,10 @@ class _Setup:
 
 @pytest.fixture
 def setup(loopback_wg):
-    return _Setup(loopback_wg.http_port)
+    """Also switches the test to the account Warpgate serves until the test
+    ends; the fixtures a test names after `setup` are made as that account."""
+    with _as_serving_account():
+        yield _Setup(loopback_wg.http_port)
 
 
 def _cookie_header(session):
