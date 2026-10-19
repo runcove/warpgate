@@ -428,11 +428,12 @@ mod tests {
     async fn cluster_peer_is_not_scoped() {
         let (ctx, _db) = context(false).await;
         let request = |from_peer: bool| {
-            let mut req = Request::builder()
-                .method(Method::GET)
-                .uri_str("/@warpgate/admin/api/users")
-                .header("host", TARGET_HOST)
-                .finish();
+            // Built as the server builds it: the scope reads `original_uri`.
+            let mut req = scoped_request(
+                &Method::GET,
+                "/@warpgate/admin/api/users",
+                &[("host", TARGET_HOST)],
+            );
             if from_peer {
                 req.extensions_mut().insert(ClusterPeer {
                     node_id: NodeId(Uuid::new_v4()),
