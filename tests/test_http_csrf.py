@@ -50,8 +50,13 @@ def setup(wg, echo_server_port):
         builtin = next(r for r in api.get_admin_roles() if r.name == "warpgate:admin")
         api.add_user_admin_role(admin.id, builtin.id)
         victim, _ = create_password_user(api)
+        # Bound to the full host it is requested on, port included, as the
+        # fork matches host bindings.
         target = _create_echo_target(
-            api, echo_server_port, role.id, external_host=TARGET_HOST
+            api,
+            echo_server_port,
+            role.id,
+            external_host=f"{TARGET_HOST}:{wg.http_port}",
         )
     return dict(admin=admin, victim=victim, role=role, builtin=builtin, target=target)
 
@@ -83,7 +88,11 @@ class TestHttpCsrf:
             for k, v in headers.items()
         }
         session = _login(CONTROL_PLANE, wg.http_port, setup["admin"].username)
-        assert _grant(session, host, wg.http_port, setup, headers).status_code == 401
+        # The fork hides the admin API on a target-bound host altogether (404);
+        # on the control plane the session is ignored (401).
+        expected = 404 if host == TARGET_HOST else 401
+        response = _grant(session, host, wg.http_port, setup, headers)
+        assert response.status_code == expected
 
         with admin_client(_url(CONTROL_PLANE, wg.http_port)) as api:
             roles = api.get_user_admin_roles(setup["victim"].id)
@@ -93,8 +102,9 @@ class TestHttpCsrf:
         session = _login(CONTROL_PLANE, wg.http_port, setup["admin"].username)
         target = _url(TARGET_HOST, wg.http_port)
 
-        assert session.get(f"{target}/@warpgate/admin/api/users").status_code == 401
-        assert session.get(f"{target}/@warpgate/api/targets").status_code == 401
+        # The fork hides Warpgate's management routes on a target-bound host.
+        assert session.get(f"{target}/@warpgate/admin/api/users").status_code == 404
+        assert session.get(f"{target}/@warpgate/api/targets").status_code == 404
 
         info = session.get(f"{target}/@warpgate/api/info")
         assert info.status_code == 200

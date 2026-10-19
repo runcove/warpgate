@@ -1,6 +1,9 @@
-use poem::Request;
-use poem::http::Method;
+use poem::error::NotFoundError;
+use poem::http::{Method, StatusCode};
+use poem::web::Data;
+use poem::{Endpoint, FromRequest, IntoResponse, Middleware, Request, Response};
 use tracing::warn;
+use warpgate_common::WarpgateError;
 use warpgate_common_http::auth::UnauthenticatedRequestContext;
 use warpgate_common_http::is_cluster_peer_request;
 use warpgate_core::ConfigProvider;
@@ -61,24 +64,38 @@ pub(crate) fn is_login_flow_route(method: &Method, path: &str) -> bool {
 /// Whether the request's host is bound to an HTTP target, resolved as the
 /// catchall resolves it: the trusted Host (or X-Forwarded-Host), port
 /// included, looked up with `get_target_by_hostname` and compared with
-/// [`bound_to_host`]. A failed lookup counts as bound: the answer decides
-/// whether credentials count, so it must not fail open.
-async fn is_target_bound(ctx: &UnauthenticatedRequestContext, req: &Request) -> bool {
+/// [`bound_to_host`].
+async fn target_binding(
+    ctx: &UnauthenticatedRequestContext,
+    req: &Request,
+) -> Result<bool, WarpgateError> {
     let Some(host) = ctx.trusted_host_header(req) else {
-        return false;
+        return Ok(false);
     };
-    match ctx
+    let target = ctx
         .services()
         .config_provider
         .get_target_by_hostname(&host)
-        .await
+        .await?;
+    Ok(target.is_some_and(|target| bound_to_host(&target, &host)))
+}
+
+/// Whether a route of Warpgate's own on this request's host is out of scope:
+/// the host is bound to an HTTP target and the route is not part of the login
+/// flow ([`is_login_flow_route`]). A cluster peer's forwarded request was
+/// scoped on the node the client reached.
+async fn out_of_scope(
+    ctx: &UnauthenticatedRequestContext,
+    req: &Request,
+) -> Result<bool, WarpgateError> {
+    let path = req.original_uri().path();
+    if is_cluster_peer_request(req)
+        || warpgate_surface_path(path).is_none()
+        || is_login_flow_route(req.method(), path)
     {
-        Ok(target) => target.is_some_and(|target| bound_to_host(&target, &host)),
-        Err(error) => {
-            warn!(%error, "Could not resolve the request host to a target; treating it as bound");
-            true
-        }
+        return Ok(false);
     }
+    target_binding(ctx, req).await
 }
 
 /// Whether the session or token a request to Warpgate's own routes carries
@@ -95,18 +112,59 @@ pub async fn credentials_refused_on_bound_host(
     ctx: &UnauthenticatedRequestContext,
     req: &Request,
 ) -> bool {
-    let path = req.original_uri().path();
-    if is_cluster_peer_request(req)
-        || warpgate_surface_path(path).is_none()
-        || is_login_flow_route(req.method(), path)
-    {
-        return false;
+    out_of_scope(ctx, req).await.unwrap_or_else(|error| {
+        // Decides whether credentials count, so it must not fail open.
+        warn!(%error, "Could not resolve the request host to a target; treating it as bound");
+        true
+    })
+}
+
+/// Hides Warpgate's own management surface on hosts bound to an HTTP target:
+/// every route under `/@warpgate` and `/_warpgate` that is not part of the
+/// login flow ([`is_login_flow_route`]) answers 404 there, whatever the
+/// request's credentials, as if it were not mounted. If the host cannot be
+/// resolved, those routes answer 503 rather than being served.
+///
+/// Stricter than upstream, which on such a host (when it is not the control
+/// plane) only ignores the session and still serves the routes, 401 where a
+/// login is needed: here the per-VM host shows none of the admin or user API,
+/// not even that it exists.
+#[derive(Clone)]
+pub struct ManagementScopeMiddleware;
+
+impl<E: Endpoint> Middleware<E> for ManagementScopeMiddleware {
+    type Output = ManagementScopeEndpoint<E>;
+
+    fn transform(&self, inner: E) -> Self::Output {
+        ManagementScopeEndpoint { inner }
     }
-    is_target_bound(ctx, req).await
+}
+
+pub struct ManagementScopeEndpoint<E: Endpoint> {
+    inner: E,
+}
+
+impl<E: Endpoint> Endpoint for ManagementScopeEndpoint<E> {
+    type Output = Response;
+
+    async fn call(&self, req: Request) -> poem::Result<Self::Output> {
+        let ctx = Data::<&UnauthenticatedRequestContext>::from_request_without_body(&req).await?;
+        match out_of_scope(&ctx, &req).await {
+            Ok(false) => {}
+            Ok(true) => return Err(NotFoundError.into()),
+            Err(error) => {
+                warn!(%error, "Could not resolve the request host to a target; refusing a management route");
+                return Err(poem::Error::from_status(StatusCode::SERVICE_UNAVAILABLE));
+            }
+        }
+        Ok(self.inner.call(req).await?.into_response())
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use poem::endpoint::make_sync;
+    use poem::{EndpointExt, Route};
     use sea_orm::ActiveValue::Set;
     use sea_orm::{ConnectionTrait, DatabaseConnection, EntityTrait};
     use uuid::Uuid;
@@ -293,6 +351,14 @@ mod tests {
         path: &str,
         headers: &[(&str, &str)],
     ) -> bool {
+        let req = scoped_request(method, path, headers);
+        credentials_refused_on_bound_host(ctx, &req).await
+    }
+
+    /// A request built as the server builds it (poem's `TestClient` leaves
+    /// `original_uri` at `/` whatever the URI, and the scope reads
+    /// `original_uri`).
+    fn scoped_request(method: &Method, path: &str, headers: &[(&str, &str)]) -> Request {
         let mut builder = poem::http::Request::builder()
             .method(method.clone())
             .uri(path);
@@ -311,7 +377,7 @@ mod tests {
         );
         // Positive control: the path under test is the one the rule reads.
         assert_eq!(req.original_uri().path(), path);
-        credentials_refused_on_bound_host(ctx, &req).await
+        req
     }
 
     #[tokio::test]
@@ -460,5 +526,58 @@ mod tests {
                 "{method} {path}"
             );
         }
+    }
+
+    /// The middleware over both mounts: out-of-scope routes are 404 on the
+    /// bound host whatever the credentials, the login flow is served, other
+    /// hosts are untouched, and a failed lookup is 503.
+    #[tokio::test]
+    async fn middleware_hides_the_management_surface_on_a_bound_host() {
+        let (ctx, db) = context(false).await;
+        let mount = || make_sync(|_| "served").with(ManagementScopeMiddleware);
+        let app = Route::new()
+            .nest("/@warpgate", mount())
+            .nest("/_warpgate", mount())
+            .data(ctx);
+        let status = |method: Method, path: &'static str, host: &'static str| {
+            let req = scoped_request(&method, path, &[("host", host), ("x-warpgate-token", "t")]);
+            let app = &app;
+            async move { app.get_response(req).await.status() }
+        };
+
+        for (method, path) in ADMIN_API.into_iter().chain(USER_API) {
+            assert_eq!(
+                status(method.clone(), path, TARGET_HOST).await,
+                StatusCode::NOT_FOUND,
+                "{method} {path}"
+            );
+            assert_eq!(
+                status(method.clone(), path, MAIN_HOST).await,
+                StatusCode::OK,
+                "{method} {path}"
+            );
+        }
+        for (method, path) in LOGIN_FLOW {
+            assert_eq!(
+                status(method.clone(), path, TARGET_HOST).await,
+                StatusCode::OK,
+                "{method} {path}"
+            );
+        }
+        // The custom logo is part of the login page.
+        assert_eq!(
+            status(Method::GET, "/@warpgate/api/logo", TARGET_HOST).await,
+            StatusCode::OK
+        );
+
+        db.execute_unprepared("DROP TABLE targets").await.unwrap();
+        assert_eq!(
+            status(Method::GET, "/@warpgate/admin/api/users", TARGET_HOST).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            status(Method::POST, "/@warpgate/api/auth/login", TARGET_HOST).await,
+            StatusCode::OK
+        );
     }
 }
