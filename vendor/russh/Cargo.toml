@@ -140,6 +140,10 @@ path = "tests/test_rekey_strict_kex.rs"
 name = "test_server_cert"
 path = "tests/test_server_cert.rs"
 
+[[test]]
+name = "test_window_adjust"
+path = "tests/test_window_adjust.rs"
+
 [[bench]]
 name = "ciphers"
 path = "benches/ciphers.rs"
