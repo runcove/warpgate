@@ -4,10 +4,11 @@
 //! loopback interface too; their connections are closed before any HTTP is
 //! read.
 //!
-//! The owner comes from the kernel's socket table: the client socket is the
-//! one whose local endpoint is the accepted connection's remote endpoint and
-//! whose remote endpoint is the listener's. A lookup that fails, times out or
-//! finds no such socket refuses the connection.
+//! The owner comes from the kernel's socket tables (`/proc/net/tcp{,6}` on
+//! Linux; on macOS each process's open sockets, through libproc): the client
+//! socket is the one whose local endpoint is the accepted connection's remote
+//! endpoint and whose remote endpoint is the listener's. A lookup that fails,
+//! times out or finds no such socket refuses the connection.
 //!
 //! Limits of the check:
 //! - TCP carries no peer credentials: the owner is looked up by address and
@@ -30,6 +31,7 @@ use tracing::warn;
 use warpgate_common::helpers::concurrent_acceptor::{Accepted, ConcurrentAcceptor};
 
 /// The socket tables are read whole; a larger one is refused rather than read.
+#[cfg(target_os = "linux")]
 const MAX_SOCKET_TABLE_BYTES: usize = 16 * 1024 * 1024;
 
 /// How long one lookup may take before the connection is refused.
@@ -43,8 +45,8 @@ pub(crate) trait SocketOwnerLookup: Send + Sync + 'static {
     fn owner_uid(&self, local: SocketAddr, remote: SocketAddr) -> anyhow::Result<Option<u32>>;
 }
 
-/// The kernel's own socket table: `/proc/net/tcp{,6}` on Linux,
-/// `net.inet.tcp.pcblist_n` on macOS.
+/// The kernel's own socket tables: `/proc/net/tcp{,6}` on Linux, the
+/// per-process file tables of libproc on macOS.
 pub(crate) struct KernelSocketTable;
 
 impl SocketOwnerLookup for KernelSocketTable {
@@ -281,124 +283,115 @@ mod linux {
     }
 }
 
-/// `net.inet.tcp.pcblist_n`: a `struct xinpgen` header, then for each socket
-/// a run of records (`xinpcb_n`, `xsocket_n`, buffers, stats, `xtcpcb_n`),
-/// each starting with its length and kind and padded to 8 bytes, then a
-/// closing `xinpgen`. Field offsets follow the kernel's `#pragma pack(4)`
-/// layouts in `netinet/in_pcb.h` and `sys/socketvar.h`.
+/// libproc's per-process file tables, which `lsof` reads too: every process
+/// this account may inspect, each of its socket descriptors, and the TCP
+/// endpoints of each. An ordinary user can inspect only its own account's
+/// processes, so a socket held by another account's process (root's
+/// included) is never found and its connection is refused.
+///
+/// The client socket is identified by its full 4-tuple (both addresses and
+/// both ports), which no two live TCP sockets share; `soi_so` is a scrambled
+/// kernel pointer and is not used. A socket can be open in several processes
+/// (an inherited or passed descriptor): every holder found must have the same
+/// uid. This process's own sockets are skipped.
+///
+/// Layouts follow `sys/proc_info.h`; `libc` declares `proc_fdinfo` and
+/// `proc_bsdinfo` but not `socket_fdinfo`, which is read as bytes at the
+/// header's offsets, and every call's returned size is checked.
 #[cfg(any(test, target_os = "macos"))]
 mod macos {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-    use anyhow::Context;
-
     use super::{same_endpoint, single_owner};
 
-    pub(super) const XSO_SOCKET: u32 = 0x001;
-    pub(super) const XSO_INPCB: u32 = 0x010;
-    pub(super) const INP_IPV4: u8 = 0x1;
-    pub(super) const INP_IPV6: u8 = 0x2;
-
-    /// `sizeof(struct xinpgen)`; a record no longer than this ends the list.
-    pub(super) const XINPGEN_LEN: usize = 24;
-
-    // `struct xinpcb_n`.
-    pub(super) const INPCB_FPORT: usize = 16;
-    pub(super) const INPCB_LPORT: usize = 18;
-    pub(super) const INPCB_VFLAG: usize = 44;
-    pub(super) const INPCB_FADDR: usize = 48;
-    pub(super) const INPCB_LADDR: usize = 64;
-    /// Within an address union, where an IPv4 address sits (`ia46_addr4`).
+    /// `sizeof(struct socket_fdinfo)`: a `struct proc_fileinfo` (24 bytes),
+    /// then `struct socket_info`.
+    pub(super) const SOCKET_FDINFO_LEN: usize = 792;
+    /// `psi.soi_kind`.
+    pub(super) const SOI_KIND: usize = 24 + 232;
+    /// `psi.soi_proto`: for `SOCKINFO_TCP`, a `struct tcp_sockinfo`, which
+    /// starts with a `struct in_sockinfo`.
+    const SOI_PROTO: usize = 24 + 240;
+    // `struct in_sockinfo`. The ports are `int`s holding the network-order
+    // `u_short`.
+    pub(super) const INSI_FPORT: usize = SOI_PROTO;
+    pub(super) const INSI_LPORT: usize = SOI_PROTO + 4;
+    pub(super) const INSI_VFLAG: usize = SOI_PROTO + 24;
+    pub(super) const INSI_FADDR: usize = SOI_PROTO + 32;
+    pub(super) const INSI_LADDR: usize = SOI_PROTO + 48;
+    /// Within an address union, where an IPv4 address sits (`ina_46`).
     pub(super) const IN_ADDR_4IN6_OFFSET: usize = 12;
-    const INPCB_MIN_LEN: usize = INPCB_LADDR + 16;
+    pub(super) const SOCKINFO_TCP: i32 = 2;
+    pub(super) const INI_IPV4: u8 = 0x1;
+    pub(super) const INI_IPV6: u8 = 0x2;
 
-    // `struct xsocket_n`.
-    pub(super) const SOCKET_SO: usize = 8;
-    pub(super) const SOCKET_UID: usize = 64;
-    const SOCKET_MIN_LEN: usize = SOCKET_UID + 4;
-
-    #[cfg(target_os = "macos")]
-    pub(super) fn owner_uid(local: SocketAddr, remote: SocketAddr) -> anyhow::Result<Option<u32>> {
-        let table = read_pcblist()?;
-        find_owner(&table, local, remote)
+    /// A TCP socket open in a process.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) struct ProcessSocket {
+        pub pid: i32,
+        pub local: SocketAddr,
+        pub remote: SocketAddr,
     }
 
-    #[cfg(target_os = "macos")]
-    #[allow(unsafe_code)]
-    fn read_pcblist() -> anyhow::Result<Vec<u8>> {
-        use super::MAX_SOCKET_TABLE_BYTES;
-
-        const NAME: &std::ffi::CStr = c"net.inet.tcp.pcblist_n";
-        // The table may grow between sizing and reading it; the kernel's
-        // size estimate leaves room, and a few retries cover the rest.
-        for _ in 0..3 {
-            let mut size: libc::size_t = 0;
-            // SAFETY: a size query: no output buffer, and `size` is a valid
-            // pointer for the length.
-            let rc = unsafe {
-                libc::sysctlbyname(
-                    NAME.as_ptr(),
-                    std::ptr::null_mut(),
-                    &raw mut size,
-                    std::ptr::null_mut(),
-                    0,
-                )
-            };
-            if rc != 0 {
-                return Err(std::io::Error::last_os_error()).context("sizing the socket table");
-            }
-            if size > MAX_SOCKET_TABLE_BYTES {
-                anyhow::bail!("the socket table is larger than {MAX_SOCKET_TABLE_BYTES} bytes");
-            }
-            let mut table = vec![0u8; size];
-            let mut read = size;
-            // SAFETY: `table` is writable for `read` bytes, and the kernel
-            // writes at most that many, storing the count back into `read`.
-            let rc = unsafe {
-                libc::sysctlbyname(
-                    NAME.as_ptr(),
-                    table.as_mut_ptr().cast(),
-                    &raw mut read,
-                    std::ptr::null_mut(),
-                    0,
-                )
-            };
-            if rc == 0 {
-                table.truncate(read.min(size));
-                return Ok(table);
-            }
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::ENOMEM) {
-                return Err(error).context("reading the socket table");
+    /// The owner of the socket with these endpoints among `sockets`: the one
+    /// uid of every process holding it, other than `own_pid`. `uid_of` gives
+    /// a holder's uid, or `None` when it has exited since (it is passed over).
+    /// Holders with different uids are an error.
+    pub(super) fn find_owner(
+        sockets: &[ProcessSocket],
+        own_pid: i32,
+        local: SocketAddr,
+        remote: SocketAddr,
+        mut uid_of: impl FnMut(i32) -> anyhow::Result<Option<u32>>,
+    ) -> anyhow::Result<Option<u32>> {
+        let mut holders = sockets
+            .iter()
+            .filter(|socket| {
+                socket.pid != own_pid
+                    && same_endpoint(socket.local, local)
+                    && same_endpoint(socket.remote, remote)
+            })
+            .map(|socket| socket.pid)
+            .collect::<Vec<_>>();
+        holders.sort_unstable();
+        holders.dedup();
+        let mut uids = Vec::new();
+        for pid in holders {
+            if let Some(uid) = uid_of(pid)? {
+                uids.push(uid);
             }
         }
-        anyhow::bail!("the socket table kept growing while it was read")
+        single_owner(uids)
     }
 
-    fn read_u32(buf: &[u8], offset: usize) -> Option<u32> {
-        let bytes = buf.get(offset..offset.checked_add(4)?)?;
-        Some(u32::from_ne_bytes(bytes.try_into().ok()?))
+    /// Whether a failed per-process call, by its errno, only means the
+    /// process or descriptor is out of reach: it has exited (`ESRCH`), closed
+    /// the descriptor (`EBADF`), or belongs to an account this one may not
+    /// inspect (`EPERM`). `0` is a call that returned nothing without an
+    /// error. Anything else refuses the connection.
+    #[cfg(unix)]
+    pub(super) fn is_out_of_reach(errno: Option<i32>) -> bool {
+        matches!(errno, Some(0 | libc::ESRCH | libc::EBADF | libc::EPERM))
     }
 
-    fn read_u64(buf: &[u8], offset: usize) -> Option<u64> {
-        let bytes = buf.get(offset..offset.checked_add(8)?)?;
-        Some(u64::from_ne_bytes(bytes.try_into().ok()?))
+    fn read_i32(record: &[u8], offset: usize) -> Option<i32> {
+        let bytes = record.get(offset..offset.checked_add(4)?)?;
+        Some(i32::from_ne_bytes(bytes.try_into().ok()?))
     }
 
-    /// A port, stored in network order.
-    fn read_port(buf: &[u8], offset: usize) -> Option<u16> {
-        let bytes = buf.get(offset..offset.checked_add(2)?)?;
-        Some(u16::from_be_bytes(bytes.try_into().ok()?))
+    /// A port: an `int` holding the network-order `u_short`.
+    fn read_port(record: &[u8], offset: usize) -> Option<u16> {
+        Some(u16::from_be(read_i32(record, offset)? as u16))
     }
 
     fn read_address(record: &[u8], union_offset: usize, vflag: u8) -> Option<IpAddr> {
-        if vflag & INP_IPV4 != 0 {
-            let start = union_offset + IN_ADDR_4IN6_OFFSET;
-            let bytes: [u8; 4] = record.get(start..start + 4)?.try_into().ok()?;
+        if vflag & INI_IPV4 != 0 {
+            let start = union_offset.checked_add(IN_ADDR_4IN6_OFFSET)?;
+            let bytes: [u8; 4] = record.get(start..start.checked_add(4)?)?.try_into().ok()?;
             Some(IpAddr::V4(Ipv4Addr::from(bytes)))
-        } else if vflag & INP_IPV6 != 0 {
+        } else if vflag & INI_IPV6 != 0 {
             let bytes: [u8; 16] = record
-                .get(union_offset..union_offset + 16)?
+                .get(union_offset..union_offset.checked_add(16)?)?
                 .try_into()
                 .ok()?;
             Some(IpAddr::V6(Ipv6Addr::from(bytes)))
@@ -407,89 +400,251 @@ mod macos {
         }
     }
 
-    /// An `xinpcb_n`'s (local, remote) endpoints.
-    fn parse_inpcb(record: &[u8]) -> Option<(SocketAddr, SocketAddr)> {
-        if record.len() < INPCB_MIN_LEN {
-            return None;
+    /// A `struct socket_fdinfo`'s (local, remote) endpoints when it is a TCP
+    /// socket; `None` for any other socket. A record of any other size is an
+    /// error: the layout is not the one this reads.
+    pub(super) fn parse_socket_fdinfo(
+        record: &[u8],
+    ) -> anyhow::Result<Option<(SocketAddr, SocketAddr)>> {
+        if record.len() != SOCKET_FDINFO_LEN {
+            anyhow::bail!(
+                "socket info is {} bytes, expected {SOCKET_FDINFO_LEN}",
+                record.len()
+            );
         }
-        let vflag = *record.get(INPCB_VFLAG)?;
+        if read_i32(record, SOI_KIND) != Some(SOCKINFO_TCP) {
+            return Ok(None);
+        }
+        Ok(tcp_endpoints(record))
+    }
+
+    /// A TCP socket's `struct in_sockinfo` endpoints: (local, remote).
+    fn tcp_endpoints(record: &[u8]) -> Option<(SocketAddr, SocketAddr)> {
+        let vflag = *record.get(INSI_VFLAG)?;
         let local = SocketAddr::new(
-            read_address(record, INPCB_LADDR, vflag)?,
-            read_port(record, INPCB_LPORT)?,
+            read_address(record, INSI_LADDR, vflag)?,
+            read_port(record, INSI_LPORT)?,
         );
         let remote = SocketAddr::new(
-            read_address(record, INPCB_FADDR, vflag)?,
-            read_port(record, INPCB_FPORT)?,
+            read_address(record, INSI_FADDR, vflag)?,
+            read_port(record, INSI_FPORT)?,
         );
         Some((local, remote))
     }
 
-    /// An `xsocket_n`'s owner uid; `None` for a PCB without a socket (its
-    /// record is zeroed past the header).
-    fn parse_socket(record: &[u8]) -> Option<u32> {
-        if record.len() < SOCKET_MIN_LEN || read_u64(record, SOCKET_SO)? == 0 {
-            return None;
+    #[cfg(target_os = "macos")]
+    pub(super) use walk::owner_uid;
+
+    #[cfg(target_os = "macos")]
+    #[allow(unsafe_code)]
+    mod walk {
+        use std::net::SocketAddr;
+        use std::time::Instant;
+
+        use anyhow::{Context, bail};
+
+        use super::{
+            ProcessSocket, SOCKET_FDINFO_LEN, find_owner, is_out_of_reach, parse_socket_fdinfo,
+        };
+
+        /// `PROC_ALL_PIDS` and `PROC_PIDFDSOCKETINFO` in `sys/proc_info.h`;
+        /// not in `libc`.
+        const PROC_ALL_PIDS: u32 = 1;
+        const PROC_PIDFDSOCKETINFO: libc::c_int = 3;
+
+        /// Bounds on the walk: past any of them, or past the deadline, the
+        /// connection is refused.
+        const MAX_PIDS: usize = 100_000;
+        const MAX_FDS_PER_PROCESS: usize = 1 << 20;
+        const MAX_SOCKETS: usize = 1 << 20;
+
+        /// `struct socket_fdinfo`, as bytes with its alignment.
+        #[repr(C, align(8))]
+        struct SocketFdInfo([u8; SOCKET_FDINFO_LEN]);
+
+        pub(in super::super) fn owner_uid(
+            local: SocketAddr,
+            remote: SocketAddr,
+        ) -> anyhow::Result<Option<u32>> {
+            let deadline = Instant::now() + super::super::LOOKUP_TIMEOUT;
+            let own_pid = i32::try_from(std::process::id()).context("process id")?;
+            let mut sockets = Vec::new();
+            let mut inspected = 0usize;
+            for pid in list_pids()? {
+                if pid <= 0 || pid == own_pid {
+                    continue;
+                }
+                let Some(fds) = list_fds(pid)? else {
+                    continue;
+                };
+                for fd in fds {
+                    if fd.proc_fdtype != libc::PROX_FDTYPE_SOCKET as u32 {
+                        continue;
+                    }
+                    inspected += 1;
+                    if inspected > MAX_SOCKETS {
+                        bail!("more than {MAX_SOCKETS} sockets to inspect");
+                    }
+                    if Instant::now() > deadline {
+                        bail!("the socket lookup ran past its deadline");
+                    }
+                    if let Some((socket_local, socket_remote)) = socket_endpoints(pid, fd.proc_fd)?
+                    {
+                        sockets.push(ProcessSocket {
+                            pid,
+                            local: socket_local,
+                            remote: socket_remote,
+                        });
+                    }
+                }
+                if Instant::now() > deadline {
+                    bail!("the socket lookup ran past its deadline");
+                }
+            }
+            find_owner(&sockets, own_pid, local, remote, process_uid)
         }
-        read_u32(record, SOCKET_UID)
-    }
 
-    const fn round_up_8(n: usize) -> Option<usize> {
-        match n.checked_add(7) {
-            Some(n) => Some(n & !7),
-            None => None,
+        fn clear_errno() {
+            // SAFETY: `__error` returns this thread's errno location.
+            unsafe { *libc::__error() = 0 };
         }
-    }
 
-    /// The owner of the socket with these endpoints in a `pcblist_n` buffer.
-    pub(super) fn find_owner(
-        table: &[u8],
-        local: SocketAddr,
-        remote: SocketAddr,
-    ) -> anyhow::Result<Option<u32>> {
-        let header_len = read_u32(table, 0).context("the socket table is empty")? as usize;
-        let mut offset = round_up_8(header_len).context("bad socket table header")?;
-
-        let mut uids = Vec::new();
-        // The record kinds seen for the current socket, and what they said.
-        let mut seen = 0u32;
-        let mut endpoints = None;
-        let mut owner = None;
-
-        while offset < table.len() {
-            let len = read_u32(table, offset).context("truncated socket table")? as usize;
-            let kind = read_u32(table, offset + 4).context("truncated socket table")?;
-            if len <= XINPGEN_LEN {
-                break;
+        /// Every process id. A list that fills the buffer may have been cut
+        /// short, and is refused.
+        fn list_pids() -> anyhow::Result<Vec<i32>> {
+            // SAFETY: a size query: no buffer.
+            let needed = unsafe { libc::proc_listpids(PROC_ALL_PIDS, 0, std::ptr::null_mut(), 0) };
+            if needed <= 0 {
+                return Err(std::io::Error::last_os_error()).context("sizing the process list");
             }
-            let end = offset.checked_add(len).context("bad socket table record")?;
-            let record = table.get(offset..end).context("truncated socket table")?;
-
-            // A kind seen twice starts the next socket's records.
-            if seen & kind != 0 {
-                seen = 0;
-                endpoints = None;
-                owner = None;
+            let count = needed as usize / size_of::<i32>() + 64;
+            if count > MAX_PIDS {
+                bail!("more than {MAX_PIDS} processes");
             }
-            seen |= kind;
-            match kind {
-                XSO_INPCB => endpoints = parse_inpcb(record),
-                XSO_SOCKET => owner = parse_socket(record),
-                _ => {}
+            let mut pids = vec![0i32; count];
+            let bytes = libc::c_int::try_from(count * size_of::<i32>())?;
+            // SAFETY: `pids` is writable for `bytes` bytes.
+            let filled =
+                unsafe { libc::proc_listpids(PROC_ALL_PIDS, 0, pids.as_mut_ptr().cast(), bytes) };
+            if filled <= 0 {
+                return Err(std::io::Error::last_os_error()).context("listing processes");
             }
-            if seen & (XSO_INPCB | XSO_SOCKET) == XSO_INPCB | XSO_SOCKET
-                && kind & (XSO_INPCB | XSO_SOCKET) != 0
-                && let (Some((socket_local, socket_remote)), Some(uid)) = (endpoints, owner)
-                && same_endpoint(socket_local, local)
-                && same_endpoint(socket_remote, remote)
-            {
-                uids.push(uid);
+            if filled >= bytes {
+                bail!("the process list grew while it was read");
             }
-
-            offset = round_up_8(end)
-                .filter(|next| *next > offset)
-                .context("bad socket table record")?;
+            pids.truncate(filled as usize / size_of::<i32>());
+            Ok(pids)
         }
-        single_owner(uids)
+
+        /// The open descriptors of `pid`, or `None` when it is out of reach.
+        fn list_fds(pid: i32) -> anyhow::Result<Option<Vec<libc::proc_fdinfo>>> {
+            const ENTRY: usize = size_of::<libc::proc_fdinfo>();
+            clear_errno();
+            // SAFETY: a size query: no buffer.
+            let needed = unsafe {
+                libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0)
+            };
+            if needed <= 0 {
+                return out_of_reach("sizing a process's descriptors").map(|()| None);
+            }
+            let count = needed as usize / ENTRY + 16;
+            if count > MAX_FDS_PER_PROCESS {
+                bail!("a process has more than {MAX_FDS_PER_PROCESS} descriptors");
+            }
+            let mut fds = vec![
+                libc::proc_fdinfo {
+                    proc_fd: 0,
+                    proc_fdtype: 0,
+                };
+                count
+            ];
+            let bytes = libc::c_int::try_from(count * ENTRY)?;
+            clear_errno();
+            // SAFETY: `fds` is writable for `bytes` bytes.
+            let filled = unsafe {
+                libc::proc_pidinfo(
+                    pid,
+                    libc::PROC_PIDLISTFDS,
+                    0,
+                    fds.as_mut_ptr().cast(),
+                    bytes,
+                )
+            };
+            if filled <= 0 {
+                return out_of_reach("listing a process's descriptors").map(|()| None);
+            }
+            if filled >= bytes || filled as usize % ENTRY != 0 {
+                bail!("a process's descriptor list does not fit its layout or grew while read");
+            }
+            fds.truncate(filled as usize / ENTRY);
+            Ok(Some(fds))
+        }
+
+        /// The TCP endpoints of `pid`'s descriptor `fd`, or `None` when it is
+        /// not a TCP socket or is out of reach.
+        fn socket_endpoints(pid: i32, fd: i32) -> anyhow::Result<Option<(SocketAddr, SocketAddr)>> {
+            let mut info = SocketFdInfo([0; SOCKET_FDINFO_LEN]);
+            clear_errno();
+            // SAFETY: `info` is writable for `SOCKET_FDINFO_LEN` bytes.
+            let size = unsafe {
+                libc::proc_pidfdinfo(
+                    pid,
+                    fd,
+                    PROC_PIDFDSOCKETINFO,
+                    info.0.as_mut_ptr().cast(),
+                    SOCKET_FDINFO_LEN as libc::c_int,
+                )
+            };
+            if size <= 0 {
+                return out_of_reach("reading a socket").map(|()| None);
+            }
+            let record = info
+                .0
+                .get(..size as usize)
+                .context("socket info larger than its buffer")?;
+            parse_socket_fdinfo(record)
+        }
+
+        /// The effective uid of `pid`, or `None` when it has exited. Any
+        /// other failure, or a reply of another size, refuses.
+        fn process_uid(pid: i32) -> anyhow::Result<Option<u32>> {
+            const EXPECTED: usize = size_of::<libc::proc_bsdinfo>();
+            // SAFETY: `proc_bsdinfo` is plain integers and arrays of them.
+            let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+            clear_errno();
+            // SAFETY: `info` is writable for `EXPECTED` bytes.
+            let size = unsafe {
+                libc::proc_pidinfo(
+                    pid,
+                    libc::PROC_PIDTBSDINFO,
+                    0,
+                    (&raw mut info).cast(),
+                    EXPECTED as libc::c_int,
+                )
+            };
+            if size <= 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::ESRCH) {
+                    return Ok(None);
+                }
+                return Err(error).context("reading a socket holder's uid");
+            }
+            if size as usize != EXPECTED {
+                bail!("process info is {size} bytes, expected {EXPECTED}");
+            }
+            Ok(Some(info.pbi_uid))
+        }
+
+        /// `Ok` when the call that just failed only found its process or
+        /// descriptor out of reach; otherwise its error.
+        fn out_of_reach(what: &str) -> anyhow::Result<()> {
+            let error = std::io::Error::last_os_error();
+            if is_out_of_reach(error.raw_os_error()) {
+                Ok(())
+            } else {
+                Err(error).context(what.to_owned())
+            }
+        }
     }
 }
 
@@ -601,8 +756,10 @@ mod tests {
     }
 
     /// A connection from this process, looked up in the real socket table,
-    /// belongs to this process's account.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    /// belongs to this process's account. Linux lists every socket in one
+    /// table, so the client being in this same process changes nothing; on
+    /// macOS see `kernel_table_finds_a_child_process_connection`.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn kernel_table_finds_our_own_connection() {
         for bind in ["127.0.0.1:0", "[::1]:0"] {
@@ -632,6 +789,61 @@ mod tests {
                 unused,
             )
             .await;
+            assert_eq!(check, OwnerCheck::NotFound, "{bind}");
+        }
+    }
+
+    /// On macOS the client is another process of this account (`nc`), as a
+    /// browser would be: its socket is found in that process. A client in
+    /// Warpgate's own process is never found, as its own sockets are skipped.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn kernel_table_finds_a_child_process_connection() {
+        use std::process::{Command, Stdio};
+
+        let our_uid = effective_uid().unwrap();
+        for bind in ["127.0.0.1:0", "[::1]:0"] {
+            let Ok(listener) = tokio::net::TcpListener::bind(bind).await else {
+                // No IPv6 loopback on this machine.
+                continue;
+            };
+            let listen_address = listener.local_addr().unwrap();
+
+            // `nc` connects and holds the connection open while its stdin is.
+            let mut child = Command::new("/usr/bin/nc")
+                .arg(listen_address.ip().to_string())
+                .arg(listen_address.port().to_string())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let accepted = tokio::time::timeout(Duration::from_secs(10), listener.accept()).await;
+            let check = match accepted {
+                Ok(Ok((_server, peer))) => Some(
+                    check_connection_owner(
+                        Arc::new(KernelSocketTable),
+                        our_uid,
+                        listen_address,
+                        peer,
+                    )
+                    .await,
+                ),
+                _ => None,
+            };
+            let _ = child.kill();
+            let _ = child.wait();
+            assert_eq!(check, Some(OwnerCheck::SameAccount), "{bind}");
+
+            // The same kind of connection from this process.
+            let client = tokio::net::TcpStream::connect(listen_address)
+                .await
+                .unwrap();
+            let (_server, peer) = listener.accept().await.unwrap();
+            assert_eq!(peer, client.local_addr().unwrap());
+            let check =
+                check_connection_owner(Arc::new(KernelSocketTable), our_uid, listen_address, peer)
+                    .await;
             assert_eq!(check, OwnerCheck::NotFound, "{bind}");
         }
     }
@@ -773,133 +985,217 @@ mod tests {
         }
     }
 
-    /// Builds a `pcblist_n` buffer the way the kernel lays it out.
-    struct PcbList(Vec<u8>);
-
-    impl PcbList {
-        fn new() -> Self {
-            let mut list = Self(Vec::new());
-            list.xinpgen();
-            list
-        }
-
-        fn xinpgen(&mut self) {
-            let mut record = vec![0u8; macos::XINPGEN_LEN];
-            put_u32(&mut record, 0, macos::XINPGEN_LEN as u32);
-            self.push(&record);
-        }
-
-        fn push(&mut self, record: &[u8]) {
-            self.0.extend_from_slice(record);
-            while self.0.len() % 8 != 0 {
-                self.0.push(0);
+    /// Builds a `struct socket_fdinfo` the way the kernel fills it in.
+    fn socket_fdinfo(kind: i32, local: SocketAddr, remote: SocketAddr) -> Vec<u8> {
+        let mut record = vec![0u8; macos::SOCKET_FDINFO_LEN];
+        let mut put = |offset: usize, bytes: &[u8]| {
+            record[offset..offset + bytes.len()].copy_from_slice(bytes);
+        };
+        put(macos::SOI_KIND, &kind.to_ne_bytes());
+        // An `int` holding the network-order `u_short`.
+        let port = |port: u16| i32::from(port.to_be()).to_ne_bytes();
+        put(macos::INSI_LPORT, &port(local.port()));
+        put(macos::INSI_FPORT, &port(remote.port()));
+        for (union_offset, ip) in [
+            (macos::INSI_LADDR, local.ip()),
+            (macos::INSI_FADDR, remote.ip()),
+        ] {
+            match ip {
+                IpAddr::V4(ip) => put(union_offset + macos::IN_ADDR_4IN6_OFFSET, &ip.octets()),
+                IpAddr::V6(ip) => put(union_offset, &ip.octets()),
             }
         }
-
-        fn other(&mut self, kind: u32, len: usize) {
-            let mut record = vec![0u8; len];
-            put_u32(&mut record, 0, len as u32);
-            put_u32(&mut record, 4, kind);
-            self.push(&record);
-        }
-
-        /// One TCP socket's records, in the kernel's order.
-        fn socket(&mut self, local: SocketAddr, remote: SocketAddr, uid: Option<u32>) {
-            // sizeof(struct xinpcb_n) under pack(4).
-            let mut inpcb = vec![0u8; 104];
-            put_u32(&mut inpcb, 0, 104);
-            put_u32(&mut inpcb, 4, macos::XSO_INPCB);
-            inpcb[macos::INPCB_FPORT..macos::INPCB_FPORT + 2]
-                .copy_from_slice(&remote.port().to_be_bytes());
-            inpcb[macos::INPCB_LPORT..macos::INPCB_LPORT + 2]
-                .copy_from_slice(&local.port().to_be_bytes());
-            let mut put_address = |union_offset: usize, ip: IpAddr| match ip {
-                IpAddr::V4(ip) => {
-                    let start = union_offset + macos::IN_ADDR_4IN6_OFFSET;
-                    inpcb[start..start + 4].copy_from_slice(&ip.octets());
-                }
-                IpAddr::V6(ip) => {
-                    inpcb[union_offset..union_offset + 16].copy_from_slice(&ip.octets());
-                }
-            };
-            put_address(macos::INPCB_FADDR, remote.ip());
-            put_address(macos::INPCB_LADDR, local.ip());
-            inpcb[macos::INPCB_VFLAG] = if local.is_ipv4() {
-                macos::INP_IPV4
+        put(
+            macos::INSI_VFLAG,
+            &[if local.is_ipv4() {
+                macos::INI_IPV4
             } else {
-                macos::INP_IPV6
-            };
-            self.push(&inpcb);
-
-            // sizeof(struct xsocket_n) under pack(4).
-            let mut socket = vec![0u8; 108];
-            put_u32(&mut socket, 0, 108);
-            put_u32(&mut socket, 4, macos::XSO_SOCKET);
-            if let Some(uid) = uid {
-                socket[macos::SOCKET_SO..macos::SOCKET_SO + 8]
-                    .copy_from_slice(&0x1234_u64.to_ne_bytes());
-                put_u32(&mut socket, macos::SOCKET_UID, uid);
-            }
-            self.push(&socket);
-
-            self.other(0x002, 36); // receive buffer
-            self.other(0x004, 36); // send buffer
-            self.other(0x008, 420); // stats
-            self.other(0x020, 260); // TCP control block
-        }
-
-        fn finish(mut self) -> Vec<u8> {
-            self.xinpgen();
-            self.0
-        }
-    }
-
-    fn put_u32(buf: &mut [u8], offset: usize, value: u32) {
-        buf[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
-    }
-
-    #[test]
-    fn pcblist_finds_the_client_socket_owner() {
-        let listener = addr("127.0.0.1:8888");
-        let mut list = PcbList::new();
-        list.socket(listener, addr("0.0.0.0:0"), Some(501));
-        list.socket(addr("127.0.0.1:50043"), listener, Some(502));
-        list.socket(listener, addr("127.0.0.1:50043"), Some(501));
-        list.socket(addr("[::1]:50044"), addr("[::1]:8888"), Some(503));
-        list.socket(addr("127.0.0.1:50045"), listener, None);
-        let table = list.finish();
-
-        let find = |local, remote| macos::find_owner(&table, addr(local), addr(remote)).unwrap();
-        assert_eq!(find("127.0.0.1:50043", "127.0.0.1:8888"), Some(502));
-        assert_eq!(find("127.0.0.1:8888", "127.0.0.1:50043"), Some(501));
-        assert_eq!(find("[::1]:50044", "[::1]:8888"), Some(503));
-        // A PCB without a socket has no owner.
-        assert_eq!(find("127.0.0.1:50045", "127.0.0.1:8888"), None);
-        assert_eq!(find("127.0.0.1:50046", "127.0.0.1:8888"), None);
-        assert_eq!(find("127.0.0.1:50043", "127.0.0.1:8889"), None);
-    }
-
-    #[test]
-    fn pcblist_refuses_disagreeing_and_malformed_tables() {
-        let listener = addr("127.0.0.1:8888");
-        let client = addr("127.0.0.1:50043");
-        let mut list = PcbList::new();
-        list.socket(client, listener, Some(501));
-        list.socket(client, listener, Some(502));
-        assert!(macos::find_owner(&list.finish(), client, listener).is_err());
-
-        assert!(macos::find_owner(&[], client, listener).is_err());
-        let mut list = PcbList::new();
-        list.socket(client, listener, Some(501));
-        let mut table = list.finish();
-        // Cut inside the first record.
-        table.truncate(macos::XINPGEN_LEN + 40);
-        assert!(macos::find_owner(&table, client, listener).is_err());
-
-        let header_only = PcbList::new().finish();
-        assert_eq!(
-            macos::find_owner(&header_only, client, listener).unwrap(),
-            None
+                macos::INI_IPV6
+            }],
         );
+        record
+    }
+
+    #[test]
+    fn socket_fdinfo_gives_tcp_endpoints() {
+        for (local, remote) in [
+            ("127.0.0.1:50043", "127.0.0.1:8888"),
+            ("[::1]:50044", "[::1]:8888"),
+        ] {
+            let record = socket_fdinfo(macos::SOCKINFO_TCP, addr(local), addr(remote));
+            assert_eq!(
+                macos::parse_socket_fdinfo(&record).unwrap(),
+                Some((addr(local), addr(remote)))
+            );
+        }
+        // Not a TCP socket (`SOCKINFO_IN`: UDP).
+        let udp = socket_fdinfo(1, addr("127.0.0.1:53"), addr("127.0.0.1:50043"));
+        assert_eq!(macos::parse_socket_fdinfo(&udp).unwrap(), None);
+    }
+
+    #[test]
+    fn socket_fdinfo_of_another_size_is_refused() {
+        let record = socket_fdinfo(
+            macos::SOCKINFO_TCP,
+            addr("127.0.0.1:50043"),
+            addr("127.0.0.1:8888"),
+        );
+        assert!(macos::parse_socket_fdinfo(&record[..record.len() - 1]).is_err());
+        let mut longer = record.clone();
+        longer.push(0);
+        assert!(macos::parse_socket_fdinfo(&longer).is_err());
+        assert!(macos::parse_socket_fdinfo(&[]).is_err());
+    }
+
+    const OWN_PID: i32 = 42;
+    const LISTENER: &str = "127.0.0.1:8888";
+
+    /// The sockets of a few processes; see `holder_uid` for their owners.
+    fn process_sockets() -> Vec<macos::ProcessSocket> {
+        let socket = |pid, local, remote| macos::ProcessSocket {
+            pid,
+            local: addr(local),
+            remote: addr(remote),
+        };
+        vec![
+            // A client of the listener, and Warpgate's accepted end of it.
+            socket(100, "127.0.0.1:50043", LISTENER),
+            socket(OWN_PID, LISTENER, "127.0.0.1:50043"),
+            // A client socket held by Warpgate's own process.
+            socket(OWN_PID, "127.0.0.1:50060", LISTENER),
+            // The same local port, talking to another port.
+            socket(101, "127.0.0.1:50044", "127.0.0.1:9999"),
+            socket(102, "[::1]:50045", "[::1]:8888"),
+            // One socket in two processes of the same account...
+            socket(103, "127.0.0.1:50046", LISTENER),
+            socket(104, "127.0.0.1:50046", LISTENER),
+            // ...of two accounts...
+            socket(105, "127.0.0.1:50047", LISTENER),
+            socket(106, "127.0.0.1:50047", LISTENER),
+            // ...and in a process that has exited since.
+            socket(107, "127.0.0.1:50048", LISTENER),
+            socket(108, "127.0.0.1:50048", LISTENER),
+            // The same port on another local address.
+            socket(109, "127.0.0.2:50049", LISTENER),
+        ]
+    }
+
+    fn holder_uid(pid: i32) -> anyhow::Result<Option<u32>> {
+        Ok(match pid {
+            100..=105 | 107 => Some(501),
+            106 => Some(502),
+            108 => None,
+            109 => Some(503),
+            other => panic!("asked for the uid of process {other}"),
+        })
+    }
+
+    fn find_in_processes(local: &str, remote: &str) -> anyhow::Result<Option<u32>> {
+        macos::find_owner(
+            &process_sockets(),
+            OWN_PID,
+            addr(local),
+            addr(remote),
+            holder_uid,
+        )
+    }
+
+    #[test]
+    fn process_sockets_find_the_client_socket_owner() {
+        let find = |local, remote| find_in_processes(local, remote).unwrap();
+        assert_eq!(find("127.0.0.1:50043", LISTENER), Some(501));
+        assert_eq!(find("[::1]:50045", "[::1]:8888"), Some(501));
+        // An IPv4 socket, asked for with IPv4-mapped addresses.
+        assert_eq!(
+            find("[::ffff:127.0.0.1]:50043", "[::ffff:127.0.0.1]:8888"),
+            Some(501)
+        );
+        // Unknown endpoints match nothing.
+        assert_eq!(find("127.0.0.1:50099", LISTENER), None);
+    }
+
+    #[test]
+    fn process_sockets_match_the_full_four_tuple() {
+        let find = |local, remote| find_in_processes(local, remote).unwrap();
+        // Wrong remote port, wrong remote address, wrong local address.
+        assert_eq!(find("127.0.0.1:50044", LISTENER), None);
+        assert_eq!(find("127.0.0.1:50043", "127.0.0.2:8888"), None);
+        assert_eq!(find("127.0.0.1:50049", LISTENER), None);
+        assert_eq!(find("127.0.0.2:50049", LISTENER), Some(503));
+    }
+
+    #[test]
+    fn process_sockets_of_our_own_process_are_skipped() {
+        let find = |local, remote| find_in_processes(local, remote).unwrap();
+        assert_eq!(find("127.0.0.1:50060", LISTENER), None);
+        // Warpgate's accepted end, asked for as a client, is skipped too.
+        assert_eq!(find(LISTENER, "127.0.0.1:50043"), None);
+    }
+
+    #[test]
+    fn process_sockets_with_several_holders_need_one_owner() {
+        assert_eq!(
+            find_in_processes("127.0.0.1:50046", LISTENER).unwrap(),
+            Some(501)
+        );
+        assert!(find_in_processes("127.0.0.1:50047", LISTENER).is_err());
+        // A holder that has exited is passed over.
+        assert_eq!(
+            find_in_processes("127.0.0.1:50048", LISTENER).unwrap(),
+            Some(501)
+        );
+    }
+
+    #[test]
+    fn process_sockets_whose_holder_cannot_be_read_are_refused() {
+        let result = macos::find_owner(
+            &process_sockets(),
+            OWN_PID,
+            addr("127.0.0.1:50043"),
+            addr(LISTENER),
+            |_| Err(anyhow::anyhow!("not permitted")),
+        );
+        assert!(result.is_err());
+    }
+
+    /// The process walk through the owner check: a client of another
+    /// account, or none, is refused.
+    #[tokio::test]
+    async fn process_sockets_through_the_owner_check() {
+        struct Processes;
+        impl SocketOwnerLookup for Processes {
+            fn owner_uid(
+                &self,
+                local: SocketAddr,
+                remote: SocketAddr,
+            ) -> anyhow::Result<Option<u32>> {
+                macos::find_owner(&process_sockets(), OWN_PID, local, remote, holder_uid)
+            }
+        }
+        let check = |our_uid, client| {
+            check_connection_owner(Arc::new(Processes), our_uid, addr(LISTENER), addr(client))
+        };
+        assert_eq!(check(501, "127.0.0.1:50043").await, OwnerCheck::SameAccount);
+        assert_eq!(
+            check(502, "127.0.0.1:50043").await,
+            OwnerCheck::OtherAccount(501)
+        );
+        assert_eq!(check(501, "127.0.0.1:50099").await, OwnerCheck::NotFound);
+        assert!(matches!(
+            check(501, "127.0.0.1:50047").await,
+            OwnerCheck::LookupFailed(_)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_gone_and_uninspectable_processes_are_passed_over() {
+        for errno in [0, libc::ESRCH, libc::EBADF, libc::EPERM] {
+            assert!(macos::is_out_of_reach(Some(errno)), "{errno}");
+        }
+        for errno in [libc::EACCES, libc::EINVAL, libc::ENOMEM] {
+            assert!(!macos::is_out_of_reach(Some(errno)), "{errno}");
+        }
+        assert!(!macos::is_out_of_reach(None));
     }
 }
