@@ -570,10 +570,20 @@ pub struct HttpConfig {
     /// with the listening port; only the raw `Host` header is read, never
     /// `X-Forwarded-Host`, so a local proxy in front must pass the original
     /// `Host` through.
-    /// Supported on Linux and macOS only. Other OS accounts on the machine can
-    /// reach loopback too: a connection is served only when the connecting
-    /// socket belongs to the account Warpgate runs as, looked up in the
-    /// kernel's socket table, and is otherwise closed before any HTTP is read.
+    /// Supported on Linux and macOS only, and refused when Warpgate runs as
+    /// root. Other OS accounts on the machine can reach loopback too: a
+    /// connection is served only when the connecting socket belongs to the
+    /// account Warpgate runs as, and is otherwise closed before any HTTP is
+    /// read. TCP carries no peer credentials, so the owner is looked up in the
+    /// kernel's socket table by the connection's addresses and ports, after
+    /// it is accepted. Every process of that account is trusted, including
+    /// relays it runs (an `ssh -R` forward, a proxy it started, a target that
+    /// points back at Warpgate's own port): whoever reaches such a relay is
+    /// served as that account. A local reverse proxy in front of Warpgate
+    /// must run as the same account; one running as another account is
+    /// refused. Only this HTTP listener is checked: the SSH listener, even on
+    /// a loopback address, accepts any local account and relies on SSH
+    /// authentication alone.
     /// A state-changing request or websocket upgrade, to Warpgate or to a
     /// target, that carries Warpgate's session cookie must carry an `Origin`
     /// equal to Warpgate's own (scheme, host and port), or without one
