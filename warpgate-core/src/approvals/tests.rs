@@ -2182,3 +2182,91 @@ mod polled_gate {
         );
     }
 }
+
+/// Kept from 3176929f, whose own ticket-delete path v0.30.0's
+/// `Services::delete_ticket_closing_sessions` replaced: deleting a ticket ends
+/// the sessions it opened in the database, so an HTTP cookie can no longer use
+/// them, and leaves every other session open.
+mod ticket_deletion {
+    use sea_orm::ActiveModelTrait;
+    use warpgate_common::TargetSessionId;
+    use warpgate_db_entities::{TargetSession, Ticket, UserSession};
+
+    use super::*;
+
+    async fn session_with_target_session(
+        db: &DatabaseConnection,
+        target_id: Uuid,
+        ticket_id: Option<Uuid>,
+    ) -> UserSessionId {
+        let session_id = UserSessionId(Uuid::new_v4());
+        UserSession::ActiveModel {
+            id: Set(session_id),
+            username: Set(Some("alice".into())),
+            user_id: Set(None),
+            remote_address: Set("127.0.0.1:22".into()),
+            started: Set(OffsetDateTime::now_utc()),
+            ended: Set(None),
+            protocol: Set("HTTP".into()),
+            node_id: Set(None),
+            auth_state_node_id: Set(None),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        TargetSession::ActiveModel {
+            id: Set(TargetSessionId(Uuid::new_v4())),
+            user_session_id: Set(session_id),
+            target_snapshot: Set(r#"{"name":"web"}"#.into()),
+            target_id: Set(target_id),
+            started: Set(OffsetDateTime::now_utc()),
+            ended: Set(None),
+            ticket_id: Set(ticket_id),
+            node_id: Set(None),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        session_id
+    }
+
+    async fn ended(db: &DatabaseConnection, id: UserSessionId) -> bool {
+        UserSession::Entity::find_by_id(id)
+            .one(db)
+            .await
+            .unwrap()
+            .unwrap()
+            .ended
+            .is_some()
+    }
+
+    #[tokio::test]
+    async fn deleting_a_ticket_ends_only_the_sessions_it_opened() {
+        let db = migrated_db().await;
+        let services = super::delivery::test_services(&db).await;
+        let ticket_id = seed_ticket(&db, None, None).await;
+        let ticket = Ticket::Entity::find_by_id(ticket_id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let with_ticket = session_with_target_session(&db, ticket.target_id, Some(ticket_id)).await;
+        let without = session_with_target_session(&db, ticket.target_id, None).await;
+
+        services
+            .delete_ticket_closing_sessions(ticket_id)
+            .await
+            .unwrap();
+
+        assert!(ended(&db, with_ticket).await);
+        assert!(!ended(&db, without).await);
+        assert!(
+            Ticket::Entity::find_by_id(ticket_id)
+                .one(&db)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+}
