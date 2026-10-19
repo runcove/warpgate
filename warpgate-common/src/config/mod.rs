@@ -574,16 +574,29 @@ pub struct HttpConfig {
     /// root. Other OS accounts on the machine can reach loopback too: a
     /// connection is served only when the connecting socket belongs to the
     /// account Warpgate runs as, and is otherwise closed before any HTTP is
-    /// read. TCP carries no peer credentials, so the owner is looked up in the
-    /// kernel's socket table by the connection's addresses and ports, after
-    /// it is accepted. Every process of that account is trusted, including
-    /// relays it runs (an `ssh -R` forward, a proxy it started, a target that
-    /// points back at Warpgate's own port): whoever reaches such a relay is
-    /// served as that account. A local reverse proxy in front of Warpgate
-    /// must run as the same account; one running as another account is
-    /// refused. Only this HTTP listener is checked: the SSH listener, even on
-    /// a loopback address, accepts any local account and relies on SSH
-    /// authentication alone.
+    /// read. TCP carries no peer credentials, so after each accept the owner
+    /// is looked up by the connection's addresses and ports. On Linux it is
+    /// read from `/proc/net/tcp`, where a socket belongs to the account that
+    /// created it, wherever its descriptor is passed. On macOS the open
+    /// sockets of every process Warpgate may inspect (those of its own
+    /// account) are walked, and a socket belongs to the account when one of
+    /// its processes other than Warpgate itself holds it, including a
+    /// descriptor another account passed into that process. So on macOS a
+    /// socket held only by processes Warpgate cannot inspect (root's or
+    /// another account's) is never found and its connection is refused; a
+    /// descriptor the account hands to another account's process still counts
+    /// as the account's while one of the account's processes holds it too;
+    /// and a target pointing at Warpgate's own port is refused, where Linux
+    /// serves it. Every process of the account is trusted, including relays
+    /// it runs (an `ssh -R` forward, a proxy it started): whoever reaches such
+    /// a relay is served as that account. A local reverse proxy in front of
+    /// Warpgate must run as the same account; one running as another account
+    /// is refused. Each accept costs a lookup (a walk of the process table on
+    /// macOS, a read of `/proc/net/tcp` on Linux) bounded at 2 seconds, and a
+    /// lookup that fails or runs over refuses the connection: another local
+    /// account can slow the listener down but not get through. Only this HTTP
+    /// listener is checked: the SSH listener, even on a loopback address,
+    /// accepts any local account and relies on SSH authentication alone.
     /// A state-changing request or websocket upgrade, to Warpgate or to a
     /// target, that carries Warpgate's session cookie must carry an `Origin`
     /// equal to Warpgate's own (scheme, host and port), or without one
