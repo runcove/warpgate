@@ -11,13 +11,25 @@ from .util import wait_port
 ALLOWED_IP = "9.9.9.9"
 DENIED_IP = "8.8.8.8"
 
+# The header the proxy in front of Warpgate writes the client address into,
+# named in `http.client_ip_header`. Warpgate never takes the client address
+# from `X-Forwarded-For`, even with `trust_x_forwarded_headers` on.
+CLIENT_IP_HEADER = "X-Real-IP"
+
 
 @pytest.fixture(scope="session")
 def proxied_wg(processes: ProcessManager):
     # The allow-list is only meaningfully testable from a single test host if
     # the client IP is header-supplied, which is also the reverse-proxy
     # deployment the check has to be correct for.
-    wg = processes.start_wg(config_patch={"http": {"trust_x_forwarded_headers": True}})
+    wg = processes.start_wg(
+        config_patch={
+            "http": {
+                "trust_x_forwarded_headers": True,
+                "client_ip_header": CLIENT_IP_HEADER,
+            }
+        }
+    )
     wait_port(wg.http_port, for_process=wg.process, recv=False)
     yield wg
 
@@ -33,10 +45,12 @@ def ip_restricted_user(proxied_wg: WarpgateProcess):
         yield url, user, admin
 
 
-def _login(url: str, username: str, ip: str) -> tuple[requests.Session, requests.Response]:
+def _login(
+    url: str, username: str, ip: str, header: str = CLIENT_IP_HEADER
+) -> tuple[requests.Session, requests.Response]:
     session = requests.Session()
     session.verify = False
-    session.headers["X-Forwarded-For"] = ip
+    session.headers[header] = ip
     return session, session.post(
         f"{url}/@warpgate/api/auth/login",
         json={"username": username, "password": "123"},
@@ -61,6 +75,12 @@ def test_login_honours_forwarded_client_ip(ip_restricted_user):
     assert denied.status_code == 401
     assert denied.json()["state"] == "IpRejected"
 
+    # X-Forwarded-For names no client: the request is the loopback peer's,
+    # outside the allowed range.
+    _, forwarded_for = _login(url, user.username, ALLOWED_IP, header="X-Forwarded-For")
+    assert forwarded_for.status_code == 401
+    assert forwarded_for.json()["state"] == "IpRejected"
+
 
 def test_api_token_is_bound_to_the_users_allowed_ranges(ip_restricted_user):
     url, user, admin = ip_restricted_user
@@ -81,12 +101,13 @@ def test_api_token_is_bound_to_the_users_allowed_ranges(ip_restricted_user):
 
     _restrict(admin, user, [f"{ALLOWED_IP}/32"])
 
-    def username_seen_from(ip: str):
+    def username_seen_from(ip: str, header: str = CLIENT_IP_HEADER):
         return requests.get(
             f"{url}/@warpgate/api/info",
-            headers={"X-Warpgate-Token": token, "X-Forwarded-For": ip},
+            headers={"X-Warpgate-Token": token, header: ip},
             verify=False,
         ).json()["username"]
 
     assert username_seen_from(ALLOWED_IP) == user.username
     assert username_seen_from(DENIED_IP) is None
+    assert username_seen_from(ALLOWED_IP, header="X-Forwarded-For") is None
