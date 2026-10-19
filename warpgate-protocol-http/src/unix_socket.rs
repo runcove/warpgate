@@ -181,12 +181,12 @@ mod tests {
     impl TempDir {
         fn new(mode: u32) -> Self {
             // Canonical, so the chain has no symlink in it (macOS `/var`).
+            // A short name: macOS's canonical temp dir is already ~58 bytes
+            // and a socket path may have at most 103.
             let base = std::fs::canonicalize(std::env::temp_dir()).unwrap();
-            let path = base.join(format!(
-                "wg-uds-{}-{}",
-                std::process::id(),
-                uuid::Uuid::new_v4().simple()
-            ));
+            let mut id = uuid::Uuid::new_v4().simple().to_string();
+            id.truncate(8);
+            let path = base.join(format!("wg-{id}"));
             std::fs::create_dir(&path).unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
             Self(path)
