@@ -99,16 +99,18 @@ async fn recordings_s3_browser_origin(ctx: &UnauthenticatedRequestContext) -> Op
     }
 }
 
-/// The acceptor of a plain-HTTP loopback listener on `address`: only
-/// connections whose client socket `lookup` finds owned by `our_uid` come out
-/// of it. Wrapped inside the PROXY protocol reader, so the owner checked is
-/// the one of the actual TCP peer.
+/// The acceptor of a plain-HTTP loopback listener on `address`, for a
+/// process whose effective uid is `euid`: refused, before anything is bound,
+/// when that is root's; otherwise only connections whose client socket
+/// `lookup` finds owned by `euid` come out of it. Wrapped inside the PROXY
+/// protocol reader, so the owner checked is the one of the actual TCP peer.
 async fn loopback_acceptor(
     address: &ListenEndpoint,
     proxy_protocol: bool,
     lookup: Arc<dyn loopback_owner::SocketOwnerLookup>,
-    our_uid: u32,
+    euid: u32,
 ) -> Result<BoxAcceptor> {
+    let our_uid = loopback_owner::serving_uid(euid)?;
     let acceptor = address.poem_acceptor().await?;
     let acceptor = loopback_owner::same_account_acceptor(acceptor, lookup, our_uid);
     Ok(MaybeProxyProtocolAcceptor::new(acceptor, proxy_protocol).boxed())
@@ -432,12 +434,11 @@ impl ProtocolServer for HTTPProtocolServer {
         let Some(tls_configs) = tls_configs else {
             // Other OS accounts on this machine can reach loopback too: only
             // connections opened by this process's account are served.
-            let our_uid = loopback_owner::listener_uid()?;
             let acceptor = loopback_acceptor(
                 &address,
                 proxy_protocol,
                 Arc::new(loopback_owner::KernelSocketTable),
-                our_uid,
+                loopback_owner::effective_uid()?,
             )
             .await?;
             warn!(
@@ -528,6 +529,15 @@ mod tests {
                 .unwrap();
         }
         (accepted.is_ok_and(|accepted| accepted.is_ok()), received)
+    }
+
+    #[tokio::test]
+    async fn loopback_listener_refuses_to_start_as_root() {
+        let address = ListenEndpoint::from("127.0.0.1:0".parse::<SocketAddr>().unwrap());
+        let Err(error) = loopback_acceptor(&address, false, Arc::new(OwnedBy(0)), 0).await else {
+            panic!("a loopback listener started for root");
+        };
+        assert!(error.to_string().contains("root"), "{error}");
     }
 
     #[tokio::test]
