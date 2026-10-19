@@ -553,6 +553,77 @@ class Test:
         finally:
             transport.close()
 
+    def test_a_flooding_session_does_not_hold_up_others(
+        self,
+        processes: ProcessManager,
+        wg_c_ed25519_pubkey,
+        shared_wg: WarpgateProcess,
+    ):
+        # Session A floods output and then stops reading it; like every session
+        # in this harness it is recorded. New sessions of the same user and
+        # target, and new channels on a connection opened before the flood,
+        # must keep answering promptly. Recording never waits for its disk
+        # queue (it leaves data out and marks a gap instead), so a flood cannot
+        # hold up its own session's loop, nor load the process into stalling
+        # anyone else's.
+        user, ssh_target = setup_user_and_target(
+            processes, shared_wg, wg_c_ed25519_pubkey
+        )
+        username = f"{user.username}:{ssh_target.name}"
+
+        def connect():
+            transport = paramiko.Transport(("localhost", shared_wg.ssh_port))
+            transport.connect(username=username, password="123")
+            return transport
+
+        def answers_within(seconds, run):
+            result = {}
+
+            def worker():
+                try:
+                    result["status"] = run()
+                except Exception as error:  # noqa: BLE001
+                    result["error"] = error
+
+            thread = threading.Thread(target=worker, daemon=True)
+            thread.start()
+            thread.join(seconds)
+            assert not thread.is_alive(), f"no answer within {seconds} s"
+            assert "error" not in result, result.get("error")
+            assert result["status"] == 0
+
+        def exec_true(transport):
+            channel = transport.open_session(timeout=10)
+            channel.exec_command("true")
+            return channel.recv_exit_status()
+
+        long_lived = connect()
+        flooding = connect()
+        fresh = []
+        try:
+            flood = flooding.open_session()
+            flood.settimeout(30)
+            flood.exec_command("cat /dev/zero")
+            received = 0
+            while received < 10 * 1024 * 1024:
+                chunk = flood.recv(65536)
+                assert chunk, f"the flood ended after {received} bytes"
+                received += len(chunk)
+            # From here on A never reads again.
+
+            def new_session():
+                transport = connect()
+                fresh.append(transport)
+                return exec_true(transport)
+
+            for _ in range(5):
+                time.sleep(4)
+                answers_within(5, lambda: exec_true(long_lived))
+                answers_within(10, new_session)
+        finally:
+            for transport in [flooding, long_lived, *fresh]:
+                transport.close()
+
     def test_input_waits_for_a_target_that_does_not_read(
         self,
         processes: ProcessManager,
