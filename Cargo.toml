@@ -35,6 +35,7 @@ members = [
 # so Cranky's deny lints don't apply to their upstream code. Each carries a PATCHES.md
 # describing the fork and a warpgate.patch reproducing it.
 exclude = [
+    "vendor/russh",
     "vendor/ironrdp-async",
     "vendor/ironrdp-connector",
     "vendor/ironrdp-dvc",
@@ -54,6 +55,7 @@ resolver = "2"
 # forked to drop those pins so both stacks share one crypto generation. See PATCHES.md in
 # each vendored crate.
 [patch.crates-io]
+russh = { path = "vendor/russh" }
 ironrdp-async = { path = "vendor/ironrdp-async" }
 ironrdp-connector = { path = "vendor/ironrdp-connector" }
 ironrdp-dvc = { path = "vendor/ironrdp-dvc" }
