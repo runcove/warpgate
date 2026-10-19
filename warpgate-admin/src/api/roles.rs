@@ -8,6 +8,7 @@ use warpgate_common::{
     AdminPermission, Role as RoleConfig, Target as TargetConfig, User as UserConfig, WarpgateError,
 };
 use warpgate_common_http::errors::invalid_field;
+use warpgate_core::AccessChange;
 use warpgate_core::resources::ResourceError;
 use warpgate_core::resources::roles::{self as store, RoleDataRequest};
 use warpgate_db_entities::{Role, Target, User};
@@ -177,7 +178,14 @@ impl DetailApi {
         admin.require(AdminPermission::AccessRolesDelete)?;
 
         match store::delete(&admin.services().db, id.0).await {
-            Ok(()) => Ok(DeleteRoleResponse::Deleted),
+            Ok(()) => {
+                // Whoever reached a target only through this role may not any more.
+                admin
+                    .services()
+                    .close_sessions_no_longer_authorised(AccessChange::All)
+                    .await?;
+                Ok(DeleteRoleResponse::Deleted)
+            }
             Err(ResourceError::NotFound) => Ok(DeleteRoleResponse::NotFound),
             Err(err) => Err(err.into()),
         }

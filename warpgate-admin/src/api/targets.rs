@@ -9,6 +9,7 @@ use warpgate_common::{
     TargetSSHOptions, WarpgateError,
 };
 use warpgate_common_http::errors::invalid_field;
+use warpgate_core::AccessChange;
 use warpgate_core::resources::ResourceError;
 use warpgate_core::resources::targets::{self as store, TargetDataRequest};
 use warpgate_db_entities::Target::fuzzy_filter_targets;
@@ -253,6 +254,11 @@ impl DetailApi {
         match store::delete(&services.db, id.0).await {
             Ok(admitted) => {
                 services.close_admitted_sessions(admitted).await?;
+                // The sessions a ticket opened went with its ticket above; any other
+                // live session to the target ends now that no one may reach it.
+                services
+                    .close_sessions_no_longer_authorised(AccessChange::Targets(vec![id.0]))
+                    .await?;
                 Ok(DeleteTargetResponse::Deleted)
             }
             Err(ResourceError::NotFound) => Ok(DeleteTargetResponse::NotFound),
@@ -390,7 +396,13 @@ impl RolesApi {
         admin.require(AdminPermission::AccessRolesAssign)?;
 
         match store::remove_role(&admin.services().db, id.0, role_id.0).await {
-            Ok(()) => Ok(DeleteTargetRoleResponse::Deleted),
+            Ok(()) => {
+                admin
+                    .services()
+                    .close_sessions_no_longer_authorised(AccessChange::Targets(vec![id.0]))
+                    .await?;
+                Ok(DeleteTargetRoleResponse::Deleted)
+            }
             Err(ResourceError::NotFound) => Ok(DeleteTargetRoleResponse::NotFound),
             Err(err) => Err(err.into()),
         }
