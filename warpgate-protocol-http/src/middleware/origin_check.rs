@@ -330,7 +330,7 @@ mod tests {
             (MAIN, MAIN),
             ("https://warpgate.example.test:443", MAIN),
             (TARGET, TARGET),
-            ("https://localhost:8888", "localhost"),
+            ("https://localhost:8888", "https://localhost:8888"),
         ] {
             for path in [LOGIN, LOGOUT] {
                 assert!(allows(&post_from(path, origin), host), "{origin} {path}");
