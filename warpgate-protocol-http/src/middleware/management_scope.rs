@@ -14,9 +14,10 @@ use crate::catchall::bound_to_host;
 /// host bound to an HTTP target still serves under `/@warpgate` and
 /// `/_warpgate`. That covers the gateway shell and its assets (the login page
 /// is a route inside the shell), the login steps, the browser's own login
-/// state, SSO start, return and logout, and `info` for the login page and the
-/// embedded session bar. Everything else, including the admin API, the rest
-/// of the user API and forced MFA enrolment, is only served on other hosts.
+/// state, SSO start, return and logout, `info` for the login page and the
+/// embedded session bar, and the custom logo the login page shows. Everything
+/// else, including the admin API, the rest of the user API and forced MFA
+/// enrolment, is only served on other hosts.
 ///
 /// Paths are matched exactly; a dot or empty segment, or an escape in an
 /// asset path, is never part of the login flow.
@@ -44,9 +45,8 @@ pub(crate) fn is_login_flow_route(method: &Method, path: &str) -> bool {
         return method == Method::GET && !name.contains('/');
     }
     match path {
-        "/api/info" | "/api/sso/providers" | "/api/sso/auto-start" | "/api/sso/logout" => {
-            method == Method::GET
-        }
+        "/api/info" | "/api/logo" | "/api/sso/providers" | "/api/sso/auto-start"
+        | "/api/sso/logout" => method == Method::GET,
         "/api/auth/login" | "/api/auth/otp" | "/api/auth/logout" => method == Method::POST,
         // The browser's own login only; `/api/auth/state/:id` and its
         // approve and reject routes act on someone else's.
@@ -144,6 +144,8 @@ mod tests {
                 (Method::POST, "/assets/index-abc123.js", false),
                 // Login flow
                 (Method::GET, "/api/info", true),
+                // The custom logo on the login page
+                (Method::GET, "/api/logo", true),
                 (Method::POST, "/api/auth/login", true),
                 (Method::POST, "/api/auth/otp", true),
                 (Method::POST, "/api/auth/logout", true),
@@ -157,6 +159,8 @@ mod tests {
                 (Method::GET, "/api/sso/logout", true),
                 // Wrong methods on login routes
                 (Method::POST, "/api/info", false),
+                (Method::POST, "/api/logo", false),
+                (Method::DELETE, "/api/logo", false),
                 (Method::GET, "/api/auth/login", false),
                 (Method::PUT, "/api/auth/state", false),
                 (Method::POST, "/api/sso/providers/corp-idp/start", false),
@@ -192,6 +196,7 @@ mod tests {
                 (Method::GET, "/admin/api/playground", false),
                 // Path shapes that are never the login flow
                 (Method::GET, "/api/info/", false),
+                (Method::GET, "/api/logo/", false),
                 (Method::GET, "/api//info", false),
                 (Method::GET, "/assets/../admin/api/users", false),
                 (Method::GET, "/assets/./index.js", false),
