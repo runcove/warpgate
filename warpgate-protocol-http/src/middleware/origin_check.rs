@@ -9,7 +9,7 @@ use warpgate_common_http::{PlainHttpListener, is_cluster_peer_request};
 use super::loopback_host::request_host;
 use super::management_scope::is_login_flow_route;
 use super::mfa_enforcement::warpgate_surface_path;
-use crate::common::{is_cross_origin_request, is_warpgate_session_cookie_name};
+use crate::common::{accepted_origins, is_cross_origin_request, is_warpgate_session_cookie_name};
 
 static SEC_FETCH_SITE: HeaderName = HeaderName::from_static("sec-fetch-site");
 
@@ -101,8 +101,10 @@ fn login_flow_request_allowed(
     req: &Request,
     check: &OriginCheckRequest<'_>,
     request_host: Option<&str>,
+    accepted: &[Origin],
 ) -> bool {
-    !is_login_flow_route(&check.method, check.path) || !is_cross_origin_request(req, request_host)
+    !is_login_flow_route(&check.method, check.path)
+        || !is_cross_origin_request(req, request_host, accepted)
 }
 
 fn is_plain_http_loopback(req: &Request) -> bool {
@@ -127,7 +129,8 @@ fn origin_check_request(req: &Request, cluster_peer: bool) -> OriginCheckRequest
 /// login-flow route that comes from another origin, by upstream's test
 /// ([`is_cross_origin_request`]: the `Origin`, else `Referer`, host must be
 /// the request's own, and `Sec-Fetch-Site` must not be `cross-site` or
-/// `same-site`).
+/// `same-site`) with our stricter addition: its full origin - scheme, host and
+/// port - must be Warpgate's own ([`accepted_origins`]).
 ///
 /// Upstream only ignores the session on such a request
 /// (`inject_request_authorization`), which refuses every route that needs a
@@ -165,7 +168,13 @@ impl<E: Endpoint> Endpoint for OriginCheckEndpoint<E> {
             } else {
                 let ctx =
                     Data::<&UnauthenticatedRequestContext>::from_request_without_body(&req).await?;
-                login_flow_request_allowed(&req, &check, ctx.trusted_hostname(&req).as_deref())
+                let accepted = accepted_origins(&req, &*ctx.services().config.lock().await).await;
+                login_flow_request_allowed(
+                    &req,
+                    &check,
+                    ctx.trusted_hostname(&req).as_deref(),
+                    &accepted,
+                )
             };
             if !allowed {
                 warn!(
@@ -236,7 +245,6 @@ mod tests {
     const MAIN: &str = "https://warpgate.example.test";
     const MAIN_HOST: &str = "warpgate.example.test";
     const TARGET: &str = "https://vm.warpgate.example.test:8443";
-    const TARGET_HOST: &str = "vm.warpgate.example.test";
     const FOREIGN: &str = "https://elsewhere.example";
 
     const ADMIN_API: &str = "/@warpgate/admin/api/targets";
@@ -279,10 +287,13 @@ mod tests {
         )
     }
 
-    /// Whether the check off loopback lets `req` to `host` through.
-    fn allows(req: &Request, host: &str) -> bool {
+    /// Whether the check off loopback lets `req` through to Warpgate reached
+    /// at `own` (its full origin, from which the request host is taken).
+    fn allows(req: &Request, own: &str) -> bool {
+        let own = url(own);
         let check = origin_check_request(req, is_cluster_peer_request(req));
-        !check.is_checked() || login_flow_request_allowed(req, &check, Some(host))
+        !check.is_checked()
+            || login_flow_request_allowed(req, &check, own.host_str(), &[own.origin()])
     }
 
     fn post_from(path: &str, origin: &str) -> Request {
@@ -304,21 +315,21 @@ mod tests {
             LOGOUT,
             "/_warpgate/api/auth/login",
         ] {
-            assert!(!allows(&post_from(path, FOREIGN), MAIN_HOST), "{path}");
+            assert!(!allows(&post_from(path, FOREIGN), MAIN), "{path}");
             // A target's page under the main host is another origin too ...
-            assert!(!allows(&post_from(path, TARGET), MAIN_HOST), "{path}");
+            assert!(!allows(&post_from(path, TARGET), MAIN), "{path}");
             // ... and so is the main host's page, on a target's host.
-            assert!(!allows(&post_from(path, MAIN), TARGET_HOST), "{path}");
+            assert!(!allows(&post_from(path, MAIN), TARGET), "{path}");
         }
-        assert!(!allows(&cancel(FOREIGN), MAIN_HOST));
+        assert!(!allows(&cancel(FOREIGN), MAIN));
     }
 
     #[test]
     fn login_flow_allows_its_own_origin() {
         for (origin, host) in [
-            (MAIN, MAIN_HOST),
-            ("https://warpgate.example.test:443", MAIN_HOST),
-            (TARGET, TARGET_HOST),
+            (MAIN, MAIN),
+            ("https://warpgate.example.test:443", MAIN),
+            (TARGET, TARGET),
             ("https://localhost:8888", "localhost"),
         ] {
             for path in [LOGIN, LOGOUT] {
@@ -327,10 +338,40 @@ mod tests {
         }
     }
 
+    /// Ours, stricter than upstream's host-only test: the same host with
+    /// another scheme or port is another origin.
+    #[test]
+    fn login_flow_compares_the_full_origin() {
+        for origin in [
+            "http://warpgate.example.test",
+            "https://warpgate.example.test:8443",
+            "http://warpgate.example.test:443",
+        ] {
+            assert!(!allows(&post_from(LOGIN, origin), MAIN), "{origin}");
+        }
+        assert!(allows(&post_from(LOGIN, MAIN), MAIN));
+        // The same holds for a Referer standing in for the Origin.
+        let referer = |r| request(Method::POST, LOGIN, &[("referer", r)]);
+        assert!(!allows(
+            &referer("https://warpgate.example.test:9999/x"),
+            MAIN
+        ));
+        assert!(allows(
+            &referer("https://warpgate.example.test/@warpgate"),
+            MAIN
+        ));
+        // And on a target's host with its own port.
+        assert!(!allows(
+            &post_from(LOGIN, "https://vm.warpgate.example.test"),
+            TARGET
+        ));
+        assert!(allows(&post_from(LOGIN, TARGET), TARGET));
+    }
+
     #[test]
     fn login_flow_refuses_null_and_unparseable_origins() {
         for origin in ["null", "", "not a url", "data:text/plain,x"] {
-            assert!(!allows(&post_from(LOGIN, origin), MAIN_HOST), "{origin:?}");
+            assert!(!allows(&post_from(LOGIN, origin), MAIN), "{origin:?}");
         }
     }
 
@@ -341,24 +382,21 @@ mod tests {
             LOGIN,
             &[("referer", "https://elsewhere.example/page")],
         );
-        assert!(!allows(&referer, MAIN_HOST));
+        assert!(!allows(&referer, MAIN));
         for site in ["cross-site", "same-site"] {
             let req = request(Method::POST, LOGIN, &[("sec-fetch-site", site)]);
-            assert!(!allows(&req, MAIN_HOST), "{site}");
+            assert!(!allows(&req, MAIN), "{site}");
         }
         for site in ["same-origin", "none"] {
             let req = request(Method::POST, LOGIN, &[("sec-fetch-site", site)]);
-            assert!(allows(&req, MAIN_HOST), "{site}");
+            assert!(allows(&req, MAIN), "{site}");
         }
     }
 
     #[test]
     fn allows_request_without_browser_headers() {
         for path in [ADMIN_API, USER_API, LOGIN] {
-            assert!(
-                allows(&request(Method::POST, path, &[]), MAIN_HOST),
-                "{path}"
-            );
+            assert!(allows(&request(Method::POST, path, &[]), MAIN), "{path}");
         }
     }
 
@@ -367,14 +405,14 @@ mod tests {
     #[test]
     fn leaves_other_routes_to_upstream() {
         for path in [ADMIN_API, USER_API, "/@warpgate/api/auth/state/x/approve"] {
-            assert!(allows(&post_from(path, FOREIGN), MAIN_HOST), "{path}");
+            assert!(allows(&post_from(path, FOREIGN), MAIN), "{path}");
         }
         let stream = request(
             Method::GET,
             "/@warpgate/api/web-ssh/sessions/x/stream",
             &[("upgrade", "websocket"), ("origin", FOREIGN)],
         );
-        assert!(allows(&stream, MAIN_HOST));
+        assert!(allows(&stream, MAIN));
     }
 
     #[test]
@@ -392,17 +430,17 @@ mod tests {
             "/@warpgate/api/info",
             &[("upgrade", "websocket"), ("origin", FOREIGN)],
         );
-        assert!(!allows(&upgrade, MAIN_HOST));
+        assert!(!allows(&upgrade, MAIN));
     }
 
     #[test]
     fn exempts_sso_return_post() {
         let idp = "https://idp.example";
         for path in [SSO_RETURN, "/_warpgate/api/sso/return"] {
-            assert!(allows(&post_from(path, idp), MAIN_HOST), "{path}");
+            assert!(allows(&post_from(path, idp), MAIN), "{path}");
         }
         // Only that route.
-        assert!(!allows(&post_from(LOGOUT, idp), MAIN_HOST));
+        assert!(!allows(&post_from(LOGOUT, idp), MAIN));
     }
 
     #[test]
@@ -412,7 +450,7 @@ mod tests {
             .insert(warpgate_common_http::ClusterPeer {
                 node_id: warpgate_common::NodeId(uuid::Uuid::new_v4()),
             });
-        assert!(allows(&req, MAIN_HOST));
+        assert!(allows(&req, MAIN));
     }
 
     /// The middleware, end to end, under the `/@warpgate` mount.
@@ -430,6 +468,17 @@ mod tests {
         for (path, origin, expected) in [
             (LOGIN, Some(MAIN), StatusCode::OK),
             (LOGIN, Some(FOREIGN), StatusCode::FORBIDDEN),
+            // Same host, another scheme or port: another origin.
+            (
+                LOGIN,
+                Some("http://warpgate.example.test"),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                LOGIN,
+                Some("https://warpgate.example.test:8443"),
+                StatusCode::FORBIDDEN,
+            ),
             (LOGIN, None, StatusCode::OK),
             (ADMIN_API, Some(FOREIGN), StatusCode::OK),
         ] {
