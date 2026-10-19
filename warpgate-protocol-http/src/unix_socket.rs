@@ -401,7 +401,12 @@ mod tests {
 
     /// Serves a tiny app on a Unix socket in a 0700 directory.
     async fn serve_app() -> (TempDir, PathBuf) {
-        let dir = TempDir::new(0o700);
+        serve_app_in(0o700).await
+    }
+
+    /// Serves a tiny app on a Unix socket in a directory with `mode`.
+    async fn serve_app_in(mode: u32) -> (TempDir, PathBuf) {
+        let dir = TempDir::new(mode);
         let socket = dir.join("app.sock");
         let acceptor = UnixListener::bind(socket.to_str().unwrap())
             .into_acceptor()
@@ -438,14 +443,9 @@ mod tests {
         assert_eq!(response.text().await.unwrap(), "hello from app.local");
     }
 
-    #[tokio::test]
-    async fn websockets_reach_the_target_through_its_socket() {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        let (_dir, socket) = serve_app().await;
-        let tls = warpgate_tls::configure_tls_connector(false, false, None)
-            .await
-            .unwrap();
-        let request = http::Request::builder()
+    /// A WebSocket upgrade request for the app's `/ws`.
+    fn ws_request() -> http::Request<()> {
+        http::Request::builder()
             .uri("ws://app.local/ws")
             .header(http::header::HOST, "app.local")
             .header(http::header::CONNECTION, "Upgrade")
@@ -456,14 +456,23 @@ mod tests {
                 tungstenite::handshake::client::generate_key(),
             )
             .body(())
+            .unwrap()
+    }
+
+    async fn connector() -> tokio_tungstenite::Connector {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let tls = warpgate_tls::configure_tls_connector(false, false, None)
+            .await
             .unwrap();
+        tokio_tungstenite::Connector::Rustls(Arc::new(tls))
+    }
+
+    #[tokio::test]
+    async fn websockets_reach_the_target_through_its_socket() {
+        let (_dir, socket) = serve_app().await;
         let (upstream, response) = tokio::time::timeout(
             Duration::from_secs(10),
-            crate::proxy::connect_upstream_websocket(
-                request,
-                Some(socket),
-                tokio_tungstenite::Connector::Rustls(Arc::new(tls)),
-            ),
+            crate::proxy::connect_upstream_websocket(ws_request(), Some(socket), connector().await),
         )
         .await
         .unwrap()
@@ -482,5 +491,68 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(reply, tungstenite::Message::Text("echo hi".into()));
+    }
+
+    #[tokio::test]
+    async fn websockets_refuse_a_socket_served_by_another_account() {
+        let (_dir, socket) = serve_app().await;
+        let connect = |our_uid: u32| {
+            let socket = socket.clone();
+            async move {
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    crate::proxy::connect_unix_websocket(
+                        ws_request(),
+                        &socket,
+                        our_uid,
+                        connector().await,
+                    ),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        assert!(connect(our_uid()).await.is_ok());
+        // The app runs as us; to a Warpgate running as any other uid it is
+        // another account's.
+        let Err(tungstenite::Error::Io(error)) = connect(our_uid().wrapping_add(1)).await else {
+            panic!("connected to a socket served by another account");
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn websockets_check_the_socket_before_connecting() {
+        let mut req = Request::builder().finish();
+        req.extensions_mut().insert(PlainHttpListener(true));
+        let connect = |socket: PathBuf| {
+            let req = &req;
+            async move {
+                let target = options(&socket);
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    crate::proxy::connect_target_websocket(
+                        req,
+                        &target,
+                        ws_request(),
+                        connector().await,
+                    ),
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        let (_dir, socket) = serve_app().await;
+        assert!(connect(socket).await.is_ok());
+
+        // The same app, its directory open to others: the app would answer,
+        // but the socket is refused before it is connected.
+        let (_open_dir, socket) = serve_app_in(0o755).await;
+        let Err(error) = connect(socket).await else {
+            panic!("connected through a socket in a directory open to others");
+        };
+        assert_eq!(error.status(), StatusCode::BAD_GATEWAY);
+        assert!(error.to_string().contains("0700"), "{error}");
     }
 }
