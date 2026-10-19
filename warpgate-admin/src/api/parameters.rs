@@ -36,7 +36,9 @@ fn parse_cidr_list(value: Option<Value>) -> ParseResult<Option<Vec<String>>> {
     };
     for cidr in &cidrs {
         if let Err(e) = cidr.parse::<ipnet::IpNet>() {
-            return Err(ParseError::custom(format!("{cidr:?} is not a CIDR network: {e}")));
+            return Err(ParseError::custom(format!(
+                "{cidr:?} is not a CIDR network: {e}"
+            )));
         }
     }
     Ok(Some(cidrs))

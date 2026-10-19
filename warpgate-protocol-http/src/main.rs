@@ -1,7 +1,7 @@
 use poem_openapi::OpenApiService;
 use regex::Regex;
-use warpgate_version::warpgate_version;
 use warpgate_protocol_http::api;
+use warpgate_version::warpgate_version;
 
 #[allow(clippy::unwrap_used)]
 pub fn main() {

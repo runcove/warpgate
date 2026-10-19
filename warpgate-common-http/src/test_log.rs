@@ -61,11 +61,7 @@ pub fn logged(f: impl Fn()) -> String {
             tracing::callsite::rebuild_interest_cache();
             f();
         });
-        let out = captured
-            .0
-            .lock()
-            .map(|out| out.clone())
-            .unwrap_or_default();
+        let out = captured.0.lock().map(|out| out.clone()).unwrap_or_default();
         if !out.is_empty() {
             return out;
         }

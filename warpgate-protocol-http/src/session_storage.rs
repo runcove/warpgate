@@ -972,7 +972,10 @@ mod tests {
         let elapsed = started.elapsed();
         writer.await.unwrap();
 
-        assert!(elapsed < BUSY_TIMEOUT * 2, "GC kept going after a busy row: {elapsed:?}");
+        assert!(
+            elapsed < BUSY_TIMEOUT * 2,
+            "GC kept going after a busy row: {elapsed:?}"
+        );
         for id in ["a", "b", "c"] {
             assert!(
                 HttpSession::Entity::find_by_id(id.to_string())

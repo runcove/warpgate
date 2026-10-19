@@ -45,7 +45,10 @@ pub(crate) fn is_login_flow_route(method: &Method, path: &str) -> bool {
         return method == Method::GET && !name.contains('/');
     }
     match path {
-        "/api/info" | "/api/logo" | "/api/sso/providers" | "/api/sso/auto-start"
+        "/api/info"
+        | "/api/logo"
+        | "/api/sso/providers"
+        | "/api/sso/auto-start"
         | "/api/sso/logout" => method == Method::GET,
         "/api/auth/login" | "/api/auth/otp" | "/api/auth/logout" => method == Method::POST,
         // The browser's own login only; `/api/auth/state/:id` and its
@@ -258,7 +261,13 @@ mod tests {
         let db = crate::test_db::memory_db().await;
         bind_target(&db, TARGET_HOST).await;
         let services = crate::test_db::services(db.clone()).await;
-        services.config.lock().await.store.http.trust_x_forwarded_headers = trust_x_forwarded;
+        services
+            .config
+            .lock()
+            .await
+            .store
+            .http
+            .trust_x_forwarded_headers = trust_x_forwarded;
         let ctx = UnauthenticatedRequestContext::new(services).await;
         let mount = || make_sync(|_| "served").with(ManagementScopeMiddleware);
         let app = Route::new()

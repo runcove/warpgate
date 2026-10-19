@@ -13,7 +13,6 @@ use sea_orm::{
 use tracing::{error, info};
 use uuid::Uuid;
 use warpgate_common::helpers::fs::{secure_directory, secure_file};
-use warpgate_version::warpgate_version;
 use warpgate_common::{
     GlobalParams, HttpConfig, KubernetesConfig, ListenEndpoint, MySqlConfig, PostgresConfig,
     RdpConfig, Secret, SshConfig, SshHostKeyVerificationMode, VncConfig, WarpgateConfig,
@@ -23,6 +22,7 @@ use warpgate_core::consts::{BUILTIN_ADMIN_ROLE_NAME, BUILTIN_ADMIN_USERNAME};
 use warpgate_core::db::connect_to_db_and_migrate;
 use warpgate_db_entities::Parameters::{RecordingsDiskConfig, RecordingsStorageConfig};
 use warpgate_db_entities::{Parameters, Role, User, UserRoleAssignment};
+use warpgate_version::warpgate_version;
 
 use crate::commands::common::{assert_interactive_terminal, is_docker};
 use crate::config::load_config;

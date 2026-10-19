@@ -829,7 +829,9 @@ mod tests {
         let service = LoginProtectionService::new(db.clone()).await.unwrap();
         // The attempts table is gone, so the insert fails as a database
         // error would in production.
-        db.execute_unprepared("DROP TABLE failed_login_attempts").await.unwrap();
+        db.execute_unprepared("DROP TABLE failed_login_attempts")
+            .await
+            .unwrap();
         let username = format!("unrecorded-{}", Uuid::new_v4());
 
         let result = service
@@ -852,13 +854,23 @@ mod tests {
         assert_eq!(logged.len(), 1, "logged exactly once: {logged:?}");
         let event = &logged[0];
         assert!(
-            event.get("message").is_some_and(|m| m.contains("could not be recorded")),
+            event
+                .get("message")
+                .is_some_and(|m| m.contains("could not be recorded")),
             "{event:?}"
         );
         assert_eq!(event.get("ip").map(String::as_str), Some(OTHER_V4));
         assert_eq!(event.get("protocol").map(String::as_str), Some("SSH"));
-        assert_eq!(event.get("credential_type").map(String::as_str), Some("password"));
-        assert!(event.get("error").is_some_and(|e| e.contains("database error")), "{event:?}");
+        assert_eq!(
+            event.get("credential_type").map(String::as_str),
+            Some("password")
+        );
+        assert!(
+            event
+                .get("error")
+                .is_some_and(|e| e.contains("database error")),
+            "{event:?}"
+        );
     }
 
     #[tokio::test]
@@ -877,7 +889,10 @@ mod tests {
         );
         assert!(block_row(&db, EXEMPT_V4).await.is_none());
         // The attempts themselves are still on record.
-        assert_eq!(FailedLoginAttempt::Entity::find().count(&db).await.unwrap(), 20);
+        assert_eq!(
+            FailedLoginAttempt::Entity::find().count(&db).await.unwrap(),
+            20
+        );
     }
 
     #[tokio::test]
@@ -982,8 +997,14 @@ mod tests {
             .iter()
             .find(|r| r.info.ip_address == OTHER_V4.parse::<IpAddr>().unwrap())
             .expect("the non-exempt address' row is missing from the listing");
-        assert!(exempt_row.is_exempt, "an exempt address' row must be flagged");
-        assert!(!other_row.is_exempt, "a normal address' row must not be flagged");
+        assert!(
+            exempt_row.is_exempt,
+            "an exempt address' row must be flagged"
+        );
+        assert!(
+            !other_row.is_exempt,
+            "a normal address' row must not be flagged"
+        );
     }
 
     #[tokio::test]
@@ -1050,7 +1071,10 @@ mod tests {
     async fn unreadable_list_exempts_nothing() {
         for stored in ["", "not json", r#"["not-a-network"]"#] {
             let config = config_with_stored_list(stored).await;
-            assert!(!config.is_ip_exempt(&"10.1.2.3".parse().unwrap()), "{stored}");
+            assert!(
+                !config.is_ip_exempt(&"10.1.2.3".parse().unwrap()),
+                "{stored}"
+            );
         }
     }
 

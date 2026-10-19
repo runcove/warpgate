@@ -498,7 +498,10 @@ mod tests {
             assert_eq!(req.send().await.0.status(), expected, "{origin:?}");
         }
         let req = cli.get(ADMIN_API).header("host", host);
-        req.header("origin", FOREIGN).send().await.assert_status_is_ok();
+        req.header("origin", FOREIGN)
+            .send()
+            .await
+            .assert_status_is_ok();
     }
 
     // Loopback mode: Warpgate on http://127.0.0.1:8888 (port P), another local

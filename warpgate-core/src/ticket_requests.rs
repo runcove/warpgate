@@ -662,7 +662,11 @@ mod tests {
             "the second activation of one request minted a ticket too"
         );
         let tickets = Ticket::Entity::find().all(&db).await.unwrap();
-        assert_eq!(tickets.len(), 1, "the losing activation left its ticket behind");
+        assert_eq!(
+            tickets.len(),
+            1,
+            "the losing activation left its ticket behind"
+        );
         assert_eq!(won.request.ticket_id, Some(tickets[0].id));
         let stored = TicketRequest::Entity::find_by_id(request_id)
             .one(&db)

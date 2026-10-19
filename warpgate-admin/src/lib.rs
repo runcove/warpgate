@@ -5,9 +5,9 @@ use poem::http::header::CONTENT_SECURITY_POLICY;
 use poem::middleware::SetHeader;
 use poem::{EndpointExt, IntoEndpoint, Route};
 use poem_openapi::OpenApiService;
-use warpgate_version::warpgate_version;
 use warpgate_common_http::WARPGATE_PLAYGROUND_CSP;
 use warpgate_core::cluster::{CLOSE_SESSIONS_ROUTE, NOTIFICATIONS_ROUTE};
+use warpgate_version::warpgate_version;
 
 pub fn admin_api_app() -> impl IntoEndpoint {
     let api_service =
