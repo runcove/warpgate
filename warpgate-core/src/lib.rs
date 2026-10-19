@@ -18,6 +18,7 @@ pub mod login_protection;
 mod protocols;
 pub mod rate_limiting;
 pub mod recordings;
+mod revocation;
 mod secret_backend_registry;
 mod services;
 mod state;
@@ -29,6 +30,7 @@ pub use data::*;
 pub use db_auth::*;
 pub use listener_status::*;
 pub use protocols::*;
+pub use revocation::AccessChange;
 pub use secret_backend_registry::SecretBackendRegistry;
 pub use services::*;
 pub use state::{

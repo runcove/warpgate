@@ -11,6 +11,7 @@ use warpgate_common::{
     TargetSSHOptions, WarpgateError,
 };
 use warpgate_common_http::errors::invalid_field;
+use warpgate_core::AccessChange;
 use warpgate_db_entities::Target::{TargetKind, fuzzy_filter_targets};
 use warpgate_db_entities::{
     KnownHost, Role, Target, TargetGroup, TargetRoleAssignment, Ticket, TicketRequest,
@@ -407,7 +408,15 @@ impl DetailApi {
             }
         }
 
+        let target_id = target.id;
         target.delete(db).await?;
+
+        // The sessions a ticket opened went with its ticket above; any other
+        // live session to the target ends now that no one may reach it.
+        admin
+            .services()
+            .close_sessions_no_longer_authorised(AccessChange::Targets(vec![target_id]))
+            .await?;
         Ok(DeleteTargetResponse::Deleted)
     }
 
@@ -569,6 +578,11 @@ impl RolesApi {
         };
 
         model.delete(db).await.map_err(WarpgateError::from)?;
+
+        admin
+            .services()
+            .close_sessions_no_longer_authorised(AccessChange::Targets(vec![id.0]))
+            .await?;
 
         Ok(DeleteTargetRoleResponse::Deleted)
     }

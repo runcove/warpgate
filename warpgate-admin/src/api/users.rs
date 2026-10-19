@@ -13,8 +13,8 @@ use warpgate_common::{
     UserRequireCredentialsPolicy, WarpgateError,
 };
 use warpgate_common_http::errors::{bad_request, invalid_field};
-use warpgate_core::SessionsFilter;
 use warpgate_core::logging::{AuditEvent, format_related_ids};
+use warpgate_core::{AccessChange, SessionsFilter};
 use warpgate_db_entities::{
     AdminRole, Role, Ticket, TicketRequest, User, UserAdminRoleAssignment, UserRoleAssignment,
 };
@@ -780,6 +780,11 @@ impl RolesApi {
         }
         .emit();
 
+        admin
+            .services()
+            .close_sessions_no_longer_authorised(AccessChange::Users(vec![grantee.id]))
+            .await?;
+
         Ok(DeleteUserRoleResponse::Deleted)
     }
 
@@ -817,6 +822,12 @@ impl RolesApi {
         // If renewing an expired role, clear revoked_at
         model.revoked_at = Set(None);
         let updated = model.update(db).await?;
+
+        // A new expiry may already have passed.
+        admin
+            .services()
+            .close_sessions_no_longer_authorised(AccessChange::Users(vec![id.0]))
+            .await?;
 
         Ok(UpdateUserRoleResponse::Ok(Json(build_assignment_response(
             &updated, &role,

@@ -352,6 +352,19 @@ async fn authenticate(req: &Request, services: &Services) -> poem::Result<Option
                 continue;
             };
 
+            // The role sync above may have taken targets away.
+            services
+                .close_sessions_no_longer_authorised(warpgate_core::AccessChange::Username(
+                    username.clone(),
+                ))
+                .await
+                .map_err(|e| {
+                    poem::Error::from_string(
+                        format!("Closing sessions after the role sync failed: {e}"),
+                        poem::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    )
+                })?;
+
             // The verified OIDC token is the identity; it is not re-checked against
             // the stored-SSO-linkage `validate_credential` arm, which would deny
             // legitimately-authenticated users resolved via preferred-username or

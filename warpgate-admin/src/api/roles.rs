@@ -9,6 +9,7 @@ use warpgate_common::{
     AdminPermission, Role as RoleConfig, Target as TargetConfig, User as UserConfig, WarpgateError,
 };
 use warpgate_common_http::errors::invalid_field;
+use warpgate_core::AccessChange;
 use warpgate_db_entities::{Role, Target, TargetRoleAssignment, User, UserRoleAssignment};
 
 use super::AdminContext;
@@ -205,6 +206,13 @@ impl DetailApi {
             .await?;
 
         role.delete(db).await?;
+
+        // Whoever reached a target only through this role may not any more.
+        admin
+            .services()
+            .close_sessions_no_longer_authorised(AccessChange::All)
+            .await?;
+
         Ok(DeleteRoleResponse::Deleted)
     }
 
