@@ -974,4 +974,53 @@ mod tests {
             .id();
         assert_eq!(again_id, target_session_id);
     }
+
+    struct CountingHandle(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl SessionHandle for CountingHandle {
+        fn close(&mut self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Kept from 3176929f against v0.30.0's `SessionsFilter`: closing by id
+    /// reaches exactly the listed sessions' live handles, and an id this node
+    /// holds no handle for is skipped rather than an error.
+    #[tokio::test]
+    async fn closing_by_ids_closes_only_the_listed_sessions() {
+        set_config_migration_values(ConfigMigrationValues::default());
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        migrate_database(&db).await.unwrap();
+        let rate_limiters = Arc::new(Mutex::new(RateLimiterRegistry::new(db.clone())));
+        let state = State::new(&db, &rate_limiters, NodeId(Uuid::new_v4()));
+
+        let mut sessions = vec![];
+        for _ in 0..2 {
+            let closed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let handle = State::register_node_local_user_session(
+                &state,
+                Protocol::Ssh,
+                UserSessionStateInit {
+                    remote_address: None,
+                    handle: Box::new(CountingHandle(closed.clone())),
+                },
+            )
+            .await
+            .unwrap();
+            let id = handle.lock().await.user_session_id();
+            sessions.push((handle, id, closed));
+        }
+
+        let elsewhere = UserSessionId(Uuid::new_v4());
+        State::close_local_sessions(
+            &state,
+            &SessionsFilter::Sessions {
+                ids: vec![sessions[0].1, elsewhere],
+            },
+        )
+        .await;
+
+        assert_eq!(sessions[0].2.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(sessions[1].2.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
 }
