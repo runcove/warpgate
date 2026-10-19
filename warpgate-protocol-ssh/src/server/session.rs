@@ -462,18 +462,22 @@ fn next_web_auth_step(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{HashSet, VecDeque};
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     use russh::{MethodKind, MethodSet};
-    use tokio::sync::broadcast;
+    use tokio::sync::{Semaphore, broadcast, oneshot};
     use uuid::Uuid;
     use warpgate_common::auth::{AuthResult, AuthStateUserInfo, CredentialKind};
+    use warpgate_common::eventhub::EventHub;
 
     use super::{
-        MAX_WEB_AUTH_WAITS, PendingKeyboardInteractiveAuth, WebApprovalWait, WebAuthStep,
-        bump_waits, carry_forward, is_reserved_env_name, next_web_auth_step,
-        reject_with_allowed_auth_methods, round_creates_wait, wait_for_state,
+        ChannelOperation, EventIntake, MAX_WEB_AUTH_WAITS, PendingCommand,
+        PendingKeyboardInteractiveAuth, RCCommand, SshClientError, TARGET_FORWARD_OPEN_TIMEOUT,
+        TARGET_REPLY_TIMEOUT, WebApprovalWait, WebAuthStep, bump_waits, carry_forward,
+        is_reserved_env_name, next_web_auth_step, reject_with_allowed_auth_methods, reply_limit,
+        round_creates_wait, wait_for_reply, wait_for_state,
     };
 
     /// A client cannot set the variables Warpgate injects about the user;
@@ -869,6 +873,85 @@ mod tests {
             next_web_auth_step(now, Some(now), true, &need_web_approval()),
             WebAuthStep::Reject { message: Some(_) }
         ));
+    }
+
+    async fn test_intake() -> (
+        EventIntake<&'static str>,
+        warpgate_common::eventhub::EventSender<&'static str>,
+    ) {
+        let (hub, sender) = EventHub::setup(4);
+        let control = hub.subscribe(|_| true).await;
+        let target = hub.subscribe(|_| false).await;
+        (
+            EventIntake::new(control, target, Arc::new(Semaphore::new(1))),
+            sender,
+        )
+    }
+
+    /// A target connection that never answers (russh#789) fails the command
+    /// once the bound has passed instead of holding the session for good,
+    /// and events that arrived meanwhile are kept for the main loop.
+    #[tokio::test]
+    async fn unit_command_reply_wait_ends_at_the_limit() {
+        let (mut intake, sender) = test_intake().await;
+        let (_reply_tx, reply_rx) = oneshot::channel();
+        sender.send_once("meanwhile").await.unwrap();
+        let mut held = VecDeque::new();
+        let limit = Duration::from_millis(50);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            wait_for_reply(
+                PendingCommand::Waiting(reply_rx),
+                limit,
+                &mut intake,
+                &mut held,
+            ),
+        )
+        .await
+        .expect("the wait must end at its limit");
+
+        assert!(matches!(result, Err(SshClientError::NoReply(l)) if l == limit));
+        assert_eq!(held, VecDeque::from(["meanwhile"]));
+    }
+
+    #[tokio::test]
+    async fn unit_command_reply_wait_returns_the_reply() {
+        let (mut intake, _sender) = test_intake().await;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        reply_tx.send(Ok(())).unwrap();
+        let mut held = VecDeque::new();
+
+        let result = wait_for_reply(
+            PendingCommand::Waiting(reply_rx),
+            Duration::from_secs(30),
+            &mut intake,
+            &mut held,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert!(held.is_empty());
+    }
+
+    #[test]
+    fn unit_command_reply_limit_is_longer_only_for_forwarded_opens() {
+        let id = Uuid::nil();
+        assert_eq!(
+            reply_limit(&RCCommand::Channel(id, ChannelOperation::OpenShell)),
+            TARGET_REPLY_TIMEOUT
+        );
+        assert_eq!(
+            reply_limit(&RCCommand::ForwardTCPIP("localhost".into(), 1)),
+            TARGET_REPLY_TIMEOUT
+        );
+        assert_eq!(
+            reply_limit(&RCCommand::Channel(
+                id,
+                ChannelOperation::OpenDirectStreamlocal("/tmp/socket".into())
+            )),
+            TARGET_FORWARD_OPEN_TIMEOUT
+        );
     }
 }
 
@@ -2315,7 +2398,12 @@ impl ServerSession {
                 self.confirm_channel_open(uuid).await?;
                 Ok(())
             }
-            Err(SshClientError::Russh(russh::Error::ChannelOpenFailure(_))) => {
+            // No reply from a stuck target connection: already logged by
+            // `send_command_and_wait`; the client gets a failed open.
+            Err(
+                SshClientError::Russh(russh::Error::ChannelOpenFailure(_))
+                | SshClientError::NoReply(_),
+            ) => {
                 open_handle.reject(ChannelOpenFailure::ConnectFailed).await;
                 self.channels.close(uuid);
                 Ok(())
@@ -3761,26 +3849,45 @@ impl ServerSession {
     /// Holding them back is safe because no reply depends on anything the
     /// session does: the client task answers commands from a loop that never
     /// waits on the session, not even for the unknown-host-key prompt.
+    ///
+    /// The wait is bounded ([`reply_limit`]): a target connection that has
+    /// stopped sending (russh#789) never answers a channel open, and without a
+    /// bound the client's open would hang silently for the life of the
+    /// session. Past the bound the command fails with
+    /// [`SshClientError::NoReply`], so the caller rejects the open.
     async fn send_command_and_wait(&mut self, command: RCCommand) -> Result<(), SshClientError> {
+        let kind = command_kind(&command);
+        let limit = reply_limit(&command);
+        let opening = match &command {
+            RCCommand::Channel(
+                id,
+                ChannelOperation::OpenShell
+                | ChannelOperation::OpenDirectTCPIP(_)
+                | ChannelOperation::OpenDirectStreamlocal(_),
+            ) => Some(*id),
+            _ => None,
+        };
         let (tx, rx) = oneshot::channel();
-        let mut cmd = match self.rc_tx.send((command, Some(tx))) {
+        let cmd = match self.rc_tx.send((command, Some(tx))) {
             Ok(()) => PendingCommand::Waiting(rx),
             Err(_) => PendingCommand::Failed,
         };
 
-        loop {
-            tokio::select! {
-                result = &mut cmd => {
-                    break result
-                }
-                event = self.get_next_event() => {
-                    match event {
-                        Some(event) => self.pending_events.push_back(event),
-                        None => break Err(SshClientError::MpscError),
-                    }
-                }
+        let result = wait_for_reply(cmd, limit, &mut self.intake, &mut self.pending_events).await;
+        if let Err(SshClientError::NoReply(_)) = result {
+            warn!(
+                command = kind,
+                channel = ?opening,
+                ?limit,
+                "No reply from the target connection; failing the request"
+            );
+            // Should the open still complete later, close the target-side
+            // channel it would leave behind.
+            if let Some(id) = opening {
+                let _ = self.send_command(RCCommand::Channel(id, ChannelOperation::Close));
             }
         }
+        result
     }
 
     pub fn _disconnect(&self) {
@@ -3864,6 +3971,81 @@ impl Drop for ServerSession {
         let _ = self.rc_abort_tx.send(());
         info!("Closed session");
         debug!("Dropped");
+    }
+}
+
+/// How long [`ServerSession::send_command_and_wait`] waits for the target
+/// connection to answer a command. A target answers a session channel open
+/// or a request within milliseconds; no reply after this long means the
+/// target connection has stopped sending.
+const TARGET_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A `direct-tcpip` or `direct-streamlocal` open is only answered once the
+/// target has connected onwards, which may take until its own TCP connect
+/// times out (about two minutes on Linux), so it gets longer.
+const TARGET_FORWARD_OPEN_TIMEOUT: Duration = Duration::from_secs(150);
+
+const fn reply_limit(command: &RCCommand) -> Duration {
+    match command {
+        RCCommand::Channel(
+            _,
+            ChannelOperation::OpenDirectTCPIP(_) | ChannelOperation::OpenDirectStreamlocal(_),
+        ) => TARGET_FORWARD_OPEN_TIMEOUT,
+        _ => TARGET_REPLY_TIMEOUT,
+    }
+}
+
+/// What a command is, for logs: never its arguments (commands, environment
+/// values and paths stay out of the log).
+const fn command_kind(command: &RCCommand) -> &'static str {
+    match command {
+        RCCommand::Connect(_) => "connect",
+        RCCommand::CheckHostKey { .. } => "check host key",
+        RCCommand::Channel(_, operation) => match operation {
+            ChannelOperation::OpenShell => "open session channel",
+            ChannelOperation::OpenDirectTCPIP(_) => "open direct-tcpip channel",
+            ChannelOperation::OpenDirectStreamlocal(_) => "open direct-streamlocal channel",
+            ChannelOperation::OpenX11(..) => "open x11 channel",
+            ChannelOperation::RequestPty(_) => "pty request",
+            ChannelOperation::ResizePty(_) => "window change",
+            ChannelOperation::RequestShell => "shell request",
+            ChannelOperation::RequestEnv(..) => "env request",
+            ChannelOperation::RequestExec(_) => "exec request",
+            ChannelOperation::RequestX11(_) => "x11 request",
+            ChannelOperation::AgentForward => "agent forwarding request",
+            ChannelOperation::RequestSubsystem(_) => "subsystem request",
+            ChannelOperation::Data(_) | ChannelOperation::ExtendedData { .. } => "data",
+            ChannelOperation::Close => "close",
+            ChannelOperation::Eof => "eof",
+            ChannelOperation::Signal(_) => "signal",
+        },
+        RCCommand::ForwardTCPIP(..) => "tcpip-forward",
+        RCCommand::CancelTCPIPForward(..) => "cancel-tcpip-forward",
+        RCCommand::StreamlocalForward(_) => "streamlocal-forward",
+        RCCommand::CancelStreamlocalForward(_) => "cancel-streamlocal-forward",
+        RCCommand::Disconnect => "disconnect",
+    }
+}
+
+/// Wait up to `limit` for `reply`, moving every event that arrives meanwhile
+/// into `held` (see [`ServerSession::send_command_and_wait`]).
+async fn wait_for_reply<E>(
+    mut reply: PendingCommand,
+    limit: Duration,
+    intake: &mut EventIntake<E>,
+    held: &mut VecDeque<E>,
+) -> Result<(), SshClientError> {
+    let deadline = tokio::time::sleep(limit);
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            result = &mut reply => break result,
+            () = &mut deadline => break Err(SshClientError::NoReply(limit)),
+            event = intake.next() => match event {
+                Some(event) => held.push_back(event),
+                None => break Err(SshClientError::MpscError),
+            },
+        }
     }
 }
 
