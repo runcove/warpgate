@@ -504,6 +504,55 @@ class Test:
         finally:
             transport.close()
 
+    def test_a_channel_closed_with_output_pending_does_not_stall_the_next(
+        self,
+        processes: ProcessManager,
+        wg_c_ed25519_pubkey,
+        shared_wg: WarpgateProcess,
+    ):
+        # The client closes a channel whose output it stopped reading, so
+        # Warpgate still holds data russh could not send. A new channel on the
+        # same connection must still work (russh#789: the peer-closed channel
+        # kept its pending data and gated every later write, so the next
+        # channel's exec never got a reply; OpenSSH ControlMaster hung).
+        user, ssh_target = setup_user_and_target(
+            processes, shared_wg, wg_c_ed25519_pubkey
+        )
+        transport = paramiko.Transport(("localhost", shared_wg.ssh_port))
+        try:
+            transport.connect(
+                username=f"{user.username}:{ssh_target.name}", password="123"
+            )
+            first = transport.open_session()
+            first.exec_command("head -c 67108864 /dev/zero")
+            # Never recv(): paramiko's 2 MiB window shuts and Warpgate's
+            # writes towards the client pile up inside russh.
+            time.sleep(3)
+            first.close()  # CHANNEL_CLOSE from the client, output still pending
+
+            result = {}
+
+            def second_exec():
+                try:
+                    channel = transport.open_session(timeout=10)
+                    channel.settimeout(10)
+                    channel.exec_command("echo second")
+                    result["out"] = channel.makefile("rb").read()
+                except Exception as error:  # noqa: BLE001
+                    result["error"] = error
+
+            # paramiko's exec_command waits for the reply without a timeout.
+            worker = threading.Thread(target=second_exec, daemon=True)
+            worker.start()
+            worker.join(30)
+            assert not worker.is_alive(), (
+                "the next channel on the connection never got a reply"
+            )
+            assert "error" not in result, result.get("error")
+            assert result["out"] == b"second\n"
+        finally:
+            transport.close()
+
     def test_input_waits_for_a_target_that_does_not_read(
         self,
         processes: ProcessManager,
