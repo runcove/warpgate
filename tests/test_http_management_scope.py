@@ -1,11 +1,9 @@
 """Warpgate's management routes on hosts bound to an HTTP target.
 
-A host that is some target's `external_host` honours a session or token under
-`/@warpgate` and `/_warpgate` only on the login flow: the gateway shell and
-assets, the login steps, SSO, `info` and logout. Elsewhere there - the user
-API and the admin API - neither counts, so they answer 401, as upstream's
-session restriction does on hosts other than the control plane. Every other
-host is unaffected.
+A host that is some target's `external_host` serves only the login flow under
+`/@warpgate` and `/_warpgate`: the gateway shell and assets, the login steps,
+SSO, `info` and logout. The user API and the admin API answer 404 there and
+are served on every other host as before.
 """
 
 from uuid import uuid4
@@ -86,16 +84,17 @@ def setup(scoped_wg, echo_server_port):
 
 
 class TestHTTPManagementScope:
-    def test_admin_api_refuses_a_token_on_target_host(self, setup):
+    def test_admin_api_is_404_on_target_host(self, setup):
         for path in [
             "/@warpgate/admin/api/users",
             "/_warpgate/admin/api/users",
             "/@warpgate/admin/api/targets",
+            "/@warpgate/admin",
         ]:
             response = requests.get(
                 f"{setup.target_url}{path}", headers=ADMIN_TOKEN, verify=False
             )
-            assert response.status_code == 401, f"{path}: {response.status_code}"
+            assert response.status_code == 404, f"{path}: {response.status_code}"
 
         response = requests.post(
             f"{setup.target_url}/@warpgate/admin/api/roles",
@@ -103,9 +102,9 @@ class TestHTTPManagementScope:
             json={"name": f"role-{uuid4()}"},
             verify=False,
         )
-        assert response.status_code == 401, response.status_code
+        assert response.status_code == 404, response.status_code
 
-    def test_user_api_refuses_the_session_on_target_host(self, setup):
+    def test_user_api_is_404_on_target_host(self, setup):
         session = setup.login(setup.target_url)
         for method, path in [
             ("GET", "/@warpgate/api/targets"),
@@ -117,7 +116,7 @@ class TestHTTPManagementScope:
             ("GET", "/_warpgate/api/targets"),
         ]:
             response = session.request(method, f"{setup.target_url}{path}", json={})
-            assert response.status_code == 401, (
+            assert response.status_code == 404, (
                 f"{method} {path}: {response.status_code}"
             )
 

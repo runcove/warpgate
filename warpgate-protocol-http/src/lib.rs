@@ -64,8 +64,8 @@ use crate::client_cache::HttpClientCache;
 use crate::common::{endpoint_auth, page_auth};
 use crate::middleware::{
     CookieHostMiddleware, LOOPBACK_SESSION_COOKIE_MAX_AGE_CAP, LoopbackHostMiddleware,
-    LoopbackSessionCookieMiddleware, OriginCheckMiddleware, SecurityHeadersMiddleware,
-    TargetOriginCheckMiddleware, TicketMiddleware,
+    LoopbackSessionCookieMiddleware, ManagementScopeMiddleware, OriginCheckMiddleware,
+    SecurityHeadersMiddleware, TargetOriginCheckMiddleware, TicketMiddleware,
 };
 use crate::session::SessionStore;
 use crate::session_handle::warpgate_server_handle_for_request;
@@ -308,7 +308,10 @@ impl ProtocolServer for HTTPProtocolServer {
                         .with(cache_bust()),
                 )
                 // Inside the request log, so refused requests are logged too.
+                // The scope runs first: a route not served on this host is a
+                // 404 whatever its origin.
                 .with(OriginCheckMiddleware)
+                .with(ManagementScopeMiddleware)
                 .around({
                     let services = services;
                     move |ep, req| {
