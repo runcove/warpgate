@@ -27,7 +27,7 @@ use futures::FutureExt;
 use futures::future::BoxFuture;
 use http::HeaderValue;
 use poem::endpoint::{EmbeddedFileEndpoint, EmbeddedFilesEndpoint};
-use poem::listener::BoxIo;
+use poem::listener::{AcceptorExt, BoxAcceptor};
 use poem::middleware::SetHeader;
 use poem::session::ServerSession;
 use poem::web::Data;
@@ -37,7 +37,6 @@ use tokio::sync::Mutex;
 use tracing::{Instrument, warn};
 use warpgate_admin::admin_api_app;
 use warpgate_common::ListenEndpoint;
-use warpgate_common::helpers::concurrent_acceptor::ConcurrentAcceptor;
 use warpgate_common::helpers::proxy_protocol::MaybeProxyProtocolAcceptor;
 use warpgate_version::warpgate_version;
 use warpgate_common_http::auth::UnauthenticatedRequestContext;
@@ -109,10 +108,10 @@ async fn loopback_acceptor(
     proxy_protocol: bool,
     lookup: Arc<dyn loopback_owner::SocketOwnerLookup>,
     our_uid: u32,
-) -> Result<MaybeProxyProtocolAcceptor<ConcurrentAcceptor<BoxIo>>> {
+) -> Result<BoxAcceptor> {
     let acceptor = address.poem_acceptor().await?;
     let acceptor = loopback_owner::same_account_acceptor(acceptor, lookup, our_uid);
-    Ok(MaybeProxyProtocolAcceptor::new(acceptor, proxy_protocol))
+    Ok(MaybeProxyProtocolAcceptor::new(acceptor, proxy_protocol).boxed())
 }
 
 impl ProtocolServer for HTTPProtocolServer {
