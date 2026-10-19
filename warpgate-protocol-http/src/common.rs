@@ -162,17 +162,47 @@ fn session_host_is_authorized(request_host: Option<&str>, base_host: &str) -> bo
 /// Only the host is compared. The listener speaks TLS only, so the scheme
 /// adds nothing, and the port is routinely stripped or rewritten by reverse
 /// proxies while Warpgate serves nothing on another port of the same host.
-fn is_cross_origin_api_request(req: &Request, request_host: Option<&str>) -> bool {
+fn is_cross_origin_api_request(
+    req: &Request,
+    request_host: Option<&str>,
+    accepted: &[url::Origin],
+) -> bool {
     if warpgate_surface_path(req.uri().path()).is_none() {
         return false;
     }
-    is_cross_origin_request(req, request_host)
+    is_cross_origin_request(req, request_host, accepted)
+}
+
+/// The full origins (scheme, host and port) a page of Warpgate's own sends
+/// requests from: the request's own, as Warpgate is reached
+/// (`construct_external_url` for the request), and the configured external
+/// URL's, which covers a proxy that rewrites the port.
+pub(crate) async fn accepted_origins(
+    req: &Request,
+    config: &warpgate_common::WarpgateConfig,
+) -> Vec<url::Origin> {
+    let mut accepted = vec![];
+    for for_request in [Some(req), None] {
+        if let Ok(url) = construct_external_url(for_request, config, None).await {
+            accepted.push(url.origin());
+        }
+    }
+    accepted
 }
 
 /// [`is_cross_origin_api_request`] without the path test, for a caller that
 /// has already decided the route is one of Warpgate's own (the origin check,
 /// which runs under the `/@warpgate` mount and sees its path stripped).
-pub(crate) fn is_cross_origin_request(req: &Request, request_host: Option<&str>) -> bool {
+///
+/// Upstream compares only the host, to survive proxies that strip or rewrite
+/// the port. Ours is stricter: the source's full origin must also be one of
+/// `accepted` ([`accepted_origins`]), so another scheme or another port on
+/// the same host - another service there - is another origin.
+pub(crate) fn is_cross_origin_request(
+    req: &Request,
+    request_host: Option<&str>,
+    accepted: &[url::Origin],
+) -> bool {
     let headers = req.headers();
 
     let is_websocket = headers
@@ -198,15 +228,14 @@ pub(crate) fn is_cross_origin_request(req: &Request, request_host: Option<&str>)
     };
 
     // An opaque ("null") or unparsable origin is never ours.
-    let source = source
-        .to_str()
-        .ok()
-        .and_then(|s| url::Url::parse(s).ok())
-        .and_then(|url| url.host_str().map(str::to_owned));
-    match (source, request_host) {
+    let Some(source) = source.to_str().ok().and_then(|s| url::Url::parse(s).ok()) else {
+        return true;
+    };
+    let host_differs = match (source.host_str(), request_host) {
         (Some(host), Some(request_host)) => !host.eq_ignore_ascii_case(request_host),
         _ => true,
-    }
+    };
+    host_differs || !accepted.contains(&source.origin())
 }
 
 /// restricted sessions are only allowed to access the API parts needed for login/logout and captive MFA flow
@@ -998,13 +1027,14 @@ pub async fn inject_request_authorization<E: Endpoint + 'static>(
     if session_auth.is_some() && !is_cluster_peer {
         // Host binding only means something when `external_host` pins an
         // origin. Without it the external URL is derived from Host header
-        let (base_host, control_plane_host) = {
+        let (base_host, control_plane_host, accepted) = {
             let config = ctx.services().config.lock().await;
             let base_host = construct_external_url(None, &config, None)
                 .await
                 .ok()
                 .and_then(|url| url.host_str().map(str::to_owned));
-            (base_host, config.control_plane_host())
+            let accepted = accepted_origins(&req, &config).await;
+            (base_host, config.control_plane_host(), accepted)
         };
         let request_host = ctx.trusted_hostname(&req);
         if let Some(base_host) = &base_host
@@ -1038,7 +1068,7 @@ pub async fn inject_request_authorization<E: Endpoint + 'static>(
                 req.uri().path(),
             );
             session_auth = None;
-        } else if is_cross_origin_api_request(&req, request_host.as_deref()) {
+        } else if is_cross_origin_api_request(&req, request_host.as_deref(), &accepted) {
             tracing::warn!(
                 "Session cookie ignored for cross-origin {} {}",
                 req.method(),
@@ -1327,7 +1357,8 @@ mod tests {
             for (k, v) in headers {
                 req = req.header(*k, *v);
             }
-            is_cross_origin_api_request(&req.finish(), Some("example.com"))
+            let accepted = [url::Url::parse("https://example.com").unwrap().origin()];
+            is_cross_origin_api_request(&req.finish(), Some("example.com"), &accepted)
         };
         let api = "/@warpgate/admin/api/sessions/x/close";
         let evil = [("origin", "https://evil.example")];
@@ -1365,14 +1396,26 @@ mod tests {
             api,
             &[("origin", "https://example.com")]
         ));
-        // Proxies strip or rewrite the port, so only the host counts.
-        assert!(!check(
+        // Ours, stricter than upstream: the full origin counts, so the same
+        // host on another port or scheme is another origin. A proxy that
+        // rewrites the port is covered by the configured external URL.
+        assert!(check(
             Method::POST,
             api,
             &[
                 ("origin", "https://Example.com:8443"),
                 ("sec-fetch-site", "same-origin")
             ]
+        ));
+        assert!(check(
+            Method::POST,
+            api,
+            &[("origin", "http://example.com")]
+        ));
+        assert!(!check(
+            Method::POST,
+            api,
+            &[("origin", "https://example.com:443")]
         ));
         assert!(!check(
             Method::POST,
