@@ -1149,25 +1149,46 @@ mod tests {
         assert_eq!(socket.state, 4);
     }
 
-    /// A `struct socket_fdinfo` captured on a real Mac, as hex (whitespace
-    /// ignored), with the socket it describes: (hex, local, remote, state).
-    /// `None` until a capture is pasted in; the test below then checks it.
-    const CAPTURED_SOCKET_FDINFO: Option<(&str, &str, &str, i32)> = None;
+    /// `struct socket_fdinfo` records of the client end of a loopback
+    /// connection, captured with `proc_pidfdinfo(PROC_PIDFDSOCKETINFO)` on
+    /// macOS 27.0.1 (26A434), Apple silicon, on jeremys-mac, 19 Oct 2026.
+    /// Their opaque words (`soi_so`, `soi_pcb`, ...) are scrambled kernel
+    /// addresses and are not read. Integers are little-endian.
+    #[cfg(target_endian = "little")]
+    const MACOS27_SOCKET_FDINFO_V4: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/testdata/macos27-socket-fdinfo-v4.bin"
+    ));
+    #[cfg(target_endian = "little")]
+    const MACOS27_SOCKET_FDINFO_V6: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/testdata/macos27-socket-fdinfo-v6.bin"
+    ));
 
+    #[cfg(target_endian = "little")]
     #[test]
-    fn captured_socket_fdinfo_parses() {
-        let Some((hex, local, remote, state)) = CAPTURED_SOCKET_FDINFO else {
-            return;
-        };
-        let hex = hex.split_whitespace().collect::<String>();
-        let record = (0..hex.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
-            .collect::<Vec<_>>();
-        let socket = macos::parse_socket_fdinfo(&record).unwrap().unwrap();
-        assert_eq!(socket.local, addr(local));
-        assert_eq!(socket.remote, addr(remote));
-        assert_eq!(socket.state, state);
+    fn captured_ipv4_socket_fdinfo_parses() {
+        assert_eq!(MACOS27_SOCKET_FDINFO_V4.len(), 792);
+        let socket = macos::parse_socket_fdinfo(MACOS27_SOCKET_FDINFO_V4)
+            .unwrap()
+            .unwrap();
+        assert_eq!(socket.local, addr("127.0.0.1:57616"));
+        assert_eq!(socket.remote, addr("127.0.0.1:57615"));
+        assert!(socket.local.is_ipv4() && socket.remote.is_ipv4());
+        assert_eq!(socket.state, 4);
+    }
+
+    #[cfg(target_endian = "little")]
+    #[test]
+    fn captured_ipv6_socket_fdinfo_parses() {
+        assert_eq!(MACOS27_SOCKET_FDINFO_V6.len(), 792);
+        let socket = macos::parse_socket_fdinfo(MACOS27_SOCKET_FDINFO_V6)
+            .unwrap()
+            .unwrap();
+        assert_eq!(socket.local, addr("[::1]:57618"));
+        assert_eq!(socket.remote, addr("[::1]:57617"));
+        assert!(socket.local.is_ipv6() && socket.remote.is_ipv6());
+        assert_eq!(socket.state, 4);
     }
 
     #[test]
