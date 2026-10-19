@@ -198,11 +198,7 @@ impl<E: Endpoint> Endpoint for OriginCheckEndpoint<E> {
     type Output = Response;
 
     async fn call(&self, req: Request) -> poem::Result<Self::Output> {
-        let ctx = Data::<&UnauthenticatedRequestContext>::from_request_without_body(&req).await?;
-        let check = origin_check_request(
-            &req,
-            is_cluster_peer_request(&req, &ctx.services().cluster.cluster_token),
-        );
+        let check = origin_check_request(&req, is_cluster_peer_request(&req));
         if check.is_checked() {
             let loopback = is_plain_http_loopback(&req);
             let allowed = if loopback {
@@ -252,13 +248,7 @@ impl<E: Endpoint> Endpoint for TargetOriginCheckEndpoint<E> {
 
     async fn call(&self, req: Request) -> poem::Result<Self::Output> {
         if is_plain_http_loopback(&req) {
-            let cluster_peer =
-                match Data::<&UnauthenticatedRequestContext>::from_request_without_body(&req).await
-                {
-                    Ok(ctx) => is_cluster_peer_request(&req, &ctx.services().cluster.cluster_token),
-                    Err(_) => false,
-                };
-            let check = origin_check_request(&req, cluster_peer);
+            let check = origin_check_request(&req, is_cluster_peer_request(&req));
             if check.is_checked() && !loopback_request_allowed(&req, &check) {
                 warn!(
                     method = %check.method,

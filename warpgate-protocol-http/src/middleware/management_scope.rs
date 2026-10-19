@@ -64,7 +64,7 @@ pub(crate) fn is_login_flow_route(method: &Method, path: &str) -> bool {
 /// node the client reached.
 async fn is_target_bound(req: &Request) -> poem::Result<bool> {
     let ctx = Data::<&UnauthenticatedRequestContext>::from_request_without_body(req).await?;
-    if is_cluster_peer_request(req, &ctx.services().cluster.cluster_token) {
+    if is_cluster_peer_request(req) {
         return Ok(false);
     }
     let Some(host) = ctx.trusted_host_header(req) else {
@@ -122,7 +122,8 @@ mod tests {
     use sea_orm::ActiveValue::Set;
     use sea_orm::{ConnectionTrait, DatabaseConnection, EntityTrait};
     use uuid::Uuid;
-    use warpgate_common::http_headers::X_WARPGATE_CLUSTER_TOKEN;
+    use warpgate_common::NodeId;
+    use warpgate_common_http::ClusterPeer;
     use warpgate_db_entities::Target;
 
     use super::*;
@@ -380,12 +381,14 @@ mod tests {
         }
     }
 
+    /// A cluster peer, identified by the acceptor's mTLS check (the
+    /// `ClusterPeer` extension), forwards a request the node the client
+    /// reached has already scoped; a plain request on the same host is scoped.
     #[tokio::test]
     async fn cluster_peer_is_not_scoped() {
         let db = crate::test_db::memory_db().await;
         bind_target(&db, TARGET_HOST).await;
         let services = crate::test_db::services(db).await;
-        let token = services.cluster.cluster_token.expose_secret().clone();
         let ctx = UnauthenticatedRequestContext::new(services).await;
         let app = Route::new()
             .nest(
@@ -393,22 +396,25 @@ mod tests {
                 make_sync(|_| "served").with(ManagementScopeMiddleware),
             )
             .data(ctx);
-        let cli = app;
-        let peer = [
-            ("host", TARGET_HOST),
-            (X_WARPGATE_CLUSTER_TOKEN.as_str(), token.as_str()),
-        ];
-        let admin = "/@warpgate/admin/api/users";
+        let request = |from_peer: bool| {
+            let mut req = Request::builder()
+                .method(Method::GET)
+                .uri_str("/@warpgate/admin/api/users")
+                .header("host", TARGET_HOST)
+                .finish();
+            if from_peer {
+                req.extensions_mut().insert(ClusterPeer {
+                    node_id: NodeId(Uuid::new_v4()),
+                });
+            }
+            req
+        };
         assert_eq!(
-            status(&cli, &Method::GET, admin, &peer).await,
+            app.get_response(request(true)).await.status(),
             StatusCode::OK
         );
-        let wrong = [
-            ("host", TARGET_HOST),
-            (X_WARPGATE_CLUSTER_TOKEN.as_str(), "wrong"),
-        ];
         assert_eq!(
-            status(&cli, &Method::GET, admin, &wrong).await,
+            app.get_response(request(false)).await.status(),
             StatusCode::NOT_FOUND
         );
     }
