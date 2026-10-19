@@ -455,3 +455,7 @@ version = "0.3"
 
 [target."cfg(windows)".dependencies.pageant]
 version = "0.2"
+
+[lints.rust]
+# Vendored code: silence upstream lints so they do not surface in our builds.
+warnings = { level = "allow", priority = 1 }
