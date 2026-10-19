@@ -570,6 +570,41 @@ pub struct HttpConfig {
     /// with the listening port; only the raw `Host` header is read, never
     /// `X-Forwarded-Host`, so a local proxy in front must pass the original
     /// `Host` through.
+    /// Supported on Linux and macOS only, and refused when Warpgate runs as
+    /// root. Other OS accounts on the machine can reach loopback too: a
+    /// connection is served only when the connecting socket belongs to the
+    /// account Warpgate runs as, and is otherwise closed before any HTTP is
+    /// read. TCP carries no peer credentials, so after each accept the owner
+    /// is looked up by the connection's addresses and ports. On Linux it is
+    /// read from `/proc/net/tcp`, where a socket belongs to the account that
+    /// created it, wherever its descriptor is passed. On macOS the open
+    /// sockets of every process Warpgate may inspect (those of its own
+    /// account) are walked, and a socket belongs to the account when one of
+    /// its processes other than Warpgate itself holds it, including a
+    /// descriptor another account passed into that process. So on macOS a
+    /// socket held only by processes Warpgate cannot inspect (root's or
+    /// another account's) is never found and its connection is refused; a
+    /// descriptor the account hands to another account's process still counts
+    /// as the account's while one of the account's processes holds it too;
+    /// and a target pointing at Warpgate's own port is refused, where Linux
+    /// serves it. Every process of the account is trusted, including relays
+    /// it runs (an `ssh -R` forward, a proxy it started): whoever reaches such
+    /// a relay is served as that account. A local reverse proxy in front of
+    /// Warpgate must run as the same account; one running as another account
+    /// is refused. Each accept costs a lookup (a walk of the process table on
+    /// macOS, a read of `/proc/net/tcp` on Linux) bounded at 2 seconds, and a
+    /// lookup that fails or runs over refuses the connection: another local
+    /// account can slow the listener down but not get through. Only this HTTP
+    /// listener is checked: the SSH listener, even on a loopback address,
+    /// accepts any local account and relies on SSH authentication alone.
+    /// A state-changing request or websocket upgrade, to Warpgate or to a
+    /// target, that carries Warpgate's session cookie must carry an `Origin`
+    /// equal to Warpgate's own (scheme, host and port), or without one
+    /// `Sec-Fetch-Site: same-origin` or `none`; anything else, including such
+    /// a request with neither header, gets a 403. Requests without the
+    /// session cookie (admin tokens, ticket links) are not affected.
+    /// HTTP targets may be reached through a Unix socket (`unix_socket`) only
+    /// in this mode.
     #[serde(default)]
     pub plain_http_on_loopback: bool,
 
@@ -611,12 +646,25 @@ impl HttpConfig {
 
     /// Refuses `plain_http_on_loopback` on a listen address that is not a
     /// loopback one, wildcards included: plain HTTP is never served off the
-    /// loopback interface.
+    /// loopback interface. Also refused on platforms where Warpgate cannot
+    /// tell which OS account opened a loopback connection.
+    ///
+    /// `http.listen` is the only listener that serves the web session: the
+    /// other protocols' listeners never read the session cookie, so there is
+    /// no second listener to check here.
     pub fn check_plain_http_on_loopback(&self) -> anyhow::Result<()> {
-        if self.plain_http_on_loopback && !self.listen.is_loopback() {
+        if !self.plain_http_on_loopback {
+            return Ok(());
+        }
+        if !self.listen.is_loopback() {
             anyhow::bail!(
                 "`http.plain_http_on_loopback` is set, but `http.listen` ({:?}) is not a loopback address (127.0.0.0/8 or ::1); refusing to serve plain HTTP",
                 self.listen
+            );
+        }
+        if !cfg!(any(target_os = "linux", target_os = "macos")) {
+            anyhow::bail!(
+                "`http.plain_http_on_loopback` is only supported on Linux and macOS, where Warpgate can check which OS account opened each connection"
             );
         }
         Ok(())
@@ -1383,6 +1431,23 @@ ssh:
             let config = http_config(&format!("listen: \"{listen}\""));
             assert!(config.check_plain_http_on_loopback().is_ok(), "{listen}");
         }
+    }
+
+    /// Loopback mode checks each connection on `http.listen`; that holds only
+    /// while it is the one HTTP listener. A second listen address added to
+    /// `HttpConfig` must get the same check before this test is updated.
+    #[test]
+    fn unit_http_config_has_a_single_listener() {
+        let value = serde_json::to_value(HttpConfig::default()).unwrap();
+        let mut listeners: Vec<&str> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .filter(|key| key.contains("listen") || key.contains("port"))
+            .collect();
+        listeners.sort_unstable();
+        assert_eq!(listeners, ["external_port", "listen"]);
     }
 
     #[test]

@@ -66,7 +66,7 @@ impl<E: Endpoint> Endpoint for LoopbackHostEndpoint<E> {
 
 /// The host the client asked for: the raw `Host` header, never
 /// `X-Forwarded-Host`; without one (HTTP/2), the request's own authority.
-fn request_host(req: &Request) -> Option<String> {
+pub(crate) fn request_host(req: &Request) -> Option<String> {
     match req.headers().get(header::HOST) {
         Some(value) => value.to_str().ok().map(ToOwned::to_owned),
         None => req

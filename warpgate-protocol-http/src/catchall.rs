@@ -465,6 +465,7 @@ mod public_target_tests {
             headers: Default::default(),
             external_host: external_host.map(str::to_string),
             public,
+            unix_socket: None,
         }
     }
 
@@ -751,6 +752,7 @@ mod target_selection_tests {
                 headers: Default::default(),
                 external_host: external_host.map(str::to_string),
                 public: false,
+                unix_socket: None,
             }),
             rate_limit_bytes_per_second: None,
             group_id: None,
