@@ -1380,6 +1380,7 @@ pub(crate) mod delivery {
             listener_status: Default::default(),
             secret_backends,
             live_streams: Default::default(),
+            pending_revocations: Default::default(),
         }
     }
 

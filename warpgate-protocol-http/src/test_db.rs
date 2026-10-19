@@ -114,5 +114,6 @@ pub async fn services(db: DatabaseConnection) -> Services {
         listener_status: Default::default(),
         secret_backends: Arc::new(SecretBackendRegistry::new(db.clone())),
         live_streams: Default::default(),
+        pending_revocations: Default::default(),
     }
 }
