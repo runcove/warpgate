@@ -1,12 +1,14 @@
 from uuid import uuid4
 
+import pytest
 import requests
-import yaml
 
-from tests.conftest import WarpgateProcess
+from tests.conftest import ProcessManager, WarpgateProcess
 
 from .api_client import admin_client, sdk
 from .test_http_common import *  # noqa
+from .test_http_user_auth_oidc import _resolve_hosts_to_localhost
+from .util import wait_port
 
 
 def _echo_target(api, echo_server_port, role, label, external_host=None):
@@ -48,25 +50,52 @@ def _refused(response):
     assert response.headers["location"] == "/@warpgate"
 
 
+MAIN_HOST = "warpgate.binding.test"
+
+
+@pytest.fixture(scope="module")
+def binding_wg(processes: ProcessManager):
+    # Its own gateway with a dotted external host: a cookie scoped to a
+    # single-label domain (shared_wg's `external-host`) is one a client's
+    # cookie jar refuses to store.
+    wg = processes.start_wg(config_patch={"external_host": MAIN_HOST})
+    wait_port(wg.http_port, for_process=wg.process, recv=False)
+    yield wg
+
+
 class Test:
     def test_a_bound_target_is_served_on_its_own_host_only(
         self,
         echo_server_port,
-        shared_wg: WarpgateProcess,
+        binding_wg: WarpgateProcess,
     ):
-        url = f"https://localhost:{shared_wg.http_port}"
+        port = binding_wg.http_port
         # Target hosts sit under Warpgate's external host, as a deployment
-        # binds them: the session cookie is scoped to that domain, and a
-        # session presented on a host outside it is refused and cleared. The
-        # user logs in once (on localhost, which stands in for the main host)
-        # and the same session reaches each target host. The full Host
-        # header, port included, is what a binding matches.
-        base = yaml.safe_load(shared_wg.config_path.read_text())["external_host"]
-        port = shared_wg.http_port
-        bound_host = f"bound-{uuid4().hex[:8]}.{base}:{port}"
-        second_host = f"second-{uuid4().hex[:8]}.{base}:{port}"
+        # binds them, and every host is reached by its own URL, as a browser
+        # reaches it: the user logs in on the bound target's host (the login
+        # flow is served there), the session cookie is scoped to
+        # `.<external host>`, and the same session reaches the main host and
+        # every target host. The full Host header, port included, is what a
+        # binding matches.
+        tag = uuid4().hex[:8]
+        bound_name = f"bound-{tag}.{MAIN_HOST}"
+        second_name = f"second-{tag}.{MAIN_HOST}"
         # A host under the external host that no target is bound to.
-        free_host = f"free-{uuid4().hex[:8]}.{base}:{port}"
+        free_name = f"free-{tag}.{MAIN_HOST}"
+        bound_host = f"{bound_name}:{port}"
+        second_host = f"{second_name}:{port}"
+        free_host = f"{free_name}:{port}"
+        url = f"https://{MAIN_HOST}:{port}"
+        bound_url = f"https://{bound_host}"
+        second_url = f"https://{second_host}"
+        free_url = f"https://{free_host}"
+
+        with _resolve_hosts_to_localhost(MAIN_HOST, bound_name, second_name, free_name):
+            self._check(echo_server_port, url, bound_url, second_url, free_url)
+
+    def _check(self, echo_server_port, url, bound_url, second_url, free_url):
+        bound_host = bound_url.removeprefix("https://")
+        second_host = second_url.removeprefix("https://")
 
         with admin_client(url) as api:
             role = api.create_role(sdk.RoleDataRequest(name=f"role-{uuid4()}"))
@@ -83,37 +112,32 @@ class Test:
         session = requests.Session()
         session.verify = False
         response = session.post(
-            f"{url}/@warpgate/api/auth/login",
+            f"{bound_url}/@warpgate/api/auth/login",
             json={"username": user.username, "password": "123"},
         )
         assert response.status_code == 201
 
-        on_bound_host = {"Host": bound_host}
-
         # Another target named in the query parameter: the bound target answers.
         response = session.get(
-            f"{url}/?warpgate-target={other.name}",
-            headers=on_bound_host,
+            f"{bound_url}/?warpgate-target={other.name}",
             allow_redirects=False,
         )
         assert _served_by(response) == ["bound"]
 
         # The bound target named in the query parameter: honoured.
         response = session.get(
-            f"{url}/?warpgate-target={bound.name}",
-            headers=on_bound_host,
+            f"{bound_url}/?warpgate-target={bound.name}",
             allow_redirects=False,
         )
         assert _served_by(response) == ["bound"]
 
         # No query parameter: the binding.
-        response = session.get(f"{url}/", headers=on_bound_host, allow_redirects=False)
+        response = session.get(f"{bound_url}/", allow_redirects=False)
         assert _served_by(response) == ["bound"]
 
         # Another bound target named on the bound host: the bound target.
         response = session.get(
-            f"{url}/?warpgate-target={second.name}",
-            headers=on_bound_host,
+            f"{bound_url}/?warpgate-target={second.name}",
             allow_redirects=False,
         )
         assert _served_by(response) == ["bound"]
@@ -131,16 +155,14 @@ class Test:
 
         # Nor on a host bound to nothing.
         response = session.get(
-            f"{url}/?warpgate-target={second.name}",
-            headers={"Host": free_host},
+            f"{free_url}/?warpgate-target={second.name}",
             allow_redirects=False,
         )
         _refused(response)
 
         # On its own host it is served.
         response = session.get(
-            f"{url}/?warpgate-target={second.name}",
-            headers={"Host": second_host},
+            f"{second_url}/?warpgate-target={second.name}",
             allow_redirects=False,
         )
         assert _served_by(response) == ["second"]
@@ -151,12 +173,11 @@ class Test:
             ticket = api.create_ticket(
                 sdk.CreateTicketRequest(target_name=bound.name, username=user.username)
             ).secret
-        for host, served in ((None, False), (free_host, False), (bound_host, True)):
+        for base_url, served in ((url, False), (free_url, False), (bound_url, True)):
             ticket_session = requests.Session()
             ticket_session.verify = False
             response = ticket_session.get(
-                f"{url}/?warpgate-ticket={ticket}",
-                headers={"Host": host} if host else {},
+                f"{base_url}/?warpgate-ticket={ticket}",
                 allow_redirects=False,
             )
             if served:
@@ -172,8 +193,7 @@ class Test:
         )
         assert _served_by(response) == ["other"]
         response = session.get(
-            f"{url}/?warpgate-target={other.name}",
-            headers={"Host": free_host},
+            f"{free_url}/?warpgate-target={other.name}",
             allow_redirects=False,
         )
         assert _served_by(response) == ["other"]
