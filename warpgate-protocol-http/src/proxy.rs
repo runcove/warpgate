@@ -681,7 +681,6 @@ async fn proxy_ws_inner(
     options: TargetHTTPOptions,
     mut close_rx: broadcast::Receiver<()>,
 ) -> poem::Result<impl IntoResponse> {
-    let unix_socket = checked_unix_socket(req, &options)?;
     let keepalive_guard = Data::<&SessionKeepalive>::from_request_without_body(req)
         .await
         .ok()
@@ -717,15 +716,16 @@ async fn proxy_ws_inner(
         .map_err(poem::error::InternalServerError)?;
     let connector = Connector::Rustls(Arc::new(tls_config));
 
-    let connect = connect_upstream_websocket(
+    let connect = connect_target_websocket(
+        req,
+        &options,
         client_request
             .body(())
             .map_err(poem::error::InternalServerError)?,
-        unix_socket,
         connector,
     );
     let (client, client_response) = tokio::select! {
-        result = connect => result.map_err(poem::error::BadGateway)?,
+        result = connect => result?,
         _ = close_rx.recv() => {
             return Err(poem::Error::from_status(StatusCode::GONE));
         }
@@ -760,6 +760,22 @@ pub(crate) enum UpstreamWebSocket {
     Unix(WebSocketStream<MaybeTlsStream<tokio::net::UnixStream>>),
 }
 
+/// Opens the upstream WebSocket for a proxied `req` to the target with
+/// `options`: its Unix socket is checked for this request first
+/// ([`checked_unix_socket`], refused with a 502), then connected as
+/// [`connect_upstream_websocket`] does; a failed connection is a 502 too.
+pub(crate) async fn connect_target_websocket(
+    req: &Request,
+    options: &TargetHTTPOptions,
+    request: http::Request<()>,
+    connector: Connector,
+) -> poem::Result<(UpstreamWebSocket, tungstenite::handshake::client::Response)> {
+    let unix_socket = checked_unix_socket(req, options)?;
+    connect_upstream_websocket(request, unix_socket, connector)
+        .await
+        .map_err(poem::error::BadGateway)
+}
+
 /// Opens the upstream WebSocket for `request`: through `unix_socket` when the
 /// target has one (its path already checked), refusing a socket whose
 /// listening process is not our account; otherwise to the host in the request
@@ -777,23 +793,35 @@ pub(crate) async fn connect_upstream_websocket(
         }
         #[cfg(unix)]
         Some(path) => {
-            let stream = tokio::net::UnixStream::connect(&path)
-                .await
-                .map_err(tungstenite::Error::Io)?;
-            // Connected by us, so the listening process can be checked too.
             let our_uid = crate::loopback_owner::effective_uid().map_err(|error| {
                 tungstenite::Error::Io(std::io::Error::other(format!("{error:#}")))
             })?;
-            crate::unix_socket::check_peer_uid(&stream, our_uid).map_err(tungstenite::Error::Io)?;
-            let (client, response) =
-                client_async_tls_with_config(request, stream, None, Some(connector)).await?;
-            Ok((UpstreamWebSocket::Unix(client), response))
+            connect_unix_websocket(request, &path, our_uid, connector).await
         }
         #[cfg(not(unix))]
         Some(_) => Err(tungstenite::Error::Io(std::io::Error::other(
             "Unix sockets are not supported on this platform",
         ))),
     }
+}
+
+/// Opens the upstream WebSocket for `request` through the Unix socket at
+/// `path`, refused unless the process listening on it runs as `our_uid`.
+#[cfg(unix)]
+pub(crate) async fn connect_unix_websocket(
+    request: http::Request<()>,
+    path: &std::path::Path,
+    our_uid: u32,
+    connector: Connector,
+) -> Result<(UpstreamWebSocket, tungstenite::handshake::client::Response), tungstenite::Error> {
+    let stream = tokio::net::UnixStream::connect(path)
+        .await
+        .map_err(tungstenite::Error::Io)?;
+    // Connected by us, so the listening process can be checked too.
+    crate::unix_socket::check_peer_uid(&stream, our_uid).map_err(tungstenite::Error::Io)?;
+    let (client, response) =
+        client_async_tls_with_config(request, stream, None, Some(connector)).await?;
+    Ok((UpstreamWebSocket::Unix(client), response))
 }
 
 /// Accepts the browser's upgrade and pumps messages both ways between it and
