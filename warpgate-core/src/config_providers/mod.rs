@@ -8,7 +8,7 @@ mod sso_user;
 pub use db::DatabaseConfigProvider;
 use enum_dispatch::enum_dispatch;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
-pub use sso_user::resolve_and_map_sso_user;
+pub use sso_user::{SsoUserMapping, resolve_and_map_sso_user};
 use time::OffsetDateTime;
 use tracing::warn;
 use uuid::Uuid;
@@ -58,12 +58,13 @@ pub trait ConfigProvider {
         sso_config: SsoProviderConfig,
     ) -> Result<Option<String>, WarpgateError>;
 
+    /// Whether any of the user's roles was taken away.
     async fn apply_sso_role_mappings(
         &self,
         username: &str,
         managed_role_names: Option<Vec<String>>,
         active_role_names: Vec<String>,
-    ) -> Result<(), WarpgateError>;
+    ) -> Result<bool, WarpgateError>;
 
     /// Similar to `apply_sso_role_mappings` but operates on *admin* roles.
     async fn apply_sso_admin_role_mappings(

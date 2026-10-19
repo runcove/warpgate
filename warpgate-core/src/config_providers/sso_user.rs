@@ -5,6 +5,13 @@ use warpgate_sso::{RoleMapping, SsoLoginResponse, SsoProviderConfig};
 
 use crate::ConfigProvider;
 
+/// The Warpgate user an SSO response resolved to, and whether its role
+/// mappings took any of the user's roles away.
+pub struct SsoUserMapping {
+    pub username: String,
+    pub roles_removed: bool,
+}
+
 /// Resolve the Warpgate username for a verified SSO response (creating the user
 /// if `auto_create_users` is set), then apply role and admin-role mappings.
 /// Returns `None` when no user matches and auto-create is disabled.
@@ -12,7 +19,7 @@ pub async fn resolve_and_map_sso_user<C: ConfigProvider + Send + ?Sized>(
     cp: &C,
     provider_config: &SsoProviderConfig,
     response: &SsoLoginResponse,
-) -> Result<Option<String>, WarpgateError> {
+) -> Result<Option<SsoUserMapping>, WarpgateError> {
     let Some(email) = response.email.clone() else {
         return Ok(None);
     };
@@ -37,6 +44,7 @@ pub async fn resolve_and_map_sso_user<C: ConfigProvider + Send + ?Sized>(
         return Ok(None);
     };
 
+    let mut roles_removed = false;
     let mappings = provider_config.provider.role_mappings();
     if let Some(remote_groups) = response.access_roles.clone() {
         let managed_role_names = mappings
@@ -67,7 +75,8 @@ pub async fn resolve_and_map_sso_user<C: ConfigProvider + Send + ?Sized>(
         debug!(
             "SSO role mappings for {username}: active={active_role_names:?}, managed={managed_role_names:?}"
         );
-        cp.apply_sso_role_mappings(&username, managed_role_names, active_role_names)
+        roles_removed = cp
+            .apply_sso_role_mappings(&username, managed_role_names, active_role_names)
             .await?;
     }
 
@@ -99,5 +108,8 @@ pub async fn resolve_and_map_sso_user<C: ConfigProvider + Send + ?Sized>(
             .await?;
     }
 
-    Ok(Some(username))
+    Ok(Some(SsoUserMapping {
+        username,
+        roles_removed,
+    }))
 }

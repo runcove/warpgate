@@ -819,8 +819,9 @@ impl ConfigProvider for DatabaseConfigProvider {
         username: &str,
         managed_role_names: Option<Vec<String>>,
         assigned_role_names: Vec<String>,
-    ) -> Result<(), WarpgateError> {
+    ) -> Result<bool, WarpgateError> {
         let db = &self.db;
+        let mut removed = false;
 
         let user = entities::User::Entity::find()
             .filter(entities::User::Entity::username_eq_ci(username))
@@ -867,12 +868,13 @@ impl ConfigProvider for DatabaseConfigProvider {
                     let mut model: entities::UserRoleAssignment::ActiveModel = assignment.into();
                     model.revoked_at = Set(Some(OffsetDateTime::now_utc()));
                     model.update(db).await?;
+                    removed = true;
                 }
                 _ => (),
             }
         }
 
-        Ok(())
+        Ok(removed)
     }
 
     async fn apply_sso_admin_role_mappings(
