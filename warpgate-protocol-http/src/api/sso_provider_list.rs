@@ -418,21 +418,10 @@ impl Api {
             });
         }
 
-        if let Some(mapping) = warpgate_core::resolve_and_map_sso_user(
-            services.config_provider.as_ref(),
-            provider_config,
-            &response,
-        )
-        .await?
-            && mapping.roles_removed
-        {
-            // The role sync took roles away, and maybe targets with them.
-            services
-                .close_sessions_no_longer_authorised(warpgate_core::AccessChange::Username(
-                    mapping.username,
-                ))
-                .await?;
-        }
+        // Also ends whatever access the role sync took away.
+        services
+            .resolve_and_map_sso_user(provider_config, &response)
+            .await?;
 
         Ok(Ok(post_login_redirect(
             context.next_url.as_deref(),
