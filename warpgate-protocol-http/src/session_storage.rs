@@ -74,9 +74,8 @@ impl RecentlyLoaded {
 }
 
 /// A browser session's user session and login, as this node held them before
-/// forwarding a login step to a peer: what
-/// [`SharedSessionStorage::adopt_forwarded_login`] compares the peer's result
-/// against.
+/// forwarding a login step to a peer: what `run_login_step` compares the
+/// peer's result against to decide on upstream's `SessionRotation`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct LoginSnapshot {
     session_id: Option<UserSessionId>,
@@ -89,6 +88,18 @@ impl LoginSnapshot {
             session_id: session.get_session_id(),
             user_id: session.get_auth().map(|auth| auth.user_id()),
         }
+    }
+
+    /// Whether a forwarded login step that turned `self` into `after` logged
+    /// the browser session in, so its storage id must be rotated: a login is
+    /// present afterwards and its user session or its user changed. Upstream
+    /// rotates only when no login existed before the hop; a stale cookie that
+    /// still carries one is given a fresh session at the login entry point
+    /// (see [`crate::session::SessionStore::handle_for_login`]) and then
+    /// logged in under the same storage id, which must be rotated like any
+    /// other login.
+    pub fn login_changed_to(&self, after: &Self) -> bool {
+        after.user_id.is_some() && after != self
     }
 }
 
@@ -156,31 +167,6 @@ impl SharedSessionStorage {
         session.clear();
         for (key, value) in entries {
             session.set(&key, value);
-        }
-        Ok(())
-    }
-
-    /// [`Self::adopt_stored`] after a login step was forwarded to a peer, then
-    /// rotates the storage id if the step logged the browser session in.
-    ///
-    /// The peer does not rotate the id for a forwarded request, and a cookie it
-    /// sets never reaches the browser, so the rotation that retires the
-    /// pre-login id has to happen here. It is decided on whether the login
-    /// changed the session — its user session or its user — not on whether a
-    /// login existed before the hop: a stale cookie that still carries an
-    /// authorization is given a fresh session at the login entry point (see
-    /// [`crate::session::SessionStore::handle_for_login`]) and then logged in
-    /// under the same storage id, which must be rotated like any other login.
-    pub async fn adopt_forwarded_login(
-        &self,
-        stored_id: Option<String>,
-        session: &Session,
-        before_hop: LoginSnapshot,
-    ) -> poem::Result<()> {
-        self.adopt_stored(stored_id.clone(), session).await?;
-        let after_hop = LoginSnapshot::of(session);
-        if after_hop.user_id.is_some() && after_hop != before_hop {
-            self.rotate_session_id(stored_id, session).await?;
         }
         Ok(())
     }
@@ -502,7 +488,6 @@ impl SessionStorage for SharedSessionStorage {
 
 #[cfg(test)]
 mod tests {
-    use poem::session::SessionStatus;
     use sea_orm::Database;
     use warpgate_common_http::SessionAuthorization;
 
@@ -647,82 +632,48 @@ mod tests {
         session
     }
 
-    /// Runs the forwarding node's side of a login step the peer answered by
-    /// storing `stored` as the browser session `id1`: `session` is the copy
-    /// the node loaded before the hop, and afterwards holds what it writes
-    /// back.
-    async fn adopt_after_hop(s: &SharedSessionStorage, stored: &Session, session: &Session) {
-        s.update_session("id1", &stored.entries(), Some(Duration::from_secs(3600)))
-            .await
-            .unwrap();
-        let before_hop = LoginSnapshot::of(session);
-        s.adopt_forwarded_login(Some("id1".into()), session, before_hop)
-            .await
-            .unwrap();
-    }
-
-    async fn assert_rotated(s: &SharedSessionStorage, session: &Session) {
-        assert_eq!(
-            session.status(),
-            SessionStatus::Renewed,
-            "the storage id was kept"
-        );
-        assert!(s.load_session("id1").await.unwrap().is_none());
+    fn changed(before: &Session, after: &Session) -> bool {
+        LoginSnapshot::of(before).login_changed_to(&LoginSnapshot::of(after))
     }
 
     /// A stale cookie still logged in under a closed session, whose forwarded
     /// login replaced that session and logged the replacement in: the login
     /// existed before the hop, but it is a new one on a new session.
-    #[tokio::test]
-    async fn a_forwarded_login_on_a_replaced_session_rotates_the_id() {
-        let s = storage().await;
-        let replacement = insert_user_session(&s).await;
+    #[test]
+    fn a_forwarded_login_on_a_replaced_session_changes_the_login() {
         let closed = UserSessionId(Uuid::new_v4());
-        let session = logged_in(closed, ALICE);
-
-        adopt_after_hop(&s, &logged_in(replacement, ALICE), &session).await;
-
-        assert_rotated(&s, &session).await;
-        assert_eq!(session.get_session_id(), Some(replacement));
+        let replacement = UserSessionId(Uuid::new_v4());
+        assert!(changed(
+            &logged_in(closed, ALICE),
+            &logged_in(replacement, ALICE)
+        ));
     }
 
     /// The same browser session, logged in as someone else by the step.
-    #[tokio::test]
-    async fn a_forwarded_login_as_another_user_rotates_the_id() {
-        let s = storage().await;
-        let id = insert_user_session(&s).await;
-        let session = logged_in(id, ALICE);
-
-        adopt_after_hop(&s, &logged_in(id, BOB), &session).await;
-
-        assert_rotated(&s, &session).await;
+    #[test]
+    fn a_forwarded_login_as_another_user_changes_the_login() {
+        let id = UserSessionId(Uuid::new_v4());
+        assert!(changed(&logged_in(id, ALICE), &logged_in(id, BOB)));
     }
 
-    /// A first login, the case that never carried a login before the hop.
-    #[tokio::test]
-    async fn a_forwarded_first_login_rotates_the_id() {
-        let s = storage().await;
-        let id = insert_user_session(&s).await;
+    /// A first login, the only case upstream's own rule covers.
+    #[test]
+    fn a_forwarded_first_login_changes_the_login() {
+        let id = UserSessionId(Uuid::new_v4());
         let session = Session::default();
         session.set(SESSION_ID_SESSION_KEY, id);
-
-        adopt_after_hop(&s, &logged_in(id, ALICE), &session).await;
-
-        assert_rotated(&s, &session).await;
+        assert!(changed(&session, &logged_in(id, ALICE)));
     }
 
     /// A step that left the login as it was, such as a state poll from a
-    /// logged-in browser, keeps the id.
-    #[tokio::test]
-    async fn a_forwarded_step_that_changed_no_login_keeps_the_id() {
-        let s = storage().await;
-        let id = insert_user_session(&s).await;
-        let session = logged_in(id, ALICE);
-
-        adopt_after_hop(&s, &logged_in(id, ALICE), &session).await;
-
-        assert_ne!(session.status(), SessionStatus::Renewed);
-        assert!(s.load_session("id1").await.unwrap().is_some());
+    /// logged-in browser, or one that left no login, changes nothing.
+    #[test]
+    fn a_forwarded_step_that_logged_no_one_in_changes_nothing() {
+        let id = UserSessionId(Uuid::new_v4());
+        assert!(!changed(&logged_in(id, ALICE), &logged_in(id, ALICE)));
+        let anonymous = Session::default();
+        anonymous.set(SESSION_ID_SESSION_KEY, id);
+        assert!(!changed(&anonymous, &anonymous));
     }
 
     #[tokio::test]

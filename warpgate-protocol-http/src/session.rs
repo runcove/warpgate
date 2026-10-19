@@ -183,7 +183,7 @@ impl SessionStore {
     /// cookie's storage id is deliberately kept, so the write-back reaches the
     /// browser even from a forwarded request; the login that completes on it
     /// rotates that id, like every completed login (`authorize_session` on the
-    /// first hop, `SharedSessionStorage::adopt_forwarded_login` after a
+    /// first hop, `run_login_step`'s `SessionRotation` after a
     /// forwarded step).
     ///
     /// Known limitations, all failing safe:
