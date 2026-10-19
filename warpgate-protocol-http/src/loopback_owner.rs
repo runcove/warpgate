@@ -8,6 +8,17 @@
 //! one whose local endpoint is the accepted connection's remote endpoint and
 //! whose remote endpoint is the listener's. A lookup that fails, times out or
 //! finds no such socket refuses the connection.
+//!
+//! Limits of the check:
+//! - TCP carries no peer credentials: the owner is looked up by address and
+//!   port after the connection is accepted.
+//! - Every process of the account is trusted, relays included: an `ssh -R`
+//!   forward, a proxy the account runs, a target pointing back at this
+//!   listener. Whoever reaches such a relay is served as the account.
+//! - A reverse proxy in front of the listener running as another account is
+//!   refused like any other account.
+//! - Only the HTTP listener is checked; the SSH listener is not, even on a
+//!   loopback address.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -70,6 +81,24 @@ pub(crate) fn effective_uid() -> anyhow::Result<u32> {
             "`http.plain_http_on_loopback` is only supported on Linux and macOS, where Warpgate can check which OS account opened each connection"
         )
     }
+}
+
+/// The uid a plain-HTTP loopback listener serves: this process's effective
+/// uid, refused when it is root's.
+pub(crate) fn listener_uid() -> anyhow::Result<u32> {
+    serving_uid(effective_uid()?)
+}
+
+/// `uid`, unless it is root's: root owns system services' sockets as well,
+/// and the kernel lists sockets with no process behind them under uid 0, so
+/// serving root's connections would not tell them apart.
+fn serving_uid(uid: u32) -> anyhow::Result<u32> {
+    if uid == 0 {
+        bail!(
+            "`http.plain_http_on_loopback` is set, but Warpgate runs as root; run it as the OS account whose connections it should serve"
+        );
+    }
+    Ok(uid)
 }
 
 /// What the owner check concluded about one connection.
@@ -170,9 +199,6 @@ mod linux {
 
     use super::same_endpoint;
 
-    /// TIME_WAIT entries are listed with uid 0 and no longer belong to anyone.
-    const TCP_TIME_WAIT: &str = "06";
-
     #[cfg(target_os = "linux")]
     pub(super) fn owner_uid(local: SocketAddr, remote: SocketAddr) -> anyhow::Result<Option<u32>> {
         let mut uids = Vec::new();
@@ -208,8 +234,11 @@ mod linux {
         Ok(Some(table))
     }
 
-    /// The uids of the table's sockets with these endpoints. Lines that do
-    /// not parse are skipped: they can only leave a socket unfound.
+    /// The uids of the table's sockets with these endpoints. A row with
+    /// inode 0 has no open socket behind it (TIME_WAIT, a socket its process
+    /// has closed, a connection not yet accepted), is listed under uid 0 and
+    /// belongs to no one: it is skipped. Lines that do not parse are skipped
+    /// too: they can only leave a socket unfound.
     pub(super) fn matching_uids(
         table: &str,
         local: SocketAddr,
@@ -220,13 +249,12 @@ mod linux {
             let _slot = fields.next()?;
             let line_local = parse_endpoint(fields.next()?)?;
             let line_remote = parse_endpoint(fields.next()?)?;
-            let state = fields.next()?;
-            // tx/rx queue, timer, retransmits, then the uid.
-            let uid = fields.nth(3)?.parse::<u32>().ok()?;
-            (state != TCP_TIME_WAIT
-                && same_endpoint(line_local, local)
-                && same_endpoint(line_remote, remote))
-            .then_some(uid)
+            // State, tx/rx queue, timer, retransmits, then the uid.
+            let uid = fields.nth(4)?.parse::<u32>().ok()?;
+            // Timeout, then the inode.
+            let inode = fields.nth(1)?.parse::<u64>().ok()?;
+            (inode != 0 && same_endpoint(line_local, local) && same_endpoint(line_remote, remote))
+                .then_some(uid)
         })
     }
 
@@ -638,6 +666,8 @@ mod tests {
    2: 0100007F:22B8 0100007F:C37B 01 00000000:00000000 00:00000000 00000000   501        0 1003 1 0000000000000000 20 4 30 10 -1
    3: 0100007F:C37C 0100007F:22B8 06 00000000:00000000 03:00001770 00000000     0        0 0 3 0000000000000000
    4: 0100007F:C37D 0100007F:22B8 01 00000000:00000000 00:00000000 00000000   501        0 1004 1 0000000000000000 20 4 30 10 -1
+   5: 0100007F:C382 0100007F:22B8 05 00000000:00000000 00:00000000 00000000     0        0 0 1 0000000000000000 20 4 30 10 -1
+   6: 0100007F:C383 0100007F:22B8 03 00000000:00000000 00:00000000 00000000     0        0 0 1 0000000000000000 20 4 30 10 -1
 ";
 
     #[cfg(target_endian = "little")]
@@ -662,11 +692,47 @@ mod tests {
             uids(PROC_NET_TCP, "127.0.0.1:50045", "127.0.0.1:8888"),
             vec![501]
         );
-        // TIME_WAIT entries belong to no one.
+        // TIME_WAIT, closed and pending rows (inode 0) belong to no one.
         assert!(uids(PROC_NET_TCP, "127.0.0.1:50044", "127.0.0.1:8888").is_empty());
+        assert!(uids(PROC_NET_TCP, "127.0.0.1:50050", "127.0.0.1:8888").is_empty());
+        assert!(uids(PROC_NET_TCP, "127.0.0.1:50051", "127.0.0.1:8888").is_empty());
         // Unknown endpoints and the listening socket match nothing.
         assert!(uids(PROC_NET_TCP, "127.0.0.1:50046", "127.0.0.1:8888").is_empty());
         assert!(uids(PROC_NET_TCP, "127.0.0.1:50043", "127.0.0.1:8889").is_empty());
+    }
+
+    /// A lookup in a fixed `/proc/net/tcp` table.
+    #[cfg(target_endian = "little")]
+    struct ProcTable(&'static str);
+
+    #[cfg(target_endian = "little")]
+    impl SocketOwnerLookup for ProcTable {
+        fn owner_uid(&self, local: SocketAddr, remote: SocketAddr) -> anyhow::Result<Option<u32>> {
+            single_owner(linux::matching_uids(self.0, local, remote))
+        }
+    }
+
+    /// Rows with no socket behind them are listed under uid 0; even a
+    /// process running as uid 0 finds no owner in them.
+    #[cfg(target_endian = "little")]
+    #[tokio::test]
+    async fn proc_net_tcp_rows_without_a_socket_match_no_account() {
+        let listener = addr("127.0.0.1:8888");
+        for client in ["127.0.0.1:50044", "127.0.0.1:50050", "127.0.0.1:50051"] {
+            let lookup = Arc::new(ProcTable(PROC_NET_TCP));
+            let check = check_connection_owner(lookup, 0, listener, addr(client)).await;
+            assert_eq!(check, OwnerCheck::NotFound, "{client}");
+        }
+        let lookup = Arc::new(ProcTable(PROC_NET_TCP));
+        let check = check_connection_owner(lookup, 0, listener, addr("127.0.0.1:50043")).await;
+        assert_eq!(check, OwnerCheck::OtherAccount(502));
+    }
+
+    #[test]
+    fn loopback_mode_refuses_to_serve_root() {
+        let error = serving_uid(0).unwrap_err();
+        assert!(error.to_string().contains("root"), "{error}");
+        assert_eq!(serving_uid(501).unwrap(), 501);
     }
 
     #[cfg(target_endian = "little")]
