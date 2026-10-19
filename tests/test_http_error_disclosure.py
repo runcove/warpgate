@@ -297,9 +297,15 @@ def test_a_database_failure_does_not_hand_its_sql_to_the_client(
     one -- an ordinary admin request whose query fails underneath it, which is
     what a corrupted, migrated-past or partially-restored database looks like
     from inside a handler.
+
+    The broken table is `roles`, which only the handler reads. Before any
+    admin route runs, the management-scope check looks the request's host up
+    in `targets`, and when that lookup fails it refuses with a bare 503
+    rather than serve the route; breaking `targets` would test that refusal,
+    not what a handler's database error puts in the body.
     """
     wg, log_path = _start_wg_with_log(processes, tmp_path, {})
-    url = f"https://localhost:{wg.http_port}/@warpgate/admin/api/targets"
+    url = f"https://localhost:{wg.http_port}/@warpgate/admin/api/roles"
 
     healthy = requests.get(
         url, headers=ADMIN_TOKEN_HEADER, verify=False, timeout=10
@@ -311,7 +317,7 @@ def test_a_database_failure_does_not_hand_its_sql_to_the_client(
 
     database = _sqlite_path(wg)
     with sqlite3.connect(database) as connection:
-        connection.execute("DROP TABLE targets")
+        connection.execute("DROP TABLE roles")
 
     response = requests.get(
         url, headers=ADMIN_TOKEN_HEADER, verify=False, timeout=10
@@ -322,7 +328,7 @@ def test_a_database_failure_does_not_hand_its_sql_to_the_client(
         f"dropping the table did not fail the query: "
         f"{response.status_code} {body!r}"
     )
-    for fragment in ("no such table", "targets", "SELECT", "sqlx", "sea_orm"):
+    for fragment in ("no such table", "roles", "SELECT", "sqlx", "sea_orm"):
         assert fragment not in body, (
             f"the database's own words reached the client ({fragment!r}): {body!r}"
         )
