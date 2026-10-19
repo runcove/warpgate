@@ -1,6 +1,7 @@
 from uuid import uuid4
 
 import requests
+import yaml
 
 from tests.conftest import WarpgateProcess
 
@@ -54,11 +55,18 @@ class Test:
         shared_wg: WarpgateProcess,
     ):
         url = f"https://localhost:{shared_wg.http_port}"
-        # The full Host header, port included, is what a binding matches.
-        bound_host = f"bound-{uuid4().hex[:8]}.example:{shared_wg.http_port}"
-        second_host = f"second-{uuid4().hex[:8]}.example:{shared_wg.http_port}"
-        # A host no target is bound to.
-        free_host = f"free-{uuid4().hex[:8]}.example:{shared_wg.http_port}"
+        # Target hosts sit under Warpgate's external host, as a deployment
+        # binds them: the session cookie is scoped to that domain, and a
+        # session presented on a host outside it is refused and cleared. The
+        # user logs in once (on localhost, which stands in for the main host)
+        # and the same session reaches each target host. The full Host
+        # header, port included, is what a binding matches.
+        base = yaml.safe_load(shared_wg.config_path.read_text())["external_host"]
+        port = shared_wg.http_port
+        bound_host = f"bound-{uuid4().hex[:8]}.{base}:{port}"
+        second_host = f"second-{uuid4().hex[:8]}.{base}:{port}"
+        # A host under the external host that no target is bound to.
+        free_host = f"free-{uuid4().hex[:8]}.{base}:{port}"
 
         with admin_client(url) as api:
             role = api.create_role(sdk.RoleDataRequest(name=f"role-{uuid4()}"))
