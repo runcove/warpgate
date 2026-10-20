@@ -2,12 +2,18 @@ import pytest
 import requests
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
+import subprocess
 import time
 
 from .api_client import admin_client, sdk
 from .conftest import ProcessManager, WarpgateProcess
 from .test_api import make_limited_admin_role_payload
-from .util import wait_port
+from .util import (
+    mysql_client_opts,
+    mysql_client_ssl_opt,
+    wait_mysql_port,
+    wait_port,
+)
 from .test_http_common import *  # noqa
 
 
@@ -720,3 +726,158 @@ class TestLoginProtection:
         assert resp.json().get("state") == "UserLocked", (
             "admin must be lockable once exemption is disabled"
         )
+
+    def test_ip_block_made_at_run_time_refuses_mysql(
+        self,
+        processes: ProcessManager,
+        wg_c_ed25519_pubkey,
+        timeout,
+    ):
+        """A block earned over SSH on a running Warpgate refuses the MySQL door
+        at once, with no restart.
+
+        Both doors are dialled on 127.0.0.1, so the block and the MySQL login
+        are about the same address ("localhost" can resolve to ::1). A MySQL
+        session opened before the block is kept: blocks gate logins, they do
+        not end sessions already admitted.
+        """
+        wg = _lp_wg(processes, ip_max=3, user_max=100)
+        ssh_port = processes.start_ssh_server(
+            trusted_keys=[wg_c_ed25519_pubkey.read_text()]
+        )
+        db_port = processes.start_mysql_server()
+        url = f"https://localhost:{wg.http_port}"
+
+        with admin_client(url) as api:
+            role = api.create_role(sdk.RoleDataRequest(name=f"role-{uuid4()}"))
+            user = api.create_user(sdk.CreateUserRequest(username=f"user-{uuid4()}"))
+            api.create_password_credential(
+                user.id, sdk.NewPasswordCredential(password="correct_password")
+            )
+            api.add_user_role(user.id, role.id)
+            ssh_target = api.create_target(
+                sdk.TargetDataRequest(
+                    name=f"ssh-{uuid4()}",
+                    require_approval=False,
+                    ticket_requests_disabled=False,
+                    ticket_require_approval=False,
+                    options=sdk.TargetOptions(
+                        sdk.TargetOptionsTargetSSHOptions(
+                            kind="Ssh",
+                            allow_insecure_algos=False,
+                            host="localhost",
+                            port=ssh_port,
+                            username="root",
+                            auth=sdk.SSHTargetAuth(
+                                sdk.SSHTargetAuthSshTargetPublicKeyAuth(
+                                    kind="PublicKey"
+                                )
+                            ),
+                        )
+                    ),
+                )
+            )
+            api.add_target_role(ssh_target.id, role.id)
+            mysql_target = api.create_target(
+                sdk.TargetDataRequest(
+                    name=f"mysql-{uuid4()}",
+                    require_approval=False,
+                    ticket_requests_disabled=False,
+                    ticket_require_approval=False,
+                    options=sdk.TargetOptions(
+                        sdk.TargetOptionsTargetMySqlOptions(
+                            kind="MySql",
+                            host="localhost",
+                            port=db_port,
+                            username="root",
+                            auth=sdk.DatabaseTargetAuth(
+                                sdk.DatabaseTargetAuthDatabaseTargetPasswordAuth(
+                                    kind="Password",
+                                    password="123",
+                                )
+                            ),
+                            tls=sdk.Tls(mode=sdk.TlsMode.PREFERRED, verify=False),
+                        )
+                    ),
+                )
+            )
+            api.add_target_role(mysql_target.id, role.id)
+
+        wait_port(ssh_port)
+        wait_mysql_port(db_port)
+        wait_port(wg.mysql_port, recv=False)
+
+        def mysql_client(password):
+            return processes.start(
+                [
+                    "mysql",
+                    "--user",
+                    f"{user.username}#{mysql_target.name}",
+                    f"-p{password}",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    str(wg.mysql_port),
+                    *mysql_client_opts,
+                    mysql_client_ssl_opt,
+                    "db",
+                ],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+
+        def mysql_login(password):
+            client = mysql_client(password)
+            out, err = client.communicate(b"select 'marker';", timeout=timeout)
+            return client.returncode, out, err
+
+        def ssh_login(password):
+            client = processes.start_ssh_client(
+                f"{user.username}:{ssh_target.name}@127.0.0.1",
+                "-p",
+                str(wg.ssh_port),
+                "-i",
+                "/dev/null",
+                "-o",
+                "PreferredAuthentications=password",
+                "-o",
+                "NumberOfPasswordPrompts=1",
+                "ls",
+                "/bin/sh",
+                password=password,
+            )
+            client.communicate(timeout=timeout)
+            return client.returncode
+
+        # Control: the MySQL door lets this user in before any block.
+        rc, out, err = mysql_login("correct_password")
+        assert rc == 0 and b"marker" in out, (out, err)
+
+        # A session admitted before the block; it waits on stdin.
+        held = mysql_client("correct_password")
+        time.sleep(1)
+
+        for _ in range(3):
+            assert ssh_login("wrong") != 0
+        with admin_client(url) as api:
+            blocked = [b.ip_address for b in api.list_blocked_ips()]
+        assert "127.0.0.1" in blocked, blocked
+
+        # The point of the test: a new MySQL login from the blocked address is
+        # refused by the running process, even with the correct password.
+        rc, out, err = mysql_login("correct_password")
+        assert rc != 0, "a run-time IP block must refuse a new MySQL login"
+        assert b"marker" not in out
+        assert b"access denied" in err.lower(), err
+
+        # The session admitted before the block still answers.
+        out, err = held.communicate(b"select 'still-here';", timeout=timeout)
+        assert held.returncode == 0 and b"still-here" in out, (out, err)
+
+        # Unblocked, the same login works again: the refusal was the block.
+        with admin_client(url) as api:
+            for ip in blocked:
+                api.unblock_ip(sdk.UnblockIpRequest(ip=ip))
+        rc, out, err = mysql_login("correct_password")
+        assert rc == 0 and b"marker" in out, (out, err)
