@@ -1,9 +1,10 @@
 import { svelte } from '@sveltejs/vite-plugin-svelte'
 import { defineConfig } from 'vite'
+import { bundleLicenses } from './build/bundle-licenses.ts'
 
 // https://vitejs.dev/config/
 export default defineConfig({
-    plugins: [svelte()],
+    plugins: [svelte(), bundleLicenses()],
     base: '/@warpgate',
     build: {
         sourcemap: true,
