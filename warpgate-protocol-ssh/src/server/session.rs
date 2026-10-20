@@ -972,9 +972,34 @@ impl ServerSession {
     ) -> Result<impl Future<Output = Result<()>> + use<>> {
         let id = server_handle.lock().await.user_session_id();
 
+        // The span goes on the futures, not on the thread: an `enter()` guard
+        // held across the awaits below stayed entered on whichever worker
+        // thread the setup last ran on, and that thread's later log lines,
+        // from other connections, carried this session's span.
         let span_ = info_span!("SSH", session=%id);
-        let _enter = span_.enter();
+        let session = Self::start_in_span(
+            id,
+            remote_address,
+            services,
+            server_handle,
+            session_handle_rx,
+            handler_event_rx,
+            client_socket,
+        )
+        .instrument(span_.clone())
+        .await?;
+        Ok(session.instrument(span_))
+    }
 
+    async fn start_in_span(
+        id: UserSessionId,
+        remote_address: SocketAddr,
+        services: &Services,
+        server_handle: Arc<Mutex<WarpgateServerHandle>>,
+        mut session_handle_rx: UnboundedReceiver<SessionHandleCommand>,
+        mut handler_event_rx: UnboundedReceiver<ServerHandlerEvent>,
+        client_socket: std::net::TcpStream,
+    ) -> Result<impl Future<Output = Result<()>> + use<>> {
         let mut rc_handles = RemoteClient::create(id, services.clone())?;
 
         let (hub, event_sender) = EventHub::setup(EVENT_QUEUE_CAPACITY);
