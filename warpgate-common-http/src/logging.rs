@@ -106,6 +106,24 @@ mod tests {
     }
 }
 
+/// An upstream address for logs. A target's URL can carry its credentials
+/// (`https://user:password@host/`), so the userinfo is left out, and a ticket
+/// in the query is redacted as in [`redacted_uri`].
+pub fn upstream_uri_for_log(uri: &Uri) -> String {
+    let Some((_, host)) = uri.authority().and_then(|a| a.as_str().rsplit_once('@')) else {
+        return redacted_uri(uri);
+    };
+    let mut parts = uri.clone().into_parts();
+    let stripped = host.parse().ok().and_then(|host| {
+        parts.authority = Some(host);
+        Uri::from_parts(parts).ok()
+    });
+    match stripped {
+        Some(stripped) => redacted_uri(&stripped),
+        None => "<address withheld>".to_owned(),
+    }
+}
+
 pub fn log_request_result(method: &Method, url: &Uri, client_ip: Option<&str>, status: StatusCode) {
     let url = redacted_uri(url);
     let client_ip = client_ip.unwrap_or("<unknown>");
@@ -131,7 +149,7 @@ pub fn log_request_error(method: &Method, url: &Uri, client_ip: Option<&str>, er
 mod log_line_tests {
     use poem::http::{Method, StatusCode, Uri};
 
-    use super::{log_request_error, log_request_result, redacted_uri};
+    use super::{log_request_error, log_request_result, redacted_uri, upstream_uri_for_log};
     use crate::test_log::logged;
 
     const SECRET: &str = "s3cr3t-ticket-value";
@@ -197,6 +215,50 @@ mod log_line_tests {
         ] {
             let parsed: Uri = uri.parse().unwrap();
             assert_eq!(redacted_uri(&parsed), uri);
+        }
+    }
+
+    /// A target URL's credentials never reach a logged upstream address; the
+    /// scheme, host, port, path and query do.
+    #[test]
+    fn a_logged_upstream_uri_never_contains_the_password() {
+        const PASSWORD: &str = "pa55-w0rd";
+        for (uri, expected) in [
+            (
+                format!("https://user:{PASSWORD}@app.example:8443/x?a=1"),
+                "https://app.example:8443/x?a=1".to_owned(),
+            ),
+            (
+                format!("http://{PASSWORD}@app.example/"),
+                "http://app.example/".to_owned(),
+            ),
+            (
+                format!("wss://user:{PASSWORD}@app.example/socket"),
+                "wss://app.example/socket".to_owned(),
+            ),
+            (
+                format!("https://us%40er:{PASSWORD}@app.example/"),
+                "https://app.example/".to_owned(),
+            ),
+        ] {
+            let parsed: Uri = uri.parse().unwrap();
+            let logged = upstream_uri_for_log(&parsed);
+            assert!(!logged.contains(PASSWORD), "{uri} logged as {logged}");
+            assert_eq!(logged, expected, "{uri}");
+        }
+    }
+
+    /// An upstream address without userinfo is logged as it is, ticket
+    /// redaction included.
+    #[test]
+    fn an_upstream_uri_without_userinfo_is_logged_as_redacted_uri() {
+        for uri in [
+            "https://app.example:8443/x?a=1",
+            "http://127.0.0.1/",
+            "https://app.example/?warpgate-ticket=s3cr3t",
+        ] {
+            let parsed: Uri = uri.parse().unwrap();
+            assert_eq!(upstream_uri_for_log(&parsed), redacted_uri(&parsed));
         }
     }
 }
