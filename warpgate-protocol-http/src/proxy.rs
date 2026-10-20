@@ -29,7 +29,7 @@ use warpgate_common::http_headers::{
     X_FORWARDED_FOR, X_FORWARDED_HOST, X_FORWARDED_PROTO, may_forward_header,
 };
 use warpgate_common::{TargetHTTPOptions, WarpgateError, try_block};
-use warpgate_common_http::logging::{get_client_ip, log_request_result};
+use warpgate_common_http::logging::{get_client_ip, log_request_result, upstream_uri_for_log};
 use warpgate_common_http::ticket_query::without_ticket_query_param;
 use warpgate_common_http::{
     AuthenticatedRequestContext, SessionAuthorization, SessionKeepalive, SessionKeepaliveGuard,
@@ -503,7 +503,7 @@ pub async fn proxy_normal_request(
     // The client connects through the socket itself; checked on each request.
     checked_unix_socket(req, &options)?;
 
-    tracing::debug!("URI: {:?}", uri);
+    tracing::debug!("URI: {}", upstream_uri_for_log(&uri));
 
     let client = client_cache
         .get_or_build(&admitted.target().name, &options, || async {
@@ -659,7 +659,7 @@ pub async fn proxy_websocket_request(
     proxy_ws_inner(req, ws, uri.clone(), ctx, options, close_rx)
         .await
         .map_err(|error| {
-            tracing::error!(?uri, ?error, "WebSocket proxy failed");
+            tracing::error!(uri = %upstream_uri_for_log(&uri), ?error, "WebSocket proxy failed");
             error
         })
 }
