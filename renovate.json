@@ -2,7 +2,7 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "description": "Our work lives on the cove-patches line, not on main (a stale upstream mirror). A new version-line changes baseBranchPatterns. Patch bundles are merged by the fork's CI check once green; minor and major updates wait for review.",
   "baseBranchPatterns": [
-    "cove-patches-v0.29.1"
+    "cove-patches-v0.30.0"
   ],
   "enabledManagers": [
     "cargo",
