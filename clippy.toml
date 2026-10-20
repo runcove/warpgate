@@ -1,2 +1,9 @@
 avoid-breaking-exported-api = false
 allow-unwrap-in-tests = true
+# A span guard held across an await stays entered on the worker thread the
+# task last ran on, so other tasks' log lines carry that span. Use
+# `.instrument(span)` on the future instead.
+await-holding-invalid-types = [
+  { path = "tracing::span::Entered", reason = "use .instrument(span) on the future, not an enter() guard" },
+  { path = "tracing::span::EnteredSpan", reason = "use .instrument(span) on the future, not an entered() span" },
+]
