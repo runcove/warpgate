@@ -74,6 +74,7 @@ ignore = [
     "RUSTSEC-2026-0194", # quick-xml quadratic time - see above
     "RUSTSEC-2021-0141", # dotenv is unmaintaned - only used for dev
     "RUSTSEC-2024-0449", # unsafe-libyaml is unmaintained - serde_yaml (config) and poem still depend on it
+    "RUSTSEC-2026-0381", # emSign roots: matches the webpki-roots 0.26.11 shim (sqlx-core) by version, but the shim re-exports webpki-roots 1.x, locked at the fixed 1.0.10
 ]
 # If this is true, then cargo deny will use the git executable to fetch advisory database.
 # If this is false, then it uses a built-in git library.
