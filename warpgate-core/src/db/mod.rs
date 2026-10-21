@@ -129,16 +129,20 @@ async fn connection_is_clean(
 ) -> Result<bool, sea_orm::sqlx::Error> {
     use sea_orm::sqlx::Connection;
 
-    // sqlx's counter: non-zero means a begin was never matched by a successful
-    // commit or rollback.
-    let counted = conn.is_in_transaction();
-
-    // SQLite's own state: autocommit is off while a transaction is open.
+    // SQLite's own state: autocommit is off while a transaction is open. Taking
+    // the lock goes through the worker's queue, so a ROLLBACK queued when a
+    // transaction was dropped without a commit has run by the time it returns.
     let mut handle = conn.lock_handle().await?;
     // SAFETY: the handle is locked out of the worker thread for the duration of
     // the call, and `sqlite3_get_autocommit` only reads connection state.
     let in_transaction =
         unsafe { libsqlite3_sys::sqlite3_get_autocommit(handle.as_raw_handle().as_ptr()) == 0 };
+    drop(handle);
+
+    // sqlx's counter: non-zero means a begin was never matched by a successful
+    // commit or rollback. Read only after the lock, for the same reason: before
+    // it, a queued ROLLBACK may not have brought the counter back to 0 yet.
+    let counted = conn.is_in_transaction();
 
     if counted || in_transaction {
         tracing::warn!(
@@ -357,10 +361,12 @@ mod tests {
         // Without the guard the only pooled connection would be reused as it is.
         // With it, the connection is closed (rolling the transaction back) and the
         // lock is free for another connection.
+        // The guard closes the connection in the background, so this waits on the
+        // lock for up to 10 s rather than racing that close on a busy runner.
         let mut other = SqliteConnection::connect_with(
             &SqliteConnectOptions::new()
                 .filename(&path)
-                .busy_timeout(Duration::from_millis(200)),
+                .busy_timeout(Duration::from_secs(10)),
         )
         .await
         .unwrap();
@@ -404,7 +410,14 @@ mod tests {
 
         assert!(!connection_is_clean(&mut conn).await.unwrap());
 
+        // Released, it is dropped: the pool's only slot gets a new connection
+        // whose counter starts at 0.
         drop(conn);
+        let mut fresh = pool.acquire().await.unwrap();
+        assert!(!fresh.is_in_transaction(), "the pool must replace the desynced connection");
+        assert!(connection_is_clean(&mut fresh).await.unwrap());
+
+        drop(fresh);
         pool.close().await;
         std::fs::remove_dir_all(&dir).unwrap();
     }
