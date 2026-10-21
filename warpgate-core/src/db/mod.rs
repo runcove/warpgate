@@ -134,7 +134,9 @@ async fn connection_is_clean(
     // transaction was dropped without a commit has run by the time it returns.
     let mut handle = conn.lock_handle().await?;
     // SAFETY: the handle is locked out of the worker thread for the duration of
-    // the call, and `sqlite3_get_autocommit` only reads connection state.
+    // the call, and `sqlite3_get_autocommit` only reads connection state. sqlx
+    // 0.8 offers no safe accessor for it.
+    #[allow(unsafe_code)]
     let in_transaction =
         unsafe { libsqlite3_sys::sqlite3_get_autocommit(handle.as_raw_handle().as_ptr()) == 0 };
     drop(handle);
