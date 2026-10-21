@@ -101,10 +101,56 @@ async fn connect_to_sqlite(url: &str) -> Result<DatabaseConnection> {
         .acquire_timeout(Duration::from_secs(30))
         .idle_timeout(Duration::from_secs(5 * 60))
         .max_lifetime(Duration::from_secs(30 * 60))
+        .after_release(|conn, _meta| Box::pin(connection_is_clean(conn)))
         .connect_with(connect_options)
         .await?;
 
     Ok(SqlxSqliteConnector::from_sqlx_sqlite_pool(pool))
+}
+
+/// `after_release` guard for the SQLite pool: false if the connection must not
+/// be reused because it still holds, or believes it holds, a transaction.
+///
+/// sqlx-sqlite 0.8.6 keeps a `transaction_depth` counter beside SQLite's own
+/// state. When SQLite rolls a transaction back by itself (SQLITE_FULL, IOERR,
+/// BUSY, NOMEM), sqlx's following ROLLBACK fails and the counter stays at 1. On
+/// that connection the next `begin()` becomes a `SAVEPOINT`, which opens a real
+/// transaction that `ROLLBACK TO` never ends: the connection keeps the WAL write
+/// lock for good and every other writer gets "database is locked" until the
+/// process restarts. Nothing may be inside a transaction when a connection is
+/// released, so either signal means the connection is dropped and replaced.
+#[cfg(feature = "sqlite")]
+async fn connection_is_clean(
+    conn: &mut sea_orm::sqlx::SqliteConnection,
+) -> Result<bool, sea_orm::sqlx::Error> {
+    use sea_orm::sqlx::Connection;
+
+    // SQLite's own state: autocommit is off while a transaction is open. Taking
+    // the lock goes through the worker's queue, so a ROLLBACK queued when a
+    // transaction was dropped without a commit has run by the time it returns.
+    let mut handle = conn.lock_handle().await?;
+    // SAFETY: the handle is locked out of the worker thread for the duration of
+    // the call, and `sqlite3_get_autocommit` only reads connection state. sqlx
+    // 0.8 offers no safe accessor for it.
+    #[allow(unsafe_code)]
+    let in_transaction =
+        unsafe { libsqlite3_sys::sqlite3_get_autocommit(handle.as_raw_handle().as_ptr()) == 0 };
+    drop(handle);
+
+    // sqlx's counter: non-zero means a begin was never matched by a successful
+    // commit or rollback. Read only after the lock, for the same reason: before
+    // it, a queued ROLLBACK may not have brought the counter back to 0 yet.
+    let counted = conn.is_in_transaction();
+
+    if counted || in_transaction {
+        tracing::warn!(
+            counted,
+            in_transaction,
+            "Dropping a SQLite connection released inside a transaction (it would hold the write lock)"
+        );
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 #[cfg(not(feature = "sqlite"))]
@@ -275,6 +321,104 @@ mod tests {
     use warpgate_db_migrations::migrate_database;
 
     use super::*;
+
+    /// A temp-file database with one pooled connection and the release guard.
+    async fn guarded_pool(path: &std::path::Path) -> sea_orm::sqlx::SqlitePool {
+        use sea_orm::sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+
+        let options = SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(Duration::from_millis(200));
+        SqlitePoolOptions::new()
+            .max_connections(1)
+            .after_release(|conn, _meta| Box::pin(connection_is_clean(conn)))
+            .connect_with(options)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn released_connection_inside_a_transaction_is_dropped_and_frees_the_lock() {
+        use sea_orm::sqlx::sqlite::{SqliteConnectOptions, SqliteConnection};
+        use sea_orm::sqlx::{Connection, Executor};
+
+        let dir = std::env::temp_dir().join(format!("wg-stuck-tx-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("db.sqlite3");
+        let pool = guarded_pool(&path).await;
+        pool.execute("CREATE TABLE t (id INTEGER)").await.unwrap();
+
+        // The stuck state: a connection returned to the pool holding the write lock.
+        let mut conn = pool.acquire().await.unwrap();
+        conn.execute("BEGIN IMMEDIATE").await.unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").await.unwrap();
+        drop(conn);
+
+        // Without the guard the only pooled connection would be reused as it is.
+        // With it, the connection is closed (rolling the transaction back) and the
+        // lock is free for another connection.
+        // The guard closes the connection in the background, so this waits on the
+        // lock for up to 10 s rather than racing that close on a busy runner.
+        let mut other = SqliteConnection::connect_with(
+            &SqliteConnectOptions::new()
+                .filename(&path)
+                .busy_timeout(Duration::from_secs(10)),
+        )
+        .await
+        .unwrap();
+        other
+            .execute("INSERT INTO t VALUES (2)")
+            .await
+            .expect("the released connection must not still hold the write lock");
+
+        // The pool hands out a fresh, clean connection and the abandoned row is gone.
+        let mut fresh = pool.acquire().await.unwrap();
+        assert!(!fresh.is_in_transaction());
+        let rows: Vec<(i64,)> = sea_orm::sqlx::query_as("SELECT id FROM t")
+            .fetch_all(&mut *fresh)
+            .await
+            .unwrap();
+        assert_eq!(rows, vec![(2,)]);
+
+        drop(fresh);
+        pool.close().await;
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn connection_with_a_desynced_transaction_depth_is_not_clean() {
+        use sea_orm::sqlx::{Connection, Executor};
+
+        let dir = std::env::temp_dir().join(format!("wg-desync-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("db.sqlite3");
+        let pool = guarded_pool(&path).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        assert!(connection_is_clean(&mut conn).await.unwrap());
+
+        // SQLite ends the transaction by itself (as it does on SQLITE_FULL);
+        // sqlx's own ROLLBACK then fails and its depth stays at 1.
+        let mut tx = conn.begin().await.unwrap();
+        (&mut *tx).execute("ROLLBACK").await.unwrap();
+        assert!(tx.rollback().await.is_err());
+        assert!(conn.is_in_transaction(), "sqlx must still count the transaction");
+
+        assert!(!connection_is_clean(&mut conn).await.unwrap());
+
+        // Released, it is dropped: the pool's only slot gets a new connection
+        // whose counter starts at 0.
+        drop(conn);
+        let mut fresh = pool.acquire().await.unwrap();
+        assert!(!fresh.is_in_transaction(), "the pool must replace the desynced connection");
+        assert!(connection_is_clean(&mut fresh).await.unwrap());
+
+        drop(fresh);
+        pool.close().await;
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     async fn open_session(db: &DatabaseConnection, node_id: Option<Uuid>) -> Uuid {
         open_session_for_user(db, node_id, Uuid::new_v4()).await
