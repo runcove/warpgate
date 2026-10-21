@@ -4,7 +4,7 @@ from uuid import uuid4
 
 from .api_client import admin_client, sdk
 from .conftest import WarpgateProcess, ProcessManager
-from .util import wait_port
+from .util import wait_port, target_host
 
 
 class Test:
@@ -33,7 +33,7 @@ class Test:
                         sdk.TargetOptionsTargetPostgresOptions(
                             kind="Postgres",
                             protocol_version=sdk.PostgresProtocolVersion.ENUM_3_DOT_2,
-                            host="localhost",
+                            host=target_host(db_port),
                             port=db_port,
                             username="user",
                             auth=sdk.DatabaseTargetAuth(

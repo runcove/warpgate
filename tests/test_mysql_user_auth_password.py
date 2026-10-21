@@ -3,7 +3,7 @@ from uuid import uuid4
 
 from .api_client import admin_client, sdk
 from .conftest import WarpgateProcess, ProcessManager
-from .util import wait_port, wait_mysql_port, mysql_client_ssl_opt, mysql_client_opts
+from .util import wait_port, wait_mysql_port, mysql_client_ssl_opt, mysql_client_opts, target_host
 
 
 class Test:
@@ -36,7 +36,7 @@ class Test:
                         options=sdk.TargetOptions(
                             sdk.TargetOptionsTargetMySqlOptions(
                                 kind="MySql",
-                                host="localhost",
+                                host=target_host(db_port),
                                 port=db_port,
                                 username="root",
                                 auth=sdk.DatabaseTargetAuth(

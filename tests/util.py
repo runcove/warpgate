@@ -22,6 +22,45 @@ last_port = 1234 + _worker * 3000
 # that process exits instead of waiting out its timeout.
 port_owners: dict = {}
 
+
+def _prestarted_targets():
+    """CI's pre-started targets (WARPGATE_E2E_TARGETS=prestarted): {kind: (host, port)}.
+
+    The runcove warpgate-integration job starts an sshd, a MySQL and a Postgres before the
+    tests' sandbox, which has no docker, and names them in WARPGATE_E2E_<KIND>_HOST and
+    _PORT. In that mode every one must be set: there is no fallback to localhost. Unset,
+    nothing changes."""
+    mode = os.getenv("WARPGATE_E2E_TARGETS", "")
+    if mode == "":
+        return {}
+    if mode != "prestarted":
+        raise RuntimeError(f"WARPGATE_E2E_TARGETS is {mode!r}; the only mode is 'prestarted'")
+    out = {}
+    for kind in ("ssh", "mysql", "postgres"):
+        host = os.getenv(f"WARPGATE_E2E_{kind.upper()}_HOST", "")
+        port = os.getenv(f"WARPGATE_E2E_{kind.upper()}_PORT", "")
+        if not host or not port.isdigit() or not 0 < int(port) < 65536:
+            raise RuntimeError(
+                f"WARPGATE_E2E_TARGETS=prestarted, but WARPGATE_E2E_{kind.upper()}_HOST and _PORT "
+                f"are {host!r} and {port!r}, not a host and a port; there is no fallback to localhost"
+            )
+        out[kind] = (host, int(port))
+    if len({p for _, p in out.values()}) != len(out):
+        raise RuntimeError("WARPGATE_E2E_TARGETS=prestarted, but two targets share a port")
+    return out
+
+
+prestarted_targets = _prestarted_targets()
+# The pre-started targets' hosts by port. alloc_port never hands these ports out,
+# so a port here is always a pre-started target's, never one of ours.
+target_hosts = {port: host for host, port in prestarted_targets.values()}
+
+
+def target_host(port, default="localhost"):
+    """The host a test reaches a target on: the pre-started target's for its
+    port, otherwise `default`, the address the test always used."""
+    return target_hosts.get(port, default)
+
 mysql_client_ssl_opt = "--ssl"
 mysql_client_opts = []
 if "GITHUB_ACTION" in os.environ:
@@ -57,7 +96,7 @@ def alloc_port():
     # keeps this process from racing itself, nothing guards other processes.
     global last_port
     last_port += 1
-    while not _port_is_free(last_port):
+    while last_port in target_hosts or not _port_is_free(last_port):
         last_port += 1
     return last_port
 
@@ -92,7 +131,7 @@ def wait_port(port, recv=True, timeout=60, for_process: subprocess.Popen = None,
     def wait():
         while True:
             try:
-                s = socket.create_connection(("localhost", port), timeout=connect_timeout)
+                s = socket.create_connection((target_host(port), port), timeout=connect_timeout)
                 try:
                     if recv:
                         s.settimeout(read_timeout)
@@ -134,7 +173,7 @@ def wait_mysql_port(port):
         while True:
             try:
                 subprocess.check_call(
-                    f'mysql --user=root --password=123 --host=127.0.0.1 --port={port} --execute="show schemas;"',
+                    f'mysql --user=root --password=123 --host={target_host(port, "127.0.0.1")} --port={port} --execute="show schemas;"',
                     shell=True,
                 )
                 logging.debug(f"Port {port} is up")

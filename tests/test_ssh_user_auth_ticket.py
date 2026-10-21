@@ -3,7 +3,7 @@ from uuid import uuid4
 
 from .api_client import admin_client, sdk
 from .conftest import ProcessManager, WarpgateProcess
-from .util import wait_port
+from .util import wait_port, target_host
 
 
 class Test:
@@ -40,7 +40,7 @@ class Test:
                         sdk.TargetOptionsTargetSSHOptions(
                             kind="Ssh",
                             allow_insecure_algos=False,
-                            host="localhost",
+                            host=target_host(ssh_port),
                             port=ssh_port,
                             username="root",
                             auth=sdk.SSHTargetAuth(

@@ -10,7 +10,7 @@ import pytest
 from .api_client import admin_client, sdk
 from .conftest import ProcessManager, WarpgateProcess
 from .approval_util import wait_for_pending_approval
-from .util import wait_port
+from .util import wait_port, target_host
 
 
 class Test:
@@ -321,7 +321,7 @@ def _held_ssh_target(processes, wg_c_ed25519_pubkey, shared_wg, require_approval
                     sdk.TargetOptionsTargetSSHOptions(
                         kind="Ssh",
                         allow_insecure_algos=False,
-                        host="localhost",
+                        host=target_host(ssh_port),
                         port=ssh_port,
                         username="root",
                         auth=sdk.SSHTargetAuth(
