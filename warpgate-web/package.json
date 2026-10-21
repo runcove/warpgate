@@ -36,7 +36,6 @@
         "@sveltestrap/sveltestrap": "^7",
         "@tsconfig/svelte": "^5.0.8",
         "@types/qrcode": "^1.5.6",
-        "@types/ua-parser-js": "^0.7.36",
         "@xterm/addon-fit": "^0.11",
         "@xterm/addon-unicode11": "^0.9",
         "@xterm/xterm": "^6.0",
@@ -60,7 +59,6 @@
         "thenby": "^1.4.1",
         "tslib": "^2.8.0",
         "typescript": "^5.9.3",
-        "ua-parser-js": "^2.0.10",
         "vite": "^8.3.3",
         "zmodem.js": "^0.1.10"
     },
