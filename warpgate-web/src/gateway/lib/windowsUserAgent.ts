@@ -8,7 +8,10 @@ const WINDOWS =
     /windows nt(?!.+xbox)|\bwin(?=3| ?9|n)|windows[/ ](?:1[01]|2000|3\.1|7|8|9[58]|me|server 20\d\d|vista|xp)/i
 const WINDOWS_PHONE = /windows phone/i
 
-export function isWindowsUserAgent(userAgent: string, platform?: string): boolean {
+export function isWindowsUserAgent(
+    userAgent: string,
+    platform?: string,
+): boolean {
     // userAgentData.platform is Chromium's and names the OS outright.
     if (platform) {
         return platform === 'Windows'

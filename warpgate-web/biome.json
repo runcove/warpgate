@@ -12,6 +12,7 @@
             "!**/openapitools.json",
             "!**/package.json",
             "!**/openapi-schema.json",
+            "!**/test-fixtures",
             "!**/*.svg"
         ],
         "ignoreUnknown": false
