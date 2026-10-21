@@ -1,3 +1,5 @@
+import { isWindowsBrowser } from './windowsUserAgent'
+
 function escapeUnix(arg: string): string {
     if (!/^[A-Za-z0-9_/-]+$/.test(arg)) {
         return `'${arg.replace(/'/g, "'\"'\"'")}'`.replace(/''/g, '')
@@ -12,19 +14,7 @@ function escapeWin(arg: string): string {
     return arg
 }
 
-// Whether the copied commands are quoted for a Windows shell. userAgentData is
-// Chromium's; elsewhere the user agent string says "Windows" for every Windows.
-function isWindows(): boolean {
-    const platform = (
-        navigator as Navigator & { userAgentData?: { platform?: string } }
-    ).userAgentData?.platform
-    if (platform) {
-        return platform === 'Windows'
-    }
-    return /\bWindows\b/.test(navigator.userAgent)
-}
-
-const isWin = isWindows()
+const isWin = isWindowsBrowser()
 
 export function shellEscape(stringOrArray: string[] | string): string {
     const ret: string[] = []
