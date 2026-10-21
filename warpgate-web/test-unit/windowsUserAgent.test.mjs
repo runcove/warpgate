@@ -5,11 +5,19 @@ import { test } from 'node:test'
 import { isWindowsUserAgent } from '../src/gateway/lib/windowsUserAgent.ts'
 
 const fixtures = JSON.parse(
-    fs.readFileSync(new URL('../test-fixtures/ua-parser-1.0.41/os-test.json', import.meta.url), 'utf8'),
+    fs.readFileSync(
+        new URL(
+            '../test-fixtures/ua-parser-1.0.41/os-test.json',
+            import.meta.url,
+        ),
+        'utf8',
+    ),
 )
 
 // ua-parser-js 1.x names this one "Windows"; 2.x and this check call it Windows CE.
-const DEPARTURES = new Set(['Mozilla/4.0 (compatible; MSIE 6.0; Windows CE; IEMobile 7.11)'])
+const DEPARTURES = new Set([
+    'Mozilla/4.0 (compatible; MSIE 6.0; Windows CE; IEMobile 7.11)',
+])
 
 test('agrees with ua-parser-js 1.0.41 on every user agent in its OS tests', () => {
     assert.ok(fixtures.length >= 100, `only ${fixtures.length} fixtures`)
@@ -44,8 +52,10 @@ test('Windows devices with no desktop shell are not Windows', () => {
 })
 
 test("Chromium's userAgentData platform decides when present", () => {
-    const mac = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36'
-    const win = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36'
+    const mac =
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36'
+    const win =
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36'
     assert.equal(isWindowsUserAgent(win, 'Windows'), true)
     assert.equal(isWindowsUserAgent(mac, 'macOS'), false)
     assert.equal(isWindowsUserAgent(win, 'Linux'), false)
