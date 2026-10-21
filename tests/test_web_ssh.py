@@ -11,7 +11,7 @@ from websocket import WebSocketTimeoutException, create_connection
 from .api_client import admin_client, sdk
 from .approval_util import wait_for_pending_approval
 from .conftest import ProcessManager, WarpgateProcess
-from .util import wait_port
+from .util import wait_port, target_host
 
 
 def _web_ssh_login(processes, wg_c_ed25519_pubkey, shared_wg, require_approval=False):
@@ -39,7 +39,7 @@ def _web_ssh_login(processes, wg_c_ed25519_pubkey, shared_wg, require_approval=F
                     sdk.TargetOptionsTargetSSHOptions(
                         kind="Ssh",
                         allow_insecure_algos=False,
-                        host="localhost",
+                        host=target_host(ssh_port),
                         port=ssh_port,
                         username="root",
                         auth=sdk.SSHTargetAuth(

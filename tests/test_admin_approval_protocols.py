@@ -22,7 +22,7 @@ from .approval_util import (
     wait_for_pending_approval,
 )
 from .conftest import VNC_BACKEND_SIZE, ProcessManager, WarpgateProcess
-from .util import mysql_client_opts, mysql_client_ssl_opt, wait_mysql_port, wait_port
+from .util import mysql_client_opts, mysql_client_ssl_opt, wait_mysql_port, wait_port, target_host
 from .vnc_client import VncClient
 
 
@@ -302,7 +302,7 @@ class Test:
                         sdk.TargetOptionsTargetPostgresOptions(
                             kind="Postgres",
                             protocol_version=sdk.PostgresProtocolVersion.ENUM_3_DOT_2,
-                            host="localhost",
+                            host=target_host(shared_postgres_port),
                             port=shared_postgres_port,
                             username="user",
                             auth=sdk.DatabaseTargetAuth(

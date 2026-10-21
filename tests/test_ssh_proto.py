@@ -14,7 +14,7 @@ from textwrap import dedent
 
 from .api_client import admin_client, sdk
 from .conftest import ProcessManager, WarpgateProcess
-from .util import read_until, wait_port, alloc_port
+from .util import read_until, wait_port, alloc_port, target_host
 
 
 @pytest.fixture(scope="session")
@@ -37,7 +37,7 @@ def setup_user_and_target(
     extra_config='',
     *,
     ssh_port=None,
-    host="localhost",
+    host=None,
     username="root",
     auth=None,
     jump_host=None,
@@ -48,6 +48,9 @@ def setup_user_and_target(
             extra_config=extra_config,
         )
         wait_port(ssh_port)
+    if host is None:
+        # localhost, or the pre-started sshd's host in CI (util.target_host)
+        host = target_host(ssh_port)
 
     url = f"https://localhost:{wg.http_port}"
     with admin_client(url) as api:

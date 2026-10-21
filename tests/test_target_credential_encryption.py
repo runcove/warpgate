@@ -12,6 +12,7 @@ import requests
 from .api_client import admin_client, sdk
 from .conftest import ProcessManager
 from .util import (
+    target_host,
     mysql_client_opts,
     mysql_client_ssl_opt,
     open_wg_sqlite_db,
@@ -92,7 +93,7 @@ def _provision(api, db_port):
             options=sdk.TargetOptions(
                 sdk.TargetOptionsTargetMySqlOptions(
                     kind="MySql",
-                    host="localhost",
+                    host=target_host(db_port),
                     port=db_port,
                     username="root",
                     auth=sdk.DatabaseTargetAuth(

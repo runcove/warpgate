@@ -12,7 +12,7 @@ from uuid import uuid4
 from .api_client import admin_client, sdk
 from .conftest import ProcessManager
 from .test_ticket_requests import _default_params as default_params  # noqa: F401
-from .util import wait_port
+from .util import wait_port, target_host
 
 # Every admin-role permission, all off. Tests switch on only what they are
 # asserting about, so a role can't accidentally pass a check via a permission
@@ -60,7 +60,7 @@ def create_postgres_target(api, role, db_port, require_approval=True):
                 sdk.TargetOptionsTargetPostgresOptions(
                     kind="Postgres",
                     protocol_version=sdk.PostgresProtocolVersion.ENUM_3_DOT_2,
-                    host="localhost",
+                    host=target_host(db_port),
                     port=db_port,
                     username="user",
                     auth=sdk.DatabaseTargetAuth(
@@ -88,7 +88,7 @@ def create_mysql_target(api, role, db_port, require_approval=True):
             options=sdk.TargetOptions(
                 sdk.TargetOptionsTargetMySqlOptions(
                     kind="MySql",
-                    host="localhost",
+                    host=target_host(db_port),
                     port=db_port,
                     username="root",
                     auth=sdk.DatabaseTargetAuth(
