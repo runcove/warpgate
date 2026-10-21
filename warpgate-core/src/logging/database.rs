@@ -1,9 +1,12 @@
+use std::future::Future;
 use std::sync::OnceLock;
 
 use sea_orm::query::JsonValue;
 use sea_orm::{ActiveModelTrait, DatabaseConnection};
 use time::OffsetDateTime;
-use tracing::{Subscriber, error};
+use tokio::sync::broadcast::Receiver;
+use tokio::sync::broadcast::error::RecvError;
+use tracing::{Subscriber, error, warn};
 use tracing_subscriber::Layer;
 use tracing_subscriber::registry::LookupSpan;
 use uuid::Uuid;
@@ -47,21 +50,44 @@ fn is_stored_in_database(target: &str, message: &str) -> bool {
 pub fn install_database_logger(database: DatabaseConnection) {
     tokio::spawn(async move {
         #[allow(clippy::expect_used)]
-        let mut receiver = LOG_SENDER
+        let receiver = LOG_SENDER
             .get()
             .expect("Log sender not ready yet")
             .subscribe();
-        loop {
-            match receiver.recv().await {
-                Err(_) => break,
-                Ok(log_entry) => {
-                    if let Err(error) = log_entry.insert(&database).await {
-                        error!(?error, "Failed to store log entry");
-                    }
+        store_log_entries(receiver, |log_entry| {
+            let database = &database;
+            async move {
+                if let Err(error) = log_entry.insert(database).await {
+                    error!(?error, "Failed to store log entry");
                 }
             }
-        }
+        })
+        .await;
     });
+}
+
+/// Hands every entry from the channel to `store` until the channel closes.
+///
+/// A receiver that falls behind (a slow or locked database) gets `Lagged`
+/// from the broadcast channel once it has dropped entries; that is not the
+/// end of the stream, so the loop warns and keeps going. The warning has no
+/// session and a non-audit target, so `values_to_log_entry_data` discards
+/// it: it cannot feed back into this channel as a stored row.
+async fn store_log_entries<T, F, Fut>(mut receiver: Receiver<T>, mut store: F)
+where
+    T: Clone,
+    F: FnMut(T) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    loop {
+        match receiver.recv().await {
+            Ok(log_entry) => store(log_entry).await,
+            Err(RecvError::Lagged(skipped)) => {
+                warn!(skipped, "Database logger fell behind, log entries were dropped");
+            }
+            Err(RecvError::Closed) => break,
+        }
+    }
 }
 
 fn values_to_log_entry_data(
@@ -137,5 +163,28 @@ mod tests {
             "SQL"
         ));
         assert!(is_stored_in_database("audit", "SQL"));
+    }
+
+    #[tokio::test]
+    async fn logger_keeps_storing_after_the_channel_lags() {
+        let (sender, receiver) = tokio::sync::broadcast::channel::<u32>(2);
+        // Four sends into a capacity-2 channel: the receiver lags past 1 and 2.
+        for n in 1..=4 {
+            sender.send(n).unwrap();
+        }
+
+        let stored = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = stored.clone();
+        let task = tokio::spawn(store_log_entries(receiver, move |n| {
+            let sink = sink.clone();
+            async move { sink.lock().unwrap().push(n) }
+        }));
+
+        // Sent after the lag has been seen: must still be stored.
+        sender.send(5).unwrap();
+        drop(sender);
+        task.await.unwrap();
+
+        assert_eq!(*stored.lock().unwrap(), vec![3, 4, 5]);
     }
 }
