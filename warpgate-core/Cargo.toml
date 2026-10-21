@@ -18,6 +18,7 @@ governor.workspace = true
 humantime-serde = { version = "1.1", default-features = false }
 ipnet.workspace = true
 ldap3.workspace = true
+libsqlite3-sys = { version = "0.30", default-features = false, optional = true }
 packet = { version = "0.1", default-features = false }
 password-hash.workspace = true
 png = "0.18"
@@ -59,4 +60,4 @@ zune-jpeg.workspace = true
 [features]
 postgres = ["sea-orm/sqlx-postgres"]
 mysql = ["sea-orm/sqlx-mysql"]
-sqlite = ["sea-orm/sqlx-sqlite"]
+sqlite = ["sea-orm/sqlx-sqlite", "dep:libsqlite3-sys"]

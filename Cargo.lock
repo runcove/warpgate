@@ -9152,6 +9152,7 @@ dependencies = [
  "humantime-serde",
  "ipnet",
  "ldap3",
+ "libsqlite3-sys",
  "packet",
  "password-hash 0.5.0",
  "png",
