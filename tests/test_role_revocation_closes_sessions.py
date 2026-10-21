@@ -22,7 +22,7 @@ from .api_client import admin_client, sdk
 from .conftest import ProcessManager, WarpgateProcess
 from .test_http_common import *  # noqa
 from .test_ssh_proto import common_args
-from .util import read_until, wait_port
+from .util import read_until, wait_port, target_host
 
 
 def _target(api, ssh_port, role_id):
@@ -36,7 +36,7 @@ def _target(api, ssh_port, role_id):
                 sdk.TargetOptionsTargetSSHOptions(
                     kind="Ssh",
                     allow_insecure_algos=False,
-                    host="localhost",
+                    host=target_host(ssh_port),
                     port=ssh_port,
                     username="root",
                     auth=sdk.SSHTargetAuth(

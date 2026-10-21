@@ -26,11 +26,47 @@ from typing import List, Optional
 
 from deepmerge import always_merger
 
-from .util import _wait_timeout, alloc_port, port_owners, wait_port
+from .util import _wait_timeout, alloc_port, port_owners, prestarted_targets, wait_port
 from .test_http_common import echo_server_port  # noqa
 
 
 cargo_root = Path(os.getcwd()).parent
+
+
+# CI's pre-started targets (WARPGATE_E2E_TARGETS=prestarted, read in util.py).
+# The runcove warpgate-integration job runs these tests in a sandbox with no
+# docker, so it starts an sshd (the config start_ssh_server writes with no
+# extra_config, trusting only ssh-keys/wg/client-ed25519.pub), a MySQL and a
+# Postgres itself, and the starters below hand those out. A target it does not
+# start is a skip when the job's list (WARPGATE_E2E_SKIPS) names the running
+# test, and an error otherwise. Unset, nothing here changes.
+_phase1_skips: Optional[dict] = None
+
+
+def _phase1_skip_reason(nodeid):
+    """The job's reason for skipping `nodeid` (its `node id<TAB>reason` lines), or None."""
+    global _phase1_skips
+    if _phase1_skips is None:
+        _phase1_skips = {}
+        path = os.getenv("WARPGATE_E2E_SKIPS", "")
+        if path:
+            with open(path, encoding="utf-8") as fh:
+                for line in fh:
+                    nid, _, reason = line.rstrip("\n").partition("\t")
+                    _phase1_skips[nid] = reason
+    return _phase1_skips.get(nodeid.split("[", 1)[0])
+
+
+def _no_prestarted(what):
+    """A target the pre-started set does not have: never a docker call."""
+    nodeid = os.getenv("PYTEST_CURRENT_TEST", "").rsplit(" ", 1)[0]
+    reason = _phase1_skip_reason(nodeid) if nodeid else None
+    if reason is not None:
+        pytest.skip(f"phase-1 skip list: {reason}")
+    raise RuntimeError(
+        f"WARPGATE_E2E_TARGETS=prestarted has no {what} (asked for by {nodeid or 'a fixture'}), "
+        "and the test is not on the job's skip list"
+    )
 enable_coverage = os.getenv("ENABLE_COVERAGE", "0") == "1"
 binary_path = (
     "target/llvm-cov-target/debug/warpgate"
@@ -304,6 +340,19 @@ class ProcessManager:
     def start_ssh_server(
         self, trusted_keys=[], extra_config="", root_password=None, trusted_ca=[]
     ):
+        if prestarted_targets:
+            fixed = (Path(os.getcwd()) / "ssh-keys/wg/client-ed25519.pub").read_text()
+            if (
+                list(trusted_keys) != [fixed]
+                or extra_config != ""
+                or root_password is not None
+                or list(trusted_ca) != []
+            ):
+                _no_prestarted(
+                    "sshd configured this way (it trusts only "
+                    "ssh-keys/wg/client-ed25519.pub, with nothing else)"
+                )
+            return prestarted_targets["ssh"][1]
         port = alloc_port()
         data_dir = self.ctx.tmpdir / f"sshd-{uuid.uuid4()}"
         data_dir.mkdir(parents=True)
@@ -401,6 +450,8 @@ class ProcessManager:
         return port
 
     def start_s3(self, access_key, secret_key):
+        if prestarted_targets:
+            _no_prestarted("S3 server")
         port = alloc_port()
         self.start(
             [
@@ -422,6 +473,8 @@ class ProcessManager:
         return port
 
     def start_mariadb_server(self):
+        if prestarted_targets:
+            _no_prestarted("MariaDB server")
         port = alloc_port()
         self.start(
             ["docker", "run", "--rm", "-p", f"{port}:3306", "warpgate-e2e-mariadb-server"]
@@ -429,6 +482,8 @@ class ProcessManager:
         return port
 
     def start_mysql_server(self):
+        if prestarted_targets:
+            return prestarted_targets["mysql"][1]
         port = alloc_port()
         self.start(
             ["docker", "run", "--rm", "-p", f"{port}:3306", "warpgate-e2e-mysql-server"]
@@ -436,6 +491,8 @@ class ProcessManager:
         return port
 
     def start_vnc_server(self, require_password=False):
+        if prestarted_targets:
+            _no_prestarted("VNC server")
         port = alloc_port()
         args = [
             "docker",
@@ -457,6 +514,8 @@ class ProcessManager:
     def start_rdp_server(self):
         # Headless RDP backend (images/rdp-server) with a fixed login user:pass of
         # `user`:`123`. Warpgate authenticates to it over NLA using the target password.
+        if prestarted_targets:
+            _no_prestarted("RDP server")
         port = alloc_port()
         self.start(
             [
@@ -473,6 +532,9 @@ class ProcessManager:
         return port
 
     def start_postgres_server(self):
+        if prestarted_targets:
+            # The job waited for pg_isready before the tests started.
+            return prestarted_targets["postgres"][1]
         port = alloc_port()
         container_name = f"warpgate-e2e-postgres-server-{uuid.uuid4()}"
         self.start(
@@ -521,6 +583,8 @@ class ProcessManager:
         It is not a child: the per-test cleanup must not stop it, and
         `docker rm -f` in `stop_k3s` is what removes it.
         """
+        if prestarted_targets:
+            _no_prestarted("k3s cluster")
         if self._k3s:
             return self._k3s
         port = alloc_port()
@@ -769,6 +833,8 @@ class ProcessManager:
         redirect_uris=None,
         extra_clients=None,
     ):
+        if prestarted_targets:
+            _no_prestarted("OIDC mock")
         port = alloc_port()
         container_name = f"warpgate-e2e-oidc-mock-{uuid.uuid4()}"
 
@@ -926,6 +992,8 @@ class ProcessManager:
         engine since OpenBao's dev-mode entrypoint still recognises the legacy `VAULT_*` names
         inherited from the fork, alongside its own `BAO_*` ones.
         """
+        if prestarted_targets:
+            _no_prestarted(f"{engine} server")
         assert engine in ("vault", "openbao"), f"unknown secret backend engine: {engine}"
         image = "hashicorp/vault" if engine == "vault" else "openbao/openbao"
 

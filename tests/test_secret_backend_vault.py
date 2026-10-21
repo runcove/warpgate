@@ -16,6 +16,7 @@ import pytest
 from .api_client import admin_client, sdk
 from .conftest import VNC_BACKEND_SIZE, ProcessManager, VaultInstance, WarpgateProcess
 from .util import (
+    target_host,
     _wait_timeout,
     alloc_port,
     mysql_client_opts,
@@ -477,7 +478,7 @@ class TestSecretBackendVault:
                         sdk.TargetOptionsTargetPostgresOptions(
                             kind="Postgres",
                             protocol_version="3.2",
-                            host="localhost",
+                            host=target_host(db_port),
                             port=db_port,
                             username="user",
                             auth=sdk.DatabaseTargetAuth(
@@ -616,7 +617,7 @@ class TestSecretBackendVault:
                         sdk.TargetOptionsTargetSSHOptions(
                             kind="Ssh",
                             allow_insecure_algos=False,
-                            host="localhost",
+                            host=target_host(ssh_port),
                             port=ssh_port,
                             username="root",
                             auth=sdk.SSHTargetAuth(
@@ -889,7 +890,7 @@ class TestSecretBackendVault:
                         sdk.TargetOptionsTargetPostgresOptions(
                             kind="Postgres",
                             protocol_version="3.2",
-                            host="localhost",
+                            host=target_host(db_port),
                             port=db_port,
                             username="user",
                             auth=sdk.DatabaseTargetAuth(
@@ -974,7 +975,7 @@ class TestSecretBackendVault:
                         sdk.TargetOptionsTargetSSHOptions(
                             kind="Ssh",
                             allow_insecure_algos=False,
-                            host="localhost",
+                            host=target_host(ssh_port),
                             port=ssh_port,
                             username="root",
                             auth=sdk.SSHTargetAuth(

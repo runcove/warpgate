@@ -7,7 +7,7 @@ import time
 from .api_client import admin_client, sdk
 from .conftest import ProcessManager, WarpgateProcess
 from .test_api import make_limited_admin_role_payload
-from .util import wait_port
+from .util import wait_port, target_host
 from .test_http_common import *  # noqa
 
 
@@ -488,7 +488,7 @@ class TestLoginProtection:
                         sdk.TargetOptionsTargetSSHOptions(
                             kind="Ssh",
                             allow_insecure_algos=False,
-                            host="localhost",
+                            host=target_host(ssh_port),
                             port=ssh_port,
                             username="root",
                             auth=sdk.SSHTargetAuth(
@@ -575,7 +575,7 @@ class TestLoginProtection:
                         sdk.TargetOptionsTargetSSHOptions(
                             kind="Ssh",
                             allow_insecure_algos=False,
-                            host="localhost",
+                            host=target_host(ssh_port),
                             port=ssh_port,
                             username="root",
                             auth=sdk.SSHTargetAuth(
