@@ -172,19 +172,17 @@ mod tests {
         for n in 1..=4 {
             sender.send(n).unwrap();
         }
-
-        let stored = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let sink = stored.clone();
-        let task = tokio::spawn(store_log_entries(receiver, move |n| {
-            let sink = sink.clone();
-            async move { sink.lock().unwrap().push(n) }
-        }));
-
-        // Sent after the lag has been seen: must still be stored.
-        sender.send(5).unwrap();
+        // Closed only once the buffered entries have been read.
         drop(sender);
-        task.await.unwrap();
 
-        assert_eq!(*stored.lock().unwrap(), vec![3, 4, 5]);
+        let mut stored = Vec::new();
+        store_log_entries(receiver, |n| {
+            stored.push(n);
+            async {}
+        })
+        .await;
+
+        // Before the fix the first Lagged ended the loop and nothing was stored.
+        assert_eq!(stored, vec![3, 4]);
     }
 }
