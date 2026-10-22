@@ -28,7 +28,7 @@ use warpgate_common::auth::{
 use warpgate_common::{
     Secret, TargetOptionsVariant, TargetSessionId, UserSessionId, WarpgateError,
 };
-use warpgate_common_http::ext::construct_external_url;
+use warpgate_common_http::ext::construct_control_plane_url;
 use warpgate_core::approvals::{GatedConnection, admit_target_session};
 use warpgate_core::auth::submit_credential;
 use warpgate_core::login_protection::FailedAttemptInfo;
@@ -293,7 +293,7 @@ pub async fn admit_desktop_session<O: Send + Sync>(
 async fn web_approval_url(services: &Services, state: &Arc<Mutex<AuthState>>) -> Option<String> {
     let external_url = {
         let config = services.config.lock().await;
-        construct_external_url(None, &config, None)
+        construct_control_plane_url(&config)
             .await
             .inspect_err(|error| warn!(%error, "Failed to construct external URL"))
             .ok()?

@@ -33,7 +33,7 @@ use warpgate_common::{
     Secret, TargetOptions, TargetSSHOptions, TargetSessionId, UserFacingReason, UserSessionId,
     WarpgateError,
 };
-use warpgate_common_http::ext::construct_external_url;
+use warpgate_common_http::ext::{construct_control_plane_url, construct_external_url};
 use warpgate_core::approvals::{GateOutcome, GatedConnection};
 use warpgate_core::auth::step_up::{get_pubkey_last_sso_at, is_fresh, update_pubkey_last_sso_at};
 use warpgate_core::auth::submit_credential;
@@ -3337,7 +3337,7 @@ impl ServerSession {
     async fn web_auth_instructions(&self, auth_state: &Arc<Mutex<AuthState>>) -> String {
         let identification_string = auth_state.lock().await.identification_string().to_owned();
 
-        let ext_url = construct_external_url(None, &*self.services.config.lock().await, None)
+        let ext_url = construct_control_plane_url(&*self.services.config.lock().await)
             .await
             .inspect_err(|error| {
                 warn!(?error, "Failed to construct external URL");
@@ -3398,7 +3398,7 @@ impl ServerSession {
 
         let identification_string = auth_state.lock().await.identification_string().to_owned();
 
-        let ext_url = construct_external_url(None, &*self.services.config.lock().await, None)
+        let ext_url = construct_control_plane_url(&*self.services.config.lock().await)
             .await
             .inspect_err(|error| {
                 warn!(?error, "Failed to construct external URL");
