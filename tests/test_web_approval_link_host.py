@@ -7,6 +7,7 @@ On the layout where the global `external_host` is a bound site, Warpgate's own
 
 import re
 import subprocess
+import threading
 import time
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -35,9 +36,9 @@ def test_the_ssh_approval_link_points_at_the_control_plane_host(
         config_patch={
             "external_host": MAIN_HOST,
             "http": {"external_host": ADMIN_HOST},
-            # Auto-continue rounds carry no prompt, so OpenSSH logs their
-            # instructions (the link) to stderr. A manual round's instructions
-            # go with its "Press Enter" prompt to the terminal instead.
+            # OpenSSH prints a round's instructions (the link) to stderr. An
+            # auto-continue round has no prompt, so the client needs no
+            # terminal to get past it.
             "ssh": {"web_auth_auto_continue": True},
         }
     )
@@ -115,19 +116,33 @@ def test_the_ssh_approval_link_points_at_the_control_plane_host(
             stderr=subprocess.PIPE,
         )
 
+        # Read stderr as it arrives. The approval request exists from the
+        # client's first (publickey) attempt, before the keyboard-interactive
+        # round that shows the link; approving that early lets the round accept
+        # at once and never print it. So approve only once the link is out.
+        stderr_chunks = []
+
+        def _drain_stderr():
+            for chunk in iter(lambda: ssh_client.stderr.read1(4096), b""):
+                stderr_chunks.append(chunk)
+
+        reader = threading.Thread(target=_drain_stderr, daemon=True)
+        reader.start()
+        link_re = re.compile(rb"https?://\S+/@warpgate#/login/\S+")
+        deadline = time.monotonic() + timeout
+        while not link_re.search(b"".join(stderr_chunks)):
+            assert time.monotonic() < deadline, b"".join(stderr_chunks)
+            assert ssh_client.poll() is None, b"".join(stderr_chunks)
+            time.sleep(0.1)
+
         # The list endpoint, not the stream: it has no race with the request
         # being created before the subscription.
-        auth_id = None
-        for _ in range(100):
-            pending = session.get(
-                f"{admin_url}/@warpgate/api/auth/web-auth-requests"
-            ).json()
-            ssh_pending = [p for p in pending if p["protocol"] == "SSH"]
-            if ssh_pending:
-                auth_id = ssh_pending[0]["id"]
-                break
-            time.sleep(0.1)
-        assert auth_id is not None, "no pending SSH approval request"
+        pending = session.get(
+            f"{admin_url}/@warpgate/api/auth/web-auth-requests"
+        ).json()
+        ssh_pending = [p for p in pending if p["protocol"] == "SSH"]
+        assert len(ssh_pending) == 1, pending
+        auth_id = ssh_pending[0]["id"]
 
         # The approval API answers on the host the link names.
         response = session.get(f"{admin_url}/@warpgate/api/auth/state/{auth_id}")
@@ -139,12 +154,15 @@ def test_the_ssh_approval_link_points_at_the_control_plane_host(
         )
         assert response.status_code == 200, response.text
 
-        stdout, stderr = ssh_client.communicate(timeout=timeout)
+        stdout = ssh_client.stdout.read()
+        ssh_client.wait(timeout=timeout)
+        reader.join(timeout=timeout)
+        stderr = b"".join(stderr_chunks)
 
     assert stdout == b"/bin/sh\n"
     assert ssh_client.returncode == 0
 
-    links = re.findall(rb"https?://\S+/@warpgate#/login/\S+", stderr)
+    links = link_re.findall(stderr)
     assert len(links) == 1, stderr
     (link,) = links
     link = urlsplit(link.decode())
