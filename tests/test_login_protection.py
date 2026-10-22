@@ -857,7 +857,18 @@ class TestLoginProtection:
 
         # A session admitted before the block; it waits on stdin.
         held = mysql_client("correct_password")
-        time.sleep(1)
+
+        def held_admitted():
+            with admin_client(url) as api:
+                return any(
+                    s.ended is None and s.protocol == "MySQL"
+                    for s in api.get_sessions(username=user.username).items
+                )
+
+        deadline = time.monotonic() + timeout
+        while not held_admitted():
+            assert time.monotonic() < deadline, "the held MySQL session was never admitted"
+            time.sleep(0.2)
 
         for _ in range(3):
             assert ssh_login("wrong") != 0
@@ -870,7 +881,9 @@ class TestLoginProtection:
         rc, out, err = mysql_login("correct_password")
         assert rc != 0, "a run-time IP block must refuse a new MySQL login"
         assert b"marker" not in out
-        assert b"access denied" in err.lower(), err
+        # Warpgate's own refusal ("Warpgate access denied"), not the target's
+        # 1045 "Access denied" from a failed upstream connection.
+        assert b"warpgate access denied" in err.lower(), err
 
         # The session admitted before the block still answers.
         out, err = held.communicate(b"select 'still-here';", timeout=timeout)
