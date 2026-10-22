@@ -1,7 +1,7 @@
 use poem::FromRequest;
 use poem::http::HeaderName;
 use poem::http::header::ACCEPT;
-use poem::http::uri::Scheme;
+use poem::http::uri::{Authority, Scheme};
 use poem::web::Data;
 use url::Url;
 use warpgate_common::WarpgateError;
@@ -62,10 +62,45 @@ pub async fn construct_external_url(
         ));
     }
 
+    origin_url(&scheme, &host, port)
+}
+
+/// The URL of the control-plane host, where the `/@warpgate` routes (including
+/// the browser approval page) are served: `http.external_host` when set, else
+/// the global external host. A port written in `http.external_host` wins over
+/// `http.external_port` and the listen port.
+pub async fn construct_control_plane_url(
+    config: &warpgate_common::WarpgateConfig,
+) -> Result<Url, WarpgateError> {
+    let Some(authority) = config
+        .store
+        .http
+        .external_host
+        .as_deref()
+        .and_then(|value| value.parse::<Authority>().ok())
+    else {
+        return construct_external_url(None, config, None).await;
+    };
+    let host = config
+        .control_plane_host()
+        .ok_or(WarpgateError::ExternalHostUnknown)?;
+    let scheme = if config.store.http.plain_http_on_loopback {
+        Scheme::HTTP
+    } else {
+        Scheme::HTTPS
+    };
+    let port = authority
+        .port_u16()
+        .or(config.store.http.external_port)
+        .unwrap_or_else(|| config.store.http.listen.port());
+    origin_url(&scheme, &host, Some(port))
+}
+
+fn origin_url(scheme: &Scheme, host: &str, port: Option<u16>) -> Result<Url, WarpgateError> {
     let mut url = format!("{scheme}://{host}");
     if let Some(port) = port {
         // can't `match` `Scheme`
-        if scheme == Scheme::HTTP && port != 80 || scheme == Scheme::HTTPS && port != 443 {
+        if *scheme == Scheme::HTTP && port != 80 || *scheme == Scheme::HTTPS && port != 443 {
             url = format!("{url}:{port}");
         }
     }
@@ -120,5 +155,71 @@ mod tests {
             .expect("external url");
 
         assert_eq!(url.as_str(), "http://localhost:8888/");
+    }
+
+    fn control_plane_config(http_external_host: Option<&str>) -> WarpgateConfig {
+        let mut config = test_config(Some("config.example"));
+        config.store.http.external_host = http_external_host.map(str::to_owned);
+        config
+    }
+
+    #[tokio::test]
+    async fn construct_control_plane_url_matches_external_url_without_http_external_host() {
+        let config = control_plane_config(None);
+
+        let url = construct_control_plane_url(&config)
+            .await
+            .expect("control plane url");
+        let external = construct_external_url(None, &config, None)
+            .await
+            .expect("external url");
+
+        assert_eq!(url, external);
+    }
+
+    #[tokio::test]
+    async fn construct_control_plane_url_uses_http_external_host_without_port() {
+        let config = control_plane_config(Some("admin.example"));
+
+        let url = construct_control_plane_url(&config)
+            .await
+            .expect("control plane url");
+
+        assert_eq!(url.as_str(), "https://admin.example:8888/");
+    }
+
+    #[tokio::test]
+    async fn construct_control_plane_url_prefers_the_port_in_http_external_host() {
+        let mut config = control_plane_config(Some("admin.example:8443"));
+        config.store.http.external_port = Some(9443);
+
+        let url = construct_control_plane_url(&config)
+            .await
+            .expect("control plane url");
+
+        assert_eq!(url.as_str(), "https://admin.example:8443/");
+    }
+
+    #[tokio::test]
+    async fn construct_control_plane_url_omits_the_default_port() {
+        let config = control_plane_config(Some("admin.example:443"));
+
+        let url = construct_control_plane_url(&config)
+            .await
+            .expect("control plane url");
+
+        assert_eq!(url.as_str(), "https://admin.example/");
+    }
+
+    #[tokio::test]
+    async fn construct_control_plane_url_is_http_on_a_plain_http_listener() {
+        let mut config = control_plane_config(Some("admin.example"));
+        config.store.http.plain_http_on_loopback = true;
+
+        let url = construct_control_plane_url(&config)
+            .await
+            .expect("control plane url");
+
+        assert_eq!(url.as_str(), "http://admin.example:8888/");
     }
 }

@@ -19,7 +19,7 @@ use warpgate_common::auth::{AuthSelector, redacted_selector};
 use warpgate_common::{
     PostgresProtocolVersion, Protocol, Secret, TargetPostgresOptions, UserSessionId, WarpgateError,
 };
-use warpgate_common_http::ext::construct_external_url;
+use warpgate_common_http::ext::construct_control_plane_url;
 use warpgate_core::{
     AdmittedTarget, ApprovedTarget, AuthOkPermit, DbAuthTransport, Services, WarpgateServerHandle,
     run_db_authorization,
@@ -87,7 +87,7 @@ impl<S: AsyncRead + AsyncWrite + Send + Unpin> DbAuthTransport for PostgresSessi
     }
 
     async fn external_url(&mut self) -> Result<Url, PostgresError> {
-        Ok(construct_external_url(None, &*self.services.config.lock().await, None).await?)
+        Ok(construct_control_plane_url(&*self.services.config.lock().await).await?)
     }
 
     async fn send_web_approval_prompt(

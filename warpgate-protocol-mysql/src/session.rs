@@ -12,7 +12,7 @@ use url::Url;
 use warpgate_common::auth::{AuthSelector, redacted_selector};
 use warpgate_common::helpers::rng::get_crypto_rng;
 use warpgate_common::{Protocol, Secret, TargetMySqlOptions, UserSessionId};
-use warpgate_common_http::ext::construct_external_url;
+use warpgate_common_http::ext::construct_control_plane_url;
 use warpgate_core::{
     AdmittedTarget, ApprovedTarget, AuthOkPermit, DbAuthTransport, Services, WarpgateServerHandle,
     run_db_authorization,
@@ -75,7 +75,7 @@ impl<S: AsyncRead + AsyncWrite + Send + Unpin> DbAuthTransport for MySqlSession<
     }
 
     async fn external_url(&mut self) -> Result<Url, MySqlError> {
-        Ok(construct_external_url(None, &*self.services.config.lock().await, None).await?)
+        Ok(construct_control_plane_url(&*self.services.config.lock().await).await?)
     }
 
     /// The MySQL connection phase has no packet for showing the user a link, so
