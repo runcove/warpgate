@@ -643,28 +643,52 @@ class Test:
         )
 
         transport = paramiko.Transport(("localhost", shared_wg.ssh_port))
+        sender = None
         try:
             transport.connect(
                 username=f"{user.username}:{ssh_target.name}", password="123"
             )
             channel = transport.open_session()
             channel.exec_command("sleep 60")
-            channel.settimeout(0.5)
 
-            chunk = b"x" * 32768
-            sent = 0
-            deadline = time.monotonic() + 15
-            while time.monotonic() < deadline and sent < 256 * 1024 * 1024:
+            # Once TCP is full, paramiko blocks inside the socket send, where
+            # the channel timeout does not apply. So the sending happens on a
+            # thread that only counts, and this thread decides when to stop.
+            sent = [0]
+
+            def send_forever():
+                chunk = b"x" * 32768
                 try:
-                    sent += channel.send(chunk)
-                except socket.timeout:
+                    while sent[0] < 256 * 1024 * 1024:
+                        sent[0] += channel.send(chunk)
+                except Exception:
+                    # The transport was closed under the blocked send.
                     pass
 
-            assert sent < 32 * 1024 * 1024, (
-                f"the client sent {sent} bytes to a target that reads none"
+            sender = threading.Thread(target=send_forever, daemon=True)
+            sender.start()
+
+            deadline = time.monotonic() + 15
+            last_count = -1
+            last_change = time.monotonic()
+            while time.monotonic() < deadline and sender.is_alive():
+                time.sleep(0.25)
+                if sent[0] != last_count:
+                    last_count = sent[0]
+                    last_change = time.monotonic()
+                elif sent[0] > 0 and time.monotonic() - last_change > 4:
+                    break
+
+            accepted = sent[0]
+            assert accepted > 0, "the client could not send anything"
+            assert accepted < 32 * 1024 * 1024, (
+                f"the client sent {accepted} bytes to a target that reads none"
             )
         finally:
+            # Closing the socket releases a send that is blocked on TCP.
             transport.close()
+            if sender is not None:
+                sender.join(timeout=10)
 
     # https://github.com/warp-tech/warpgate/issues/2498
     def test_direct_tcpip_stuck_open_does_not_block_siblings(
