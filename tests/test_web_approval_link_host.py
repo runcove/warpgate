@@ -35,6 +35,10 @@ def test_the_ssh_approval_link_points_at_the_control_plane_host(
         config_patch={
             "external_host": MAIN_HOST,
             "http": {"external_host": ADMIN_HOST},
+            # Auto-continue rounds carry no prompt, so OpenSSH logs their
+            # instructions (the link) to stderr. A manual round's instructions
+            # go with its "Press Enter" prompt to the terminal instead.
+            "ssh": {"web_auth_auto_continue": True},
         }
     )
     wait_port(wg.http_port, for_process=wg.process, recv=False)
@@ -135,13 +139,14 @@ def test_the_ssh_approval_link_points_at_the_control_plane_host(
         )
         assert response.status_code == 200, response.text
 
-        ssh_client.stdin.write(b"\r\n")
         stdout, stderr = ssh_client.communicate(timeout=timeout)
 
     assert stdout == b"/bin/sh\n"
     assert ssh_client.returncode == 0
 
-    (link,) = re.findall(rb"https?://\S+/@warpgate#/login/\S+", stderr)
+    links = re.findall(rb"https?://\S+/@warpgate#/login/\S+", stderr)
+    assert len(links) == 1, stderr
+    (link,) = links
     link = urlsplit(link.decode())
     assert link.scheme == "https"
     assert link.netloc == f"{ADMIN_HOST}:{port}"
