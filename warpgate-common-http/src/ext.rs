@@ -201,6 +201,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn construct_control_plane_url_keeps_the_brackets_of_an_ipv6_http_external_host() {
+        let config = control_plane_config(Some("[::1]:8443"));
+
+        let url = construct_control_plane_url(&config)
+            .await
+            .expect("control plane url");
+
+        assert_eq!(url.as_str(), "https://[::1]:8443/");
+    }
+
+    #[tokio::test]
+    async fn construct_control_plane_url_falls_back_to_external_port() {
+        let mut config = control_plane_config(Some("admin.example"));
+        config.store.http.external_port = Some(9443);
+
+        let url = construct_control_plane_url(&config)
+            .await
+            .expect("control plane url");
+
+        assert_eq!(url.as_str(), "https://admin.example:9443/");
+    }
+
+    #[tokio::test]
+    async fn construct_control_plane_url_needs_the_global_external_host() {
+        let mut config = test_config(None);
+        config.store.http.external_host = Some("admin.example".to_owned());
+
+        let err = construct_control_plane_url(&config)
+            .await
+            .expect_err("no global external host");
+
+        assert!(matches!(err, WarpgateError::ExternalHostUnknown));
+    }
+
+    #[tokio::test]
     async fn construct_control_plane_url_omits_the_default_port() {
         let config = control_plane_config(Some("admin.example:443"));
 
