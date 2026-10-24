@@ -8,7 +8,7 @@ import requests
 
 from .api_client import admin_client, sdk
 from .conftest import ProcessManager, WarpgateProcess, binary_path, cargo_root
-from .util import wait_port
+from .util import own_database_url, wait_port
 
 
 def _copy_database(config_path: Path, target_url: str) -> subprocess.CompletedProcess:
@@ -82,7 +82,7 @@ class TestCopyDatabase:
         _stop(wg)
 
         db_port = processes.start_postgres_server()
-        postgres_url = f"postgres://user:123@localhost:{db_port}/db"
+        postgres_url = own_database_url("postgres", db_port)
 
         copy = _copy_database(wg.config_path, postgres_url)
         assert copy.returncode == 0, f"copy-database failed:\n{copy.stderr}"
