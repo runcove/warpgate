@@ -274,6 +274,10 @@ async fn _main() -> Result<()> {
     }
 }
 
+#[cfg(feature = "jemalloc")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 #[tokio::main]
 async fn main() {
     warpgate_version::set_warpgate_version(warpgate_version::git_describe!());

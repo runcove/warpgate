@@ -213,7 +213,8 @@ debug = "line-tables-only"
 
 [profile.release]
 lto = true
-strip = "debuginfo"
+# Diagnostic branch: keep the symbol table so jeprof can name allocation sites.
+strip = "none"
 
 [profile.release-no-lto]
 inherits = "release"
