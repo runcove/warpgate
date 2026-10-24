@@ -6,7 +6,7 @@ import requests
 
 from .api_client import sdk, admin_client
 from .conftest import ProcessManager, WarpgateProcess
-from .util import wait_mysql_port, wait_port
+from .util import own_database_url, wait_mysql_port, wait_port
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"logo-bytes"
 
@@ -157,13 +157,13 @@ class TestLogo:
 
 def _start_postgres(processes: ProcessManager) -> str:
     port = processes.start_postgres_server()
-    return f"postgres://user:123@localhost:{port}/db"
+    return own_database_url("postgres", port)
 
 
 def _start_mysql(processes: ProcessManager) -> str:
     port = processes.start_mysql_server()
     wait_mysql_port(port)
-    return f"mysql://root:123@localhost:{port}/db"
+    return own_database_url("mysql", port)
 
 
 def _start_mariadb(processes: ProcessManager) -> str:
