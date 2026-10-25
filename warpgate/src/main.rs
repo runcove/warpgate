@@ -274,6 +274,11 @@ async fn _main() -> Result<()> {
     }
 }
 
+/// The static musl build uses jemalloc; see `warpgate/Cargo.toml`.
+#[cfg(target_env = "musl")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 #[tokio::main]
 async fn main() {
     warpgate_version::set_warpgate_version(warpgate_version::git_describe!());
