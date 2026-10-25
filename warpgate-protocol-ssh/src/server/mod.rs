@@ -17,7 +17,7 @@ use futures::FutureExt;
 use futures::future::BoxFuture;
 use russh::keys::{Algorithm, HashAlg, PrivateKey};
 use russh::{MethodKind, MethodSet, Preferred};
-pub use russh_handler::ServerHandler;
+pub use russh_handler::{ChannelInputs, ServerHandler};
 pub use session::ServerSession;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
@@ -110,7 +110,8 @@ async fn _handle_connection(
     // Input waiting on a stalled target ends the connection after the same
     // quiet period as an idle one.
     let input_wait_limit = services.config.lock().await.store.ssh.inactivity_timeout;
-    let handler = ServerHandler::new(event_tx, banner, input_wait_limit);
+    let channel_inputs = ChannelInputs::default();
+    let handler = ServerHandler::new(event_tx, banner, input_wait_limit, channel_inputs.clone());
 
     let session = match ServerSession::start(
         remote_address,
@@ -118,6 +119,7 @@ async fn _handle_connection(
         server_handle,
         session_handle_rx,
         event_rx,
+        channel_inputs,
         client_socket,
     )
     .await
