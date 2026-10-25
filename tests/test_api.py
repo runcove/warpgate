@@ -17,7 +17,7 @@ import requests
 from .api_client import sdk, admin_client as new_admin_client
 from .conftest import ProcessManager, WarpgateProcess
 from .test_http_common import *  # noqa
-from .util import wait_port
+from .util import own_database_url, wait_port
 
 
 @dataclass
@@ -1066,7 +1066,7 @@ def _create_user_api_token(
 def pg_wg(processes: ProcessManager):
     db_port = processes.start_postgres_server()
     wg = processes.start_wg(
-        database_url=f"postgres://user:123@localhost:{db_port}/db",
+        database_url=own_database_url("postgres", db_port),
     )
     wait_port(wg.http_port, for_process=wg.process, recv=False)
     wait_port(wg.ssh_port, for_process=wg.process)

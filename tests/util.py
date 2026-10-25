@@ -7,6 +7,7 @@ import sqlite3
 import subprocess
 import threading
 import time
+import uuid
 
 import yaml
 
@@ -60,6 +61,30 @@ def target_host(port, default="localhost"):
     """The host a test reaches a target on: the pre-started target's for its
     port, otherwise `default`, the address the test always used."""
     return target_hosts.get(port, default)
+
+def own_database_url(kind, port):
+    """The URL of a database for a Warpgate of its own (`database_url`), on the
+    Postgres (kind "postgres") or MySQL (kind "mysql") server at `port`.
+
+    Started by the test itself, the server is that Warpgate's alone and the URL
+    names its `db` on localhost, as it always did. A pre-started server is shared
+    and is reached on its own host, so each call makes an empty database there
+    with the same clients the tests use, and Warpgate gets that one."""
+    user = {"postgres": "user", "mysql": "root"}[kind]
+    scheme = {"postgres": "postgres", "mysql": "mysql"}[kind]
+    if port not in target_hosts:
+        return f"{scheme}://{user}:123@localhost:{port}/db"
+    host = target_hosts[port]
+    name = f"wg_{uuid.uuid4().hex}"
+    if kind == "postgres":
+        cmd = ["psql", "-h", host, "-p", str(port), "-U", user, "-d", "db", "-v", "ON_ERROR_STOP=1", "-c", f"CREATE DATABASE {name}"]
+        env = {**os.environ, "PGPASSWORD": "123"}
+    else:
+        cmd = ["mysql", f"--user={user}", "--password=123", f"--host={host}", f"--port={port}", f"--execute=CREATE DATABASE {name}"]
+        env = os.environ
+    subprocess.run(cmd, check=True, env=env, stdout=subprocess.DEVNULL)
+    return f"{scheme}://{user}:123@{host}:{port}/{name}"
+
 
 mysql_client_ssl_opt = "--ssl"
 mysql_client_opts = []

@@ -1,7 +1,7 @@
 import requests
 
 from .conftest import ProcessManager, WarpgateProcess
-from .util import wait_port, wait_mysql_port
+from .util import own_database_url, wait_port, wait_mysql_port
 
 
 def _check_info_endpoint(wg: WarpgateProcess, timeout: int) -> None:
@@ -16,7 +16,7 @@ class TestPostgresMigrations:
     def test_postgres_migrations(self, processes: ProcessManager, timeout):
         db_port = processes.start_postgres_server()
         wg = processes.start_wg(
-            database_url=f"postgres://user:123@localhost:{db_port}/db",
+            database_url=own_database_url("postgres", db_port),
         )
         _check_info_endpoint(wg, timeout)
 
@@ -26,7 +26,7 @@ class TestMariaDBMigrations:
         db_port = processes.start_mariadb_server()
         wait_mysql_port(db_port)
         wg = processes.start_wg(
-            database_url=f"mysql://root:123@localhost:{db_port}/db",
+            database_url=own_database_url("mysql", db_port),
         )
         _check_info_endpoint(wg, timeout)
 
@@ -36,6 +36,6 @@ class TestMysqlMigrations:
         db_port = processes.start_mysql_server()
         wait_mysql_port(db_port)
         wg = processes.start_wg(
-            database_url=f"mysql://root:123@localhost:{db_port}/db",
+            database_url=own_database_url("mysql", db_port),
         )
         _check_info_endpoint(wg, timeout)
