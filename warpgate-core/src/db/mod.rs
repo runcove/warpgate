@@ -104,9 +104,9 @@ async fn connect_to_sqlite(url: &str) -> Result<DatabaseConnection> {
     // connection parses the schema and grows a page cache of up to ~2 MiB in
     // small pieces; closing it frees them, but an allocator that only returns
     // whole groups (musl's mallocng, in the static build) keeps most of them
-    // resident, pinned by live neighbours. With idle and lifetime closes the
-    // embedded Warpgate's memory climbed by ~0.5-2 MiB per login or API
-    // request until the cgroup killed it. The pool stops at
+    // resident, pinned by live neighbours. With idle and lifetime closes a
+    // busy pool kept replacing connections, and the static build's resident
+    // memory kept rising with them. The pool stops at
     // SQLITE_MAX_CONNECTIONS, so the most it holds is that many caches. A
     // connection that goes bad is still dropped by `connection_is_clean`.
     let pool = SqlitePoolOptions::new()
