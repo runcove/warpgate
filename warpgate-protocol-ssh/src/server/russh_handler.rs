@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fmt::Debug;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -10,6 +10,7 @@ use russh::server::{Auth, ChannelOpenHandle, Handle, Msg, Session};
 use russh::{Channel, ChannelId, Pty, Sig};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
+use tokio_util::sync::CancellationToken;
 use tracing::*;
 use warpgate_common::Secret;
 
@@ -158,12 +159,67 @@ async fn hold_input(
     }))
 }
 
+/// One channel's input state: its budget and a token that is cancelled once
+/// the channel is closed, so input waiting for budget can stop waiting.
+#[derive(Clone)]
+struct ChannelInput {
+    budget: Arc<Semaphore>,
+    closed: CancellationToken,
+}
+
+/// Every channel's input state on one connection. The handler waits on it
+/// while the session, which learns of a channel closing from the target, ends
+/// those waits through [`Self::close`]. Channels are keyed by their number.
+#[derive(Clone, Default)]
+pub struct ChannelInputs(Arc<Mutex<HashMap<u32, ChannelInput>>>);
+
+impl ChannelInputs {
+    fn get(&self, channel: u32) -> ChannelInput {
+        let mut inputs = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        inputs
+            .entry(channel)
+            .or_insert_with(|| ChannelInput {
+                budget: Arc::new(Semaphore::new(CHANNEL_INPUT_BUDGET)),
+                closed: CancellationToken::new(),
+            })
+            .clone()
+    }
+
+    /// Ends any input waiting on the channel's budget and forgets the channel.
+    pub fn close(&self, channel: u32) {
+        let removed = self
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&channel);
+        if let Some(input) = removed {
+            input.closed.cancel();
+        }
+    }
+}
+
+/// Like [`hold_input`], but ends with `None` (dropping `data`) as soon as
+/// `closed` is cancelled, releasing any share of the budgets already taken.
+async fn hold_input_until_closed(
+    channel_budget: Arc<Semaphore>,
+    connection_budget: Arc<Semaphore>,
+    data: &[u8],
+    wait_limit: Duration,
+    closed: &CancellationToken,
+) -> anyhow::Result<Option<Bytes>> {
+    tokio::select! {
+        biased;
+        () = closed.cancelled() => Ok(None),
+        held = hold_input(channel_budget, connection_budget, data, wait_limit) => held.map(Some),
+    }
+}
+
 pub struct ServerHandler {
     pub event_tx: UnboundedSender<ServerHandlerEvent>,
     /// Optional custom banner shown to the client during authentication.
     pub banner: Option<String>,
     /// Per channel, the input budget still free (see [`CHANNEL_INPUT_BUDGET`]).
-    pub input_budgets: HashMap<ChannelId, Arc<Semaphore>>,
+    pub channel_inputs: ChannelInputs,
     /// The whole connection's input budget still free (see [`CONNECTION_INPUT_BUDGET`]).
     pub connection_input_budget: Arc<Semaphore>,
     /// How long input may wait for budget before the connection is dropped.
@@ -181,11 +237,12 @@ impl ServerHandler {
         event_tx: UnboundedSender<ServerHandlerEvent>,
         banner: Option<String>,
         input_wait_limit: Duration,
+        channel_inputs: ChannelInputs,
     ) -> Self {
         Self {
             event_tx,
             banner,
-            input_budgets: HashMap::new(),
+            channel_inputs,
             connection_input_budget: Arc::new(Semaphore::new(CONNECTION_INPUT_BUDGET)),
             input_wait_limit,
         }
@@ -193,18 +250,19 @@ impl ServerHandler {
 
     /// Waits until the channel's and the connection's budgets have room for
     /// `data`, then returns it as bytes that hold that room until they are
-    /// dropped.
-    async fn hold_input(&mut self, channel: ChannelId, data: &[u8]) -> anyhow::Result<Bytes> {
-        let budget = self
-            .input_budgets
-            .entry(channel)
-            .or_insert_with(|| Arc::new(Semaphore::new(CHANNEL_INPUT_BUDGET)))
-            .clone();
-        hold_input(
-            budget,
+    /// dropped. `None` means the channel closed meanwhile and `data` is dropped.
+    async fn hold_input(
+        &mut self,
+        channel: ChannelId,
+        data: &[u8],
+    ) -> anyhow::Result<Option<Bytes>> {
+        let input = self.channel_inputs.get(u32::from(channel));
+        hold_input_until_closed(
+            input.budget,
             self.connection_input_budget.clone(),
             data,
             self.input_wait_limit,
+            &input.closed,
         )
         .await
     }
@@ -400,7 +458,9 @@ impl russh::server::Handler for ServerHandler {
         data: &[u8],
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        let data = self.hold_input(channel, data).await?;
+        let Some(data) = self.hold_input(channel, data).await? else {
+            return Ok(());
+        };
         let channel = ServerChannelId(channel);
 
         let (tx, rx) = oneshot::channel();
@@ -418,7 +478,9 @@ impl russh::server::Handler for ServerHandler {
         data: &[u8],
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        let data = self.hold_input(channel, data).await?;
+        let Some(data) = self.hold_input(channel, data).await? else {
+            return Ok(());
+        };
         let channel = ServerChannelId(channel);
         let (tx, rx) = oneshot::channel();
 
@@ -432,7 +494,7 @@ impl russh::server::Handler for ServerHandler {
         channel: ChannelId,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        self.input_budgets.remove(&channel);
+        self.channel_inputs.close(u32::from(channel));
         let channel = ServerChannelId(channel);
         let (tx, rx) = oneshot::channel();
         self.send_event(ServerHandlerEvent::ChannelClose(channel, tx))?;
@@ -857,5 +919,116 @@ mod tests {
             CHANNEL_INPUT_BUDGET,
             "a wait that gave up keeps no share of the channel's budget"
         );
+    }
+
+    /// Input waiting on a full budget stops waiting, and is dropped, as soon
+    /// as its channel closes, long before the wait limit.
+    #[tokio::test]
+    async fn channel_input_waiting_for_budget_ends_when_the_channel_closes() {
+        let inputs = ChannelInputs::default();
+        let channel = 1;
+        let input = inputs.get(channel);
+        let _held = hold_input(
+            input.budget.clone(),
+            connection(),
+            &vec![0; CHANNEL_INPUT_BUDGET],
+            WAIT,
+        )
+        .await
+        .unwrap();
+
+        let waiting = tokio::spawn({
+            let input = input.clone();
+            async move {
+                hold_input_until_closed(
+                    input.budget,
+                    connection(),
+                    b"more",
+                    Duration::from_secs(30),
+                    &input.closed,
+                )
+                .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiting.is_finished(), "input past the budget must wait");
+
+        inputs.close(channel);
+        let ended = tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("a closed channel must end the wait")
+            .unwrap()
+            .unwrap();
+        assert!(ended.is_none());
+    }
+
+    /// A wait that ends because its channel closed gives back the shares of
+    /// the budgets it had already taken, so the connection's other channels
+    /// are not held up by it.
+    #[tokio::test]
+    async fn closing_a_channel_releases_the_budget_its_waiting_input_took() {
+        let inputs = ChannelInputs::default();
+        let connection = Arc::new(Semaphore::new(CHANNEL_INPUT_BUDGET));
+        let hog = hold_input(
+            Arc::new(Semaphore::new(CHANNEL_INPUT_BUDGET)),
+            connection.clone(),
+            &vec![0; CHANNEL_INPUT_BUDGET],
+            WAIT,
+        )
+        .await
+        .unwrap();
+
+        // Holds the closing channel's own share, then waits for the
+        // connection's.
+        let closing = 1;
+        let input = inputs.get(closing);
+        let waiting = tokio::spawn({
+            let input = input.clone();
+            let connection = connection.clone();
+            async move {
+                hold_input_until_closed(
+                    input.budget,
+                    connection,
+                    b"more",
+                    Duration::from_secs(30),
+                    &input.closed,
+                )
+                .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiting.is_finished());
+
+        inputs.close(closing);
+        assert!(waiting.await.unwrap().unwrap().is_none());
+        assert_eq!(input.budget.available_permits(), CHANNEL_INPUT_BUDGET);
+
+        drop(hog);
+        let other = inputs.get(2);
+        let passed = hold_input_until_closed(
+            other.budget,
+            connection.clone(),
+            &vec![5; CHANNEL_INPUT_BUDGET],
+            WAIT,
+            &other.closed,
+        )
+        .await
+        .unwrap();
+        assert!(passed.is_some(), "another channel must not stay blocked");
+    }
+
+    /// Closing one channel leaves the others' waits alone, and a channel
+    /// that is used again afterwards starts with a fresh budget.
+    #[tokio::test]
+    async fn closing_a_channel_does_not_touch_other_channels() {
+        let inputs = ChannelInputs::default();
+        let (one, two) = (1, 2);
+        let first = inputs.get(one);
+        let second = inputs.get(two);
+
+        inputs.close(one);
+        assert!(first.closed.is_cancelled());
+        assert!(!second.closed.is_cancelled());
+        assert!(!inputs.get(one).closed.is_cancelled());
     }
 }

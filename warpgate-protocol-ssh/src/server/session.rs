@@ -50,7 +50,7 @@ use warpgate_db_entities::Parameters::SshHostKeyVerificationMode;
 use super::channel_registry::{Channel, ChannelRegistry};
 use super::channel_writer::ChannelWriter;
 use super::event_intake::EventIntake;
-use super::russh_handler::ServerHandlerEvent;
+use super::russh_handler::{ChannelInputs, ServerHandlerEvent};
 use super::service_output::ServiceOutput;
 use super::session_handle::SessionHandleCommand;
 use crate::server::get_allowed_auth_methods;
@@ -268,6 +268,9 @@ pub struct ServerSession {
     target_env: Option<HashMap<String, String>>,
     session_handle: Option<russh::server::Handle>,
     channels: ChannelRegistry,
+    /// The client's input waiting on each channel's budget, ended when the
+    /// target closes the channel.
+    channel_inputs: ChannelInputs,
     /// Client-side events for channel ids no registered channel carries yet.
     /// They can only refer to a server-initiated open whose
     /// [`Event::ServerChannelOpenResult`] hasn't been processed — until it is,
@@ -968,6 +971,7 @@ impl ServerSession {
         server_handle: Arc<Mutex<WarpgateServerHandle>>,
         mut session_handle_rx: UnboundedReceiver<SessionHandleCommand>,
         mut handler_event_rx: UnboundedReceiver<ServerHandlerEvent>,
+        channel_inputs: ChannelInputs,
         client_socket: std::net::TcpStream,
     ) -> Result<impl Future<Output = Result<()>> + use<>> {
         let id = server_handle.lock().await.user_session_id();
@@ -978,12 +982,12 @@ impl ServerSession {
         // from other connections, carried this session's span.
         let span_ = info_span!("SSH", session=%id);
         let session = Self::start_in_span(
-            id,
             remote_address,
             services,
             server_handle,
             session_handle_rx,
             handler_event_rx,
+            channel_inputs,
             client_socket,
         )
         .instrument(span_.clone())
@@ -992,14 +996,15 @@ impl ServerSession {
     }
 
     async fn start_in_span(
-        id: UserSessionId,
         remote_address: SocketAddr,
         services: &Services,
         server_handle: Arc<Mutex<WarpgateServerHandle>>,
         mut session_handle_rx: UnboundedReceiver<SessionHandleCommand>,
         mut handler_event_rx: UnboundedReceiver<ServerHandlerEvent>,
+        channel_inputs: ChannelInputs,
         client_socket: std::net::TcpStream,
     ) -> Result<impl Future<Output = Result<()>> + use<>> {
+        let id = server_handle.lock().await.user_session_id();
         let mut rc_handles = RemoteClient::create(id, services.clone())?;
 
         let (hub, event_sender) = EventHub::setup(EVENT_QUEUE_CAPACITY);
@@ -1018,6 +1023,7 @@ impl ServerSession {
             target_env: None,
             session_handle: None,
             channels: ChannelRegistry::new(),
+            channel_inputs,
             deferred_server_events: vec![],
             pending_events: VecDeque::new(),
             rc_tx: rc_handles.command_tx.clone(),
@@ -2105,6 +2111,9 @@ impl ServerSession {
                         // sides, so the client half may have closed first.
                         debug!(%channel, ?error, "Target closed a channel already gone from the registry");
                     }
+                }
+                if let Some(server_id) = self.channels.get(&channel).and_then(Channel::server_id) {
+                    self.channel_inputs.close(u32::from(server_id.0));
                 }
                 self.channels.close(channel);
             }
