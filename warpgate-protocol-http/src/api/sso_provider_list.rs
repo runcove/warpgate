@@ -116,6 +116,127 @@ fn make_redirect_url(err: &str) -> String {
     format!("/@warpgate?{query}")
 }
 
+/// The fixed `login_error` codes an SSO failure reports to a caller that
+/// supplied a safe `next=`. They are a stable contract with the caller (see
+/// `COVE.md`), so the wire strings are spelled out here and nowhere derived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SsoLoginError {
+    /// Login protection rejected the credential because the client IP is blocked.
+    IpBlocked,
+    /// Any other SSO validation failure. A locked account lands here too, so an
+    /// unproven caller cannot tell a locked account from a wrong one.
+    SsoFailed,
+    /// SSO succeeded but no Warpgate user matches.
+    NoMatchingUser,
+    /// The user exists but is not allowed in.
+    AccessDenied,
+}
+
+impl SsoLoginError {
+    const fn code(self) -> &'static str {
+        match self {
+            Self::IpBlocked => "ip_blocked",
+            Self::SsoFailed => "sso_failed",
+            Self::NoMatchingUser => "no_matching_user",
+            Self::AccessDenied => "access_denied",
+        }
+    }
+}
+
+/// A failed SSO return: the coded reason for a caller that can be sent back to
+/// its own `next=`, and the free-text reason for the server log and for the
+/// `/@warpgate` page everyone else gets.
+struct SsoFailure {
+    code: SsoLoginError,
+    reason: String,
+    /// Seconds until the client IP is unblocked; only set for `IpBlocked`.
+    retry_after: Option<u64>,
+    /// `(origin, next)` of the SSO start, when it carried a `next`.
+    return_to: Option<(String, String)>,
+}
+
+impl SsoFailure {
+    fn new(code: SsoLoginError, reason: impl Into<String>) -> Self {
+        Self {
+            code,
+            reason: reason.into(),
+            retry_after: None,
+            return_to: None,
+        }
+    }
+
+    fn at(
+        return_to: &Option<(String, String)>,
+        code: SsoLoginError,
+        reason: impl Into<String>,
+    ) -> Self {
+        let mut failure = Self::new(code, reason);
+        failure.return_to = return_to.clone();
+        failure
+    }
+
+    fn with_retry_after(mut self, retry_after: u64) -> Self {
+        self.retry_after = Some(retry_after);
+        self
+    }
+
+    /// Back to the caller's own `next` with the code when that is a safe
+    /// site-relative target, otherwise today's `/@warpgate` page.
+    fn into_redirect_url(self) -> String {
+        match self.return_to {
+            Some((origin, next)) if is_safe_redirect_target(&next) => {
+                error!(code = self.code.code(), "SSO error: {}", self.reason);
+                let retry_after = self
+                    .retry_after
+                    .filter(|_| self.code == SsoLoginError::IpBlocked);
+                format!(
+                    "{origin}{}",
+                    next_with_login_error(&next, self.code, retry_after)
+                )
+            }
+            _ => make_redirect_url(&self.reason),
+        }
+    }
+}
+
+/// `next` with `login_error` (and `retry_after`, if given) appended to its
+/// query, after dropping any the caller already put there. The query comes
+/// before a fragment, which stays last.
+fn next_with_login_error(next: &str, code: SsoLoginError, retry_after: Option<u64>) -> String {
+    let (before_fragment, fragment) = match next.split_once('#') {
+        Some((head, fragment)) => (head, Some(fragment)),
+        None => (next, None),
+    };
+    let (path, query) = match before_fragment.split_once('?') {
+        Some((path, query)) => (path, query),
+        None => (before_fragment, ""),
+    };
+    let kept = query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .filter(|pair| {
+            let name = pair.split_once('=').map_or(*pair, |(name, _)| name);
+            name != "login_error" && name != "retry_after"
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+
+    let mut added = form_urlencoded::Serializer::new(String::new());
+    added.append_pair("login_error", code.code());
+    if let Some(seconds) = retry_after {
+        added.append_pair("retry_after", &seconds.to_string());
+    }
+    let added = added.finish();
+
+    let separator = if kept.is_empty() { "" } else { "&" };
+    let mut url = format!("{path}?{kept}{separator}{added}");
+    if let Some(fragment) = fragment {
+        url.push('#');
+        url.push_str(fragment);
+    }
+    url
+}
+
 /// Only site-relative paths are accepted as post-login redirect targets. An
 /// absolute URL names its own authority, so allowing one would let `?next=`
 /// carry the user to another site with a freshly authenticated session — the
@@ -139,6 +260,11 @@ fn post_login_redirect(next: Option<&str>, return_origin: &str) -> String {
         .filter(|next| is_safe_redirect_target(next))
         .unwrap_or("/@warpgate#/login");
     format!("{return_origin}{next}")
+}
+
+/// Whole seconds from now to `expires_at`; zero once it has passed.
+fn seconds_until(expires_at: OffsetDateTime) -> u64 {
+    u64::try_from((expires_at - OffsetDateTime::now_utc()).whole_seconds()).unwrap_or(0)
 }
 
 #[OpenApi]
@@ -198,7 +324,7 @@ impl Api {
                 state.as_ref(),
             )
             .await?
-            .unwrap_or_else(|x| make_redirect_url(&x));
+            .unwrap_or_else(SsoFailure::into_redirect_url);
 
         Ok(Response::new(ReturnToSsoResponse::Ok).header("Location", url))
     }
@@ -227,7 +353,7 @@ impl Api {
                 data.state.as_ref().or(state.as_ref()),
             )
             .await?
-            .unwrap_or_else(|x| make_redirect_url(&x));
+            .unwrap_or_else(SsoFailure::into_redirect_url);
 
         let csp_nonce = Uuid::new_v4().simple().to_string();
         let serialized_url = html_escape::encode_script(&serde_json::to_string(&url)?).to_string();
@@ -259,21 +385,23 @@ impl Api {
         sso_store: Data<&crate::sso_request_store::SsoRequestStore>,
         code: Option<&String>,
         state: Option<&String>,
-    ) -> Result<Result<String, String>, WarpgateError> {
+    ) -> Result<Result<String, SsoFailure>, WarpgateError> {
         // pull services locally for convenience
         let services = ctx.services();
         let client_ip = get_client_ip_addr(req, services).await;
 
         let Some(state) = state else {
-            return Ok(Err(
-                "No SSO state parameter in the return request".to_string()
-            ));
+            return Ok(Err(SsoFailure::new(
+                SsoLoginError::SsoFailed,
+                "No SSO state parameter in the return request",
+            )));
         };
 
         let Some(code) = code else {
-            return Ok(Err(
-                "No authorization code in the return URL request".to_string()
-            ));
+            return Ok(Err(SsoFailure::new(
+                SsoLoginError::SsoFailed,
+                "No authorization code in the return URL request",
+            )));
         };
 
         // Retrieve the handshake from the SsoRequestStore by the IdP-echoed
@@ -282,22 +410,48 @@ impl Api {
         // exactly what caused spurious "Invalid SSO state parameter" failures.
         let session_id = session_id_for_login(req, ctx.0).await?;
         let Some(context) = sso_store.take(state, &session_id).await else {
-            return Ok(Err("Not in an active SSO process".to_string()));
+            return Ok(Err(SsoFailure::new(
+                SsoLoginError::SsoFailed,
+                "Not in an active SSO process",
+            )));
         };
+
+        // Where a failure sends the caller back to. Taken now because
+        // `verify_code` consumes the request half of the context.
+        let return_to = context
+            .next_url
+            .clone()
+            .map(|next| (context.return_origin.clone(), next));
 
         // Defence in depth: the store already keyed by `state` and bound to the
         // session, so this holds by construction; keep the explicit CSRF check.
         if !context.request.verify_state(state) {
-            return Ok(Err("Invalid SSO state parameter".to_string()));
+            return Ok(Err(SsoFailure::at(
+                &return_to,
+                SsoLoginError::SsoFailed,
+                "Invalid SSO state parameter",
+            )));
         }
 
-        let response = context
-            .request
-            .verify_code((*code).clone())
-            .await
-            .inspect_err(|e| {
+        let response = match context.request.verify_code((*code).clone()).await {
+            Ok(response) => response,
+            Err(e) => {
                 warn!("Failed to verify SSO code: {e:?}");
-            })?;
+                // Without a safe `next` to go back to this stays the error it
+                // always was.
+                if !return_to
+                    .as_ref()
+                    .is_some_and(|(_, next)| is_safe_redirect_target(next))
+                {
+                    return Err(e.into());
+                }
+                return Ok(Err(SsoFailure::at(
+                    &return_to,
+                    SsoLoginError::SsoFailed,
+                    "Failed to verify the SSO authorization code",
+                )));
+            }
+        };
 
         if !response.email_verified.unwrap_or(true) {
             error!(
@@ -307,11 +461,19 @@ impl Api {
             error!(
                 "The SSO provider did provide an email_verified claim, and it is false. Since the provider provides this claim, Warpgate requires the email to be verified."
             );
-            return Ok(Err("The SSO account's e-mail is not verified".to_string()));
+            return Ok(Err(SsoFailure::at(
+                &return_to,
+                SsoLoginError::SsoFailed,
+                "The SSO account's e-mail is not verified",
+            )));
         }
 
         let Some(ref email) = response.email else {
-            return Ok(Err("No e-mail information in the SSO response".to_string()));
+            return Ok(Err(SsoFailure::at(
+                &return_to,
+                SsoLoginError::SsoFailed,
+                "No e-mail information in the SSO response",
+            )));
         };
 
         info!("SSO login as {email}");
@@ -326,7 +488,11 @@ impl Api {
             .clone();
         let mut iter = providers_config.iter();
         let Some(provider_config) = iter.find(|x| x.name == context.provider) else {
-            return Ok(Err(format!("No provider matching {}", context.provider)));
+            return Ok(Err(SsoFailure::at(
+                &return_to,
+                SsoLoginError::SsoFailed,
+                format!("No provider matching {}", context.provider),
+            )));
         };
 
         let cred = AuthCredential::Sso {
@@ -351,7 +517,11 @@ impl Api {
                 &cred.readable_description(),
                 "unknown user",
             );
-            return Ok(Err(format!("No user matching {email}")));
+            return Ok(Err(SsoFailure::at(
+                &return_to,
+                SsoLoginError::NoMatchingUser,
+                format!("No user matching {email}"),
+            )));
         };
 
         let state_arc = match get_or_create_auth_state_for_request(req, &username, &ctx, None).await
@@ -367,10 +537,11 @@ impl Api {
                         &cred.readable_description(),
                         "IP address not allowed",
                     );
-                    return Ok(Err(
-                        "Login denied: your IP address is not in the allowed range for this user"
-                            .to_string(),
-                    ));
+                    return Ok(Err(SsoFailure::at(
+                        &return_to,
+                        SsoLoginError::AccessDenied,
+                        "Login denied: your IP address is not in the allowed range for this user",
+                    )));
                 }
                 return Err(e);
             }
@@ -387,11 +558,32 @@ impl Api {
         .await?;
 
         if !outcome.is_valid() {
+            // Asked before the failure is recorded, which can itself start a
+            // block: the code names what rejected this credential. A locked
+            // account is not told apart from any other failure.
+            let blocked_until = match state.remote_ip() {
+                Some(ip) => services
+                    .login_protection
+                    .check_ip_blocked(&ip)
+                    .await
+                    .inspect_err(|e| {
+                        warn!("Failed to check the IP block after an SSO failure: {e:?}");
+                    })
+                    .ok()
+                    .flatten()
+                    .map(|block| block.expires_at),
+                None => None,
+            };
             crate::api::auth::record_failed_login_attempt(services, client_ip, &username, "sso")
                 .await;
-            return Ok(Err(format!(
-                "Failed to validate SSO credential for {username}"
-            )));
+            let reason = format!("Failed to validate SSO credential for {username}");
+            return Ok(Err(match blocked_until {
+                Some(expires_at) => {
+                    SsoFailure::at(&return_to, SsoLoginError::IpBlocked, reason)
+                        .with_retry_after(seconds_until(expires_at))
+                }
+                None => SsoFailure::at(&return_to, SsoLoginError::SsoFailed, reason),
+            }));
         }
 
         // Stored before any remaining factor so back-channel logout and SLO
@@ -525,7 +717,10 @@ impl Api {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_safe_redirect_target, make_redirect_url, post_login_redirect};
+    use super::{
+        SsoFailure, SsoLoginError, is_safe_redirect_target, make_redirect_url,
+        next_with_login_error, post_login_redirect,
+    };
 
     #[test]
     fn error_redirect_is_site_relative_and_escaped() {
@@ -574,6 +769,133 @@ mod tests {
                 post_login_redirect(next, "https://gate.example"),
                 "https://gate.example/@warpgate#/login",
                 "{next:?} must not leave the return origin"
+            );
+        }
+    }
+
+    const ORIGIN: &str = "https://gate.example";
+
+    fn failure_url(code: SsoLoginError, next: Option<&str>) -> String {
+        let mut failure = SsoFailure::new(code, "reason");
+        failure.return_to = next.map(|next| (ORIGIN.to_string(), next.to_string()));
+        failure.into_redirect_url()
+    }
+
+    #[test]
+    fn codes_are_the_stable_wire_strings() {
+        assert_eq!(SsoLoginError::IpBlocked.code(), "ip_blocked");
+        assert_eq!(SsoLoginError::SsoFailed.code(), "sso_failed");
+        assert_eq!(SsoLoginError::NoMatchingUser.code(), "no_matching_user");
+        assert_eq!(SsoLoginError::AccessDenied.code(), "access_denied");
+    }
+
+    #[test]
+    fn each_code_returns_to_a_safe_next_on_the_return_origin() {
+        for (code, wire) in [
+            (SsoLoginError::SsoFailed, "sso_failed"),
+            (SsoLoginError::NoMatchingUser, "no_matching_user"),
+            (SsoLoginError::AccessDenied, "access_denied"),
+        ] {
+            assert_eq!(
+                failure_url(code, Some("/cove/login")),
+                format!("{ORIGIN}/cove/login?login_error={wire}")
+            );
+        }
+    }
+
+    #[test]
+    fn ip_blocked_carries_retry_after() {
+        let failure = SsoFailure::new(SsoLoginError::IpBlocked, "blocked").with_retry_after(120);
+        let failure = SsoFailure {
+            return_to: Some((ORIGIN.to_string(), "/cove/login".to_string())),
+            ..failure
+        };
+        assert_eq!(
+            failure.into_redirect_url(),
+            format!("{ORIGIN}/cove/login?login_error=ip_blocked&retry_after=120")
+        );
+    }
+
+    #[test]
+    fn retry_after_is_only_ever_sent_for_ip_blocked() {
+        for code in [
+            SsoLoginError::SsoFailed,
+            SsoLoginError::NoMatchingUser,
+            SsoLoginError::AccessDenied,
+        ] {
+            let failure = SsoFailure {
+                return_to: Some((ORIGIN.to_string(), "/cove/login".to_string())),
+                ..SsoFailure::new(code, "reason").with_retry_after(120)
+            };
+            assert!(!failure.into_redirect_url().contains("retry_after"));
+        }
+    }
+
+    #[test]
+    fn a_locked_account_reports_sso_failed_not_its_lock() {
+        // The handler builds `SsoFailed` for every rejected credential that is
+        // not an IP block, so a lock cannot surface under any other code.
+        let url = failure_url(SsoLoginError::SsoFailed, Some("/cove/login"));
+        assert_eq!(url, format!("{ORIGIN}/cove/login?login_error=sso_failed"));
+        assert!(!url.contains("lock"));
+    }
+
+    #[test]
+    fn appends_with_ampersand_when_next_has_a_query() {
+        assert_eq!(
+            next_with_login_error("/login?a=1", SsoLoginError::SsoFailed, None),
+            "/login?a=1&login_error=sso_failed"
+        );
+    }
+
+    #[test]
+    fn appends_with_question_mark_when_next_has_no_query() {
+        assert_eq!(
+            next_with_login_error("/login", SsoLoginError::SsoFailed, None),
+            "/login?login_error=sso_failed"
+        );
+    }
+
+    #[test]
+    fn strips_a_login_error_and_retry_after_the_caller_already_set() {
+        assert_eq!(
+            next_with_login_error(
+                "/login?login_error=forged&a=1&retry_after=999&b=2",
+                SsoLoginError::AccessDenied,
+                None
+            ),
+            "/login?a=1&b=2&login_error=access_denied"
+        );
+        assert_eq!(
+            next_with_login_error(
+                "/login?login_error=forged&retry_after=999",
+                SsoLoginError::SsoFailed,
+                None
+            ),
+            "/login?login_error=sso_failed"
+        );
+    }
+
+    #[test]
+    fn the_query_goes_before_a_fragment() {
+        assert_eq!(
+            next_with_login_error("/login?a=1#top", SsoLoginError::SsoFailed, None),
+            "/login?a=1&login_error=sso_failed#top"
+        );
+    }
+
+    #[test]
+    fn unsafe_or_missing_next_falls_back_to_the_warpgate_page() {
+        for next in [
+            None,
+            Some("https://evil.com/path"),
+            Some("//evil.com"),
+            Some("javascript:alert(1)"),
+        ] {
+            assert_eq!(
+                failure_url(SsoLoginError::NoMatchingUser, next),
+                "/@warpgate?login_error=reason",
+                "{next:?} must keep today's login page"
             );
         }
     }
