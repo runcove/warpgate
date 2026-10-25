@@ -1,33 +1,70 @@
+use std::ops::ControlFlow;
+
 use anyhow::Result;
 use bytes::Bytes;
-use russh::Channel;
 use russh::client::Msg;
+use russh::{Channel, ChannelReadHalf, ChannelWriteHalf};
 use tokio::sync::mpsc::{Sender, UnboundedReceiver};
 use tracing::*;
 use uuid::Uuid;
 use warpgate_common::UserSessionId;
 
+use super::channel_pump::{TargetWriter, pump};
 use super::error::SshClientError;
 use crate::{ChannelOperation, RCEvent};
 
 pub struct DirectTCPIPChannel {
-    client_channel: Channel<Msg>,
+    read_half: ChannelReadHalf,
+    writer: DirectTCPIPWriter,
     channel_id: Uuid,
     ops_rx: UnboundedReceiver<ChannelOperation>,
     events_tx: Sender<RCEvent>,
     session_id: UserSessionId,
 }
 
+struct DirectTCPIPWriter {
+    write_half: ChannelWriteHalf<Msg>,
+    channel_id: Uuid,
+    session_id: UserSessionId,
+}
+
+impl TargetWriter for DirectTCPIPWriter {
+    async fn apply(
+        &self,
+        operation: ChannelOperation,
+    ) -> Result<ControlFlow<()>, SshClientError> {
+        match operation {
+            ChannelOperation::Data(data) => {
+                self.write_half.data(&*data).await?;
+            }
+            ChannelOperation::Eof => {
+                self.write_half.eof().await?;
+            }
+            ChannelOperation::Close => return Ok(ControlFlow::Break(())),
+            operation => {
+                warn!(client_channel=%self.channel_id, ?operation, session=%self.session_id, "unexpected client_channel operation");
+            }
+        }
+        Ok(ControlFlow::Continue(()))
+    }
+}
+
 impl DirectTCPIPChannel {
-    pub const fn new(
+    pub fn new(
         client_channel: Channel<Msg>,
         channel_id: Uuid,
         ops_rx: UnboundedReceiver<ChannelOperation>,
         events_tx: Sender<RCEvent>,
         session_id: UserSessionId,
     ) -> Self {
+        let (read_half, write_half) = client_channel.split();
         Self {
-            client_channel,
+            read_half,
+            writer: DirectTCPIPWriter {
+                write_half,
+                channel_id,
+                session_id,
+            },
             channel_id,
             ops_rx,
             events_tx,
@@ -45,46 +82,53 @@ impl DirectTCPIPChannel {
     }
 
     async fn pump(&mut self) -> Result<(), SshClientError> {
-        loop {
-            tokio::select! {
-                incoming_data = self.ops_rx.recv() => {
-                    match incoming_data {
-                        Some(ChannelOperation::Data(data)) => {
-                            self.client_channel.data(&*data).await?;
-                        }
-                        Some(ChannelOperation::Eof) => {
-                            self.client_channel.eof().await?;
-                        },
-                        Some(ChannelOperation::Close)|None => break,
-                        Some(operation) => {
-                            warn!(client_channel=%self.channel_id, ?operation, session=%self.session_id, "unexpected client_channel operation");
-                        }
-                    }
-                }
-                channel_event = self.client_channel.wait() => {
-                    match channel_event {
-                        Some(russh::ChannelMsg::Data { data }) => {
-                            let bytes: &[u8] = &data;
-                            self.events_tx.send(RCEvent::Output(
-                                self.channel_id,
-                                Bytes::from(bytes.to_vec()),
-                            )).await.map_err(|_| SshClientError::MpscError)?;
-                        }
-                        Some(russh::ChannelMsg::Close) | None => break,
-                        Some(russh::ChannelMsg::Success) => {
-                            self.events_tx.send(RCEvent::Success(self.channel_id)).await.map_err(|_| SshClientError::MpscError)?;
-                        },
-                        Some(russh::ChannelMsg::Eof) => {
-                            self.events_tx.send(RCEvent::Eof(self.channel_id)).await.map_err(|_| SshClientError::MpscError)?;
-                        }
-                        Some(operation) => {
-                            warn!(client_channel=%self.channel_id, ?operation, session=%self.session_id, "unexpected client_channel operation");
-                        }
-                    }
-                }
+        pump(
+            &self.writer,
+            &mut self.ops_rx,
+            forward_target_events(
+                &mut self.read_half,
+                &self.events_tx,
+                self.channel_id,
+                self.session_id,
+            ),
+        )
+        .await
+    }
+}
+
+/// Passes on what the target sends until it closes the channel.
+async fn forward_target_events(
+    read_half: &mut ChannelReadHalf,
+    events_tx: &Sender<RCEvent>,
+    channel_id: Uuid,
+    session_id: UserSessionId,
+) -> Result<(), SshClientError> {
+    loop {
+        match read_half.wait().await {
+            Some(russh::ChannelMsg::Data { data }) => {
+                let bytes: &[u8] = &data;
+                events_tx
+                    .send(RCEvent::Output(channel_id, Bytes::from(bytes.to_vec())))
+                    .await
+                    .map_err(|_| SshClientError::MpscError)?;
+            }
+            Some(russh::ChannelMsg::Close) | None => return Ok(()),
+            Some(russh::ChannelMsg::Success) => {
+                events_tx
+                    .send(RCEvent::Success(channel_id))
+                    .await
+                    .map_err(|_| SshClientError::MpscError)?;
+            }
+            Some(russh::ChannelMsg::Eof) => {
+                events_tx
+                    .send(RCEvent::Eof(channel_id))
+                    .await
+                    .map_err(|_| SshClientError::MpscError)?;
+            }
+            Some(operation) => {
+                warn!(client_channel=%channel_id, ?operation, session=%session_id, "unexpected client_channel operation");
             }
         }
-        Ok(())
     }
 }
 
