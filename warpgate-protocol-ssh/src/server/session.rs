@@ -982,6 +982,7 @@ impl ServerSession {
         // from other connections, carried this session's span.
         let span_ = info_span!("SSH", session=%id);
         let session = Self::start_in_span(
+            id,
             remote_address,
             services,
             server_handle,
@@ -996,6 +997,7 @@ impl ServerSession {
     }
 
     async fn start_in_span(
+        id: UserSessionId,
         remote_address: SocketAddr,
         services: &Services,
         server_handle: Arc<Mutex<WarpgateServerHandle>>,
@@ -1004,7 +1006,6 @@ impl ServerSession {
         channel_inputs: ChannelInputs,
         client_socket: std::net::TcpStream,
     ) -> Result<impl Future<Output = Result<()>> + use<>> {
-        let id = server_handle.lock().await.user_session_id();
         let mut rc_handles = RemoteClient::create(id, services.clone())?;
 
         let (hub, event_sender) = EventHub::setup(EVENT_QUEUE_CAPACITY);
@@ -2112,8 +2113,13 @@ impl ServerSession {
                         debug!(%channel, ?error, "Target closed a channel already gone from the registry");
                     }
                 }
+                // The registry entry is the only record of the client-side
+                // channel number. If the client half has already gone (its own
+                // close removed it, and removed its input state with it), no
+                // input can still be waiting, so there is nothing to signal
+                // and nothing to leave behind.
                 if let Some(server_id) = self.channels.get(&channel).and_then(Channel::server_id) {
-                    self.channel_inputs.close(u32::from(server_id.0));
+                    self.channel_inputs.target_closed(u32::from(server_id.0));
                 }
                 self.channels.close(channel);
             }
