@@ -586,6 +586,17 @@ impl Api {
             }));
         }
 
+        // Stored before any remaining factor so back-channel logout and SLO
+        // can find the session even when TOTP or an approval is still pending.
+        let login_state = || SsoLoginState {
+            provider: context.provider.clone(),
+            token: response.id_token.clone(),
+            supports_single_logout: context.supports_single_logout,
+            subject: Some(response.subject.clone()),
+            sid: response.sid.clone(),
+        };
+        session.set_sso_login_state(login_state());
+
         if let Ok(user_info) = outcome.into_accepted() {
             authorize_session(req, &ctx, user_info).await?;
             // Stamp the HTTP per-session step-up clock, after
@@ -602,15 +613,10 @@ impl Api {
                     .clear_failed_attempts(&ip, &username)
                     .await;
             }
-            drop(state);
-            session.set_sso_login_state(SsoLoginState {
-                provider: context.provider,
-                token: response.id_token.clone(),
-                supports_single_logout: context.supports_single_logout,
-                subject: Some(response.subject.clone()),
-                sid: response.sid.clone(),
-            });
+            // `authorize_session` can clear the session, so store it again.
+            session.set_sso_login_state(login_state());
         }
+        drop(state);
 
         // Also ends whatever access the role sync took away.
         services
