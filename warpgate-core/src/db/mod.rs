@@ -93,14 +93,24 @@ async fn connect_to_sqlite(url: &str) -> Result<DatabaseConnection> {
     // its own page and statement caches, so the old 100 connections recycled
     // every 8 s meant up to 100 threads churning constantly; under a burst of
     // sessions the lobby's memory climbed to its limit (glibc arenas fragment
-    // under thread churn). A connection now lives for minutes, and a caller
-    // waits as long for a connection as a statement waits for the lock.
+    // under thread churn). A caller waits as long for a connection as a
+    // statement waits for the lock.
+    //
+    // A connection, once opened, is kept: no idle or lifetime close. Every new
+    // connection parses the schema and grows a page cache of up to ~2 MiB in
+    // small pieces; closing it frees them, but an allocator that only returns
+    // whole groups (musl's mallocng, in the static build) keeps most of them
+    // resident, pinned by live neighbours. With idle and lifetime closes a
+    // busy pool kept replacing connections, and the static build's resident
+    // memory kept rising with them. The pool stops at
+    // SQLITE_MAX_CONNECTIONS, so the most it holds is that many caches. A
+    // connection that goes bad is still dropped by `connection_is_clean`.
     let pool = SqlitePoolOptions::new()
         .max_connections(SQLITE_MAX_CONNECTIONS)
         .min_connections(1)
         .acquire_timeout(Duration::from_secs(30))
-        .idle_timeout(Duration::from_secs(5 * 60))
-        .max_lifetime(Duration::from_secs(30 * 60))
+        .idle_timeout(None::<Duration>)
+        .max_lifetime(None::<Duration>)
         .after_release(|conn, _meta| Box::pin(connection_is_clean(conn)))
         .connect_with(connect_options)
         .await?;
@@ -337,6 +347,24 @@ mod tests {
             .connect_with(options)
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn sqlite_pool_keeps_its_connections_open() {
+        let dir = std::env::temp_dir().join(format!("wg-pool-keep-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let url = format!("sqlite:{}", dir.join("db.sqlite3").display());
+        let db = connect_to_sqlite(&url).await.unwrap();
+
+        // Closing idle or old connections churns SQLite page caches through the
+        // allocator, which the static (musl) build never gives back.
+        let options = db.get_sqlite_connection_pool().options();
+        assert_eq!(options.get_idle_timeout(), None);
+        assert_eq!(options.get_max_lifetime(), None);
+        assert_eq!(options.get_max_connections(), SQLITE_MAX_CONNECTIONS);
+
+        db.close().await.unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]
