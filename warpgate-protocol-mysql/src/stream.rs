@@ -110,7 +110,10 @@ where
     }
 }
 
-const MAX_ALLOWED_PACKET: usize = 1024 * 1024 * 1024;
+/// Upper bound for the negotiated packet size. MySQL allows up to 1 GiB, but a
+/// packet is buffered whole, so a 1 GiB ceiling lets one connection hold as much
+/// memory as a small deployment has in total.
+const MAX_ALLOWED_PACKET: usize = 64 * 1024 * 1024;
 
 fn effective_max_packet(negotiated: u32) -> usize {
     (negotiated as usize).clamp(DEFAULT_MAX_ALLOWED_PACKET, MAX_ALLOWED_PACKET)
@@ -125,5 +128,7 @@ mod tests {
         assert_eq!(effective_max_packet(0), DEFAULT_MAX_ALLOWED_PACKET);
         assert_eq!(effective_max_packet(64 << 20), 64 << 20);
         assert_eq!(effective_max_packet(u32::MAX), MAX_ALLOWED_PACKET);
+        assert_eq!(MAX_ALLOWED_PACKET, 64 << 20);
+        assert_eq!(effective_max_packet(1 << 30), MAX_ALLOWED_PACKET);
     }
 }
