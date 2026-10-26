@@ -1,5 +1,6 @@
 mod certificate;
 mod channel_direct_tcpip;
+mod channel_pump;
 mod channel_session;
 mod error;
 mod handler;
