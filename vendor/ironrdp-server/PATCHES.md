@@ -22,3 +22,13 @@ carrying the headers has been built. It also drops a `* 2` from the adjacent buf
 `Cargo.toml` additionally sets `[lints.rust] warnings = { level = "allow", priority = 1 }`
 so this vendored path dependency's warnings don't surface in Warpgate's builds. This is not
 in `warpgate.patch` (which is source-only); re-apply it by hand on re-vendor.
+
+## zstd-safe 8.2
+
+`Cargo.toml` (and `Cargo.toml.orig`) ask for `zstd-safe` 8.2 instead of upstream's 7.2, so
+the `qoiz` codec builds against a `zstd-safe`/`zstd-sys` with the fixes for
+RUSTSEC-2026-0395 to -0406 and -0410 (26 Oct 2026). The calls the encoder makes
+(`CCtx::default`, `set_parameter`, `compress_stream2`, `InBuffer::around`,
+`OutBuffer::around_pos`, `get_error_name`) have the same signatures in 8.2. Drop this on
+re-vendor once upstream `ironrdp-server` asks for 8.2 or later. This crate's own
+`Cargo.lock` is upstream's and is not used by Warpgate's workspace.
