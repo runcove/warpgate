@@ -1359,6 +1359,24 @@ mod tests {
     }
 
     #[test]
+    fn client_forwarding_headers_are_not_copied() {
+        let req = Request::builder()
+            .header(&X_FORWARDED_FOR, "203.0.113.10")
+            .header(&X_FORWARDED_HOST, "evil.example")
+            .header(&X_FORWARDED_PROTO, "https")
+            .header(http::header::FORWARDED, "for=203.0.113.10")
+            .header("x-real-ip", "203.0.113.10")
+            .header("x-custom", "kept")
+            .finish();
+        let copied = copy_server_request(&req, http::Request::builder())
+            .unwrap()
+            .body(())
+            .unwrap();
+        let names: Vec<_> = copied.headers().keys().map(HeaderName::as_str).collect();
+        assert_eq!(names, ["x-custom"]);
+    }
+
+    #[test]
     fn request_cookie_header_omits_only_warpgate_session() {
         assert_eq!(
             forwarded_cookie_header(&[
