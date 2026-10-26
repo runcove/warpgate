@@ -103,6 +103,9 @@ pub enum RequestAuthorization {
 pub struct UnauthenticatedRequestContext {
     services: warpgate_core::Services,
     should_trust_x_forwarded: bool,
+    /// The header the deployment's proxy writes the client address into
+    /// (`http.client_ip_header`); without one the client is the connecting peer.
+    client_ip_header: Option<String>,
     /// Request-scoped cache of the global parameters row, loaded at most once
     /// per request on first access. The base context injected at startup is
     /// shared across requests, so [`Self::for_request`] gives each request its
@@ -113,16 +116,17 @@ pub struct UnauthenticatedRequestContext {
 /// Provided to API handlers as Data<>
 impl UnauthenticatedRequestContext {
     pub async fn new(services: warpgate_core::Services) -> Self {
-        let should_trust_x_forwarded = services
-            .config
-            .lock()
-            .await
-            .store
-            .http
-            .trust_x_forwarded_headers;
+        let (should_trust_x_forwarded, client_ip_header) = {
+            let config = services.config.lock().await;
+            (
+                config.store.http.trust_x_forwarded_headers,
+                config.store.http.client_ip_header.clone(),
+            )
+        };
         Self {
             services,
             should_trust_x_forwarded,
+            client_ip_header,
             parameters: Arc::new(OnceCell::new()),
         }
     }
@@ -133,6 +137,7 @@ impl UnauthenticatedRequestContext {
         Self {
             services: self.services.clone(),
             should_trust_x_forwarded: self.should_trust_x_forwarded,
+            client_ip_header: self.client_ip_header.clone(),
             parameters: Arc::new(OnceCell::new()),
         }
     }
@@ -172,7 +177,7 @@ impl UnauthenticatedRequestContext {
     }
 
     pub fn trusted_client_ip(&self, req: &Request) -> Option<String> {
-        trusted_client_ip(req, raw_remote_ip(req), self.should_trust_x_forwarded)
+        trusted_client_ip(req, raw_remote_ip(req), self.client_ip_header.as_deref())
     }
 
     /// Returns the trusted hostname only (port stripped),
