@@ -187,12 +187,33 @@ impl ChannelInputs {
             .clone()
     }
 
-    /// The target closed the channel: ends any input waiting on its budget and
-    /// leaves the channel cancelled, so input the client still sends before its
-    /// own close is dropped at once. The client's close ([`Self::close`])
-    /// removes the entry. A channel with no entry yet gets a cancelled one.
+    /// The target closed the channel: ends any input waiting on its budget
+    /// and leaves the channel cancelled, so input the client still sends
+    /// before its own close is dropped at once. The client's close
+    /// ([`Self::close`]) removes the entry.
+    ///
+    /// This only cancels an entry that exists, and never creates one: the
+    /// client's close may already have removed it (it runs in the handler
+    /// before the session handles the same close), and an entry created now
+    /// would outlive the channel. The entry exists whenever input has been
+    /// held on the channel. The remaining gap is a channel that received no
+    /// input before the target closed: input arriving after that finds no
+    /// entry, so it waits as it did before, ending on the client's close or
+    /// the wait limit.
     pub fn target_closed(&self, channel: u32) {
-        self.get(channel).closed.cancel();
+        let inputs = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(input) = inputs.get(&channel) {
+            input.closed.cancel();
+        }
+    }
+
+    /// A channel with this number was just opened: forgets any state left by
+    /// an earlier channel of the same number, so the new one starts fresh.
+    pub fn opened(&self, channel: u32) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&channel);
     }
 
     /// The client closed the channel: ends any input waiting on its budget
@@ -304,6 +325,7 @@ impl russh::server::Handler for ServerHandler {
         reply: ChannelOpenHandle,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
+        self.channel_inputs.opened(u32::from(channel.id()));
         self.send_event(ServerHandlerEvent::ChannelOpenSession(
             ServerChannelId(channel.id()),
             ChannelOpenHandleWrapper(reply),
@@ -626,6 +648,7 @@ impl russh::server::Handler for ServerHandler {
     ) -> Result<(), Self::Error> {
         let host_to_connect = host_to_connect.to_string();
         let originator_address = originator_address.to_string();
+        self.channel_inputs.opened(u32::from(channel.id()));
         self.send_event(ServerHandlerEvent::ChannelOpenDirectTcpIp(
             ServerChannelId(channel.id()),
             DirectTCPIPParams {
@@ -647,6 +670,7 @@ impl russh::server::Handler for ServerHandler {
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         let socket_path = socket_path.to_string();
+        self.channel_inputs.opened(u32::from(channel.id()));
         self.send_event(ServerHandlerEvent::ChannelOpenDirectStreamlocal(
             ServerChannelId(channel.id()),
             socket_path,
@@ -1071,6 +1095,7 @@ mod tests {
     async fn the_clients_close_removes_what_the_targets_close_left() {
         let inputs = ChannelInputs::default();
         let channel = 1;
+        inputs.get(channel);
         inputs.target_closed(channel);
         assert!(inputs.get(channel).closed.is_cancelled());
 
@@ -1081,16 +1106,40 @@ mod tests {
         assert_eq!(fresh.budget.available_permits(), CHANNEL_INPUT_BUDGET);
     }
 
-    /// A close for a channel with no entry must not panic, and the client's
-    /// close of it leaves nothing behind.
+    /// The client's close can run before the session handles the target's
+    /// close of the same channel; that must not bring the entry back.
+    #[tokio::test]
+    async fn the_targets_close_after_the_clients_close_leaves_no_entry() {
+        let inputs = ChannelInputs::default();
+        let channel = 1;
+        inputs.get(channel);
+        inputs.close(channel);
+        inputs.target_closed(channel);
+        assert!(inputs.0.lock().unwrap().is_empty());
+    }
+
+    /// A channel opened with the number of an earlier, target-closed one
+    /// starts with an uncancelled entry and a full budget.
+    #[tokio::test]
+    async fn a_channel_opened_with_a_reused_number_starts_fresh() {
+        let inputs = ChannelInputs::default();
+        let channel = 1;
+        inputs.get(channel);
+        inputs.target_closed(channel);
+
+        inputs.opened(channel);
+        let fresh = inputs.get(channel);
+        assert!(!fresh.closed.is_cancelled());
+        assert_eq!(fresh.budget.available_permits(), CHANNEL_INPUT_BUDGET);
+    }
+
+    /// A close for a channel with no entry must not panic or leave one.
     #[tokio::test]
     async fn closing_an_unknown_channel_is_harmless() {
         let inputs = ChannelInputs::default();
         inputs.close(7);
-        assert!(inputs.0.lock().unwrap().is_empty());
         inputs.target_closed(7);
-        assert!(inputs.get(7).closed.is_cancelled());
-        inputs.close(7);
+        inputs.opened(7);
         assert!(inputs.0.lock().unwrap().is_empty());
     }
 
