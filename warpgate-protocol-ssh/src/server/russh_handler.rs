@@ -169,7 +169,9 @@ struct ChannelInput {
 
 /// Every channel's input state on one connection. The handler waits on it
 /// while the session, which learns of a channel closing from the target, ends
-/// those waits through [`Self::close`]. Channels are keyed by their number.
+/// those waits through [`Self::target_closed`]. Channels are keyed by their
+/// number. The map lives as long as the connection's handler and session, so
+/// whatever entries remain are freed with them.
 #[derive(Clone, Default)]
 pub struct ChannelInputs(Arc<Mutex<HashMap<u32, ChannelInput>>>);
 
@@ -185,7 +187,16 @@ impl ChannelInputs {
             .clone()
     }
 
-    /// Ends any input waiting on the channel's budget and forgets the channel.
+    /// The target closed the channel: ends any input waiting on its budget and
+    /// leaves the channel cancelled, so input the client still sends before its
+    /// own close is dropped at once. The client's close ([`Self::close`])
+    /// removes the entry. A channel with no entry yet gets a cancelled one.
+    pub fn target_closed(&self, channel: u32) {
+        self.get(channel).closed.cancel();
+    }
+
+    /// The client closed the channel: ends any input waiting on its budget
+    /// and forgets the channel, whether or not the target closed it first.
     pub fn close(&self, channel: u32) {
         let removed = self
             .0
@@ -1015,6 +1026,72 @@ mod tests {
         .await
         .unwrap();
         assert!(passed.is_some(), "another channel must not stay blocked");
+    }
+
+    /// Input that arrives after the target closed the channel but before the
+    /// client's own close finds the channel already cancelled: it is dropped
+    /// at once, without waiting and without taking any budget.
+    #[tokio::test]
+    async fn input_after_the_target_closed_is_dropped_at_once() {
+        let inputs = ChannelInputs::default();
+        let channel = 1;
+        let _held = hold_input(
+            inputs.get(channel).budget,
+            connection(),
+            &vec![0; CHANNEL_INPUT_BUDGET],
+            WAIT,
+        )
+        .await
+        .unwrap();
+        inputs.target_closed(channel);
+
+        let input = inputs.get(channel);
+        let connection = connection();
+        let dropped = tokio::time::timeout(
+            Duration::from_secs(5),
+            hold_input_until_closed(
+                input.budget.clone(),
+                connection.clone(),
+                b"late",
+                Duration::from_secs(30),
+                &input.closed,
+            ),
+        )
+        .await
+        .expect("input after the target's close must not wait")
+        .unwrap();
+        assert!(dropped.is_none());
+        assert_eq!(input.budget.available_permits(), 0, "nothing more is taken");
+        assert_eq!(connection.available_permits(), CONNECTION_INPUT_BUDGET);
+    }
+
+    /// The target's close leaves a cancelled entry only until the client
+    /// closes too; a channel number used again afterwards starts fresh.
+    #[tokio::test]
+    async fn the_clients_close_removes_what_the_targets_close_left() {
+        let inputs = ChannelInputs::default();
+        let channel = 1;
+        inputs.target_closed(channel);
+        assert!(inputs.get(channel).closed.is_cancelled());
+
+        inputs.close(channel);
+        assert!(inputs.0.lock().unwrap().is_empty());
+        let fresh = inputs.get(channel);
+        assert!(!fresh.closed.is_cancelled());
+        assert_eq!(fresh.budget.available_permits(), CHANNEL_INPUT_BUDGET);
+    }
+
+    /// A close for a channel with no entry must not panic, and the client's
+    /// close of it leaves nothing behind.
+    #[tokio::test]
+    async fn closing_an_unknown_channel_is_harmless() {
+        let inputs = ChannelInputs::default();
+        inputs.close(7);
+        assert!(inputs.0.lock().unwrap().is_empty());
+        inputs.target_closed(7);
+        assert!(inputs.get(7).closed.is_cancelled());
+        inputs.close(7);
+        assert!(inputs.0.lock().unwrap().is_empty());
     }
 
     /// Closing one channel leaves the others' waits alone, and a channel
