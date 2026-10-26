@@ -104,6 +104,8 @@ pub struct SsoKubernetesConfigDescription {
 enum GetSsoKubernetesConfigsResponse {
     #[oai(status = 200)]
     Ok(Json<Vec<SsoKubernetesConfigDescription>>),
+    #[oai(status = 403)]
+    Forbidden,
 }
 
 fn make_redirect_url(err: &str) -> String {
@@ -678,6 +680,9 @@ impl Api {
         &self,
         ctx: AuthedSession,
     ) -> Result<GetSsoKubernetesConfigsResponse, WarpgateError> {
+        if ctx.auth.as_full_user().is_none() {
+            return Ok(GetSsoKubernetesConfigsResponse::Forbidden);
+        }
         let mut providers = ctx
             .services()
             .config
