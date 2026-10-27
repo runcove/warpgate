@@ -143,7 +143,7 @@ pub async fn map_sso_result(
 ///
 /// The diagnostic matters more than a usual lost log line. This is the whole
 /// username path for a provider mapped onto a custom claim (such as
-/// `username_claim: "EXTRAUsername"`), and when it yields nothing the caller
+/// `username_claim: "login_id"`), and when it yields nothing the caller
 /// silently falls through to `preferred_username` and then `email` — so a
 /// renamed, misspelled or non-string claim does not fail the login, it logs
 /// the user in under a *different* username. That is close to undiagnosable
@@ -243,9 +243,9 @@ mod tests {
 
     #[test]
     fn a_configured_string_claim_resolves() {
-        let claims = json!({"EXTRAUsername": "alice", "email": "alice@example.com"});
+        let claims = json!({"login_id": "alice", "email": "alice@example.com"});
         assert_eq!(
-            resolve_custom_username(Some("EXTRAUsername"), Some(&claims)),
+            resolve_custom_username(Some("login_id"), Some(&claims)),
             Some("alice".to_owned())
         );
     }
@@ -254,21 +254,21 @@ mod tests {
     fn an_unconfigured_claim_resolves_to_none_without_inspecting_claims() {
         // The normal path: no `username_claim`, so the caller falls through to
         // `preferred_username`. This must not warn.
-        let claims = json!({"EXTRAUsername": "alice"});
+        let claims = json!({"login_id": "alice"});
         assert_eq!(resolve_custom_username(None, Some(&claims)), None);
         assert_eq!(resolve_custom_username(None, None), None);
     }
 
     #[test]
     fn a_configured_claim_with_no_raw_claims_at_all_resolves_to_none() {
-        assert_eq!(resolve_custom_username(Some("EXTRAUsername"), None), None);
+        assert_eq!(resolve_custom_username(Some("login_id"), None), None);
     }
 
     #[test]
     fn a_configured_claim_absent_from_the_token_resolves_to_none() {
         let claims = json!({"preferred_username": "alice@example.com"});
         assert_eq!(
-            resolve_custom_username(Some("EXTRAUsername"), Some(&claims)),
+            resolve_custom_username(Some("login_id"), Some(&claims)),
             None
         );
     }
@@ -276,9 +276,9 @@ mod tests {
     #[test]
     fn a_configured_claim_that_is_not_a_string_resolves_to_none() {
         for value in [json!(42), json!(null), json!(["alice"]), json!({"u": 1})] {
-            let claims = json!({"EXTRAUsername": value});
+            let claims = json!({"login_id": value});
             assert_eq!(
-                resolve_custom_username(Some("EXTRAUsername"), Some(&claims)),
+                resolve_custom_username(Some("login_id"), Some(&claims)),
                 None,
                 "non-string claim {value} must not be used as a username"
             );
