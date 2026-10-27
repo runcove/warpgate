@@ -22,7 +22,7 @@ impl MigrationTrait for Migration {
 #[cfg(all(test, feature = "sqlite"))]
 mod tests {
     use sea_orm::{ConnectionTrait, Database, Statement};
-    use sea_orm_migration::MigratorTrait;
+    use sea_orm_migration::{MigrationName, MigratorTrait};
     use sea_orm_migration::prelude::{Alias, Query};
     use uuid::Uuid;
     use warpgate_db_entities::Parameters::{ConfigMigrationValues, set_config_migration_values};
@@ -33,7 +33,13 @@ mod tests {
     async fn duplicate_role_names_are_renamed_and_then_rejected() {
         set_config_migration_values(ConfigMigrationValues::default());
         let db = Database::connect("sqlite::memory:").await.unwrap();
-        let before = u32::try_from(Migrator::migrations().len() - 1).unwrap();
+        // The fork registers its own migrations after upstream's, so this one is
+        // not the last: stop just before it by name, not by the list's length.
+        let before = Migrator::migrations()
+            .iter()
+            .position(|m| m.name() == "m00094_unique_role_names")
+            .unwrap();
+        let before = u32::try_from(before).unwrap();
         Migrator::up(&db, Some(before)).await.unwrap();
 
         let backend = db.get_database_backend();
