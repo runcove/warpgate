@@ -588,7 +588,6 @@ impl Api {
 
         // Stored before any remaining factor so back-channel logout and SLO
         // can find the session even when TOTP or an approval is still pending.
-        session.remove(SSO_CONTEXT_SESSION_KEY);
         let login_state = || SsoLoginState {
             provider: context.provider.clone(),
             token: response.id_token.clone(),
