@@ -437,7 +437,7 @@ impl ProtocolServer for HTTPProtocolServer {
             let acceptor = loopback_acceptor(
                 &address,
                 proxy_protocol,
-                Arc::new(loopback_owner::KernelSocketTable),
+                Arc::new(loopback_owner::KernelSocketTable::detect()),
                 loopback_owner::effective_uid()?,
             )
             .await?;

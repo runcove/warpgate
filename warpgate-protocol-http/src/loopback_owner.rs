@@ -4,17 +4,19 @@
 //! loopback interface too; their connections are closed before any HTTP is
 //! read.
 //!
-//! The owner comes from the kernel's socket tables (`/proc/net/tcp{,6}` on
-//! Linux; on macOS each process's open sockets, through libproc): the client
-//! socket is the one whose local endpoint is the accepted connection's remote
-//! endpoint and whose remote endpoint is the listener's. A lookup that fails,
-//! times out or finds no such socket refuses the connection.
+//! The owner comes from the kernel (on Linux, a `sock_diag` netlink lookup of
+//! the one socket, or `/proc/net/tcp{,6}` where that is unavailable; on macOS
+//! each process's open sockets, through libproc): the client socket is the
+//! one whose local endpoint is the accepted connection's remote endpoint and
+//! whose remote endpoint is the listener's. A lookup that fails, times out or
+//! finds no such socket refuses the connection.
 //!
 //! Limits of the check:
 //! - TCP carries no peer credentials: the owner is looked up by address and
-//!   port after the connection is accepted. Each accept costs a lookup (a
-//!   walk of the process table on macOS, a read of `/proc/net/tcp` on Linux)
-//!   bounded at 2 seconds; one that fails or runs over refuses, so
+//!   port after the connection is accepted. Each accept costs a lookup (one
+//!   netlink request on Linux, a walk of the process table on macOS), at most
+//!   [`MAX_CONCURRENT_LOOKUPS`] at a time and each bounded at 2 seconds
+//!   including its wait for a turn; one that fails or runs over refuses, so
 //!   another account can slow the listener down but not get through.
 //! - On Linux a socket belongs to the account that created it, wherever its
 //!   descriptor is passed. On macOS it belongs to the account when one of
@@ -46,8 +48,22 @@ use warpgate_common::helpers::concurrent_acceptor::{Accepted, ConcurrentAcceptor
 #[cfg(target_os = "linux")]
 const MAX_SOCKET_TABLE_BYTES: usize = 16 * 1024 * 1024;
 
-/// How long one lookup may take before the connection is refused.
+/// How long one lookup may take, waiting for its turn included, before the
+/// connection is refused.
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How many lookups run at once; the rest wait their turn, first come first
+/// served, within [`LOOKUP_TIMEOUT`]. Each running lookup holds a blocking
+/// thread, so this also bounds the threads a burst of connections can take.
+/// A netlink lookup is a single request; the macOS walk reads every process's
+/// sockets, so fewer of those run at once.
+#[cfg(not(target_os = "macos"))]
+const MAX_CONCURRENT_LOOKUPS: usize = 16;
+#[cfg(target_os = "macos")]
+const MAX_CONCURRENT_LOOKUPS: usize = 4;
+
+static LOOKUP_TURNS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(MAX_CONCURRENT_LOOKUPS);
 
 /// Finds the OS account owning a TCP socket.
 pub(crate) trait SocketOwnerLookup: Send + Sync + 'static {
@@ -57,14 +73,50 @@ pub(crate) trait SocketOwnerLookup: Send + Sync + 'static {
     fn owner_uid(&self, local: SocketAddr, remote: SocketAddr) -> anyhow::Result<Option<u32>>;
 }
 
-/// The kernel's own socket tables: `/proc/net/tcp{,6}` on Linux, the
-/// per-process file tables of libproc on macOS.
-pub(crate) struct KernelSocketTable;
+/// The kernel's own socket tables: on Linux a `sock_diag` lookup, or
+/// `/proc/net/tcp{,6}` when `sock_diag` failed its self-test; the per-process
+/// file tables of libproc on macOS.
+pub(crate) struct KernelSocketTable {
+    #[cfg(target_os = "linux")]
+    sock_diag: bool,
+}
+
+impl KernelSocketTable {
+    /// On Linux, checks once that `sock_diag` finds a connection this
+    /// process has just opened, and falls back to reading `/proc/net/tcp`
+    /// when it does not: the kernel answers a lookup it cannot serve (no
+    /// `tcp_diag`, a filter on netlink) the way it answers one for a socket
+    /// that does not exist, which would refuse every connection.
+    pub(crate) fn detect() -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            let sock_diag = match linux::sock_diag::self_test() {
+                Ok(()) => true,
+                Err(error) => {
+                    warn!(
+                        error = %format!("{error:#}"),
+                        "The sock_diag socket lookup is unavailable; reading /proc/net/tcp for each loopback connection instead"
+                    );
+                    false
+                }
+            };
+            Self { sock_diag }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Self {}
+        }
+    }
+}
 
 impl SocketOwnerLookup for KernelSocketTable {
     #[cfg(target_os = "linux")]
     fn owner_uid(&self, local: SocketAddr, remote: SocketAddr) -> anyhow::Result<Option<u32>> {
-        linux::owner_uid(local, remote)
+        if self.sock_diag {
+            linux::sock_diag::owner_uid(local, remote)
+        } else {
+            linux::owner_uid(local, remote)
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -124,23 +176,43 @@ pub(crate) enum OwnerCheck {
 }
 
 /// Looks up the owner of the client end of the connection `remote` ->
-/// `local` (as seen by the listener), off the async executor and within
-/// [`LOOKUP_TIMEOUT`].
+/// `local` (as seen by the listener), off the async executor, at most
+/// [`MAX_CONCURRENT_LOOKUPS`] at a time, and within [`LOOKUP_TIMEOUT`].
 pub(crate) async fn check_connection_owner(
     lookup: Arc<dyn SocketOwnerLookup>,
     our_uid: u32,
     local: SocketAddr,
     remote: SocketAddr,
 ) -> OwnerCheck {
-    // The client socket's endpoints are the accepted connection's, swapped.
-    let task = tokio::task::spawn_blocking(move || lookup.owner_uid(remote, local));
-    match tokio::time::timeout(LOOKUP_TIMEOUT, task).await {
+    let looked_up = tokio::time::timeout(LOOKUP_TIMEOUT, async move {
+        // The turn goes into the blocking task, so a lookup still running
+        // after the timeout keeps its place until it ends.
+        let turn = LOOKUP_TURNS.acquire().await?;
+        // The client socket's endpoints are the accepted connection's, swapped.
+        let task = tokio::task::spawn_blocking(move || {
+            let _turn = turn;
+            lookup.owner_uid(remote, local)
+        });
+        anyhow::Ok(task.await)
+    })
+    .await;
+    match looked_up {
         Err(_) => OwnerCheck::LookupFailed("timed out".into()),
         Ok(Err(error)) => OwnerCheck::LookupFailed(error.to_string()),
-        Ok(Ok(Err(error))) => OwnerCheck::LookupFailed(format!("{error:#}")),
-        Ok(Ok(Ok(None))) => OwnerCheck::NotFound,
-        Ok(Ok(Ok(Some(uid)))) if uid == our_uid => OwnerCheck::SameAccount,
-        Ok(Ok(Ok(Some(uid)))) => OwnerCheck::OtherAccount(uid),
+        Ok(Ok(looked_up)) => owner_check(looked_up, our_uid),
+    }
+}
+
+fn owner_check(
+    looked_up: Result<anyhow::Result<Option<u32>>, tokio::task::JoinError>,
+    our_uid: u32,
+) -> OwnerCheck {
+    match looked_up {
+        Err(error) => OwnerCheck::LookupFailed(error.to_string()),
+        Ok(Err(error)) => OwnerCheck::LookupFailed(format!("{error:#}")),
+        Ok(Ok(None)) => OwnerCheck::NotFound,
+        Ok(Ok(Some(uid))) if uid == our_uid => OwnerCheck::SameAccount,
+        Ok(Ok(Some(uid))) => OwnerCheck::OtherAccount(uid),
     }
 }
 
@@ -287,6 +359,296 @@ mod linux {
             _ => return None,
         };
         Some(SocketAddr::new(ip, port))
+    }
+
+    /// The kernel's `sock_diag` netlink interface (`linux/inet_diag.h`),
+    /// asked for the one TCP socket with the given endpoints: a lookup in the
+    /// kernel's connection table rather than a read of all of it, so its cost
+    /// does not grow with the number of sockets on the machine, and the
+    /// answer is one socket at one moment rather than rows read over time.
+    ///
+    /// Structures are written and read as bytes at the header's offsets, in
+    /// the kernel's byte order (host order, except ports and addresses, which
+    /// are in network order). Values are Linux's, so the encoding is tested on
+    /// every platform.
+    pub(super) mod sock_diag {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+        use anyhow::{Context, bail};
+
+        use super::super::same_endpoint;
+
+        /// `SOCK_DIAG_BY_FAMILY`, `NLMSG_ERROR` and `NLM_F_REQUEST`.
+        const SOCK_DIAG_BY_FAMILY: u16 = 20;
+        const NLMSG_ERROR: u16 = 2;
+        const NLM_F_REQUEST: u16 = 1;
+        /// `sizeof(struct nlmsghdr)`.
+        pub(in super::super) const NLMSG_HDRLEN: usize = 16;
+        /// `sizeof(struct inet_diag_req_v2)`.
+        pub(in super::super) const REQ_LEN: usize = 56;
+        /// `sizeof(struct inet_diag_msg)`.
+        pub(in super::super) const MSG_LEN: usize = 72;
+        pub(in super::super) const AF_INET: u8 = 2;
+        pub(in super::super) const AF_INET6: u8 = 10;
+        const IPPROTO_TCP: u8 = 6;
+        /// `TCP_LISTEN` in `idiag_state`.
+        pub(in super::super) const TCP_LISTEN: u8 = 10;
+        const ENOENT: i32 = 2;
+
+        /// The request for the TCP socket whose local endpoint is `local`
+        /// and whose remote endpoint is `remote`, or `None` when one is IPv4
+        /// and the other IPv6, which no socket is.
+        pub(in super::super) fn request(
+            local: SocketAddr,
+            remote: SocketAddr,
+            seq: u32,
+        ) -> Option<Vec<u8>> {
+            let (family, src, dst) = match (local.ip().to_canonical(), remote.ip().to_canonical()) {
+                (IpAddr::V4(src), IpAddr::V4(dst)) => {
+                    // An IPv4 address is the first of the four words.
+                    let mut src_words = [0u8; 16];
+                    let mut dst_words = [0u8; 16];
+                    src_words.get_mut(..4)?.copy_from_slice(&src.octets());
+                    dst_words.get_mut(..4)?.copy_from_slice(&dst.octets());
+                    (AF_INET, src_words, dst_words)
+                }
+                (IpAddr::V6(src), IpAddr::V6(dst)) => (AF_INET6, src.octets(), dst.octets()),
+                _ => return None,
+            };
+            let mut out = Vec::with_capacity(NLMSG_HDRLEN + REQ_LEN);
+            // struct nlmsghdr: length, type, flags, sequence, port id (0 is
+            // the kernel).
+            out.extend_from_slice(&u32::try_from(NLMSG_HDRLEN + REQ_LEN).ok()?.to_ne_bytes());
+            out.extend_from_slice(&SOCK_DIAG_BY_FAMILY.to_ne_bytes());
+            out.extend_from_slice(&NLM_F_REQUEST.to_ne_bytes());
+            out.extend_from_slice(&seq.to_ne_bytes());
+            out.extend_from_slice(&0u32.to_ne_bytes());
+            // struct inet_diag_req_v2: family, protocol, no extensions,
+            // padding, every state.
+            out.extend_from_slice(&[family, IPPROTO_TCP, 0, 0]);
+            out.extend_from_slice(&u32::MAX.to_ne_bytes());
+            // struct inet_diag_sockid: ports, addresses, any interface,
+            // INET_DIAG_NOCOOKIE.
+            out.extend_from_slice(&local.port().to_be_bytes());
+            out.extend_from_slice(&remote.port().to_be_bytes());
+            out.extend_from_slice(&src);
+            out.extend_from_slice(&dst);
+            out.extend_from_slice(&0u32.to_ne_bytes());
+            out.extend_from_slice(&[0xff; 8]);
+            Some(out)
+        }
+
+        /// The owner of the socket in the kernel's reply to request `seq`.
+        /// "No such socket" is `None`. So is a socket that is not the one
+        /// asked for: the kernel's lookup falls back to a listening socket on
+        /// the local endpoint, and lists one with no open descriptor behind it
+        /// (TIME_WAIT, closed by its process) under uid 0 and inode 0; neither
+        /// belongs to the client.
+        pub(in super::super) fn parse_reply(
+            reply: &[u8],
+            seq: u32,
+            local: SocketAddr,
+            remote: SocketAddr,
+        ) -> anyhow::Result<Option<u32>> {
+            let length = ne_u32(reply, 0).context("short netlink reply")? as usize;
+            let kind = ne_u16(reply, 4).context("short netlink reply")?;
+            if ne_u32(reply, 8) != Some(seq) {
+                bail!("netlink reply to another request");
+            }
+            let body = reply
+                .get(NLMSG_HDRLEN..length)
+                .context("netlink reply shorter than its header says")?;
+            match kind {
+                NLMSG_ERROR => {
+                    let error = ne_i32(body, 0).context("short netlink error")?;
+                    if error == -ENOENT {
+                        return Ok(None);
+                    }
+                    bail!(
+                        "the kernel refused the socket lookup: {}",
+                        std::io::Error::from_raw_os_error(-error)
+                    );
+                }
+                SOCK_DIAG_BY_FAMILY => {}
+                other => bail!("unexpected netlink message type {other}"),
+            }
+            let message = body.get(..MSG_LEN).context("short inet_diag_msg")?;
+            let family = *message.first().context("short inet_diag_msg")?;
+            let state = *message.get(1).context("short inet_diag_msg")?;
+            let (Some(found_local), Some(found_remote)) = (
+                endpoint(message, family, 4, 8),
+                endpoint(message, family, 6, 24),
+            ) else {
+                return Ok(None);
+            };
+            let uid = ne_u32(message, 64).context("short inet_diag_msg")?;
+            let inode = ne_u32(message, 68).context("short inet_diag_msg")?;
+            let is_the_client = state != TCP_LISTEN
+                && inode != 0
+                && same_endpoint(found_local, local)
+                && same_endpoint(found_remote, remote);
+            Ok(is_the_client.then_some(uid))
+        }
+
+        fn ne_u16(bytes: &[u8], at: usize) -> Option<u16> {
+            Some(u16::from_ne_bytes(bytes.get(at..at + 2)?.try_into().ok()?))
+        }
+
+        fn ne_i32(bytes: &[u8], at: usize) -> Option<i32> {
+            Some(i32::from_ne_bytes(bytes.get(at..at + 4)?.try_into().ok()?))
+        }
+
+        fn ne_u32(bytes: &[u8], at: usize) -> Option<u32> {
+            Some(u32::from_ne_bytes(bytes.get(at..at + 4)?.try_into().ok()?))
+        }
+
+        /// The endpoint with its port at `port_at` and its address at
+        /// `address_at`, both in network order.
+        fn endpoint(
+            message: &[u8],
+            family: u8,
+            port_at: usize,
+            address_at: usize,
+        ) -> Option<SocketAddr> {
+            let port = u16::from_be_bytes(message.get(port_at..port_at + 2)?.try_into().ok()?);
+            let ip = match family {
+                AF_INET => IpAddr::V4(Ipv4Addr::from(
+                    <[u8; 4]>::try_from(message.get(address_at..address_at + 4)?).ok()?,
+                )),
+                AF_INET6 => IpAddr::V6(Ipv6Addr::from(
+                    <[u8; 16]>::try_from(message.get(address_at..address_at + 16)?).ok()?,
+                )),
+                _ => return None,
+            };
+            Some(SocketAddr::new(ip, port))
+        }
+
+        /// Opens a loopback connection and looks its client socket up: the
+        /// lookup must find it under this process's uid.
+        #[cfg(target_os = "linux")]
+        pub(in super::super) fn self_test() -> anyhow::Result<()> {
+            let listener =
+                std::net::TcpListener::bind("127.0.0.1:0").context("binding a test listener")?;
+            let listen_address = listener.local_addr()?;
+            let client =
+                std::net::TcpStream::connect(listen_address).context("connecting to it")?;
+            let (_server, _) = listener.accept().context("accepting the connection")?;
+            let found = owner_uid(client.local_addr()?, listen_address)?;
+            let ours = super::super::effective_uid()?;
+            if found != Some(ours) {
+                bail!("a connection of this process was looked up as {found:?}, not uid {ours}");
+            }
+            Ok(())
+        }
+
+        /// The uid owning the TCP socket with these endpoints, from one
+        /// `sock_diag` request.
+        #[cfg(target_os = "linux")]
+        #[allow(unsafe_code)]
+        pub(in super::super) fn owner_uid(
+            local: SocketAddr,
+            remote: SocketAddr,
+        ) -> anyhow::Result<Option<u32>> {
+            use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+            use std::sync::atomic::{AtomicU32, Ordering};
+
+            static SEQUENCE: AtomicU32 = AtomicU32::new(1);
+
+            let seq = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let Some(request) = request(local, remote, seq) else {
+                return Ok(None);
+            };
+
+            // SAFETY: socket(2) has no memory preconditions; the descriptor
+            // is owned (and closed) by `socket` below.
+            let fd = unsafe {
+                libc::socket(
+                    libc::AF_NETLINK,
+                    libc::SOCK_DGRAM | libc::SOCK_CLOEXEC,
+                    libc::NETLINK_SOCK_DIAG,
+                )
+            };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error()).context("opening a sock_diag socket");
+            }
+            // SAFETY: `fd` is a descriptor just opened that nothing else owns.
+            let socket = unsafe { OwnedFd::from_raw_fd(fd) };
+
+            // A reply that never comes ends the read here rather than holding
+            // the thread for good.
+            let timeout = libc::timeval {
+                tv_sec: super::super::LOOKUP_TIMEOUT
+                    .as_secs()
+                    .try_into()
+                    .unwrap_or(libc::time_t::MAX),
+                tv_usec: 0,
+            };
+            // SAFETY: setsockopt reads `timeout` for the length given.
+            let set = unsafe {
+                libc::setsockopt(
+                    socket.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_RCVTIMEO,
+                    (&raw const timeout).cast(),
+                    std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+                )
+            };
+            if set != 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("setting the sock_diag read timeout");
+            }
+
+            // SAFETY: an all-zero sockaddr_nl is valid; port id 0 is the
+            // kernel.
+            let mut kernel: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+            kernel.nl_family = libc::AF_NETLINK as libc::sa_family_t;
+            // SAFETY: sendto reads `request` and `kernel` for the lengths
+            // given.
+            let sent = unsafe {
+                libc::sendto(
+                    socket.as_raw_fd(),
+                    request.as_ptr().cast(),
+                    request.len(),
+                    0,
+                    (&raw const kernel).cast(),
+                    std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+                )
+            };
+            if sent < 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("sending the sock_diag request");
+            }
+            if sent as usize != request.len() {
+                bail!("the sock_diag request was sent short");
+            }
+
+            let mut reply = [0u8; 8192];
+            // SAFETY: as above, all zeroes is a valid sockaddr_nl.
+            let mut sender: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+            let mut sender_len = std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t;
+            // SAFETY: recvfrom writes at most `reply.len()` bytes into
+            // `reply` and at most `sender_len` bytes into `sender`.
+            let received = unsafe {
+                libc::recvfrom(
+                    socket.as_raw_fd(),
+                    reply.as_mut_ptr().cast(),
+                    reply.len(),
+                    0,
+                    (&raw mut sender).cast(),
+                    &raw mut sender_len,
+                )
+            };
+            if received < 0 {
+                return Err(std::io::Error::last_os_error()).context("reading the sock_diag reply");
+            }
+            if sender.nl_pid != 0 {
+                bail!("a sock_diag reply that did not come from the kernel");
+            }
+            let reply = reply
+                .get(..received as usize)
+                .context("sock_diag reply longer than its buffer")?;
+            parse_reply(reply, seq, local, remote)
+        }
     }
 }
 
@@ -810,15 +1172,19 @@ mod tests {
             assert_eq!(peer, client.local_addr().unwrap());
 
             let our_uid = effective_uid().unwrap();
-            let check =
-                check_connection_owner(Arc::new(KernelSocketTable), our_uid, listen_address, peer)
-                    .await;
+            let check = check_connection_owner(
+                Arc::new(KernelSocketTable::detect()),
+                our_uid,
+                listen_address,
+                peer,
+            )
+            .await;
             assert_eq!(check, OwnerCheck::SameAccount, "{bind}");
 
             // An endpoint nobody holds is not found.
             let unused = SocketAddr::new(peer.ip(), 1);
             let check = check_connection_owner(
-                Arc::new(KernelSocketTable),
+                Arc::new(KernelSocketTable::detect()),
                 our_uid,
                 listen_address,
                 unused,
@@ -857,7 +1223,7 @@ mod tests {
             let check = match accepted {
                 Ok(Ok((_server, peer))) => Some(
                     check_connection_owner(
-                        Arc::new(KernelSocketTable),
+                        Arc::new(KernelSocketTable::detect()),
                         our_uid,
                         listen_address,
                         peer,
@@ -876,9 +1242,13 @@ mod tests {
                 .unwrap();
             let (_server, peer) = listener.accept().await.unwrap();
             assert_eq!(peer, client.local_addr().unwrap());
-            let check =
-                check_connection_owner(Arc::new(KernelSocketTable), our_uid, listen_address, peer)
-                    .await;
+            let check = check_connection_owner(
+                Arc::new(KernelSocketTable::detect()),
+                our_uid,
+                listen_address,
+                peer,
+            )
+            .await;
             assert_eq!(check, OwnerCheck::NotFound, "{bind}");
         }
     }
@@ -1397,5 +1767,283 @@ mod tests {
             assert!(!macos::is_out_of_reach(Some(errno)), "{errno}");
         }
         assert!(!macos::is_out_of_reach(None));
+    }
+
+    /// A connection from this process, looked up through `sock_diag` and
+    /// through `/proc/net/tcp`: both find it under this process's uid, and
+    /// `detect` picks `sock_diag`. Covers IPv4, IPv6, and an IPv6 socket
+    /// connected to an IPv4 listener through a mapped address, which the
+    /// listener sees as plain IPv4.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn sock_diag_and_proc_tables_find_our_own_connection() {
+        assert!(KernelSocketTable::detect().sock_diag);
+        let our_uid = effective_uid().unwrap();
+        for (bind, connect_from_v6) in [
+            ("127.0.0.1:0", false),
+            ("[::1]:0", false),
+            ("127.0.0.1:0", true),
+        ] {
+            let Ok(listener) = tokio::net::TcpListener::bind(bind).await else {
+                // No IPv6 loopback on this machine.
+                continue;
+            };
+            let listen_address = listener.local_addr().unwrap();
+            let client = if connect_from_v6 {
+                let Ok(socket) = tokio::net::TcpSocket::new_v6() else {
+                    continue;
+                };
+                let mapped = SocketAddr::new(
+                    IpAddr::V6(match listen_address.ip() {
+                        IpAddr::V4(ip) => ip.to_ipv6_mapped(),
+                        IpAddr::V6(ip) => ip,
+                    }),
+                    listen_address.port(),
+                );
+                socket.connect(mapped).await.unwrap()
+            } else {
+                tokio::net::TcpStream::connect(listen_address)
+                    .await
+                    .unwrap()
+            };
+            let (_server, peer) = listener.accept().await.unwrap();
+            assert_eq!(peer.port(), client.local_addr().unwrap().port());
+
+            // The listener's view: the client is `peer`, the listener is
+            // `listen_address`; the client socket's own view is the swap.
+            assert_eq!(
+                linux::sock_diag::owner_uid(peer, listen_address).unwrap(),
+                Some(our_uid),
+                "sock_diag {bind} v6:{connect_from_v6}"
+            );
+            assert_eq!(
+                linux::owner_uid(peer, listen_address).unwrap(),
+                Some(our_uid),
+                "/proc {bind} v6:{connect_from_v6}"
+            );
+            // An endpoint nobody holds is not found.
+            let unused = SocketAddr::new(peer.ip(), 1);
+            assert_eq!(
+                linux::sock_diag::owner_uid(unused, listen_address).unwrap(),
+                None,
+                "{bind} v6:{connect_from_v6}"
+            );
+        }
+    }
+
+    /// The listening socket is not the client: asked for endpoints whose
+    /// local one is a listener's, `sock_diag` falls back to the listener,
+    /// which is passed over.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn sock_diag_does_not_take_a_listener_for_the_client() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen_address = listener.local_addr().unwrap();
+        let elsewhere = addr("127.0.0.1:9");
+        assert_eq!(
+            linux::sock_diag::owner_uid(listen_address, elsewhere).unwrap(),
+            None
+        );
+    }
+
+    fn sock_diag_reply(
+        seq: u32,
+        family: u8,
+        state: u8,
+        local: SocketAddr,
+        remote: SocketAddr,
+        uid: u32,
+        inode: u32,
+    ) -> Vec<u8> {
+        use linux::sock_diag::{MSG_LEN, NLMSG_HDRLEN};
+        let address = |ip: IpAddr| -> [u8; 16] {
+            match ip {
+                IpAddr::V4(ip) => {
+                    let mut words = [0u8; 16];
+                    words
+                        .iter_mut()
+                        .zip(ip.octets())
+                        .for_each(|(out, byte)| *out = byte);
+                    words
+                }
+                IpAddr::V6(ip) => ip.octets(),
+            }
+        };
+        let mut out = Vec::new();
+        out.extend_from_slice(&u32::try_from(NLMSG_HDRLEN + MSG_LEN).unwrap().to_ne_bytes());
+        out.extend_from_slice(&20u16.to_ne_bytes());
+        out.extend_from_slice(&0u16.to_ne_bytes());
+        out.extend_from_slice(&seq.to_ne_bytes());
+        out.extend_from_slice(&0u32.to_ne_bytes());
+        out.extend_from_slice(&[family, state, 0, 0]);
+        out.extend_from_slice(&local.port().to_be_bytes());
+        out.extend_from_slice(&remote.port().to_be_bytes());
+        out.extend_from_slice(&address(local.ip()));
+        out.extend_from_slice(&address(remote.ip()));
+        out.extend_from_slice(&0u32.to_ne_bytes());
+        out.extend_from_slice(&[0u8; 8]);
+        // Expires, receive and send queues.
+        out.extend_from_slice(&[0u8; 12]);
+        out.extend_from_slice(&uid.to_ne_bytes());
+        out.extend_from_slice(&inode.to_ne_bytes());
+        assert_eq!(out.len(), NLMSG_HDRLEN + MSG_LEN);
+        out
+    }
+
+    fn sock_diag_error(seq: u32, errno: i32) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&36u32.to_ne_bytes());
+        out.extend_from_slice(&2u16.to_ne_bytes());
+        out.extend_from_slice(&0u16.to_ne_bytes());
+        out.extend_from_slice(&seq.to_ne_bytes());
+        out.extend_from_slice(&0u32.to_ne_bytes());
+        out.extend_from_slice(&(-errno).to_ne_bytes());
+        // The request's own header, echoed back.
+        out.extend_from_slice(&[0u8; 16]);
+        out
+    }
+
+    #[test]
+    fn sock_diag_request_asks_for_exactly_the_client_socket() {
+        use linux::sock_diag::{AF_INET, AF_INET6, NLMSG_HDRLEN, REQ_LEN, request};
+        let (local, remote) = (addr("127.0.0.1:50123"), addr("127.0.0.2:8888"));
+        let bytes = request(local, remote, 7).unwrap();
+        assert_eq!(bytes.len(), NLMSG_HDRLEN + REQ_LEN);
+        let at = |from: usize, to: usize| bytes.get(from..to).unwrap().to_vec();
+        assert_eq!(at(0, 4), 72u32.to_ne_bytes());
+        // SOCK_DIAG_BY_FAMILY, NLM_F_REQUEST only (one socket, no dump).
+        assert_eq!(at(4, 6), 20u16.to_ne_bytes());
+        assert_eq!(at(6, 8), 1u16.to_ne_bytes());
+        assert_eq!(at(8, 12), 7u32.to_ne_bytes());
+        assert_eq!(at(16, 20), [AF_INET, 6, 0, 0]);
+        assert_eq!(at(20, 24), u32::MAX.to_ne_bytes());
+        assert_eq!(at(24, 26), 50123u16.to_be_bytes());
+        assert_eq!(at(26, 28), 8888u16.to_be_bytes());
+        assert_eq!(
+            at(28, 44),
+            [127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            at(44, 60),
+            [127, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(at(60, 64), [0; 4]);
+        assert_eq!(at(64, 72), [0xff; 8]);
+
+        // IPv6, and IPv4-mapped addresses asked for as the IPv4 they are.
+        let bytes = request(addr("[::1]:50123"), addr("[::1]:8888"), 8).unwrap();
+        assert_eq!(bytes.get(16), Some(&AF_INET6));
+        assert_eq!(
+            bytes.get(28..44).unwrap(),
+            std::net::Ipv6Addr::LOCALHOST.octets()
+        );
+        let bytes = request(addr("[::ffff:127.0.0.1]:50123"), addr("127.0.0.1:8888"), 9).unwrap();
+        assert_eq!(bytes.get(16), Some(&AF_INET));
+
+        // No socket has an IPv4 and an IPv6 end.
+        assert!(request(addr("127.0.0.1:1"), addr("[::1]:2"), 1).is_none());
+    }
+
+    #[test]
+    fn sock_diag_reply_gives_the_client_socket_owner() {
+        use linux::sock_diag::{AF_INET, AF_INET6, TCP_LISTEN, parse_reply};
+        let (local, remote) = (addr("127.0.0.1:50123"), addr("127.0.0.1:8888"));
+        let established = 1;
+        let parse = |reply: Vec<u8>| parse_reply(&reply, 5, local, remote);
+
+        let found = sock_diag_reply(5, AF_INET, established, local, remote, 501, 4242);
+        assert_eq!(parse(found).unwrap(), Some(501));
+        // An IPv6 socket on mapped addresses is the same connection.
+        let mapped = sock_diag_reply(
+            5,
+            AF_INET6,
+            established,
+            addr("[::ffff:127.0.0.1]:50123"),
+            addr("[::ffff:127.0.0.1]:8888"),
+            501,
+            4242,
+        );
+        assert_eq!(parse(mapped).unwrap(), Some(501));
+
+        // No such socket.
+        assert_eq!(parse(sock_diag_error(5, 2)).unwrap(), None);
+        // A socket with no descriptor behind it, a listener the kernel fell
+        // back to, and a socket with other endpoints belong to no one.
+        let no_descriptor = sock_diag_reply(5, AF_INET, established, local, remote, 0, 0);
+        assert_eq!(parse(no_descriptor).unwrap(), None);
+        let listening = sock_diag_reply(5, AF_INET, TCP_LISTEN, local, remote, 502, 4243);
+        assert_eq!(parse(listening).unwrap(), None);
+        let other = sock_diag_reply(
+            5,
+            AF_INET,
+            established,
+            addr("127.0.0.1:50124"),
+            remote,
+            502,
+            4244,
+        );
+        assert_eq!(parse(other).unwrap(), None);
+
+        // Anything else fails the lookup, which refuses the connection.
+        // EACCES.
+        assert!(parse(sock_diag_error(5, 13)).is_err());
+        assert!(
+            parse(sock_diag_reply(
+                6,
+                AF_INET,
+                established,
+                local,
+                remote,
+                501,
+                1
+            ))
+            .is_err()
+        );
+        assert!(parse(vec![0u8; 8]).is_err());
+        let mut truncated = sock_diag_reply(5, AF_INET, established, local, remote, 501, 1);
+        truncated.truncate(40);
+        assert!(parse(truncated).is_err());
+    }
+
+    /// However many connections arrive at once, no more than
+    /// `MAX_CONCURRENT_LOOKUPS` lookups run together; the others wait their
+    /// turn and are still answered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn lookups_run_at_most_the_cap_at_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct SlowLookup {
+            running: AtomicUsize,
+            most: AtomicUsize,
+        }
+
+        impl SocketOwnerLookup for SlowLookup {
+            fn owner_uid(
+                &self,
+                _local: SocketAddr,
+                _remote: SocketAddr,
+            ) -> anyhow::Result<Option<u32>> {
+                let now = self.running.fetch_add(1, Ordering::SeqCst) + 1;
+                self.most.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(20));
+                self.running.fetch_sub(1, Ordering::SeqCst);
+                Ok(Some(501))
+            }
+        }
+
+        let lookup = Arc::new(SlowLookup {
+            running: AtomicUsize::new(0),
+            most: AtomicUsize::new(0),
+        });
+        let (local, remote) = (addr("127.0.0.1:8888"), addr("127.0.0.1:50123"));
+        let checks = (0..MAX_CONCURRENT_LOOKUPS * 3).map(|_| {
+            let lookup: Arc<dyn SocketOwnerLookup> = lookup.clone();
+            tokio::spawn(check_connection_owner(lookup, 501, local, remote))
+        });
+        for check in checks.collect::<Vec<_>>() {
+            assert_eq!(check.await.unwrap(), OwnerCheck::SameAccount);
+        }
+        let most = lookup.most.load(Ordering::SeqCst);
+        assert!(most <= MAX_CONCURRENT_LOOKUPS, "{most} lookups ran at once");
     }
 }
