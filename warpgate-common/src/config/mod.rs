@@ -587,8 +587,9 @@ pub struct HttpConfig {
     /// connection is served only when the connecting socket belongs to the
     /// account Warpgate runs as, and is otherwise closed before any HTTP is
     /// read. TCP carries no peer credentials, so after each accept the owner
-    /// is looked up by the connection's addresses and ports. On Linux it is
-    /// read from `/proc/net/tcp`, where a socket belongs to the account that
+    /// is looked up by the connection's addresses and ports. On Linux the
+    /// kernel is asked for that one socket (`sock_diag`, or `/proc/net/tcp`
+    /// where that is unavailable), and a socket belongs to the account that
     /// created it, wherever its descriptor is passed. On macOS the open
     /// sockets of every process Warpgate may inspect (those of its own
     /// account) are walked, and a socket belongs to the account when one of
@@ -603,8 +604,9 @@ pub struct HttpConfig {
     /// it runs (an `ssh -R` forward, a proxy it started): whoever reaches such
     /// a relay is served as that account. A local reverse proxy in front of
     /// Warpgate must run as the same account; one running as another account
-    /// is refused. Each accept costs a lookup (a walk of the process table on
-    /// macOS, a read of `/proc/net/tcp` on Linux) bounded at 2 seconds, and a
+    /// is refused. Each accept costs a lookup (one request to the kernel on
+    /// Linux, a walk of the process table on macOS), at most 16 at a time (4 on
+    /// macOS) and each bounded at 2 seconds including its wait for a turn; a
     /// lookup that fails or runs over refuses the connection: another local
     /// account can slow the listener down but not get through. Only this HTTP
     /// listener is checked: the SSH listener, even on a loopback address,
