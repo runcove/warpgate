@@ -101,6 +101,8 @@ pub struct Session {
     inbound_channel_receiver: Receiver<Msg>,
     open_global_requests: VecDeque<GlobalRequestResponse>,
     server_sig_algs: Option<Vec<Algorithm>>,
+    /// Number of EXT_INFO messages received (RFC 8308 allows at most two).
+    ext_info_count: u8,
 }
 
 impl Drop for Session {
@@ -168,6 +170,11 @@ pub enum Msg {
     Signed {
         data: Vec<u8>,
     },
+    /// The [`Signer`][auth::Signer] could not produce the signature the
+    /// session is waiting for after a `SSH_MSG_USERAUTH_PK_OK`. The session
+    /// abandons that attempt and goes back to its main loop, so the next
+    /// authentication request gets through.
+    SignFailed,
     ChannelOpenSession {
         channel_ref: ChannelRef,
     },
@@ -311,6 +318,7 @@ pub struct Handle<H: Handler> {
     receiver: UnboundedReceiver<Reply>,
     join: russh_util::runtime::JoinHandle<Result<(), H::Error>>,
     channel_buffer_size: usize,
+    agent_session_binding: Option<crate::keys::agent::AgentSessionBinding>,
 }
 
 impl<H: Handler> Drop for Handle<H> {
@@ -322,6 +330,15 @@ impl<H: Handler> Drop for Handle<H> {
 impl<H: Handler> Handle<H> {
     pub fn is_closed(&self) -> bool {
         self.sender.is_closed()
+    }
+
+    /// Return the initial key-exchange context for OpenSSH agent session
+    /// binding.
+    ///
+    /// Pass this to [`crate::keys::agent::client::AgentClient::bind_session`]
+    /// before requesting identities or relaying a forwarded agent socket.
+    pub fn agent_session_binding(&self) -> Option<&crate::keys::agent::AgentSessionBinding> {
+        self.agent_session_binding.as_ref()
     }
 
     /// Perform no authentication. This is useful for testing, but should not be
@@ -432,6 +449,16 @@ impl<H: Handler> Handle<H> {
         }
     }
 
+    /// Tells the session that the [`Signer`][auth::Signer] could not produce
+    /// the signature it is waiting for. Without this the session keeps waiting
+    /// for `Msg::Signed` and ignores everything else sent to it, so no later
+    /// authentication attempt on this handle would get through.
+    async fn abandon_sign_request(&mut self) {
+        // A send error means the session is gone; the signer's error is still
+        // the one the caller needs.
+        let _ = self.sender.send(Msg::SignFailed).await;
+    }
+
     async fn wait_recv_reply(&mut self) -> Result<AuthResult, crate::Error> {
         loop {
             match self.receiver.recv().await {
@@ -500,6 +527,11 @@ impl<H: Handler> Handle<H> {
     /// Authenticate using a custom method that implements the
     /// [`Signer`][auth::Signer] trait. Currently, this crate only provides an
     /// implementation for an [SSH agent][crate::keys::agent::client::AgentClient].
+    ///
+    /// If the signer fails (for example an agent that does not hold the key,
+    /// or declines to sign), its error is returned and the attempt is
+    /// abandoned. The handle stays usable: another authentication method can
+    /// be tried on it.
     pub async fn authenticate_publickey_with<U: Into<String>, S: auth::Signer>(
         &mut self,
         user: U,
@@ -536,7 +568,10 @@ impl<H: Handler> Handle<H> {
                     let data = signer.auth_sign(&key.into(), hash_alg, data).await;
                     let data = match data {
                         Ok(data) => data,
-                        Err(e) => return Err(e),
+                        Err(e) => {
+                            self.abandon_sign_request().await;
+                            return Err(e);
+                        }
                     };
                     if self.sender.send(Msg::Signed { data }).await.is_err() {
                         return Err((crate::SendError {}).into());
@@ -638,6 +673,10 @@ impl<H: Handler> Handle<H> {
     /// where the signing is delegated to an external signer (e.g., SSH agent).
     ///
     /// For RSA certificates, you can specify the hash algorithm to use.
+    ///
+    /// If the signer fails, its error is returned and the attempt is
+    /// abandoned; the handle stays usable for further authentication attempts,
+    /// as with [`Handle::authenticate_publickey_with`].
     pub async fn authenticate_certificate_with<U: Into<String>, S: auth::Signer>(
         &mut self,
         user: U,
@@ -678,7 +717,10 @@ impl<H: Handler> Handle<H> {
                     let data = signer.auth_sign(&cert.into(), hash_alg, data).await;
                     let data = match data {
                         Ok(data) => data,
-                        Err(e) => return Err(e),
+                        Err(e) => {
+                            self.abandon_sign_request().await;
+                            return Err(e);
+                        }
                     };
                     if self.sender.send(Msg::Signed { data }).await.is_err() {
                         return Err((crate::SendError {}).into());
@@ -1218,19 +1260,23 @@ where
     let (kex_done_signal, kex_done_signal_rx) = oneshot::channel();
     let join = russh_util::runtime::spawn(session.run(stream, handler, Some(kex_done_signal)));
 
-    if let Err(err) = kex_done_signal_rx.await {
-        // kex_done_signal Sender is dropped when the session
-        // fails before a succesful key exchange
-        debug!("kex_done_signal sender was dropped {err:?}");
-        join.await.map_err(crate::Error::Join)??;
-        return Err(H::Error::from(crate::Error::Disconnect));
-    }
+    let agent_session_binding = match kex_done_signal_rx.await {
+        Ok(binding) => binding,
+        Err(err) => {
+            // kex_done_signal Sender is dropped when the session
+            // fails before a successful key exchange
+            debug!("kex_done_signal sender was dropped {err:?}");
+            join.await.map_err(crate::Error::Join)??;
+            return Err(H::Error::from(crate::Error::Disconnect));
+        }
+    };
 
     Ok(Handle {
         sender: handle_sender,
         receiver: handle_receiver,
         join,
         channel_buffer_size,
+        agent_session_binding,
     })
 }
 
@@ -1288,6 +1334,7 @@ impl Session {
             pending_len: 0,
             open_global_requests: VecDeque::new(),
             server_sig_algs: None,
+            ext_info_count: 0,
         }
     }
 
@@ -1295,7 +1342,9 @@ impl Session {
         mut self,
         stream: SshRead<R>,
         mut handler: H,
-        mut kex_done_signal: Option<oneshot::Sender<()>>,
+        mut kex_done_signal: Option<
+            oneshot::Sender<Option<crate::keys::agent::AgentSessionBinding>>,
+        >,
     ) -> Result<(), H::Error> {
         let (stream_read, mut stream_write) = stream.split();
         let result = self
@@ -1342,7 +1391,9 @@ impl Session {
         stream_read: SshRead<ReadHalf<R>>,
         stream_write: &mut WriteHalf<R>,
         handler: &mut H,
-        kex_done_signal: &mut Option<tokio::sync::oneshot::Sender<()>>,
+        kex_done_signal: &mut Option<
+            tokio::sync::oneshot::Sender<Option<crate::keys::agent::AgentSessionBinding>>,
+        >,
     ) -> Result<RemoteDisconnectInfo, H::Error> {
         let mut result: Result<RemoteDisconnectInfo, H::Error> = Err(Error::Disconnect.into());
         self.flush()?;
@@ -1369,7 +1420,9 @@ impl Session {
         #[allow(clippy::panic)] // false positive in select! macro
         while !self.common.disconnected {
             self.common.received_data = false;
-            let mut sent_keepalive = false;
+            // Set whenever the keepalive timer elapses, even if no keepalive
+            // could be sent yet, so that the timer is always re-armed below.
+            let mut keepalive_elapsed = false;
             // Keep reading the network for window adjustments, but leave
             // application output in its bounded receivers while a channel is
             // window-blocked.
@@ -1424,6 +1477,7 @@ impl Session {
                     debug!("rekey time limit reached");
                 }
                 () = &mut keepalive_timer => {
+                    keepalive_elapsed = true;
                     if let Some(ref mut enc) = self.common.encrypted
                         && matches!(enc.state, EncryptedState::Authenticated)
                     {
@@ -1432,7 +1486,6 @@ impl Session {
                             debug!("Timeout, server not responding to keepalives");
                             return Err(crate::Error::KeepaliveTimeout.into());
                         }
-                        sent_keepalive = true;
                         self.send_keepalive(true)?;
                     }
                 }
@@ -1512,7 +1565,7 @@ impl Session {
                 // data from it.
                 self.common.alive_timeouts = 0;
             }
-            if (self.common.received_data || sent_keepalive)
+            if (self.common.received_data || keepalive_elapsed)
                 && let (futures::future::Either::Right(ref mut sleep), Some(d)) = (
                     keepalive_timer.as_mut().as_pin_mut(),
                     self.common.config.keepalive_interval,
@@ -1520,7 +1573,7 @@ impl Session {
             {
                 sleep.as_mut().reset(tokio::time::Instant::now() + d);
             }
-            if !sent_keepalive
+            if !keepalive_elapsed
                 && let (futures::future::Either::Right(ref mut sleep), Some(d)) = (
                     inactivity_timer.as_mut().as_pin_mut(),
                     self.common.config.inactivity_timeout,
@@ -1572,7 +1625,7 @@ impl Session {
             Msg::Authenticate { user, method } => {
                 self.write_auth_request_if_needed(&user, method)?;
             }
-            Msg::Signed { .. } => {}
+            Msg::Signed { .. } | Msg::SignFailed => {}
             Msg::AuthInfoResponse { .. } => {}
             Msg::AuthGssapiToken { token } => {
                 if let Some(ref mut enc) = self.common.encrypted {
@@ -1847,7 +1900,7 @@ impl Session {
     }
 
     fn rekey_time_remaining(&self) -> Option<Duration> {
-        if !self.automatic_rekey_allowed() {
+        if cfg!(target_arch = "wasm32") || !self.automatic_rekey_allowed() {
             return None;
         }
         self.common
@@ -1890,7 +1943,9 @@ impl Session {
 async fn reply<H: Handler>(
     session: &mut Session,
     handler: &mut H,
-    kex_done_signal: &mut Option<tokio::sync::oneshot::Sender<()>>,
+    kex_done_signal: &mut Option<
+        tokio::sync::oneshot::Sender<Option<crate::keys::agent::AgentSessionBinding>>,
+    >,
     pkt: &mut IncomingSshPacket,
 ) -> Result<(), H::Error> {
     if let Some(message_type) = pkt.buffer.first() {
@@ -1971,6 +2026,7 @@ async fn reply<H: Handler>(
                 KexProgress::Done {
                     server_host_key,
                     server_host_certificate,
+                    agent_session_binding,
                     newkeys,
                 } => {
                     debug!("kex impl has completed");
@@ -2026,7 +2082,7 @@ async fn reply<H: Handler>(
                             .encrypted(initial_encrypted_state(session), newkeys);
 
                         if let Some(sender) = kex_done_signal.take() {
-                            sender.send(()).unwrap_or(());
+                            sender.send(agent_session_binding).unwrap_or(());
                         }
                     }
 
@@ -2221,6 +2277,30 @@ mod tests {
         assert!(matches!(reply.try_recv(), Ok(Ok(()))));
         assert!(session.common.encrypted.as_ref().unwrap().write.is_empty());
         assert!(session.open_global_requests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn third_ext_info_is_rejected() {
+        let (mut session, _sender, _reply) = keyboard_interactive_session();
+        let mut packet = vec![msg::EXT_INFO];
+        1u32.encode(&mut packet).unwrap();
+        "x".encode(&mut packet).unwrap();
+        b"".as_slice().encode(&mut packet).unwrap();
+
+        for _ in 0..2 {
+            session
+                .process_packet(&mut TestHandler, &packet)
+                .await
+                .unwrap();
+        }
+        assert!(session
+            .process_packet(&mut TestHandler, &packet)
+            .await
+            .is_err());
+        assert_eq!(
+            session.common.encrypted.as_ref().unwrap().received_extensions.len(),
+            2
+        );
     }
 
     #[tokio::test]
@@ -2699,7 +2779,6 @@ impl Default for Config {
 ///
 /// Note: this is an async trait. The trait functions return `impl Future`,
 /// and you can simply define them as `async fn` instead.
-#[cfg_attr(feature = "async-trait", async_trait::async_trait)]
 pub trait Handler: Sized + Send {
     type Error: From<crate::Error> + Send + core::fmt::Debug;
 

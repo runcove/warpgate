@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.89"
 name = "russh"
-version = "0.64.1"
+version = "0.65.0"
 authors = ["Pierre-Étienne Meunier <pe@pijul.org>"]
 build = false
 autolib = false
@@ -35,7 +35,6 @@ all-features = true
 
 [features]
 _bench = ["dep:criterion"]
-async-trait = ["dep:async-trait"]
 aws-lc-rs = ["dep:aws-lc-rs"]
 default = [
     "flate2",
@@ -105,8 +104,16 @@ name = "auth_partial_success"
 path = "tests/auth_partial_success.rs"
 
 [[test]]
+name = "auth_signer_failure"
+path = "tests/auth_signer_failure.rs"
+
+[[test]]
 name = "auth_state_reset"
 path = "tests/auth_state_reset.rs"
+
+[[test]]
+name = "test_agent_session_bind"
+path = "tests/test_agent_session_bind.rs"
 
 [[test]]
 name = "test_backpressure"
@@ -119,6 +126,10 @@ path = "tests/test_contention.rs"
 [[test]]
 name = "test_data_stream"
 path = "tests/test_data_stream.rs"
+
+[[test]]
+name = "test_keepalive_before_auth"
+path = "tests/test_keepalive_before_auth.rs"
 
 [[test]]
 name = "test_kex_shared_secret"
@@ -151,10 +162,6 @@ harness = false
 
 [dependencies.aes]
 version = "0.9"
-
-[dependencies.async-trait]
-version = "0.1.50"
-optional = true
 
 [dependencies.aws-lc-rs]
 version = "1.16.2"
