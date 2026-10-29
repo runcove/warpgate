@@ -121,6 +121,18 @@ async fn run_session(
     .await;
 }
 
+/// Whether a backend's raw tiles are re-encoded as JPEG before they reach the browser.
+///
+/// Both backends hand us decoded BGRA: the RDP helper only ever emits raw, and the VNC
+/// client decodes every Tight/ZRLE rect it receives, so a lossless rect (text, UI)
+/// arrives as raw pixels at 4 bytes each. Shipping those to the browser as-is cost
+/// 6.4 MB per full 1600x1000 frame and a steady ~14 Mbit/s, about 20x what Xvnc sent.
+/// The JPEG path stays sharp: a region is re-sent losslessly once it settles
+/// ([`DirtyTracker`]).
+fn encodes_jpeg(kind: TargetKind) -> bool {
+    matches!(kind, TargetKind::Vnc | TargetKind::Rdp)
+}
+
 /// connect & start recording
 async fn connect(
     session: &WebDesktopSession,
@@ -130,18 +142,10 @@ async fn connect(
 ) -> Result<(DesktopClientHandles, Option<Arc<DesktopRecorder>>, bool), WarpgateError> {
     let target_session_id = admitted.id();
     let (handles, encode_jpeg) = match session.target_kind() {
-        TargetKind::Vnc => {
-            // Tight already picks JPEG for photographic tiles and keeps text and UI
-            // lossless, so re-encoding what it deliberately sent as raw would only
-            // degrade it.
-            (
-                warpgate_protocol_vnc::connect(
-                    admitted.narrow()?,
-                    services.secret_backends.clone(),
-                )?,
-                false,
-            )
-        }
+        TargetKind::Vnc => (
+            warpgate_protocol_vnc::connect(admitted.narrow()?, services.secret_backends.clone())?,
+            encodes_jpeg(TargetKind::Vnc),
+        ),
         TargetKind::Rdp => {
             // Connect at the viewer's measured size when known, so the desktop fits the
             // browser from the first frame; the DVC resize path handles later changes.
@@ -150,8 +154,7 @@ async fn connect(
                 size.unwrap_or(warpgate_protocol_rdp::DEFAULT_SIZE),
                 services.secret_backends.clone(),
             )?;
-            // The RDP helper only ever emits raw BGRA.
-            (handles, true)
+            (handles, encodes_jpeg(TargetKind::Rdp))
         }
         _ => return Err(WarpgateError::InvalidTarget),
     };
@@ -328,4 +331,17 @@ async fn relay_events(
     // Backend ended; dropping `recorder` here finalises the recording.
     drop(recorder);
     final_result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vnc_tiles_are_jpeg_encoded_like_rdp() {
+        // VNC once shipped its decoded rects raw: ~100 MB on the websocket for 4.9 MiB
+        // from Xvnc.
+        assert!(encodes_jpeg(TargetKind::Vnc));
+        assert!(encodes_jpeg(TargetKind::Rdp));
+    }
 }
