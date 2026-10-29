@@ -233,6 +233,31 @@ async fn rejected_credential_failure(
     }
 }
 
+/// The failure for a request whose client address login protection has
+/// blocked, or `None`. Asked before the credential is submitted, as the
+/// password login does.
+async fn blocked_address_failure(
+    services: &warpgate_core::Services,
+    client_ip: Option<std::net::IpAddr>,
+    return_to: &Option<(String, String)>,
+) -> Result<Option<SsoFailure>, WarpgateError> {
+    let Some(ip) = client_ip else {
+        return Ok(None);
+    };
+    let Some(block) = services.login_protection.check_ip_blocked(&ip).await? else {
+        return Ok(None);
+    };
+    warn!(%ip, expires_at = %block.expires_at, "SSO return from a blocked IP");
+    Ok(Some(
+        SsoFailure::at(
+            return_to,
+            SsoLoginError::IpBlocked,
+            "SSO return from a blocked IP",
+        )
+        .with_retry_after(seconds_until(block.expires_at)),
+    ))
+}
+
 /// `next` with `login_error` (and `retry_after`, if given) appended to its
 /// query, after dropping any the caller already put there. The query comes
 /// before a fragment, which stays last.
@@ -584,6 +609,10 @@ impl Api {
             }
         };
 
+        if let Some(failure) = blocked_address_failure(services, client_ip, &return_to).await? {
+            return Ok(Err(failure));
+        }
+
         let mut state = state_arc.lock().await;
 
         let outcome = submit_credential(
@@ -738,8 +767,8 @@ mod tests {
     use warpgate_db_entities::{Parameters, User};
 
     use super::{
-        SsoFailure, SsoLoginError, is_safe_redirect_target, make_redirect_url,
-        next_with_login_error, post_login_redirect, rejected_credential_failure,
+        SsoFailure, SsoLoginError, blocked_address_failure, is_safe_redirect_target,
+        make_redirect_url, next_with_login_error, post_login_redirect, rejected_credential_failure,
     };
     use crate::test_db::{memory_db, services};
 
@@ -937,6 +966,47 @@ mod tests {
             "{blocked}"
         );
         assert_eq!(other, format!("{ORIGIN}/cove/login?login_error=sso_failed"));
+    }
+
+    #[tokio::test]
+    async fn the_credential_gate_reads_the_request_address_only() {
+        let services = protected_services(2, 100).await;
+        rejected_url(&services, Some("192.0.2.10"), "alice").await;
+        rejected_url(&services, Some("192.0.2.10"), "alice").await;
+        let return_to = Some((ORIGIN.to_string(), "/cove/login".to_string()));
+        let gate = |ip: Option<&str>| {
+            let ip = ip.map(|ip| ip.parse().unwrap());
+            let services = &services;
+            let return_to = &return_to;
+            async move {
+                blocked_address_failure(services, ip, return_to)
+                    .await
+                    .unwrap()
+                    .map(SsoFailure::into_redirect_url)
+            }
+        };
+
+        let blocked = gate(Some("192.0.2.10"))
+            .await
+            .expect("the blocked address is refused");
+        assert!(
+            blocked.starts_with(&format!(
+                "{ORIGIN}/cove/login?login_error=ip_blocked&retry_after="
+            )),
+            "{blocked}"
+        );
+        assert_eq!(gate(Some("192.0.2.11")).await, None);
+        assert_eq!(gate(None).await, None);
+    }
+
+    #[test]
+    fn a_plus_in_a_name_decodes_to_a_space_so_it_is_another_key() {
+        // `+` is a space in form encoding: `login_error+` is `login_error `,
+        // not `login_error`, so it is kept and the real code is still added once.
+        assert_eq!(
+            next_with_login_error("/login?login_error+=x", SsoLoginError::SsoFailed, None),
+            "/login?login_error+=x&login_error=sso_failed"
+        );
     }
 
     #[test]
