@@ -6,10 +6,9 @@ use tracing::warn;
 use warpgate_common::WarpgateError;
 use warpgate_common_http::auth::UnauthenticatedRequestContext;
 use warpgate_common_http::is_cluster_peer_request;
-use warpgate_core::ConfigProvider;
 
 use super::mfa_enforcement::warpgate_surface_path;
-use crate::catchall::bound_to_host;
+use crate::catchall::{bound_to_host, get_target_by_request_host};
 
 /// Whether `method` and `path` are part of signing in or out: the routes
 /// under `/@warpgate` and `/_warpgate` on which a host bound to an HTTP target
@@ -63,7 +62,7 @@ pub(crate) fn is_login_flow_route(method: &Method, path: &str) -> bool {
 
 /// Whether the request's host is bound to an HTTP target, resolved as the
 /// catchall resolves it: the trusted Host (or X-Forwarded-Host), port
-/// included, looked up with `get_target_by_hostname` and compared with
+/// included, looked up with `get_target_by_request_host` and compared with
 /// [`bound_to_host`].
 async fn target_binding(
     ctx: &UnauthenticatedRequestContext,
@@ -72,11 +71,7 @@ async fn target_binding(
     let Some(host) = ctx.trusted_host_header(req) else {
         return Ok(false);
     };
-    let target = ctx
-        .services()
-        .config_provider
-        .get_target_by_hostname(&host)
-        .await?;
+    let target = get_target_by_request_host(&ctx.services().config_provider, &host).await?;
     Ok(target.is_some_and(|target| bound_to_host(&target, &host)))
 }
 

@@ -15,7 +15,8 @@ use warpgate_common_http::{
     AuthenticatedRequestContext, RequestAuthorization, SessionAuthorization, SessionKeepalive,
 };
 use warpgate_core::{
-    ConfigProvider, Services, TargetAuthorization, TargetSessionStart, authorize_for_target,
+    ConfigProvider, ConfigProviderEnum, Services, TargetAuthorization, TargetSessionStart,
+    authorize_for_target,
 };
 
 use crate::approval_gate::resolve_admin_approval;
@@ -199,13 +200,52 @@ pub(crate) fn decide_public_target_access(
     }
 }
 
+/// `host`, a Host header value, without its port when the port is 80 or 443,
+/// the default ports of HTTP and HTTPS. A client may send the default port
+/// (`v.example:443`) and still mean the host a target is bound to without one
+/// (`v.example`). `None` when there is no such port to drop. An IPv6 literal
+/// keeps its brackets; a bare IPv6 address is not a Host header and is left
+/// alone.
+pub(crate) fn host_without_default_port(host: &str) -> Option<&str> {
+    let (name, port) = host.rsplit_once(':')?;
+    let bracketed = name.starts_with('[') && name.ends_with(']');
+    (matches!(port, "80" | "443") && !name.is_empty() && (bracketed || !name.contains(':')))
+        .then_some(name)
+}
+
+/// Whether a request whose Host header is `request_host` is for the host a
+/// target is bound to, `bound`: the same value, or the same value once the
+/// request's default port is dropped ([`host_without_default_port`]). Any
+/// other port must match exactly, since two targets may share a hostname and
+/// differ only by port (per-VM proxy).
+pub(crate) fn host_matches_binding(bound: &str, request_host: &str) -> bool {
+    request_host == bound || host_without_default_port(request_host) == Some(bound)
+}
+
+/// The target bound to the request's Host header, `host`: the target whose
+/// `external_host` is exactly `host`, else, when `host` carries a default
+/// port, the one bound to the host without it. An exact binding wins.
+pub(crate) async fn get_target_by_request_host(
+    config_provider: &ConfigProviderEnum,
+    host: &str,
+) -> Result<Option<Target>, WarpgateError> {
+    if let Some(target) = config_provider.get_target_by_hostname(host).await? {
+        return Ok(Some(target));
+    }
+    match host_without_default_port(host) {
+        Some(name) => config_provider.get_target_by_hostname(name).await,
+        None => Ok(None),
+    }
+}
+
 /// Filter a candidate target list down to an HTTP target whose
-/// `external_host` matches the given host header verbatim (port-aware).
+/// `external_host` matches the given host header ([`host_matches_binding`]:
+/// port-aware, but a default port may be dropped).
 ///
 /// Pure over `targets` so unit tests don't need a real config provider. The
-/// async caller narrows the candidates first — `get_target_by_hostname` does
-/// the indexed JSON-column lookup — and this helper enforces the HTTP-only
-/// and exact-`external_host` half of the contract.
+/// async caller narrows the candidates first — `get_target_by_request_host`
+/// does the indexed JSON-column lookup — and this helper enforces the
+/// HTTP-only and `external_host` half of the contract.
 pub(crate) fn find_http_target_by_external_host(
     targets: &[Target],
     host: &str,
@@ -216,7 +256,11 @@ pub(crate) fn find_http_target_by_external_host(
             TargetOptions::Http(ref options) => Some((t, options)),
             _ => None,
         })
-        .find(|(_, o)| o.external_host.as_deref() == Some(host))
+        .find(|(_, o)| {
+            o.external_host
+                .as_deref()
+                .is_some_and(|bound| host_matches_binding(bound, host))
+        })
         .map(|(t, o)| (t.clone(), o.clone()))
 }
 
@@ -232,9 +276,7 @@ pub(crate) async fn resolve_public_target_decision(
     let Some(host) = host else {
         return Ok((None, PublicTargetDecision::NotApplicable));
     };
-    let candidates: Vec<Target> = services
-        .config_provider
-        .get_target_by_hostname(host)
+    let candidates: Vec<Target> = get_target_by_request_host(&services.config_provider, host)
         .await?
         .into_iter()
         .collect();
@@ -269,12 +311,13 @@ pub(crate) fn select_target_name(
 
 /// Whether a target may be served on a request whose Host header is
 /// `request_host`, given the target's `external_host`. A target bound to a
-/// host is served only on that host, compared as `get_target_by_hostname`
-/// compares it (the full Host header, port included); an unbound target is
-/// served on any host. Pure, so it can be tested without a config provider.
+/// host is served only on that host, compared as `get_target_by_request_host`
+/// compares it ([`host_matches_binding`]: the full Host header, port included,
+/// but a default port may be dropped); an unbound target is served on any
+/// host. Pure, so it can be tested without a config provider.
 pub(crate) fn served_on_host(external_host: Option<&str>, request_host: Option<&str>) -> bool {
     match external_host.filter(|host| !host.is_empty()) {
-        Some(bound) => request_host == Some(bound),
+        Some(bound) => request_host.is_some_and(|host| host_matches_binding(bound, host)),
         None => true,
     }
 }
@@ -290,7 +333,7 @@ fn target_served_on_host(target: &Target, request_host: Option<&str>) -> bool {
 }
 
 /// Whether `target` is bound to `request_host`: it has a binding, and
-/// [`served_on_host`] serves it there. With `get_target_by_hostname` this is
+/// [`served_on_host`] serves it there. With `get_target_by_request_host` this is
 /// how the management scope tells a bound host, so it and the catchall agree
 /// on which hosts are bound.
 pub(crate) fn bound_to_host(target: &Target, request_host: &str) -> bool {
@@ -369,12 +412,12 @@ async fn get_target_for_request(
     let params: QueryParams = req.params()?;
 
     // Full Host header including `:port` — two HTTP targets may share a hostname
-    // and differ only by port (per-VM proxy), and `get_target_by_hostname` matches
-    // `external_host` verbatim.
+    // and differ only by port (per-VM proxy), and `get_target_by_request_host`
+    // matches `external_host` with the port, dropping only a default one.
     let request_host = ctx.trusted_host_header(req);
 
     let host_based_target = if let Some(host) = request_host.as_deref() {
-        let found = config_provider.get_target_by_hostname(host).await?;
+        let found = get_target_by_request_host(config_provider, host).await?;
         if found.is_some() {
             debug!(
                 "Domain rebinding detected: host={} -> target={:?}",
@@ -747,6 +790,21 @@ mod public_target_tests {
     }
 
     #[test]
+    fn a_public_share_is_found_when_the_client_names_the_default_port() {
+        // runcove-6gmui: a share bound to `vm-1.example.com` was missed for
+        // `Host: vm-1.example.com:443`, so the client got 401, not the share.
+        let targets = vec![http_target("vm-1", true, Some("vm-1.example.com"))];
+        let (t, options) = find_http_target_by_external_host(&targets, "vm-1.example.com:443")
+            .expect("the default port must not hide the share");
+        assert_eq!(t.name, "vm-1");
+        assert_eq!(
+            decide_public_target_access(Some(&options), false, None),
+            PublicTargetDecision::Bypass,
+        );
+        assert!(find_http_target_by_external_host(&targets, "vm-1.example.com:8443").is_none());
+    }
+
+    #[test]
     fn returns_none_when_no_target_matches() {
         let targets = vec![http_target("vm-1", true, Some("vm-1.example.com:3000"))];
         assert!(find_http_target_by_external_host(&targets, "other.example.com:3000").is_none());
@@ -917,8 +975,8 @@ mod target_selection_tests {
 
     #[test]
     fn the_host_must_match_the_binding_exactly() {
-        // As `get_target_by_hostname` matches it: the full Host header, port
-        // included.
+        // As `get_target_by_request_host` matches it: the full Host header,
+        // port included (a default port is the one exception, below).
         assert!(served_on_host(
             Some("c.example:8443"),
             Some("c.example:8443")
@@ -929,6 +987,41 @@ mod target_selection_tests {
         assert!(served_on_host(None, None));
         // An empty `external_host` binds nothing.
         assert!(served_on_host(Some(""), Some("warpgate.example")));
+    }
+
+    #[test]
+    fn a_default_port_in_the_host_header_still_matches_a_binding_without_one() {
+        // A client may name the default port (an iOS app sends
+        // `v.example:443`); it means the same host.
+        assert!(served_on_host(Some("v.example"), Some("v.example:443")));
+        assert!(served_on_host(Some("v.example"), Some("v.example:80")));
+        // A binding that names the default port is still matched exactly, and
+        // does not take requests without it.
+        assert!(served_on_host(Some("v.example:443"), Some("v.example:443")));
+        assert!(!served_on_host(Some("v.example:443"), Some("v.example")));
+        // Only the port is dropped: another host is still another host.
+        assert!(!served_on_host(Some("v.example"), Some("w.example:443")));
+        assert!(!served_on_host(
+            Some("v.example"),
+            Some("v.example.evil:443")
+        ));
+    }
+
+    #[test]
+    fn only_a_default_port_is_dropped_from_the_host_header() {
+        use super::host_without_default_port as strip;
+
+        assert_eq!(strip("v.example:443"), Some("v.example"));
+        assert_eq!(strip("v.example:80"), Some("v.example"));
+        assert_eq!(strip("[::1]:443"), Some("[::1]"));
+        assert_eq!(strip("v.example"), None);
+        assert_eq!(strip("v.example:8443"), None);
+        assert_eq!(strip("v.example:4430"), None);
+        assert_eq!(strip("v.example:"), None);
+        assert_eq!(strip(":443"), None);
+        // A bare IPv6 address is not a Host header with a port.
+        assert_eq!(strip("fe80::443"), None);
+        assert_eq!(strip("[::1]"), None);
     }
 
     #[test]
