@@ -12,7 +12,6 @@ use http::header::HeaderName;
 use http::uri::{Authority, PathAndQuery, Scheme};
 use http::{HeaderValue, StatusCode, Uri};
 use poem::session::Session;
-use poem::web::Data;
 use poem::web::websocket::WebSocket;
 use poem::{Body, FromRequest, IntoResponse, Request, Response};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -32,7 +31,7 @@ use warpgate_common::{TargetHTTPOptions, WarpgateError, try_block};
 use warpgate_common_http::logging::{get_client_ip, log_request_result, upstream_uri_for_log};
 use warpgate_common_http::ticket_query::without_ticket_query_param;
 use warpgate_common_http::{
-    AuthenticatedRequestContext, SessionAuthorization, SessionKeepalive, SessionKeepaliveGuard,
+    AuthenticatedRequestContext, SessionAuthorization, SessionKeepaliveGuard,
 };
 use warpgate_core::AdmittedTarget;
 use warpgate_tls::{TlsMode, configure_tls_connector};
@@ -653,15 +652,24 @@ pub async fn proxy_websocket_request(
     ctx: &AuthenticatedRequestContext,
     admitted: AdmittedTarget<TargetHTTPOptions>,
     close_rx: broadcast::Receiver<()>,
+    keepalive_guard: SessionKeepaliveGuard,
 ) -> poem::Result<impl IntoResponse> {
     let options = admitted.specific_target().options().clone();
     let uri = construct_uri(req, &options, true)?;
-    proxy_ws_inner(req, ws, uri.clone(), ctx, options, close_rx)
-        .await
-        .map_err(|error| {
-            tracing::error!(uri = %upstream_uri_for_log(&uri), ?error, "WebSocket proxy failed");
-            error
-        })
+    proxy_ws_inner(
+        req,
+        ws,
+        uri.clone(),
+        ctx,
+        options,
+        close_rx,
+        keepalive_guard,
+    )
+    .await
+    .map_err(|error| {
+        tracing::error!(uri = %upstream_uri_for_log(&uri), ?error, "WebSocket proxy failed");
+        error
+    })
 }
 
 /// Remove the username/password from the URL before using it for the Host header
@@ -701,12 +709,8 @@ async fn proxy_ws_inner(
     ctx: &AuthenticatedRequestContext,
     options: TargetHTTPOptions,
     mut close_rx: broadcast::Receiver<()>,
+    keepalive_guard: SessionKeepaliveGuard,
 ) -> poem::Result<impl IntoResponse> {
-    let keepalive_guard = Data::<&SessionKeepalive>::from_request_without_body(req)
-        .await
-        .ok()
-        .map(|x| x.guard());
-
     let (authorization_header, uri) = extract_basic_auth(uri)?;
     let mut client_request = http::request::Builder::new()
         .uri(uri.clone())
@@ -851,7 +855,7 @@ fn pump_upgraded_websocket<S>(
     ws: WebSocket,
     client: WebSocketStream<S>,
     mut close_rx: broadcast::Receiver<()>,
-    keepalive_guard: Option<SessionKeepaliveGuard>,
+    keepalive_guard: SessionKeepaliveGuard,
     span: tracing::Span,
 ) -> Response
 where

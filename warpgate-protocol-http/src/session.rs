@@ -12,7 +12,7 @@ use uuid::Uuid;
 use warpgate_common::{UserSessionId, WarpgateError};
 use warpgate_common_http::auth::UnauthenticatedRequestContext;
 use warpgate_common_http::logging::get_client_ip_addr;
-use warpgate_common_http::{SessionAuthorization, SessionKeepalive};
+use warpgate_common_http::{SessionAuthorization, SessionKeepalive, SessionKeepaliveGuard};
 use warpgate_core::{State, UserSessionStateInit, WarpgateServerHandle};
 use warpgate_db_entities::{HttpSession, UserSession};
 
@@ -500,6 +500,12 @@ impl SessionStore {
         token
     }
 
+    /// [`Self::keepalive`] as a guard a websocket pump can hold, for sessions
+    /// whose requests carry no keepalive of their own (public and ticket ones).
+    pub(crate) fn keepalive_guard(&mut self, id: UserSessionId) -> SessionKeepaliveGuard {
+        SessionKeepalive::new(self.keepalive(id)).guard()
+    }
+
     pub fn remove_session(&mut self, session: &Session) {
         if let Some(id) = session.get_session_id() {
             self.remove_session_by_id(id);
@@ -608,6 +614,83 @@ mod tests {
             now,
             Duration::from_secs(1)
         ));
+    }
+
+    #[poem::handler]
+    async fn register(
+        req: &Request,
+        store: poem::web::Data<&Arc<Mutex<SessionStore>>>,
+        ctx: poem::web::Data<&UnauthenticatedRequestContext>,
+    ) -> poem::Result<()> {
+        store.lock().await.handle_for_request(req, ctx.0).await?;
+        Ok(())
+    }
+
+    /// Registers one throwaway session (a request with no cookie has no
+    /// keepalive of its own, as for a public or ticket request), backdated
+    /// past `max_age`.
+    async fn idle_throwaway_session(
+        store: &Arc<Mutex<SessionStore>>,
+        max_age: Duration,
+    ) -> (UserSessionId, broadcast::Receiver<()>) {
+        use poem::session::{CookieConfig, MemoryStorage, ServerSession};
+        use poem::{EndpointExt, Route, get};
+
+        let ctx = UnauthenticatedRequestContext::new(
+            crate::test_db::services(crate::test_db::memory_db().await).await,
+        )
+        .await;
+        let app = Route::new()
+            .at("/", get(register))
+            .data(store.clone())
+            .data(ctx)
+            .with(ServerSession::new(
+                CookieConfig::default(),
+                MemoryStorage::new(),
+            ));
+        poem::test::TestClient::new(app)
+            .get("/")
+            .send()
+            .await
+            .assert_status_is_ok();
+
+        let mut guard = store.lock().await;
+        let id = *guard.sessions.keys().next().unwrap();
+        let close_rx = guard.close_receiver_by_id(id).unwrap();
+        guard.sessions.get_mut(&id).unwrap().last_activity =
+            Instant::now() - max_age - Duration::from_secs(1);
+        (id, close_rx)
+    }
+
+    #[tokio::test]
+    async fn vacuum_spares_an_idle_session_while_a_keepalive_is_held() {
+        let max_age = Duration::from_secs(60);
+        let store = SessionStore::new();
+        let (id, mut close_rx) = idle_throwaway_session(&store, max_age).await;
+
+        let mut guard = store.lock().await;
+        let _keepalive = guard.keepalive_guard(id);
+        guard.vacuum(max_age);
+
+        assert!(guard.sessions.contains_key(&id));
+        assert!(matches!(
+            close_rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn vacuum_removes_an_idle_session_once_the_keepalive_drops() {
+        let max_age = Duration::from_secs(60);
+        let store = SessionStore::new();
+        let (id, mut close_rx) = idle_throwaway_session(&store, max_age).await;
+
+        let mut guard = store.lock().await;
+        drop(guard.keepalive_guard(id));
+        guard.vacuum(max_age);
+
+        assert!(!guard.sessions.contains_key(&id));
+        assert!(close_rx.try_recv().is_ok());
     }
 }
 
