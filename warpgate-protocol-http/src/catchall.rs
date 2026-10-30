@@ -59,14 +59,18 @@ pub async fn catchall_endpoint(
         ));
     };
 
-    let (handle, close_rx) = {
+    let (handle, close_rx, ws_keepalive) = {
         let mut store = session_store.lock().await;
         let handle = store.handle_for_request(req, &unauthenticated_ctx).await?;
         let id = handle.lock().await.user_session_id();
         let close_rx = store.close_receiver_by_id(id).ok_or_else(|| {
             poem::Error::from_status(poem::http::StatusCode::INTERNAL_SERVER_ERROR)
         })?;
-        (handle, close_rx)
+        // A websocket outlives the request that upgraded it, and a public or
+        // ticket session carries no keepalive of its own: take one here, so the
+        // sweep doesn't cut the socket once the session is idle.
+        let ws_keepalive = ws.is_some().then(|| store.keepalive_guard(id));
+        (handle, close_rx, ws_keepalive)
     };
 
     // start_target_session already sets/checks session user info
@@ -110,11 +114,13 @@ pub async fn catchall_endpoint(
     // `session` field is UserSession, not this
     let span = info_span!("", target_session=%admitted.id(), target=%admitted.target().name);
 
-    Ok(match ws {
-        Some(ws) => proxy_websocket_request(req, ws, &ctx, admitted, close_rx)
-            .instrument(span)
-            .await?
-            .into_response(),
+    Ok(match ws.zip(ws_keepalive) {
+        Some((ws, ws_keepalive)) => {
+            proxy_websocket_request(req, ws, &ctx, admitted, close_rx, ws_keepalive)
+                .instrument(span)
+                .await?
+                .into_response()
+        }
         None => proxy_normal_request(
             req,
             *ctx,
