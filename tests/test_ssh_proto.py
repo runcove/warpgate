@@ -690,6 +690,45 @@ class Test:
             if sender is not None:
                 sender.join(timeout=10)
 
+    @pytest.mark.parametrize(
+        "size", [64 * 1024, 1024 * 1024, 16 * 1024 * 1024], ids=["64k", "1m", "16m"]
+    )
+    def test_upload_to_a_target_that_reads_completes(
+        self,
+        processes: ProcessManager,
+        wg_c_ed25519_pubkey,
+        shared_wg: WarpgateProcess,
+        timeout,
+        size,
+    ):
+        # The counterpart of the test above: a target that does read its
+        # stdin must get all of it. Input Warpgate holds for the target has to
+        # be released as the target's window reopens; an upload through a
+        # bastion was seen to stop at 32 KiB while downloads ran at full speed.
+        # OpenSSH as the client, the way that upload was sent.
+        user, ssh_target = setup_user_and_target(
+            processes, shared_wg, wg_c_ed25519_pubkey
+        )
+        ssh_client = processes.start_ssh_client(
+            f"{user.username}:{ssh_target.name}@localhost",
+            "-p",
+            str(shared_wg.ssh_port),
+            *common_args,
+            "wc",
+            "-c",
+            password="123",
+            stderr=subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = ssh_client.communicate(
+                input=os.urandom(size), timeout=timeout * 3
+            )
+        except subprocess.TimeoutExpired:
+            ssh_client.kill()
+            raise AssertionError(f"an upload of {size} bytes did not complete")
+        assert ssh_client.returncode == 0, stderr
+        assert int(stdout.strip()) == size
+
     # https://github.com/warp-tech/warpgate/issues/2498
     def test_direct_tcpip_stuck_open_does_not_block_siblings(
         self,
