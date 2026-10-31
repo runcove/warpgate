@@ -7,11 +7,12 @@ use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect};
 use time::OffsetDateTime;
 use tracing::{info, warn};
 use uuid::Uuid;
-use warpgate_common::{Protocol, UserSessionId, WarpgateError};
+use warpgate_common::{Protocol, TargetOptions, UserSessionId, WarpgateError};
 use warpgate_db_entities::{TargetSession, User, UserRoleAssignment, UserSession};
 use warpgate_sso::{SsoLoginResponse, SsoProviderConfig};
 
 use crate::cluster::ClusterNotification;
+use crate::live_streams::LiveStreamKind;
 use crate::{ConfigProvider, Services, SessionsFilter, apply_sso_mappings, resolve_sso_username};
 
 /// Whose live sessions an access change can affect.
@@ -21,7 +22,7 @@ pub enum AccessChange {
     Users(Vec<Uuid>),
     /// A user, by name, whose roles an SSO login re-synced.
     Username(String),
-    /// These targets lost roles, or were deleted.
+    /// These targets lost roles, stopped being public, or were deleted.
     Targets(Vec<Uuid>),
     /// A role went away: anyone may be affected.
     All,
@@ -77,7 +78,9 @@ impl Services {
     ///   Requests still running to a revoked target (websockets, streamed
     ///   bodies) are ended instead, on every node, through
     ///   [`ClusterNotification::LiveStreamsReauthorize`] and
-    ///   [`Self::reauthorize_live_streams`]; the browser session stays.
+    ///   [`Self::reauthorize_live_streams`]; the browser session stays. That
+    ///   includes requests admitted through the public bypass, which end once
+    ///   the target is no longer public (or is deleted), whoever made them.
     ///
     /// Fails closed and cannot lose a revocation: the cluster is told to
     /// re-check live streams before anything that can fail; a session whose
@@ -214,19 +217,46 @@ impl Services {
         }
     }
 
-    /// Ends this node's live proxied HTTP requests whose user may no longer
-    /// reach their target, by the same check as
-    /// [`Self::close_sessions_no_longer_authorised`]. The browser session that
-    /// carries them, and its requests to other targets, stay.
-    /// A pair whose check errors is ended too (fail closed).
+    /// Whether `target_id` is still reachable through the public bypass: it
+    /// exists, is an HTTP target, is `public` and does not require approval.
+    /// This is the predicate that admits a request through the bypass
+    /// (`catchall::decide_public_target_access`). Fails closed: a lookup that
+    /// errors counts as no longer shared.
+    pub async fn public_target_still_shared(&self, target_id: Uuid) -> bool {
+        match self.config_provider.get_target_by_id(target_id).await {
+            Ok(Some(target)) => {
+                !target.require_approval
+                    && matches!(&target.options, TargetOptions::Http(options) if options.public)
+            }
+            Ok(None) => false,
+            Err(error) => {
+                warn!(%error, %target_id, "Could not re-check that the target is public; treating it as unshared");
+                false
+            }
+        }
+    }
+
+    /// Ends this node's live proxied HTTP requests that may no longer run, by
+    /// the rule that admitted each. A role-based request ends when its user
+    /// may no longer reach the target, by the same check as
+    /// [`Self::close_sessions_no_longer_authorised`]. A public-bypass request
+    /// ends when the target is no longer public
+    /// ([`Self::public_target_still_shared`]), whatever the user's roles. The
+    /// browser session that carries them, and its requests to other targets,
+    /// stay. A pair whose check errors is ended too (fail closed).
     pub async fn reauthorize_live_streams(&self) -> Result<(), WarpgateError> {
-        for (user_id, target_id) in self.live_streams.in_use() {
-            if !self.still_authorised(user_id, target_id).await {
-                let ended = self.live_streams.cancel(user_id, target_id);
+        for (user_id, target_id, kind) in self.live_streams.in_use() {
+            let allowed = match kind {
+                LiveStreamKind::RoleBased => self.still_authorised(user_id, target_id).await,
+                LiveStreamKind::Public => self.public_target_still_shared(target_id).await,
+            };
+            if !allowed {
+                let ended = self.live_streams.cancel(user_id, target_id, kind);
                 info!(
                     %user_id,
                     %target_id,
                     ended,
+                    ?kind,
                     "Ended live proxied requests to a target the user may no longer reach"
                 );
             }
@@ -593,13 +623,18 @@ mod tests {
         grant_target(&db, kept_target, kept).await;
 
         let (_browser_session, browser_close) = tokio::sync::broadcast::channel(1);
-        let mut to_lost =
-            services
-                .live_streams
-                .watch(browser_close.resubscribe(), alice, lost_target);
-        let mut to_kept = services
-            .live_streams
-            .watch(browser_close, alice, kept_target);
+        let mut to_lost = services.live_streams.watch(
+            browser_close.resubscribe(),
+            alice,
+            lost_target,
+            LiveStreamKind::RoleBased,
+        );
+        let mut to_kept = services.live_streams.watch(
+            browser_close,
+            alice,
+            kept_target,
+            LiveStreamKind::RoleBased,
+        );
         let mut notifications = services.cluster.subscribe();
 
         revoke_user_role(&db, alice, lost).await;
@@ -617,6 +652,90 @@ mod tests {
         assert!(!fired(&mut to_kept).await);
     }
 
+    /// An HTTP target with `public` as given.
+    async fn http_target(db: &DatabaseConnection, public: bool) -> Uuid {
+        let id = Uuid::new_v4();
+        Target::ActiveModel {
+            id: Set(id),
+            name: Set(format!("target-{id}")),
+            description: Set(String::new()),
+            kind: Set(TargetKind::Http),
+            options: Set(serde_json::json!({"http": {"url": "http://h", "public": public}})),
+            rate_limit_bytes_per_second: Set(None),
+            group_id: Set(None),
+            ticket_max_duration_seconds: Set(None),
+            ticket_requests_disabled: Set(false),
+            ticket_require_approval: Set(false),
+            ticket_max_uses: Set(None),
+            require_approval: Set(false),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        id
+    }
+
+    /// A public-bypass stream runs while the target is public, ends once it
+    /// is not, and a deleted target ends it too. A user with no role on the
+    /// target gets no pass from the roles check.
+    #[tokio::test]
+    async fn a_public_bypass_stream_ends_when_the_target_stops_being_public() {
+        let db = migrated_db().await;
+        let services = test_services(&db).await;
+        let (alice, target_id) = (user(&db).await, http_target(&db, true).await);
+        let (_browser_session, browser_close) = tokio::sync::broadcast::channel(1);
+        let mut anonymous = services.live_streams.watch(
+            browser_close.resubscribe(),
+            Uuid::nil(),
+            target_id,
+            LiveStreamKind::Public,
+        );
+        let mut logged_in =
+            services
+                .live_streams
+                .watch(browser_close, alice, target_id, LiveStreamKind::Public);
+
+        services.reauthorize_live_streams().await.unwrap();
+        assert!(!fired(&mut anonymous).await);
+        assert!(!fired(&mut logged_in).await);
+
+        let mut unshared: Target::ActiveModel = Target::Entity::find_by_id(target_id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap()
+            .into();
+        unshared.options = Set(serde_json::json!({"http": {"url": "http://h", "public": false}}));
+        unshared.update(&db).await.unwrap();
+        services.reauthorize_live_streams().await.unwrap();
+
+        assert!(fired(&mut anonymous).await);
+        assert!(fired(&mut logged_in).await);
+    }
+
+    /// A public-bypass stream to a target that no longer exists ends.
+    #[tokio::test]
+    async fn a_public_bypass_stream_ends_when_the_target_is_deleted() {
+        let db = migrated_db().await;
+        let services = test_services(&db).await;
+        let target_id = http_target(&db, true).await;
+        let (_browser_session, browser_close) = tokio::sync::broadcast::channel(1);
+        let mut anonymous = services.live_streams.watch(
+            browser_close,
+            Uuid::nil(),
+            target_id,
+            LiveStreamKind::Public,
+        );
+
+        Target::Entity::delete_by_id(target_id)
+            .exec(&db)
+            .await
+            .unwrap();
+        services.reauthorize_live_streams().await.unwrap();
+
+        assert!(fired(&mut anonymous).await);
+    }
+
     /// A re-check that errors ends the stream (fail closed), and the loop
     /// goes on to the next pair instead of stopping.
     #[tokio::test]
@@ -631,10 +750,16 @@ mod tests {
         grant_user(&db, bob, granting).await;
         grant_target(&db, target_id, granting).await;
         let (_browser_session, browser_close) = tokio::sync::broadcast::channel(1);
-        let mut first = services
-            .live_streams
-            .watch(browser_close.resubscribe(), alice, target_id);
-        let mut second = services.live_streams.watch(browser_close, bob, target_id);
+        let mut first = services.live_streams.watch(
+            browser_close.resubscribe(),
+            alice,
+            target_id,
+            LiveStreamKind::RoleBased,
+        );
+        let mut second =
+            services
+                .live_streams
+                .watch(browser_close, bob, target_id, LiveStreamKind::RoleBased);
 
         db.execute_unprepared("DROP TABLE user_roles")
             .await

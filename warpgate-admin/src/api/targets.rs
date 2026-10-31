@@ -233,6 +233,12 @@ impl DetailApi {
         )
         .await?;
 
+        // Unsharing a public target must end the websockets and streams already
+        // open through the public bypass, on every node.
+        services
+            .close_sessions_no_longer_authorised(AccessChange::Targets(vec![id.0]))
+            .await?;
+
         Ok(UpdateTargetResponse::Ok(Json(
             target.try_into().map_err(WarpgateError::from)?,
         )))
