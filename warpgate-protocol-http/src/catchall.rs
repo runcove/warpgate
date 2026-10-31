@@ -614,6 +614,39 @@ mod live_stream_tests {
         );
         assert!(deregistered(&services).await);
     }
+
+    #[tokio::test]
+    async fn a_public_registration_is_refused_when_the_target_is_gone() {
+        let services = services(memory_db().await).await;
+        let (_session, close_rx) = tokio::sync::broadcast::channel(1);
+
+        // No such target: nothing shares it.
+        let watched =
+            watch_public_live_stream(&services, close_rx, Uuid::nil(), Uuid::new_v4()).await;
+
+        assert_eq!(
+            watched.err().map(|e| e.status()),
+            Some(poem::http::StatusCode::FORBIDDEN)
+        );
+        assert!(deregistered(&services).await);
+    }
+
+    #[tokio::test]
+    async fn a_failing_public_check_refuses_the_request() {
+        let db = memory_db().await;
+        let services = services(db.clone()).await;
+        db.execute_unprepared("DROP TABLE targets").await.unwrap();
+        let (_session, close_rx) = tokio::sync::broadcast::channel(1);
+
+        let watched =
+            watch_public_live_stream(&services, close_rx, Uuid::nil(), Uuid::new_v4()).await;
+
+        assert_eq!(
+            watched.err().map(|e| e.status()),
+            Some(poem::http::StatusCode::FORBIDDEN)
+        );
+        assert!(deregistered(&services).await);
+    }
 }
 
 #[cfg(test)]
@@ -1115,38 +1148,5 @@ mod target_selection_tests {
             Some("c".into())
         );
         assert_eq!(select_target_name(None, None, None), None);
-    }
-
-    #[tokio::test]
-    async fn a_public_registration_is_refused_once_the_target_is_not_public() {
-        let services = services(memory_db().await).await;
-        let (_session, close_rx) = tokio::sync::broadcast::channel(1);
-
-        // No such target: nothing shares it.
-        let watched =
-            watch_public_live_stream(&services, close_rx, Uuid::nil(), Uuid::new_v4()).await;
-
-        assert_eq!(
-            watched.err().map(|e| e.status()),
-            Some(poem::http::StatusCode::FORBIDDEN)
-        );
-        assert!(deregistered(&services).await);
-    }
-
-    #[tokio::test]
-    async fn a_failing_public_check_refuses_the_request() {
-        let db = memory_db().await;
-        let services = services(db.clone()).await;
-        db.execute_unprepared("DROP TABLE targets").await.unwrap();
-        let (_session, close_rx) = tokio::sync::broadcast::channel(1);
-
-        let watched =
-            watch_public_live_stream(&services, close_rx, Uuid::nil(), Uuid::new_v4()).await;
-
-        assert_eq!(
-            watched.err().map(|e| e.status()),
-            Some(poem::http::StatusCode::FORBIDDEN)
-        );
-        assert!(deregistered(&services).await);
     }
 }
