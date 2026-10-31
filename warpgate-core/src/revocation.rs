@@ -245,10 +245,19 @@ impl Services {
     /// browser session that carries them, and its requests to other targets,
     /// stay. A pair whose check errors is ended too (fail closed).
     pub async fn reauthorize_live_streams(&self) -> Result<(), WarpgateError> {
+        // One lookup per target in a pass, however many visitors share it.
+        let mut shared: std::collections::HashMap<Uuid, bool> = std::collections::HashMap::new();
         for (user_id, target_id, kind) in self.live_streams.in_use() {
             let allowed = match kind {
                 LiveStreamKind::RoleBased => self.still_authorised(user_id, target_id).await,
-                LiveStreamKind::Public => self.public_target_still_shared(target_id).await,
+                LiveStreamKind::Public => match shared.get(&target_id) {
+                    Some(allowed) => *allowed,
+                    None => {
+                        let allowed = self.public_target_still_shared(target_id).await;
+                        shared.insert(target_id, allowed);
+                        allowed
+                    }
+                },
             };
             if !allowed {
                 let ended = self.live_streams.cancel(user_id, target_id, kind);
@@ -711,6 +720,56 @@ mod tests {
 
         assert!(fired(&mut anonymous).await);
         assert!(fired(&mut logged_in).await);
+    }
+
+    /// A public-bypass stream ends once the target requires approval: such a
+    /// target is never served through the bypass.
+    #[tokio::test]
+    async fn a_public_bypass_stream_ends_when_the_target_requires_approval() {
+        let db = migrated_db().await;
+        let services = test_services(&db).await;
+        let target_id = http_target(&db, true).await;
+        let (_browser_session, browser_close) = tokio::sync::broadcast::channel(1);
+        let mut anonymous = services.live_streams.watch(
+            browser_close,
+            Uuid::nil(),
+            target_id,
+            LiveStreamKind::Public,
+        );
+
+        let mut gated: Target::ActiveModel = Target::Entity::find_by_id(target_id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap()
+            .into();
+        gated.require_approval = Set(true);
+        gated.update(&db).await.unwrap();
+        services.reauthorize_live_streams().await.unwrap();
+
+        assert!(fired(&mut anonymous).await);
+    }
+
+    /// A public re-check that errors ends the stream (fail closed).
+    #[tokio::test]
+    async fn a_public_bypass_stream_ends_when_its_check_errors() {
+        use sea_orm::ConnectionTrait;
+
+        let db = migrated_db().await;
+        let services = test_services(&db).await;
+        let target_id = http_target(&db, true).await;
+        let (_browser_session, browser_close) = tokio::sync::broadcast::channel(1);
+        let mut anonymous = services.live_streams.watch(
+            browser_close,
+            Uuid::nil(),
+            target_id,
+            LiveStreamKind::Public,
+        );
+
+        db.execute_unprepared("DROP TABLE targets").await.unwrap();
+        services.reauthorize_live_streams().await.unwrap();
+
+        assert!(fired(&mut anonymous).await);
     }
 
     /// A public-bypass stream to a target that no longer exists ends.
