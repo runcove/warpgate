@@ -1,6 +1,11 @@
 //! Long-lived proxied HTTP traffic (websockets, streamed bodies) by the user and
 //! target it runs for, so a revocation can end it without ending the browser
 //! session that carries it.
+//!
+//! A request is registered either as role-based (its user was admitted by a
+//! role grant) or as public-bypass (admitted because the target is public, with
+//! no role check). A revocation re-checks each kind by the rule that admitted
+//! it, and cancels only that kind.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -10,9 +15,19 @@ use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+/// What admitted a live request, and so what must still hold for it to run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum LiveStreamKind {
+    /// The user holds a role that grants the target.
+    RoleBased,
+    /// The target is public, and the request went through the public bypass.
+    Public,
+}
+
 struct LiveStream {
     user_id: Uuid,
     target_id: Uuid,
+    kind: LiveStreamKind,
     cancel: CancellationToken,
 }
 
@@ -40,7 +55,7 @@ impl Drop for Registration {
 }
 
 impl LiveStreams {
-    fn register(&self, user_id: Uuid, target_id: Uuid) -> Registration {
+    fn register(&self, user_id: Uuid, target_id: Uuid, kind: LiveStreamKind) -> Registration {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let cancel = CancellationToken::new();
         if let Ok(mut streams) = self.streams.lock() {
@@ -49,6 +64,7 @@ impl LiveStreams {
                 LiveStream {
                     user_id,
                     target_id,
+                    kind,
                     cancel: cancel.clone(),
                 },
             );
@@ -62,16 +78,17 @@ impl LiveStreams {
 
     /// `session_close` (the browser session's own close signal) extended:
     /// the returned receiver also fires when [`Self::cancel`] ends this
-    /// user's streams to this target. The request stays registered until the
+    /// user's streams of this kind to this target. The request stays registered until the
     /// receiver and every resubscription of it are dropped.
     pub fn watch(
         &self,
         mut session_close: broadcast::Receiver<()>,
         user_id: Uuid,
         target_id: Uuid,
+        kind: LiveStreamKind,
     ) -> broadcast::Receiver<()> {
         let (tx, rx) = broadcast::channel(1);
-        let registration = self.register(user_id, target_id);
+        let registration = self.register(user_id, target_id, kind);
         tokio::spawn(async move {
             tokio::select! {
                 _ = session_close.recv() => {}
@@ -83,28 +100,32 @@ impl LiveStreams {
         rx
     }
 
-    /// The distinct (user, target) pairs with live requests on this node.
-    pub fn in_use(&self) -> HashSet<(Uuid, Uuid)> {
+    /// The distinct (user, target, kind) triples with live requests on this
+    /// node.
+    pub fn in_use(&self) -> HashSet<(Uuid, Uuid, LiveStreamKind)> {
         self.streams
             .lock()
             .map(|streams| {
                 streams
                     .values()
-                    .map(|stream| (stream.user_id, stream.target_id))
+                    .map(|stream| (stream.user_id, stream.target_id, stream.kind))
                     .collect()
             })
             .unwrap_or_default()
     }
 
-    /// Ends this node's live requests by `user_id` to `target_id`; returns
-    /// how many.
-    pub fn cancel(&self, user_id: Uuid, target_id: Uuid) -> usize {
+    /// Ends this node's live requests of `kind` by `user_id` to `target_id`;
+    /// returns how many. Requests of the other kind for the same pair stay.
+    pub fn cancel(&self, user_id: Uuid, target_id: Uuid, kind: LiveStreamKind) -> usize {
         self.streams
             .lock()
             .map(|streams| {
                 let mut cancelled = 0;
                 for stream in streams.values() {
-                    if stream.user_id == user_id && stream.target_id == target_id {
+                    if stream.user_id == user_id
+                        && stream.target_id == target_id
+                        && stream.kind == kind
+                    {
                         stream.cancel.cancel();
                         cancelled += 1;
                     }
@@ -137,18 +158,61 @@ mod tests {
     async fn cancelling_a_target_ends_only_its_streams() {
         let streams = LiveStreams::default();
         let (_session_tx, session_rx) = broadcast::channel(1);
-        let mut lost = streams.watch(session_rx.resubscribe(), ALICE, LOST);
-        let mut kept = streams.watch(session_rx, ALICE, KEPT);
+        let mut lost = streams.watch(
+            session_rx.resubscribe(),
+            ALICE,
+            LOST,
+            LiveStreamKind::RoleBased,
+        );
+        let mut kept = streams.watch(session_rx, ALICE, KEPT, LiveStreamKind::RoleBased);
         tokio::task::yield_now().await;
         assert_eq!(
             streams.in_use(),
-            HashSet::from([(ALICE, LOST), (ALICE, KEPT)])
+            HashSet::from([
+                (ALICE, LOST, LiveStreamKind::RoleBased),
+                (ALICE, KEPT, LiveStreamKind::RoleBased)
+            ])
         );
 
-        assert_eq!(streams.cancel(ALICE, LOST), 1);
+        assert_eq!(streams.cancel(ALICE, LOST, LiveStreamKind::RoleBased), 1);
 
         assert!(fired(&mut lost).await);
         assert!(!fired(&mut kept).await);
+    }
+
+    /// Cancelling one kind leaves the other kind's stream for the same user
+    /// and target running, whichever kind is cancelled.
+    #[tokio::test]
+    async fn cancelling_one_kind_leaves_the_other_kind_running() {
+        let streams = LiveStreams::default();
+        let (_session_tx, session_rx) = broadcast::channel(1);
+        let mut public = streams.watch(
+            session_rx.resubscribe(),
+            ALICE,
+            LOST,
+            LiveStreamKind::Public,
+        );
+        let mut role = streams.watch(session_rx, ALICE, LOST, LiveStreamKind::RoleBased);
+        tokio::task::yield_now().await;
+
+        assert_eq!(streams.cancel(ALICE, LOST, LiveStreamKind::Public), 1);
+        assert!(fired(&mut public).await);
+        assert!(!fired(&mut role).await);
+
+        // And the other way round, with fresh streams.
+        let (_session_tx, session_rx) = broadcast::channel(1);
+        let mut public = streams.watch(
+            session_rx.resubscribe(),
+            ALICE,
+            KEPT,
+            LiveStreamKind::Public,
+        );
+        let mut role = streams.watch(session_rx, ALICE, KEPT, LiveStreamKind::RoleBased);
+        tokio::task::yield_now().await;
+
+        assert_eq!(streams.cancel(ALICE, KEPT, LiveStreamKind::RoleBased), 1);
+        assert!(fired(&mut role).await);
+        assert!(!fired(&mut public).await);
     }
 
     /// The browser session closing still ends the stream.
@@ -156,7 +220,7 @@ mod tests {
     async fn the_session_close_still_ends_the_stream() {
         let streams = LiveStreams::default();
         let (session_tx, session_rx) = broadcast::channel(1);
-        let mut rx = streams.watch(session_rx, ALICE, KEPT);
+        let mut rx = streams.watch(session_rx, ALICE, KEPT, LiveStreamKind::RoleBased);
         tokio::task::yield_now().await;
         session_tx.send(()).unwrap();
         assert!(fired(&mut rx).await);
@@ -167,7 +231,7 @@ mod tests {
     async fn a_finished_request_is_deregistered() {
         let streams = LiveStreams::default();
         let (_session_tx, session_rx) = broadcast::channel(1);
-        let rx = streams.watch(session_rx, ALICE, KEPT);
+        let rx = streams.watch(session_rx, ALICE, KEPT, LiveStreamKind::RoleBased);
         assert!(!streams.in_use().is_empty());
         drop(rx);
         for _ in 0..50 {

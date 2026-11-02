@@ -14,6 +14,7 @@ use warpgate_common_http::auth::UnauthenticatedRequestContext;
 use warpgate_common_http::{
     AuthenticatedRequestContext, RequestAuthorization, SessionAuthorization, SessionKeepalive,
 };
+use warpgate_core::live_streams::LiveStreamKind;
 use warpgate_core::{
     ConfigProvider, ConfigProviderEnum, Services, TargetAuthorization, TargetSessionStart,
     authorize_for_target,
@@ -99,10 +100,21 @@ pub async fn catchall_endpoint(
     };
     // A revocation of this user's access to the target ends the request if it
     // is still running (a websocket, a streamed body) without closing the
-    // browser session. Ticket and public requests are not role-based.
+    // browser session. A request admitted by the public bypass (a ticket with
+    // no ticket id, anonymous or logged in) is watched too, and ends when the
+    // target stops being public. A real ticket is not role-based: deleting the
+    // ticket is what cuts it.
     let close_rx = match &ctx.auth {
         RequestAuthorization::Session(SessionAuthorization::User { user_id, .. }) => {
             watch_live_stream(ctx.services(), close_rx, *user_id, admitted.target().id).await?
+        }
+        RequestAuthorization::Session(SessionAuthorization::Ticket {
+            user_id,
+            ticket_id: None,
+            ..
+        }) => {
+            watch_public_live_stream(ctx.services(), close_rx, *user_id, admitted.target().id)
+                .await?
         }
         _ => close_rx,
     };
@@ -510,7 +522,10 @@ async fn watch_live_stream(
     user_id: Uuid,
     target_id: Uuid,
 ) -> poem::Result<broadcast::Receiver<()>> {
-    let close_rx = services.live_streams.watch(close_rx, user_id, target_id);
+    let close_rx =
+        services
+            .live_streams
+            .watch(close_rx, user_id, target_id, LiveStreamKind::RoleBased);
     match services
         .config_provider
         .authorize_target_by_id(user_id, target_id)
@@ -525,6 +540,28 @@ async fn watch_live_stream(
     }
 }
 
+/// [`watch_live_stream`] for a request the public bypass admitted: registered
+/// first, then the target is checked again to still be public (HTTP, `public`,
+/// no approval required), by the same rule as the revocation that ends it
+/// ([`Services::public_target_still_shared`]). The user's roles play no part.
+/// Fails closed: a check that errors refuses the request.
+async fn watch_public_live_stream(
+    services: &Services,
+    close_rx: broadcast::Receiver<()>,
+    user_id: Uuid,
+    target_id: Uuid,
+) -> poem::Result<broadcast::Receiver<()>> {
+    let close_rx =
+        services
+            .live_streams
+            .watch(close_rx, user_id, target_id, LiveStreamKind::Public);
+    if services.public_target_still_shared(target_id).await {
+        Ok(close_rx)
+    } else {
+        Err(poem::Error::from_status(poem::http::StatusCode::FORBIDDEN))
+    }
+}
+
 #[cfg(test)]
 mod live_stream_tests {
     //! A proxied request is registered for revocation before its access is
@@ -533,7 +570,7 @@ mod live_stream_tests {
     use sea_orm::ConnectionTrait;
     use uuid::Uuid;
 
-    use super::watch_live_stream;
+    use super::{watch_live_stream, watch_public_live_stream};
     use crate::test_db::{memory_db, services};
 
     async fn deregistered(services: &warpgate_core::Services) -> bool {
@@ -570,6 +607,39 @@ mod live_stream_tests {
         let (_session, close_rx) = tokio::sync::broadcast::channel(1);
 
         let watched = watch_live_stream(&services, close_rx, Uuid::new_v4(), Uuid::new_v4()).await;
+
+        assert_eq!(
+            watched.err().map(|e| e.status()),
+            Some(poem::http::StatusCode::FORBIDDEN)
+        );
+        assert!(deregistered(&services).await);
+    }
+
+    #[tokio::test]
+    async fn a_public_registration_is_refused_when_the_target_is_gone() {
+        let services = services(memory_db().await).await;
+        let (_session, close_rx) = tokio::sync::broadcast::channel(1);
+
+        // No such target: nothing shares it.
+        let watched =
+            watch_public_live_stream(&services, close_rx, Uuid::nil(), Uuid::new_v4()).await;
+
+        assert_eq!(
+            watched.err().map(|e| e.status()),
+            Some(poem::http::StatusCode::FORBIDDEN)
+        );
+        assert!(deregistered(&services).await);
+    }
+
+    #[tokio::test]
+    async fn a_failing_public_check_refuses_the_request() {
+        let db = memory_db().await;
+        let services = services(db.clone()).await;
+        db.execute_unprepared("DROP TABLE targets").await.unwrap();
+        let (_session, close_rx) = tokio::sync::broadcast::channel(1);
+
+        let watched =
+            watch_public_live_stream(&services, close_rx, Uuid::nil(), Uuid::new_v4()).await;
 
         assert_eq!(
             watched.err().map(|e| e.status()),

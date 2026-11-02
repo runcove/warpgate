@@ -227,6 +227,15 @@ impl DetailApi {
             Err(err) => return Err(err.into()),
         };
 
+        // Unsharing a public target must end the websockets and streams already
+        // open through the public bypass, on every node. First, straight after
+        // the commit: nothing that can fail may come between the two, or the
+        // unshare would never reach the streams (this call queues its own
+        // failures for retry).
+        services
+            .close_sessions_no_longer_authorised(AccessChange::Targets(vec![id.0]))
+            .await?;
+
         warpgate_core::rate_limiting::apply_new_rate_limits(
             &services.rate_limiter_registry,
             &services.state,
@@ -253,12 +262,16 @@ impl DetailApi {
         let services = admin.services();
         match store::delete(&services.db, id.0).await {
             Ok(admitted) => {
-                services.close_admitted_sessions(admitted).await?;
-                // The sessions a ticket opened went with its ticket above; any other
-                // live session to the target ends now that no one may reach it.
+                // Any live session or stream to the target ends now that no one
+                // may reach it. First, straight after the commit, so a failure
+                // below cannot keep it from every node (this call queues its own
+                // failures for retry).
                 services
                     .close_sessions_no_longer_authorised(AccessChange::Targets(vec![id.0]))
                     .await?;
+                // The sessions a ticket opened, which the re-check above leaves
+                // alone, went with their ticket.
+                services.close_admitted_sessions(admitted).await?;
                 Ok(DeleteTargetResponse::Deleted)
             }
             Err(ResourceError::NotFound) => Ok(DeleteTargetResponse::NotFound),
