@@ -481,12 +481,23 @@ class ProcessManager:
         )
         return port
 
-    def start_mysql_server(self):
+    def start_mysql_server(self, *mysqld_args):
         if prestarted_targets:
+            if mysqld_args:
+                # The pre-started MySQL runs with the job's own flags.
+                _no_prestarted(f"MySQL server with {' '.join(mysqld_args)}")
             return prestarted_targets["mysql"][1]
         port = alloc_port()
         self.start(
-            ["docker", "run", "--rm", "-p", f"{port}:3306", "warpgate-e2e-mysql-server"]
+            [
+                "docker",
+                "run",
+                "--rm",
+                "-p",
+                f"{port}:3306",
+                "warpgate-e2e-mysql-server",
+                *mysqld_args,
+            ]
         )
         return port
 
@@ -531,12 +542,20 @@ class ProcessManager:
         )
         return port
 
-    def start_postgres_server(self):
+    def start_postgres_server(self, host_auth_method=None):
         if prestarted_targets:
+            if host_auth_method:
+                # The pre-started Postgres runs with the job's own auth method.
+                _no_prestarted(f"Postgres server with host auth method {host_auth_method}")
             # The job waited for pg_isready before the tests started.
             return prestarted_targets["postgres"][1]
         port = alloc_port()
         container_name = f"warpgate-e2e-postgres-server-{uuid.uuid4()}"
+        env = (
+            ["-e", f"POSTGRES_HOST_AUTH_METHOD={host_auth_method}"]
+            if host_auth_method
+            else []
+        )
         self.start(
             [
                 "docker",
@@ -546,6 +565,7 @@ class ProcessManager:
                 container_name,
                 "-p",
                 f"{port}:5432",
+                *env,
                 "warpgate-e2e-postgres-server",
             ]
         )
