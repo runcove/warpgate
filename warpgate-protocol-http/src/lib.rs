@@ -100,17 +100,18 @@ async fn recordings_s3_browser_origin(ctx: &UnauthenticatedRequestContext) -> Op
 }
 
 /// The acceptor of a plain-HTTP loopback listener on `address`, for a
-/// process whose effective uid is `euid`: refused, before anything is bound,
-/// when that is root's; otherwise only connections whose client socket
-/// `lookup` finds owned by `euid` come out of it. Wrapped inside the PROXY
-/// protocol reader, so the owner checked is the one of the actual TCP peer.
+/// process whose effective uid `effective_uid` gives: refused, before
+/// anything is bound, when that cannot be read or is root's; otherwise only
+/// connections whose client socket `lookup` finds owned by that uid come out
+/// of it. Wrapped inside the PROXY protocol reader, so the owner checked is
+/// the one of the actual TCP peer.
 async fn loopback_acceptor(
     address: &ListenEndpoint,
     proxy_protocol: bool,
     lookup: Arc<dyn loopback_owner::SocketOwnerLookup>,
-    euid: u32,
+    effective_uid: impl FnOnce() -> Result<u32>,
 ) -> Result<BoxAcceptor> {
-    let our_uid = loopback_owner::serving_uid(euid)?;
+    let our_uid = loopback_owner::serving_uid(effective_uid()?)?;
     let acceptor = address.poem_acceptor().await?;
     let acceptor = loopback_owner::same_account_acceptor(acceptor, lookup, our_uid);
     Ok(MaybeProxyProtocolAcceptor::new(acceptor, proxy_protocol).boxed())
@@ -438,7 +439,7 @@ impl ProtocolServer for HTTPProtocolServer {
                 &address,
                 proxy_protocol,
                 Arc::new(loopback_owner::KernelSocketTable::detect()),
-                loopback_owner::effective_uid()?,
+                loopback_owner::effective_uid,
             )
             .await?;
             warn!(
@@ -508,10 +509,20 @@ mod tests {
     /// the connection came out of the acceptor, and what the client read when
     /// it did not.
     async fn connect_to_loopback_listener(owner: u32) -> (bool, Vec<u8>) {
+        connect_to_loopback_listener_as(owner, || Ok(501)).await
+    }
+
+    /// As [`connect_to_loopback_listener`], for Warpgate running as the uid
+    /// `effective_uid` gives.
+    async fn connect_to_loopback_listener_as(
+        owner: u32,
+        effective_uid: impl FnOnce() -> Result<u32>,
+    ) -> (bool, Vec<u8>) {
         let address = ListenEndpoint::from("127.0.0.1:0".parse::<SocketAddr>().unwrap());
-        let mut acceptor = loopback_acceptor(&address, false, Arc::new(OwnedBy(owner)), 501)
-            .await
-            .unwrap();
+        let mut acceptor =
+            loopback_acceptor(&address, false, Arc::new(OwnedBy(owner)), effective_uid)
+                .await
+                .unwrap();
         let bound = *acceptor
             .local_addr()
             .first()
@@ -534,10 +545,43 @@ mod tests {
     #[tokio::test]
     async fn loopback_listener_refuses_to_start_as_root() {
         let address = ListenEndpoint::from("127.0.0.1:0".parse::<SocketAddr>().unwrap());
-        let Err(error) = loopback_acceptor(&address, false, Arc::new(OwnedBy(0)), 0).await else {
+        let Err(error) =
+            loopback_acceptor(&address, false, Arc::new(OwnedBy(0)), || Ok(0)).await
+        else {
             panic!("a loopback listener started for root");
         };
         assert!(error.to_string().contains("root"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn loopback_listener_refuses_to_start_without_its_uid() {
+        let address = ListenEndpoint::from("127.0.0.1:0".parse::<SocketAddr>().unwrap());
+        let Err(error) = loopback_acceptor(&address, false, Arc::new(OwnedBy(501)), || {
+            Err(anyhow::anyhow!("no uid"))
+        })
+        .await
+        else {
+            panic!("a loopback listener started without a uid");
+        };
+        assert!(error.to_string().contains("no uid"), "{error}");
+    }
+
+    /// The uid the listener serves is the one its source gives: this
+    /// process's own, as `bind` passes it, and no other.
+    #[tokio::test]
+    async fn loopback_listener_serves_the_effective_uid_of_the_process() {
+        let our_uid = loopback_owner::effective_uid().unwrap();
+        if our_uid == 0 {
+            // A listener does not start for root.
+            return;
+        }
+        let (accepted, _) =
+            connect_to_loopback_listener_as(our_uid, loopback_owner::effective_uid).await;
+        assert!(accepted);
+        let (accepted, received) =
+            connect_to_loopback_listener_as(our_uid + 1, loopback_owner::effective_uid).await;
+        assert!(!accepted);
+        assert!(received.is_empty());
     }
 
     #[tokio::test]

@@ -243,7 +243,7 @@ pub(crate) fn same_account_acceptor<A: Acceptor + 'static>(
                 ),
                 OwnerCheck::NotFound => warn!(
                     peer_port = remote.port(),
-                    "Refused a loopback connection whose client socket is not in the socket table"
+                    "Refused a loopback connection: no socket of this account matches it (on macOS, no process this account can inspect holds the client end)"
                 ),
                 OwnerCheck::LookupFailed(error) => warn!(
                     %error,
@@ -833,14 +833,12 @@ mod macos {
         })
     }
 
-    #[cfg(target_os = "macos")]
-    pub(super) use walk::owner_uid;
-
-    #[cfg(target_os = "macos")]
-    #[allow(unsafe_code)]
-    mod walk {
+    /// The walk over the process table, written against [`ProcessTable`] (the
+    /// libproc calls and the clock) so that tests can run it on a fake.
+    #[cfg(unix)]
+    pub(super) mod process_walk {
         use std::net::SocketAddr;
-        use std::time::Instant;
+        use std::time::{Duration, Instant};
 
         use anyhow::{Context, bail};
 
@@ -849,82 +847,122 @@ mod macos {
             parse_socket_fdinfo,
         };
 
-        /// `PROC_ALL_PIDS` and `PROC_PIDFDSOCKETINFO` in `sys/proc_info.h`;
-        /// not in `libc`.
-        const PROC_ALL_PIDS: u32 = 1;
-        const PROC_PIDFDSOCKETINFO: libc::c_int = 3;
+        /// `PROX_FDTYPE_SOCKET` in `sys/proc_info.h`.
+        pub(in super::super) const PROX_FDTYPE_SOCKET: u32 = 2;
 
         /// Bounds on the walk: past any of them, or past the deadline, the
         /// connection is refused.
-        const MAX_PIDS: usize = 100_000;
-        const MAX_FDS_PER_PROCESS: usize = 1 << 20;
-        const MAX_SOCKETS: usize = 1 << 20;
+        pub(in super::super) const MAX_PIDS: usize = 100_000;
+        pub(in super::super) const MAX_FDS_PER_PROCESS: usize = 1 << 20;
+        pub(in super::super) const MAX_SOCKETS: usize = 1 << 20;
 
-        /// `struct socket_fdinfo`, as bytes with its alignment.
-        #[repr(C, align(8))]
-        struct SocketFdInfo([u8; SOCKET_FDINFO_LEN]);
+        /// One entry of a process's descriptor list: `struct proc_fdinfo`.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        #[repr(C)]
+        pub(in super::super) struct FdInfo {
+            pub fd: i32,
+            pub fd_type: u32,
+        }
 
-        pub(in super::super) fn owner_uid(
+        /// The calls the walk makes, as the libproc calls make them: a size
+        /// is the call's return value, which is `<= 0` when the call failed,
+        /// and [`errno`](Self::errno) then gives the reason.
+        pub(in super::super) trait ProcessTable {
+            /// The current time, for the deadline.
+            fn now(&mut self) -> Instant;
+
+            /// `proc_listpids(PROC_ALL_PIDS)`: with no buffer, the bytes
+            /// needed; with one, the bytes written to it.
+            fn list_pids(&mut self, buffer: Option<&mut [i32]>) -> i32;
+
+            /// `proc_pidinfo(PROC_PIDLISTFDS)`: with no buffer, the bytes
+            /// needed; with one, the bytes written to it.
+            fn list_fds(&mut self, pid: i32, buffer: Option<&mut [FdInfo]>) -> i32;
+
+            /// `proc_pidfdinfo(PROC_PIDFDSOCKETINFO)` into `buffer`, which is
+            /// `SOCKET_FDINFO_LEN` bytes long: the bytes written.
+            fn socket_info(&mut self, pid: i32, fd: i32, buffer: &mut [u8]) -> i32;
+
+            /// `proc_pidinfo(PROC_PIDTBSDINFO)`: the bytes written and the
+            /// uid in what was written.
+            fn process_info(&mut self, pid: i32) -> (i32, u32);
+
+            /// `sizeof(struct proc_bsdinfo)`.
+            fn bsdinfo_len(&self) -> usize;
+
+            /// The errno of the call that just failed.
+            fn errno(&mut self) -> Option<i32>;
+        }
+
+        /// The owner of the client socket `local` -> `remote` among the sockets
+        /// of every process in `table` but `own_pid`, giving up after `timeout`.
+        pub(in super::super) fn lookup_owner(
+            table: &mut impl ProcessTable,
+            own_pid: i32,
+            timeout: Duration,
             local: SocketAddr,
             remote: SocketAddr,
         ) -> anyhow::Result<Option<u32>> {
-            let deadline = Instant::now() + super::super::LOOKUP_TIMEOUT;
-            let own_pid = i32::try_from(std::process::id()).context("process id")?;
+            let deadline = table.now() + timeout;
             let mut sockets = Vec::new();
             let mut inspected = 0usize;
-            for pid in list_pids()? {
+            for pid in list_pids(table)? {
                 if pid <= 0 || pid == own_pid {
                     continue;
                 }
-                let Some(fds) = list_fds(pid)? else {
+                let Some(fds) = list_fds(table, pid)? else {
                     continue;
                 };
                 for fd in fds {
-                    if fd.proc_fdtype != libc::PROX_FDTYPE_SOCKET as u32 {
+                    if fd.fd_type != PROX_FDTYPE_SOCKET {
                         continue;
                     }
                     inspected += 1;
                     if inspected > MAX_SOCKETS {
                         bail!("more than {MAX_SOCKETS} sockets to inspect");
                     }
-                    if Instant::now() > deadline {
+                    if table.now() > deadline {
                         bail!("the socket lookup ran past its deadline");
                     }
-                    if let Some(socket) = tcp_socket(pid, fd.proc_fd)? {
+                    if let Some(socket) = tcp_socket(table, pid, fd.fd)? {
                         sockets.push(ProcessSocket { pid, socket });
                     }
                 }
-                if Instant::now() > deadline {
+                if table.now() > deadline {
                     bail!("the socket lookup ran past its deadline");
                 }
             }
-            find_owner(&sockets, own_pid, local, remote, process_uid)
+            find_owner(&sockets, own_pid, local, remote, |pid| {
+                process_uid(table, pid)
+            })
         }
 
-        fn clear_errno() {
-            // SAFETY: `__error` returns this thread's errno location.
-            unsafe { *libc::__error() = 0 };
+        /// The error behind a failed call's errno.
+        fn os_error(errno: Option<i32>) -> std::io::Error {
+            match errno {
+                Some(errno) => std::io::Error::from_raw_os_error(errno),
+                None => std::io::Error::other("unknown OS error"),
+            }
         }
 
         /// Every process id. A list that fills the buffer may have been cut
         /// short, and is refused.
-        fn list_pids() -> anyhow::Result<Vec<i32>> {
-            // SAFETY: a size query: no buffer.
-            let needed = unsafe { libc::proc_listpids(PROC_ALL_PIDS, 0, std::ptr::null_mut(), 0) };
+        pub(in super::super) fn list_pids(
+            table: &mut impl ProcessTable,
+        ) -> anyhow::Result<Vec<i32>> {
+            let needed = table.list_pids(None);
             if needed <= 0 {
-                return Err(std::io::Error::last_os_error()).context("sizing the process list");
+                return Err(os_error(table.errno())).context("sizing the process list");
             }
             let count = needed as usize / size_of::<i32>() + 64;
             if count > MAX_PIDS {
                 bail!("more than {MAX_PIDS} processes");
             }
             let mut pids = vec![0i32; count];
-            let bytes = libc::c_int::try_from(count * size_of::<i32>())?;
-            // SAFETY: `pids` is writable for `bytes` bytes.
-            let filled =
-                unsafe { libc::proc_listpids(PROC_ALL_PIDS, 0, pids.as_mut_ptr().cast(), bytes) };
+            let bytes = i32::try_from(count * size_of::<i32>())?;
+            let filled = table.list_pids(Some(&mut pids));
             if filled <= 0 {
-                return Err(std::io::Error::last_os_error()).context("listing processes");
+                return Err(os_error(table.errno())).context("listing processes");
             }
             if filled >= bytes {
                 bail!("the process list grew while it was read");
@@ -934,41 +972,24 @@ mod macos {
         }
 
         /// The open descriptors of `pid`, or `None` when it is out of reach.
-        fn list_fds(pid: i32) -> anyhow::Result<Option<Vec<libc::proc_fdinfo>>> {
-            const ENTRY: usize = size_of::<libc::proc_fdinfo>();
-            clear_errno();
-            // SAFETY: a size query: no buffer.
-            let needed = unsafe {
-                libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0)
-            };
+        pub(in super::super) fn list_fds(
+            table: &mut impl ProcessTable,
+            pid: i32,
+        ) -> anyhow::Result<Option<Vec<FdInfo>>> {
+            const ENTRY: usize = size_of::<FdInfo>();
+            let needed = table.list_fds(pid, None);
             if needed <= 0 {
-                return out_of_reach("sizing a process's descriptors").map(|()| None);
+                return out_of_reach(table, "sizing a process's descriptors").map(|()| None);
             }
             let count = needed as usize / ENTRY + 16;
             if count > MAX_FDS_PER_PROCESS {
                 bail!("a process has more than {MAX_FDS_PER_PROCESS} descriptors");
             }
-            let mut fds = vec![
-                libc::proc_fdinfo {
-                    proc_fd: 0,
-                    proc_fdtype: 0,
-                };
-                count
-            ];
-            let bytes = libc::c_int::try_from(count * ENTRY)?;
-            clear_errno();
-            // SAFETY: `fds` is writable for `bytes` bytes.
-            let filled = unsafe {
-                libc::proc_pidinfo(
-                    pid,
-                    libc::PROC_PIDLISTFDS,
-                    0,
-                    fds.as_mut_ptr().cast(),
-                    bytes,
-                )
-            };
+            let mut fds = vec![FdInfo { fd: 0, fd_type: 0 }; count];
+            let bytes = i32::try_from(count * ENTRY)?;
+            let filled = table.list_fds(pid, Some(&mut fds));
             if filled <= 0 {
-                return out_of_reach("listing a process's descriptors").map(|()| None);
+                return out_of_reach(table, "listing a process's descriptors").map(|()| None);
             }
             if filled >= bytes || filled as usize % ENTRY != 0 {
                 bail!("a process's descriptor list does not fit its layout or grew while read");
@@ -979,24 +1000,17 @@ mod macos {
 
         /// The TCP socket behind `pid`'s descriptor `fd`, or `None` when it
         /// is not a TCP socket or is out of reach.
-        fn tcp_socket(pid: i32, fd: i32) -> anyhow::Result<Option<TcpSocket>> {
-            let mut info = SocketFdInfo([0; SOCKET_FDINFO_LEN]);
-            clear_errno();
-            // SAFETY: `info` is writable for `SOCKET_FDINFO_LEN` bytes.
-            let size = unsafe {
-                libc::proc_pidfdinfo(
-                    pid,
-                    fd,
-                    PROC_PIDFDSOCKETINFO,
-                    info.0.as_mut_ptr().cast(),
-                    SOCKET_FDINFO_LEN as libc::c_int,
-                )
-            };
+        pub(in super::super) fn tcp_socket(
+            table: &mut impl ProcessTable,
+            pid: i32,
+            fd: i32,
+        ) -> anyhow::Result<Option<TcpSocket>> {
+            let mut info = [0u8; SOCKET_FDINFO_LEN];
+            let size = table.socket_info(pid, fd, &mut info);
             if size <= 0 {
-                return out_of_reach("reading a socket").map(|()| None);
+                return out_of_reach(table, "reading a socket").map(|()| None);
             }
             let record = info
-                .0
                 .get(..size as usize)
                 .context("socket info larger than its buffer")?;
             parse_socket_fdinfo(record)
@@ -1004,42 +1018,171 @@ mod macos {
 
         /// The effective uid of `pid`, or `None` when it has exited. Any
         /// other failure, or a reply of another size, refuses.
-        fn process_uid(pid: i32) -> anyhow::Result<Option<u32>> {
-            const EXPECTED: usize = size_of::<libc::proc_bsdinfo>();
-            // SAFETY: `proc_bsdinfo` is plain integers and arrays of them.
-            let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-            clear_errno();
-            // SAFETY: `info` is writable for `EXPECTED` bytes.
-            let size = unsafe {
-                libc::proc_pidinfo(
-                    pid,
-                    libc::PROC_PIDTBSDINFO,
-                    0,
-                    (&raw mut info).cast(),
-                    EXPECTED as libc::c_int,
-                )
-            };
+        pub(in super::super) fn process_uid(
+            table: &mut impl ProcessTable,
+            pid: i32,
+        ) -> anyhow::Result<Option<u32>> {
+            let expected = table.bsdinfo_len();
+            let (size, uid) = table.process_info(pid);
             if size <= 0 {
-                let error = std::io::Error::last_os_error();
-                if error.raw_os_error() == Some(libc::ESRCH) {
+                let errno = table.errno();
+                if errno == Some(libc::ESRCH) {
                     return Ok(None);
                 }
-                return Err(error).context("reading a socket holder's uid");
+                return Err(os_error(errno)).context("reading a socket holder's uid");
             }
-            if size as usize != EXPECTED {
-                bail!("process info is {size} bytes, expected {EXPECTED}");
+            if size as usize != expected {
+                bail!("process info is {size} bytes, expected {expected}");
             }
-            Ok(Some(info.pbi_uid))
+            Ok(Some(uid))
         }
 
         /// `Ok` when the call that just failed only found its process or
         /// descriptor out of reach; otherwise its error.
-        fn out_of_reach(what: &str) -> anyhow::Result<()> {
-            let error = std::io::Error::last_os_error();
-            if is_out_of_reach(error.raw_os_error()) {
+        fn out_of_reach(table: &mut impl ProcessTable, what: &str) -> anyhow::Result<()> {
+            let errno = table.errno();
+            if is_out_of_reach(errno) {
                 Ok(())
             } else {
-                Err(error).context(what.to_owned())
+                Err(os_error(errno)).context(what.to_owned())
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) use native::owner_uid;
+
+    /// The libproc calls themselves.
+    #[cfg(target_os = "macos")]
+    #[allow(unsafe_code)]
+    mod native {
+        use std::net::SocketAddr;
+        use std::time::Instant;
+
+        use anyhow::Context;
+
+        use super::SOCKET_FDINFO_LEN;
+        use super::process_walk::{FdInfo, PROX_FDTYPE_SOCKET, ProcessTable, lookup_owner};
+
+        /// `PROC_ALL_PIDS` and `PROC_PIDFDSOCKETINFO` in `sys/proc_info.h`;
+        /// not in `libc`.
+        const PROC_ALL_PIDS: u32 = 1;
+        const PROC_PIDFDSOCKETINFO: libc::c_int = 3;
+
+        // The walk's own `FdInfo` and descriptor type are libproc's.
+        const _: () = assert!(size_of::<FdInfo>() == size_of::<libc::proc_fdinfo>());
+        const _: () = assert!(PROX_FDTYPE_SOCKET == libc::PROX_FDTYPE_SOCKET as u32);
+
+        /// `struct socket_fdinfo`, as bytes with its alignment.
+        #[repr(C, align(8))]
+        struct SocketFdInfo([u8; SOCKET_FDINFO_LEN]);
+
+        pub(in super::super) fn owner_uid(
+            local: SocketAddr,
+            remote: SocketAddr,
+        ) -> anyhow::Result<Option<u32>> {
+            let own_pid = i32::try_from(std::process::id()).context("process id")?;
+            lookup_owner(
+                &mut Libproc,
+                own_pid,
+                super::super::LOOKUP_TIMEOUT,
+                local,
+                remote,
+            )
+        }
+
+        fn clear_errno() {
+            // SAFETY: `__error` returns this thread's errno location.
+            unsafe { *libc::__error() = 0 };
+        }
+
+        /// The process table of this machine.
+        struct Libproc;
+
+        impl ProcessTable for Libproc {
+            fn now(&mut self) -> Instant {
+                Instant::now()
+            }
+
+            fn list_pids(&mut self, buffer: Option<&mut [i32]>) -> i32 {
+                let (pointer, bytes): (*mut libc::c_void, usize) = match buffer {
+                    Some(buffer) => (buffer.as_mut_ptr().cast(), buffer.len() * size_of::<i32>()),
+                    None => (std::ptr::null_mut(), 0),
+                };
+                // SAFETY: `pointer` is null with no bytes, or writable for
+                // `bytes` bytes.
+                unsafe { libc::proc_listpids(PROC_ALL_PIDS, 0, pointer, bytes as libc::c_int) }
+            }
+
+            fn list_fds(&mut self, pid: i32, buffer: Option<&mut [FdInfo]>) -> i32 {
+                let (pointer, bytes): (*mut libc::c_void, usize) = match buffer {
+                    Some(buffer) => (
+                        buffer.as_mut_ptr().cast(),
+                        buffer.len() * size_of::<FdInfo>(),
+                    ),
+                    None => (std::ptr::null_mut(), 0),
+                };
+                clear_errno();
+                // SAFETY: `pointer` is null with no bytes, or writable for
+                // `bytes` bytes.
+                unsafe {
+                    libc::proc_pidinfo(
+                        pid,
+                        libc::PROC_PIDLISTFDS,
+                        0,
+                        pointer,
+                        bytes as libc::c_int,
+                    )
+                }
+            }
+
+            fn socket_info(&mut self, pid: i32, fd: i32, buffer: &mut [u8]) -> i32 {
+                let mut info = SocketFdInfo([0; SOCKET_FDINFO_LEN]);
+                clear_errno();
+                // SAFETY: `info` is writable for `SOCKET_FDINFO_LEN` bytes.
+                let size = unsafe {
+                    libc::proc_pidfdinfo(
+                        pid,
+                        fd,
+                        PROC_PIDFDSOCKETINFO,
+                        info.0.as_mut_ptr().cast(),
+                        SOCKET_FDINFO_LEN as libc::c_int,
+                    )
+                };
+                if size > 0 {
+                    let written = (size as usize).min(SOCKET_FDINFO_LEN);
+                    if let (Some(to), Some(from)) =
+                        (buffer.get_mut(..written), info.0.get(..written))
+                    {
+                        to.copy_from_slice(from);
+                    }
+                }
+                size
+            }
+
+            fn process_info(&mut self, pid: i32) -> (i32, u32) {
+                // SAFETY: `proc_bsdinfo` is plain integers and arrays of them.
+                let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+                clear_errno();
+                // SAFETY: `info` is writable for `size_of::<proc_bsdinfo>()` bytes.
+                let size = unsafe {
+                    libc::proc_pidinfo(
+                        pid,
+                        libc::PROC_PIDTBSDINFO,
+                        0,
+                        (&raw mut info).cast(),
+                        size_of::<libc::proc_bsdinfo>() as libc::c_int,
+                    )
+                };
+                (size, info.pbi_uid)
+            }
+
+            fn bsdinfo_len(&self) -> usize {
+                size_of::<libc::proc_bsdinfo>()
+            }
+
+            fn errno(&mut self) -> Option<i32> {
+                std::io::Error::last_os_error().raw_os_error()
             }
         }
     }
@@ -1767,6 +1910,732 @@ mod tests {
             assert!(!macos::is_out_of_reach(Some(errno)), "{errno}");
         }
         assert!(!macos::is_out_of_reach(None));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn effective_uid_is_the_effective_uid_of_the_process() {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        #[allow(unsafe_code)]
+        let expected = unsafe { libc::geteuid() };
+        assert_eq!(effective_uid().unwrap(), expected);
+    }
+
+    /// The macOS walk over the process table, run on fake process tables.
+    #[cfg(unix)]
+    mod process_walk {
+        use std::collections::{HashMap, VecDeque};
+        use std::time::{Duration, Instant};
+
+        use super::{LISTENER, OWN_PID, addr, socket_fdinfo};
+        use crate::loopback_owner::macos::process_walk::{
+            FdInfo, MAX_FDS_PER_PROCESS, MAX_PIDS, MAX_SOCKETS, PROX_FDTYPE_SOCKET, ProcessTable,
+            list_fds, list_pids, lookup_owner, process_uid, tcp_socket,
+        };
+        use crate::loopback_owner::macos::{self, SOCKET_FDINFO_LEN};
+
+        const CLIENT: &str = "127.0.0.1:50043";
+        const TIMEOUT: Duration = Duration::from_secs(2);
+        const TICK: Duration = Duration::from_millis(1);
+        const BSDINFO_LEN: usize = 136;
+        const ENTRY: usize = size_of::<FdInfo>();
+
+        fn socket_fd(fd: i32) -> FdInfo {
+            FdInfo {
+                fd,
+                fd_type: PROX_FDTYPE_SOCKET,
+            }
+        }
+
+        /// A descriptor of another kind (`PROX_FDTYPE_VNODE`).
+        fn file_fd(fd: i32) -> FdInfo {
+            FdInfo { fd, fd_type: 1 }
+        }
+
+        /// What libproc returns for the client socket.
+        fn client_record() -> Vec<u8> {
+            socket_fdinfo(macos::SOCKINFO_TCP, addr(CLIENT), addr(LISTENER))
+        }
+
+        /// What libproc returns for a socket that is not the client.
+        fn other_record() -> Vec<u8> {
+            socket_fdinfo(
+                macos::SOCKINFO_TCP,
+                addr("127.0.0.1:50044"),
+                addr("127.0.0.1:9999"),
+            )
+        }
+
+        /// A process in the fake table.
+        struct Process {
+            fds: Vec<FdInfo>,
+            /// What reading each socket gives: its bytes, or an errno.
+            records: HashMap<i32, Result<Vec<u8>, i32>>,
+            /// What reading the uid gives: the uid, or an errno.
+            uid: Result<u32, i32>,
+            /// The errno of listing the descriptors, when that fails.
+            fds_errno: Option<i32>,
+        }
+
+        impl Process {
+            fn new(fds: Vec<FdInfo>) -> Self {
+                Self {
+                    fds,
+                    records: HashMap::new(),
+                    uid: Ok(0),
+                    fds_errno: None,
+                }
+            }
+
+            /// A process holding the client socket, as descriptor 3 next to
+            /// a file.
+            fn holder(uid: u32) -> Self {
+                Self::new(vec![file_fd(0), socket_fd(3)])
+                    .with_record(3, Ok(client_record()))
+                    .with_uid(Ok(uid))
+            }
+
+            fn with_record(mut self, fd: i32, record: Result<Vec<u8>, i32>) -> Self {
+                self.records.insert(fd, record);
+                self
+            }
+
+            fn with_uid(mut self, uid: Result<u32, i32>) -> Self {
+                self.uid = uid;
+                self
+            }
+
+            fn unlistable(mut self, errno: i32) -> Self {
+                self.fds_errno = Some(errno);
+                self
+            }
+        }
+
+        /// A process table that answers like libproc, and a clock that moves
+        /// only by the cost of each call.
+        struct FakeTable {
+            clock: Instant,
+            fds_cost: Duration,
+            info_cost: Duration,
+            pids: Vec<i32>,
+            processes: HashMap<i32, Process>,
+            errno: Option<i32>,
+            /// Every process whose descriptors were sized.
+            fds_sized: Vec<i32>,
+            records_read: usize,
+            uids_read: Vec<i32>,
+        }
+
+        impl FakeTable {
+            fn new(pids: Vec<i32>, processes: Vec<(i32, Process)>) -> Self {
+                Self {
+                    clock: Instant::now(),
+                    fds_cost: Duration::ZERO,
+                    info_cost: Duration::ZERO,
+                    pids,
+                    processes: processes.into_iter().collect(),
+                    errno: None,
+                    fds_sized: Vec::new(),
+                    records_read: 0,
+                    uids_read: Vec::new(),
+                }
+            }
+
+            fn find(&mut self, timeout: Duration) -> anyhow::Result<Option<u32>> {
+                lookup_owner(self, OWN_PID, timeout, addr(CLIENT), addr(LISTENER))
+            }
+        }
+
+        impl ProcessTable for FakeTable {
+            fn now(&mut self) -> Instant {
+                self.clock
+            }
+
+            fn list_pids(&mut self, buffer: Option<&mut [i32]>) -> i32 {
+                if let Some(buffer) = buffer {
+                    buffer[..self.pids.len()].copy_from_slice(&self.pids);
+                }
+                (self.pids.len() * size_of::<i32>()) as i32
+            }
+
+            fn list_fds(&mut self, pid: i32, buffer: Option<&mut [FdInfo]>) -> i32 {
+                if buffer.is_none() {
+                    self.fds_sized.push(pid);
+                }
+                let Some(process) = self.processes.get(&pid) else {
+                    self.errno = Some(libc::ESRCH);
+                    return -1;
+                };
+                if let Some(errno) = process.fds_errno {
+                    self.errno = Some(errno);
+                    return -1;
+                }
+                if process.fds.is_empty() {
+                    // Returned nothing, without an error.
+                    self.errno = Some(0);
+                    return 0;
+                }
+                if let Some(buffer) = buffer {
+                    buffer[..process.fds.len()].copy_from_slice(&process.fds);
+                    self.clock += self.fds_cost;
+                }
+                (process.fds.len() * ENTRY) as i32
+            }
+
+            fn socket_info(&mut self, pid: i32, fd: i32, buffer: &mut [u8]) -> i32 {
+                self.records_read += 1;
+                self.clock += self.info_cost;
+                match self.processes.get(&pid).and_then(|p| p.records.get(&fd)) {
+                    Some(Ok(record)) => {
+                        buffer[..record.len()].copy_from_slice(record);
+                        record.len() as i32
+                    }
+                    Some(Err(errno)) => {
+                        self.errno = Some(*errno);
+                        -1
+                    }
+                    None => {
+                        self.errno = Some(libc::EBADF);
+                        -1
+                    }
+                }
+            }
+
+            fn process_info(&mut self, pid: i32) -> (i32, u32) {
+                self.uids_read.push(pid);
+                match self.processes[&pid].uid {
+                    Ok(uid) => (BSDINFO_LEN as i32, uid),
+                    Err(errno) => {
+                        self.errno = Some(errno);
+                        (-1, 0)
+                    }
+                }
+            }
+
+            fn bsdinfo_len(&self) -> usize {
+                BSDINFO_LEN
+            }
+
+            fn errno(&mut self) -> Option<i32> {
+                self.errno
+            }
+        }
+
+        /// A process table whose calls return the sizes it is given, in
+        /// order, and fill buffers from fixed data; it records how long each
+        /// buffer was.
+        #[derive(Default)]
+        struct Scripted {
+            sizes: VecDeque<i32>,
+            errno: Option<i32>,
+            pids: Vec<i32>,
+            fds: Vec<FdInfo>,
+            record: Vec<u8>,
+            uid: u32,
+            buffer_lens: Vec<usize>,
+        }
+
+        impl Scripted {
+            fn new(sizes: &[i32], errno: Option<i32>) -> Self {
+                Self {
+                    sizes: sizes.iter().copied().collect(),
+                    errno,
+                    ..Self::default()
+                }
+            }
+
+            fn next_size(&mut self) -> i32 {
+                self.sizes.pop_front().expect("a call that was not scripted")
+            }
+        }
+
+        impl ProcessTable for Scripted {
+            fn now(&mut self) -> Instant {
+                Instant::now()
+            }
+
+            fn list_pids(&mut self, buffer: Option<&mut [i32]>) -> i32 {
+                self.buffer_lens
+                    .push(buffer.as_ref().map_or(0, |buffer| buffer.len()));
+                if let Some(buffer) = buffer {
+                    let n = self.pids.len().min(buffer.len());
+                    buffer[..n].copy_from_slice(&self.pids[..n]);
+                }
+                self.next_size()
+            }
+
+            fn list_fds(&mut self, _pid: i32, buffer: Option<&mut [FdInfo]>) -> i32 {
+                self.buffer_lens
+                    .push(buffer.as_ref().map_or(0, |buffer| buffer.len()));
+                if let Some(buffer) = buffer {
+                    let n = self.fds.len().min(buffer.len());
+                    buffer[..n].copy_from_slice(&self.fds[..n]);
+                }
+                self.next_size()
+            }
+
+            fn socket_info(&mut self, _pid: i32, _fd: i32, buffer: &mut [u8]) -> i32 {
+                self.buffer_lens.push(buffer.len());
+                let n = self.record.len().min(buffer.len());
+                buffer[..n].copy_from_slice(&self.record[..n]);
+                self.next_size()
+            }
+
+            fn process_info(&mut self, _pid: i32) -> (i32, u32) {
+                (self.next_size(), self.uid)
+            }
+
+            fn bsdinfo_len(&self) -> usize {
+                BSDINFO_LEN
+            }
+
+            fn errno(&mut self) -> Option<i32> {
+                self.errno
+            }
+        }
+
+        fn failure_text<T: std::fmt::Debug>(result: anyhow::Result<T>) -> String {
+            format!("{:#}", result.unwrap_err())
+        }
+
+        #[test]
+        fn the_walk_finds_the_holder_of_the_client_socket() {
+            let mut table = FakeTable::new(
+                // Ids that are not processes, this process, and two others.
+                vec![0, -1, OWN_PID, 100, 101],
+                vec![
+                    // Holds the client socket, but is skipped as our own.
+                    (OWN_PID, Process::holder(999)),
+                    (100, Process::holder(501)),
+                    (
+                        101,
+                        Process::new(vec![socket_fd(4)])
+                            .with_record(4, Ok(other_record()))
+                            .with_uid(Ok(502)),
+                    ),
+                ],
+            );
+            assert_eq!(table.find(TIMEOUT).unwrap(), Some(501));
+            // Only real, other processes were looked into.
+            assert_eq!(table.fds_sized, vec![100, 101]);
+            // Only sockets were read: not the file descriptors.
+            assert_eq!(table.records_read, 2);
+            // Only the holder's uid was read.
+            assert_eq!(table.uids_read, vec![100]);
+        }
+
+        #[test]
+        fn the_walk_finds_nothing_when_no_process_holds_the_socket() {
+            let mut table = FakeTable::new(
+                vec![101],
+                vec![(
+                    101,
+                    Process::new(vec![socket_fd(4)]).with_record(4, Ok(other_record())),
+                )],
+            );
+            assert_eq!(table.find(TIMEOUT).unwrap(), None);
+            assert!(table.uids_read.is_empty());
+        }
+
+        #[test]
+        fn the_walk_passes_over_processes_out_of_reach() {
+            let mut table = FakeTable::new(
+                vec![100, 101, 102, 103, 104],
+                vec![
+                    // Not inspectable, exited, and returning nothing.
+                    (100, Process::new(vec![socket_fd(3)]).unlistable(libc::EPERM)),
+                    (101, Process::new(vec![socket_fd(3)]).unlistable(libc::ESRCH)),
+                    (102, Process::new(vec![socket_fd(3)]).unlistable(0)),
+                    (103, Process::new(Vec::new())),
+                    (104, Process::holder(501)),
+                ],
+            );
+            assert_eq!(table.find(TIMEOUT).unwrap(), Some(501));
+        }
+
+        #[test]
+        fn the_walk_refuses_when_descriptors_cannot_be_listed() {
+            for errno in [libc::EACCES, libc::EINVAL, libc::ENOMEM] {
+                let mut table = FakeTable::new(
+                    vec![100, 101],
+                    vec![
+                        (100, Process::new(vec![socket_fd(3)]).unlistable(errno)),
+                        (101, Process::holder(501)),
+                    ],
+                );
+                let error = failure_text(table.find(TIMEOUT));
+                assert!(error.contains("descriptors"), "{errno}: {error}");
+            }
+        }
+
+        #[test]
+        fn the_walk_passes_over_sockets_out_of_reach() {
+            let mut table = FakeTable::new(
+                vec![100, 101],
+                vec![
+                    // Closed since listed, not inspectable, exited, and
+                    // returning nothing.
+                    (
+                        100,
+                        Process::new(vec![socket_fd(3), socket_fd(4), socket_fd(5), socket_fd(6)])
+                            .with_record(3, Err(libc::EBADF))
+                            .with_record(4, Err(libc::EPERM))
+                            .with_record(5, Err(libc::ESRCH))
+                            .with_record(6, Err(0)),
+                    ),
+                    (101, Process::holder(501)),
+                ],
+            );
+            assert_eq!(table.find(TIMEOUT).unwrap(), Some(501));
+            assert_eq!(table.records_read, 5);
+        }
+
+        #[test]
+        fn the_walk_refuses_when_a_socket_cannot_be_read() {
+            for errno in [libc::EACCES, libc::EINVAL, libc::ENOMEM] {
+                let mut table = FakeTable::new(
+                    vec![100, 101],
+                    vec![
+                        (
+                            100,
+                            Process::new(vec![socket_fd(3)]).with_record(3, Err(errno)),
+                        ),
+                        (101, Process::holder(501)),
+                    ],
+                );
+                let error = failure_text(table.find(TIMEOUT));
+                assert!(error.contains("reading a socket"), "{errno}: {error}");
+            }
+        }
+
+        #[test]
+        fn the_walk_reads_the_uid_of_every_holder() {
+            let mut table = FakeTable::new(
+                vec![100, 101],
+                vec![(100, Process::holder(501)), (101, Process::holder(501))],
+            );
+            assert_eq!(table.find(TIMEOUT).unwrap(), Some(501));
+            assert_eq!(table.uids_read, vec![100, 101]);
+
+            // Holders of different accounts are an error.
+            let mut table = FakeTable::new(
+                vec![100, 101],
+                vec![(100, Process::holder(501)), (101, Process::holder(502))],
+            );
+            assert!(table.find(TIMEOUT).is_err());
+        }
+
+        #[test]
+        fn the_walk_passes_over_a_holder_that_exited_but_not_one_it_cannot_read() {
+            let mut table = FakeTable::new(
+                vec![100, 101],
+                vec![
+                    (100, Process::holder(0).with_uid(Err(libc::ESRCH))),
+                    (101, Process::holder(501)),
+                ],
+            );
+            assert_eq!(table.find(TIMEOUT).unwrap(), Some(501));
+
+            for errno in [libc::EPERM, libc::EACCES, libc::EBADF, 0] {
+                let mut table = FakeTable::new(
+                    vec![100, 101],
+                    vec![
+                        (100, Process::holder(0).with_uid(Err(errno))),
+                        (101, Process::holder(501)),
+                    ],
+                );
+                let error = failure_text(table.find(TIMEOUT));
+                assert!(error.contains("holder's uid"), "{errno}: {error}");
+            }
+        }
+
+        /// 16 processes of 65 536 sockets each, none of them the client's:
+        /// exactly `MAX_SOCKETS`.
+        fn full_table() -> FakeTable {
+            assert_eq!(16 * 65_536, MAX_SOCKETS);
+            let pids = (100..116).collect::<Vec<i32>>();
+            let processes = pids
+                .iter()
+                .map(|pid| {
+                    let fds = (0..65_536).map(socket_fd).collect();
+                    (*pid, Process::new(fds))
+                })
+                .collect();
+            FakeTable::new(pids, processes)
+        }
+
+        #[test]
+        fn the_walk_inspects_up_to_the_socket_bound() {
+            let mut table = full_table();
+            assert_eq!(table.find(TIMEOUT).unwrap(), None);
+            assert_eq!(table.records_read, MAX_SOCKETS);
+        }
+
+        #[test]
+        fn the_walk_refuses_past_the_socket_bound() {
+            let mut table = full_table();
+            table.pids.push(200);
+            table
+                .processes
+                .insert(200, Process::new(vec![socket_fd(3)]));
+            let error = failure_text(table.find(TIMEOUT));
+            assert!(error.contains("sockets to inspect"), "{error}");
+            // Refused before the socket past the bound was read.
+            assert_eq!(table.records_read, MAX_SOCKETS);
+        }
+
+        #[test]
+        fn the_walk_counts_only_sockets_against_the_bound() {
+            let mut table = full_table();
+            table.pids.push(200);
+            table
+                .processes
+                .insert(200, Process::new(vec![file_fd(3), file_fd(4)]));
+            assert_eq!(table.find(TIMEOUT).unwrap(), None);
+        }
+
+        #[test]
+        fn the_walk_checks_its_deadline_before_each_socket() {
+            let mut table = FakeTable::new(vec![100], vec![(100, Process::holder(501))]);
+            // Listing the descriptors takes the time past a deadline of now.
+            table.fds_cost = TICK;
+            let error = failure_text(table.find(Duration::ZERO));
+            assert!(error.contains("deadline"), "{error}");
+            assert_eq!(table.records_read, 0);
+        }
+
+        #[test]
+        fn the_walk_checks_its_deadline_after_each_process() {
+            let mut table = FakeTable::new(
+                vec![100],
+                vec![(100, Process::new(vec![file_fd(0), file_fd(1)]))],
+            );
+            table.fds_cost = TICK;
+            let error = failure_text(table.find(Duration::ZERO));
+            assert!(error.contains("deadline"), "{error}");
+        }
+
+        #[test]
+        fn the_walk_runs_up_to_but_not_past_its_deadline() {
+            // Nothing takes any time: the clock is at the deadline, not past it.
+            let mut table = FakeTable::new(vec![100], vec![(100, Process::holder(501))]);
+            assert_eq!(table.find(Duration::ZERO).unwrap(), Some(501));
+
+            // Reading the socket takes the clock exactly to the deadline.
+            let mut table = FakeTable::new(vec![100], vec![(100, Process::holder(501))]);
+            table.info_cost = TICK;
+            assert_eq!(table.find(TICK).unwrap(), Some(501));
+
+            // Reading it takes the clock past the deadline.
+            let mut table = FakeTable::new(vec![100], vec![(100, Process::holder(501))]);
+            table.info_cost = TICK * 2;
+            let error = failure_text(table.find(TICK));
+            assert!(error.contains("deadline"), "{error}");
+        }
+
+        #[test]
+        fn the_walk_gives_up_after_the_time_it_is_given() {
+            // A walk given a minute is not cut off by an info call of a second.
+            let mut table = FakeTable::new(vec![100], vec![(100, Process::holder(501))]);
+            table.info_cost = Duration::from_secs(1);
+            assert_eq!(table.find(Duration::from_secs(60)).unwrap(), Some(501));
+        }
+
+        #[test]
+        fn the_process_list_gives_the_ids_it_was_filled_with() {
+            let mut table = Scripted::new(&[12, 8], None);
+            table.pids = vec![7, 8, 9];
+            assert_eq!(list_pids(&mut table).unwrap(), vec![7, 8]);
+            // Sized, then a buffer for the ids and 64 more.
+            assert_eq!(table.buffer_lens, vec![0, 3 + 64]);
+        }
+
+        #[test]
+        fn the_process_list_refuses_a_failed_size_or_listing() {
+            for (sizes, errno, step) in [
+                (vec![0], Some(libc::EPERM), "sizing the process list"),
+                (vec![-1], None, "sizing the process list"),
+                (vec![12, 0], Some(libc::EPERM), "listing processes"),
+                (vec![12, -1], Some(0), "listing processes"),
+            ] {
+                let mut table = Scripted::new(&sizes, errno);
+                let error = failure_text(list_pids(&mut table));
+                assert!(error.contains(step), "{sizes:?}: {error}");
+            }
+        }
+
+        #[test]
+        fn the_process_list_has_a_bound_on_its_size() {
+            let entry = size_of::<i32>() as i32;
+            let at_bound = (MAX_PIDS as i32 - 64) * entry;
+            let mut table = Scripted::new(&[at_bound, entry], None);
+            table.pids = vec![7];
+            assert_eq!(list_pids(&mut table).unwrap(), vec![7]);
+            assert_eq!(table.buffer_lens, vec![0, MAX_PIDS]);
+
+            let mut table = Scripted::new(&[at_bound + entry], None);
+            let error = failure_text(list_pids(&mut table));
+            assert!(error.contains("more than"), "{error}");
+        }
+
+        #[test]
+        fn the_process_list_refuses_a_listing_that_filled_its_buffer() {
+            // A buffer of 67 ids: 268 bytes.
+            let mut table = Scripted::new(&[12, 268], None);
+            let error = failure_text(list_pids(&mut table));
+            assert!(error.contains("grew"), "{error}");
+            let mut table = Scripted::new(&[12, 264], None);
+            assert_eq!(list_pids(&mut table).unwrap().len(), 66);
+        }
+
+        #[test]
+        fn the_descriptor_list_gives_the_entries_it_was_filled_with() {
+            let mut table = Scripted::new(&[3 * ENTRY as i32, 2 * ENTRY as i32], None);
+            table.fds = vec![file_fd(0), socket_fd(1), socket_fd(2)];
+            assert_eq!(
+                list_fds(&mut table, 100).unwrap(),
+                Some(vec![file_fd(0), socket_fd(1)])
+            );
+            // Sized, then a buffer for the entries and 16 more.
+            assert_eq!(table.buffer_lens, vec![0, 3 + 16]);
+        }
+
+        #[test]
+        fn the_descriptor_list_passes_over_a_process_out_of_reach() {
+            for (size, errno) in [
+                (0, Some(0)),
+                (-1, Some(libc::ESRCH)),
+                (-1, Some(libc::EBADF)),
+                (-1, Some(libc::EPERM)),
+            ] {
+                // At the size query, and at the listing.
+                let mut table = Scripted::new(&[size], errno);
+                assert_eq!(list_fds(&mut table, 100).unwrap(), None, "{size} {errno:?}");
+                let mut table = Scripted::new(&[ENTRY as i32, size], errno);
+                assert_eq!(list_fds(&mut table, 100).unwrap(), None, "{size} {errno:?}");
+            }
+        }
+
+        #[test]
+        fn the_descriptor_list_refuses_any_other_failure() {
+            for errno in [Some(libc::EACCES), Some(libc::EINVAL), None] {
+                let mut table = Scripted::new(&[-1], errno);
+                let error = failure_text(list_fds(&mut table, 100));
+                assert!(error.contains("sizing"), "{errno:?}: {error}");
+                let mut table = Scripted::new(&[ENTRY as i32, -1], errno);
+                let error = failure_text(list_fds(&mut table, 100));
+                assert!(error.contains("listing"), "{errno:?}: {error}");
+            }
+        }
+
+        #[test]
+        fn the_descriptor_list_has_a_bound_on_its_size() {
+            let at_bound = ((MAX_FDS_PER_PROCESS - 16) * ENTRY) as i32;
+            let mut table = Scripted::new(&[at_bound, ENTRY as i32], None);
+            table.fds = vec![socket_fd(1)];
+            assert_eq!(
+                list_fds(&mut table, 100).unwrap(),
+                Some(vec![socket_fd(1)])
+            );
+            assert_eq!(table.buffer_lens, vec![0, MAX_FDS_PER_PROCESS]);
+
+            let mut table = Scripted::new(&[at_bound + ENTRY as i32], None);
+            let error = failure_text(list_fds(&mut table, 100));
+            assert!(error.contains("more than"), "{error}");
+        }
+
+        #[test]
+        fn the_descriptor_list_refuses_a_listing_that_does_not_fit() {
+            // A buffer of 17 entries.
+            let full = 17 * ENTRY as i32;
+            let mut table = Scripted::new(&[ENTRY as i32, full], None);
+            let error = failure_text(list_fds(&mut table, 100));
+            assert!(error.contains("does not fit"), "{error}");
+            // Past the buffer, and not a whole number of entries.
+            for filled in [full + ENTRY as i32, ENTRY as i32 + 4] {
+                let mut table = Scripted::new(&[ENTRY as i32, filled], None);
+                let error = failure_text(list_fds(&mut table, 100));
+                assert!(error.contains("does not fit"), "{filled}: {error}");
+            }
+            // One entry fewer than the buffer holds is fine.
+            let mut table = Scripted::new(&[ENTRY as i32, full - ENTRY as i32], None);
+            table.fds = vec![socket_fd(1); 17];
+            assert_eq!(list_fds(&mut table, 100).unwrap().unwrap().len(), 16);
+        }
+
+        #[test]
+        fn a_socket_is_read_into_a_buffer_of_the_record_size() {
+            let mut table = Scripted::new(&[SOCKET_FDINFO_LEN as i32], None);
+            table.record = client_record();
+            let socket = tcp_socket(&mut table, 100, 3).unwrap().unwrap();
+            assert_eq!(socket.local, addr(CLIENT));
+            assert_eq!(socket.remote, addr(LISTENER));
+            assert_eq!(socket.state, macos::TSI_S_ESTABLISHED);
+            assert_eq!(table.buffer_lens, vec![SOCKET_FDINFO_LEN]);
+        }
+
+        #[test]
+        fn a_socket_out_of_reach_is_passed_over() {
+            for (size, errno) in [
+                (0, Some(0)),
+                (-1, Some(libc::ESRCH)),
+                (-1, Some(libc::EBADF)),
+                (-1, Some(libc::EPERM)),
+            ] {
+                let mut table = Scripted::new(&[size], errno);
+                assert_eq!(
+                    tcp_socket(&mut table, 100, 3).unwrap(),
+                    None,
+                    "{size} {errno:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn a_socket_that_cannot_be_read_for_another_reason_is_refused() {
+            for errno in [Some(libc::EACCES), Some(libc::EINVAL), None] {
+                let mut table = Scripted::new(&[-1], errno);
+                let error = failure_text(tcp_socket(&mut table, 100, 3));
+                assert!(error.contains("reading a socket"), "{errno:?}: {error}");
+            }
+        }
+
+        #[test]
+        fn a_socket_record_of_another_size_is_refused() {
+            let mut table = Scripted::new(&[SOCKET_FDINFO_LEN as i32 - 1], None);
+            table.record = client_record();
+            assert!(tcp_socket(&mut table, 100, 3).is_err());
+            // Larger than the buffer it was read into.
+            let mut table = Scripted::new(&[SOCKET_FDINFO_LEN as i32 + 1], None);
+            table.record = client_record();
+            let error = failure_text(tcp_socket(&mut table, 100, 3));
+            assert!(error.contains("larger than its buffer"), "{error}");
+        }
+
+        #[test]
+        fn a_process_uid_is_read_from_a_reply_of_the_right_size() {
+            let mut table = Scripted::new(&[BSDINFO_LEN as i32], None);
+            table.uid = 501;
+            assert_eq!(process_uid(&mut table, 100).unwrap(), Some(501));
+            for size in [BSDINFO_LEN as i32 - 1, BSDINFO_LEN as i32 + 1] {
+                let mut table = Scripted::new(&[size], None);
+                let error = failure_text(process_uid(&mut table, 100));
+                assert!(error.contains("process info is"), "{size}: {error}");
+            }
+        }
+
+        #[test]
+        fn a_process_uid_is_passed_over_only_when_the_process_exited() {
+            for size in [0, -1] {
+                let mut table = Scripted::new(&[size], Some(libc::ESRCH));
+                assert_eq!(process_uid(&mut table, 100).unwrap(), None, "{size}");
+                for errno in [Some(libc::EPERM), Some(libc::EBADF), Some(0), None] {
+                    let mut table = Scripted::new(&[size], errno);
+                    let error = failure_text(process_uid(&mut table, 100));
+                    assert!(error.contains("holder's uid"), "{size} {errno:?}: {error}");
+                }
+            }
+        }
     }
 
     /// A connection from this process, looked up through `sock_diag` and
