@@ -1,4 +1,4 @@
-Fork of `russh` 0.65.0.
+Fork of `russh` 0.65.1.
 
 The package is the crates.io release, unmodified apart from the change below.
 `LICENSE.txt` is the upstream repository's licence file at the commit the crate was published
@@ -30,7 +30,7 @@ not in `warpgate.patch` (which covers `src/` and `tests/` only); re-apply it by 
 re-vendor.
 
 Drop this fork once russh publishes a release that fixes #789. The window-credit fix we carried
-for 0.64.1 ([russh#790][2]) is in 0.65.0 (commit 13c94f0) and is no longer patched.
+for 0.64.1 ([russh#790][2]) is in 0.65.0 and later (commit 13c94f0) and is no longer patched. 0.65.1 needed no change to the patch.
 
 [1]: https://github.com/Eugeny/russh/issues/789
 [2]: https://github.com/Eugeny/russh/pull/790
