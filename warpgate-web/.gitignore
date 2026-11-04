@@ -26,3 +26,6 @@ dist-ssr
 #---
 
 api-client
+
+# Pinned OpenAPI generator jar, fetched and sha256-checked by scripts/openapi-client.mjs
+.openapi-generator
