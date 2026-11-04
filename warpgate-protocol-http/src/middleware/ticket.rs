@@ -132,6 +132,29 @@ fn clean_address_redirect(req: &Request) -> Response {
     )
 }
 
+/// True when the session is a signed-in user session for someone other than
+/// the user the ticket was issued to.
+fn ticket_belongs_to_another_user(
+    current: Option<&SessionAuthorization>,
+    ticket_user_id: Uuid,
+) -> bool {
+    matches!(
+        current,
+        Some(SessionAuthorization::User { user_id, .. }) if *user_id != ticket_user_id
+    )
+}
+
+/// The answer to a ticket link opened in a browser signed in as another user.
+fn ticket_for_another_user_response() -> Response {
+    Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(
+            "This ticket was issued to a different user than the one signed in here. \
+             Sign out first, or open the link in another browser profile or a private window.",
+        )
+}
+
 #[derive(Deserialize)]
 struct QueryParams {
     #[serde(rename = "warpgate-ticket")]
@@ -171,7 +194,18 @@ impl<E: Endpoint> Endpoint for TicketMiddlewareEndpoint<E> {
         if let Some(ticket) = ticket_value {
             let ticket_secret = Secret::new(ticket);
 
-            let presented = Ticket::for_secret(&ctx.services().db, &ticket_secret).await?;
+            let presented_owner =
+                Ticket::owner_for_secret(&ctx.services().db, &ticket_secret).await?;
+            let presented = presented_owner.map(|(ticket_id, _)| ticket_id);
+
+            // A browser already signed in as one user keeps that session when
+            // it opens a ticket issued to another user. The ticket is not spent.
+            if !session_is_temporary
+                && let Some((_, ticket_user_id)) = presented_owner
+                && ticket_belongs_to_another_user(session.get_auth().as_ref(), ticket_user_id)
+            {
+                return Ok(with_no_referrer(ticket_for_another_user_response()));
+            }
             // Do not re-spend the ticket if it has authenticated the current session already
             let already_this_ticket = matches!(
                 (session.get_auth(), presented),
@@ -260,6 +294,44 @@ async fn apply_session_rotation(rotation: Option<SessionRotation>, session: &Ses
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn user_auth(user_id: Uuid) -> SessionAuthorization {
+        SessionAuthorization::User {
+            user_id,
+            username: "someone".into(),
+        }
+    }
+
+    /// A signed-in user session is kept when the ticket belongs to a different user.
+    #[test]
+    fn a_ticket_for_another_user_does_not_replace_a_user_session() {
+        let me = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        assert!(ticket_belongs_to_another_user(Some(&user_auth(me)), other));
+    }
+
+    /// The same user's ticket, no session, and a ticket session are all
+    /// handled as before.
+    #[test]
+    fn other_sessions_do_not_block_a_ticket() {
+        let me = Uuid::new_v4();
+        assert!(!ticket_belongs_to_another_user(Some(&user_auth(me)), me));
+        assert!(!ticket_belongs_to_another_user(None, me));
+        let ticket_session = SessionAuthorization::Ticket {
+            user_id: Uuid::new_v4(),
+            username: "t".into(),
+            target_id: Uuid::new_v4(),
+            ticket_id: None,
+        };
+        assert!(!ticket_belongs_to_another_user(Some(&ticket_session), me));
+    }
+
+    /// The refusal is a plain 403 that names the way out.
+    #[test]
+    fn the_refusal_is_a_forbidden_page() {
+        let response = ticket_for_another_user_response();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
 
     const BROWSER_ACCEPT: &str = "text/html,application/xhtml+xml,*/*;q=0.8";
 

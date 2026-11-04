@@ -144,3 +144,16 @@ pub async fn for_secret(
         .await?
         .map(|ticket| ticket.id))
 }
+
+/// The ticket id and the id of the user it was issued to, for a secret, without
+/// spending a use.
+pub async fn owner_for_secret(
+    db: &DatabaseConnection,
+    secret: &Secret<String>,
+) -> Result<Option<(Uuid, Uuid)>, WarpgateError> {
+    Ok(Entity::find()
+        .filter(Column::SecretHash.eq(hash_secret(secret.expose_secret())))
+        .one(db)
+        .await?
+        .map(|ticket| (ticket.id, ticket.user_id)))
+}
