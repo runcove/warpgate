@@ -1,4 +1,5 @@
 from uuid import uuid4
+import hashlib
 import http.server
 import os
 import paramiko
@@ -93,6 +94,58 @@ def setup_user_and_target(
         )
         api.add_target_role(ssh_target.id, role.id)
         return user, ssh_target
+
+
+def input_chunks(seed: bytes, total: int, chunk_size: int = 65536):
+    """`total` bytes (a multiple of `chunk_size`) in chunks that all differ and
+    differ between seeds, so a dropped, repeated, reordered or misdirected chunk
+    changes the SHA-256 of the whole stream."""
+    for index in range(total // chunk_size):
+        block = hashlib.sha256(seed + index.to_bytes(8, "big")).digest()
+        yield block * (chunk_size // len(block))
+
+
+def input_digest(seed: bytes, total: int) -> str:
+    digest = hashlib.sha256()
+    for chunk in input_chunks(seed, total):
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
+def run_on_target(transport: paramiko.Transport, command: str, timeout: float):
+    channel = transport.open_session(timeout=timeout)
+    channel.settimeout(timeout)
+    channel.exec_command(command)
+    return channel
+
+
+def read_to_eof(channel: paramiko.Channel) -> bytes:
+    """Everything the channel sends until it ends; the channel's timeout is the
+    deadline."""
+    data = b""
+    while True:
+        chunk = channel.recv(65536)
+        if not chunk:
+            return data
+        data += chunk
+
+
+def wait_until_held(counters, deadline: float, quiet: float = 3.0):
+    """Wait until the senders have made some progress and then none for `quiet`
+    seconds, that is until every one of them is blocked. This is the one fixed
+    wait: a blocked write cannot be observed from outside, only the absence of
+    progress. Returns the total sent."""
+    last = -1
+    unchanged_since = time.monotonic()
+    while time.monotonic() < deadline:
+        total = sum(counters)
+        if total != last:
+            last = total
+            unchanged_since = time.monotonic()
+        elif total > 0 and time.monotonic() - unchanged_since >= quiet:
+            return total
+        time.sleep(0.25)
+    raise AssertionError(f"the senders did not settle; {last} bytes sent so far")
 
 
 class Test:
@@ -1013,3 +1066,135 @@ class Test:
 
         stdout, _ = ssh_client.communicate(timeout=timeout)
         assert b"123\n" == stdout
+
+    def _send_to_late_readers(
+        self,
+        processes: ProcessManager,
+        wg_c_ed25519_pubkey,
+        shared_wg: WarpgateProcess,
+        timeout,
+        channels: int,
+        per_channel: int,
+    ):
+        """Open `channels` sessions on one connection, each running a target
+        command that reads no input until a gate file exists, and send each its
+        own stream from a thread. Once every sender is blocked, open the gate
+        and collect what each target made of its input.
+
+        Returns (sent while held, total offered, digests the targets computed,
+        digests expected)."""
+        user, ssh_target = setup_user_and_target(
+            processes, shared_wg, wg_c_ed25519_pubkey
+        )
+        # Generous: the whole transfer is a few tens of MiB on loopback.
+        deadline_s = max(timeout, 10) * 6
+        gate = f"/tmp/wg-input-gate-{uuid4()}"
+        # The gate is created through another session on the same target, so the
+        # test does not rely on sharing a filesystem with the target. The poll
+        # sleep belongs to the target command, not to the test.
+        reader = (
+            f"while [ ! -e {gate} ]; do sleep 0.2; done; sha256sum"
+        )
+
+        transport = paramiko.Transport(("localhost", shared_wg.ssh_port))
+        try:
+            transport.connect(
+                username=f"{user.username}:{ssh_target.name}", password="123"
+            )
+            sessions = [
+                run_on_target(transport, reader, deadline_s) for _ in range(channels)
+            ]
+            seeds = [f"channel-{i}-{uuid4()}".encode() for i in range(channels)]
+            counters = [0] * channels
+            errors = []
+
+            def send(index):
+                try:
+                    for chunk in input_chunks(seeds[index], per_channel):
+                        sessions[index].sendall(chunk)
+                        counters[index] += len(chunk)
+                    sessions[index].shutdown_write()
+                except Exception as e:
+                    errors.append(f"channel {index}: {e!r}")
+
+            senders = [
+                threading.Thread(target=send, args=(i,), daemon=True)
+                for i in range(channels)
+            ]
+            for sender in senders:
+                sender.start()
+
+            held = wait_until_held(counters, time.monotonic() + deadline_s)
+            assert not errors, errors
+            assert all(s.is_alive() for s in senders), (
+                "a sender finished while the targets read nothing"
+            )
+
+            opener = run_on_target(transport, f"touch {gate}", deadline_s)
+            assert opener.recv_exit_status() == 0
+
+            end = time.monotonic() + deadline_s
+            for sender in senders:
+                sender.join(max(0.0, end - time.monotonic()))
+            assert not any(s.is_alive() for s in senders), (
+                f"input did not finish once the targets read: {counters}"
+            )
+            assert not errors, errors
+
+            digests = []
+            for session in sessions:
+                lines = read_to_eof(session).decode().split()
+                digests.append(lines[0] if lines else None)
+
+            cleanup = run_on_target(transport, f"rm -f {gate}", deadline_s)
+            cleanup.recv_exit_status()
+
+            expected = [input_digest(seed, per_channel) for seed in seeds]
+            return held, channels * per_channel, digests, expected
+        finally:
+            transport.close()
+
+    def test_input_over_many_channels_shares_one_budget(
+        self,
+        processes: ProcessManager,
+        wg_c_ed25519_pubkey,
+        shared_wg: WarpgateProcess,
+        timeout,
+    ):
+        # Twelve channels on one connection, each sending to a target that
+        # reads nothing. The per-channel budget (2 MiB) alone would let all of
+        # them send; the connection's budget (16 MiB) holds the client back
+        # across channels, so the total sent while the targets read nothing is
+        # well under the total offered. Once the targets read, each gets exactly
+        # its own stream: nothing is lost and nothing crosses channels.
+        channels = 12
+        per_channel = 8 * 1024 * 1024
+        held, offered, digests, expected = self._send_to_late_readers(
+            processes, wg_c_ed25519_pubkey, shared_wg, timeout, channels, per_channel
+        )
+        # The connection budget plus what the windows and TCP buffers in the
+        # path hold for each channel.
+        bound = 16 * 1024 * 1024 + channels * 4 * 1024 * 1024
+        assert held < bound, (
+            f"{held} of {offered} bytes were sent while the targets read none"
+        )
+        assert digests == expected
+
+    def test_a_late_reader_gets_every_byte_in_order(
+        self,
+        processes: ProcessManager,
+        wg_c_ed25519_pubkey,
+        shared_wg: WarpgateProcess,
+        timeout,
+    ):
+        # The target starts reading only after the client has been held back.
+        # It must then receive the whole stream: the SHA-256 of what it read
+        # matches that of what was sent, which covers loss, repeats and order.
+        per_channel = 24 * 1024 * 1024
+        held, offered, digests, expected = self._send_to_late_readers(
+            processes, wg_c_ed25519_pubkey, shared_wg, timeout, 1, per_channel
+        )
+        assert held < offered, (
+            f"the client was not held back: {held} of {offered} bytes sent early"
+        )
+        assert digests == expected
