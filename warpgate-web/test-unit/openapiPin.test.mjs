@@ -9,7 +9,7 @@ import path from 'node:path'
 import { test } from 'node:test'
 import { sha256File, verifyJar } from '../scripts/openapi-client.mjs'
 
-const read = (rel) =>
+const read = rel =>
     fs.readFileSync(new URL(`../${rel}`, import.meta.url), 'utf8')
 const pin = JSON.parse(read('openapi-generator.pin.json'))
 const pkg = JSON.parse(read('package.json'))
@@ -50,7 +50,7 @@ test('the client scripts go through the checked wrapper and install nothing', ()
 test('the wrapper verifies the jar and compiles with the locked TypeScript', () => {
     const wrapper = read('scripts/openapi-client.mjs')
         .split('\n')
-        .filter((line) => !line.trim().startsWith('//'))
+        .filter(line => !line.trim().startsWith('//'))
         .join('\n')
     // The call sites, not the definition: both the cached jar and a fresh
     // download are checked against the pin before anything runs them.

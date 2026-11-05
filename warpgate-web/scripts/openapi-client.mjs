@@ -22,7 +22,10 @@ const jarDir = path.join(root, '.openapi-generator')
 const jarPath = path.join(jarDir, `openapi-generator-cli-${pin.version}.jar`)
 
 export function sha256File(file) {
-    return crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex')
+    return crypto
+        .createHash('sha256')
+        .update(fs.readFileSync(file))
+        .digest('hex')
 }
 
 export function verifyJar(file, expected) {
@@ -61,7 +64,9 @@ function run(command, args, cwd) {
         throw result.error
     }
     if (result.status !== 0) {
-        throw new Error(`${command} ${args[0] ?? ''} exited with ${result.status}`)
+        throw new Error(
+            `${command} ${args[0] ?? ''} exited with ${result.status}`,
+        )
     }
 }
 
@@ -94,14 +99,21 @@ async function main(target) {
 
     // The TypeScript from package-lock.json, not whatever `npm i typescript@5` resolves today.
     const tsc = path.join(root, 'node_modules', 'typescript', 'bin', 'tsc')
-    run(process.execPath, [tsc, '--target', 'esnext', '--module', 'esnext'], client)
+    run(
+        process.execPath,
+        [tsc, '--target', 'esnext', '--module', 'esnext'],
+        client,
+    )
 
     fs.rmSync(path.join(client, 'src'), { recursive: true, force: true })
     fs.rmSync(path.join(client, 'tsconfig.json'), { force: true })
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-    main(process.argv[2]).catch((error) => {
+if (
+    process.argv[1] &&
+    path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)
+) {
+    main(process.argv[2]).catch(error => {
         console.error(`openapi-client: ${error.message}`)
         process.exit(1)
     })
