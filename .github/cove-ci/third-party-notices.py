@@ -18,7 +18,8 @@ sorted, so the same Cargo.lock and toolchain give the same bytes):
   3. the notice and copyright files those crates ship (NOTICE*, COPYRIGHT*);
   4. the licence texts, each once, with the crates it applies to;
   5. the licence files of native (C, assembly) code crates bundle and compile
-     in, from NATIVE_CODE below;
+     in, from NATIVE_CODE below, and the notices that code carries in its own
+     source files, from BUNDLED_NOTICES below;
   6. what the toolchain links in: the Rust standard library's own copyright
      notices and licence texts, from the toolchain's share/doc/rust, and the
      notices of the musl C library, compiler runtime and unwinder, from the
@@ -40,6 +41,11 @@ partial file, when:
     C, C++ or assembly source, header, object or library, or a symlink, in
     its package) has no NATIVE_CODE entry for exactly that version from
     crates.io, or a file its entry names is not there;
+  * a C or assembly file of zstd-sys holds a BSD-2-Clause or MIT notice (the
+    NOTICE_KINDS) BUNDLED_NOTICES does not list, or the folder of its entry
+    is missing or has a part that cannot be listed;
+  * a file BUNDLED_NOTICES names holds no notice, or a mention of one this
+    cannot cut out whole as a comment (the notice would go missing);
   * a crate is taken under MPL-2.0 from anywhere but crates.io (MPL-2.0
     section 3.2: its entry in part 2 names where its source is, a crates.io
     URL of the exact version);
@@ -127,6 +133,44 @@ NATIVE_CODE = {
                     ("0.4.5", (), "src/low_level/extract.c is the crate's own code, under the crate's licence")),
     "linux-loader": (("0.13.2", (), "the C++ under docs/ writes test fixtures and is never compiled in"),
                      ("0.14.0", (), "the C++ under docs/ writes test fixtures and is never compiled in")),
+}
+# NOTICES BUNDLED C CARRIES IN ITS SOURCE FILES. Some of the code above has
+# no licence file for part of what it compiles in, only a notice in the source
+# file, which the licence requires be reproduced. For the versions NATIVE_CODE
+# lists, BUNDLED_NOTICES says which files and under which NOTICE_KINDS licence:
+#   - zstd's legacy decoders (zstd/lib/legacy/zstd_v01.c to v07.c, compiled in
+#     by zstd-sys's default `legacy` feature) are older than zstd's
+#     BSD-3-Clause and each carries Yann Collet's BSD 2-Clause notice, with the
+#     year of the day it was written, again and again;
+#   - zstd's dictionary builder (zstd/lib/dictBuilder/divsufsort.c and .h,
+#     compiled in by the `zdict_builder` feature) is libdivsufsort-lite and
+#     carries Yuta Mori's MIT notice.
+# In a listed file every comment holding the licence's opening words
+# (NOTICE_KINDS) is kept and copied in verbatim, each distinct one once, with
+# the files it is in. A file with none, with an occurrence of the opening
+# words outside a comment this cut out, or with a kept comment that lacks a
+# copyright line, a condition or the disclaimer, fails the build, and so does
+# a version of a crate named here that has no entry. A kind is recognised by
+# what the licence says, never by the name its comment gives it.
+NOTICE_KINDS = {
+    "BSD-2-Clause": (
+        "Redistribution and use",
+        ("Redistribution and use", "Redistributions of source code", "Redistributions in binary form",
+         "SUCH DAMAGE"),
+        "BSD 2-Clause notices that C source files compiled in carry, copied verbatim; BSD-2-Clause"),
+    "MIT": (
+        "Permission is hereby granted",
+        ("Permission is hereby granted", "The above copyright notice and this permission notice",
+         "THE SOFTWARE IS PROVIDED", "OTHER DEALINGS IN THE SOFTWARE"),
+        "MIT notices that C source files compiled in carry, copied verbatim; MIT"),
+}
+_ZSTD_NOTICES = (("BSD-2-Clause", tuple(f"zstd/lib/legacy/zstd_v0{n}.c" for n in range(1, 8))),
+                 ("MIT", ("zstd/lib/dictBuilder/divsufsort.c", "zstd/lib/dictBuilder/divsufsort.h")))
+# Each entry is (version, kinds, folder): the folder of the package searched for
+# a notice in a file the entry does not list.
+BUNDLED_NOTICES = {
+    "zstd-sys": tuple((version, _ZSTD_NOTICES, "zstd") for version in ("2.0.16+zstd.1.5.7", "2.1.0+zstd.1.5.7",
+                                                                "2.1.2+zstd.1.5.7")),
 }
 # The toolchain's own notices. The Rust standard library's are one HTML page
 # in the toolchain (it names every crate std is built from, with its notices);
@@ -260,6 +304,86 @@ def read_inside(root, rel, problems, what, may_be_empty=False):
         problems.append(f"{what} is empty")
         return None
     return clean(body)
+
+
+def c_comments(body):
+    """Every /* ... */ comment of `body`, in order. One pass with str.find,
+    so an unterminated /* costs one search, not one per later character."""
+    at = 0
+    while True:
+        start = body.find("/*", at)
+        end = body.find("*/", start + 2) if start >= 0 else -1
+        if end < 0:
+            return
+        yield body[start:end + 2]
+        at = end + 2
+
+
+def in_order(text, parts):
+    """The first of `parts` that `text` lacks, looked for in the order given
+    with comment decoration and line breaks read as single spaces; or None."""
+    flat = " ".join(re.sub(r"^[\s*/]+", "", line) for line in text.splitlines())
+    flat, at = " ".join(flat.split()), 0
+    for part in parts:
+        at = flat.find(part, at)
+        if at < 0:
+            return part
+    return None
+
+
+def bundled_notices(directory, rels, problems, label, kind):
+    """The `kind` (a NOTICE_KINDS key) notice comments of the source files
+    `rels` under `directory`, as [(text, [file, ...])]: each distinct comment
+    once, in the order first met, verbatim, with the files that hold it. A
+    file is a problem if it has none, if its opening words occur more often
+    than comments were cut out, or if a kept comment lacks a copyright line or
+    any part of the licence."""
+    opening, parts, _ = NOTICE_KINDS[kind]
+    seen = {}
+    for rel in rels:
+        body = read_inside(directory, rel, problems, f"{label}: {rel}")
+        if body is None:
+            continue
+        found = [c for c in c_comments(body) if opening in c]
+        if not found or sum(c.count(opening) for c in found) != body.count(opening):
+            problems.append(f"{label}: {rel} holds {body.count(opening)} occurrence(s) of {opening!r} and "
+                            f"{len(found)} comment(s) with one: its {kind} notices cannot be copied in whole")
+        for comment in found:
+            missing = None if "Copyright" in comment else "a Copyright line"
+            missing = missing or in_order(comment, parts)
+            if missing:
+                problems.append(f"{label}: {rel} has a {kind} notice comment without {missing!r}: it cannot be "
+                                f"copied in whole")
+            files = seen.setdefault(comment, [])
+            if rel not in files:
+                files.append(rel)
+    return list(seen.items())
+
+
+def unlisted_notice_files(directory, folder, listed, problems, label):
+    """A problem for each C or assembly file under directory/folder that holds
+    the opening words of a NOTICE_KINDS licence and is not in `listed`, so a
+    new source file with a notice cannot go unreported. A folder that is not
+    there, or one that cannot be listed, is a problem too, never "nothing
+    found"."""
+    openings = tuple(k[0] for k in NOTICE_KINDS.values())
+    top_path = os.path.join(directory, folder)
+    if not os.path.isdir(top_path):
+        problems.append(f"{label}: {folder} could not be searched for notices (not a folder)")
+        return
+
+    def unreadable(error):
+        where = os.path.relpath(error.filename, directory) if error.filename else folder
+        problems.append(f"{label}: {where} could not be searched for notices ({type(error).__name__})")
+    for top, _, names in os.walk(top_path, onerror=unreadable):
+        for name in sorted(names):
+            path = os.path.join(top, name)
+            rel = os.path.relpath(path, directory)
+            if name.endswith((".c", ".S", ".h")) and rel not in listed and not os.path.islink(path):
+                with open(path, "rb") as f:
+                    text = f.read().decode("utf-8", "replace")
+                if any(o in text for o in openings):
+                    problems.append(f"{label}: {rel} holds a licence notice and BUNDLED_NOTICES does not list it")
 
 
 def may_hold_native_code(directory):
@@ -505,7 +629,19 @@ def build(about, src, rust_doc, rustc_version, zig_dir, zig_version):
                                 f"what this version compiles in, then list its licence files, or none and why")
                 continue
             _, files, why = audited
-            found = [(rel, read_inside(d, rel, problems, f"{label}: {rel}")) for rel in files]
+            found = [(rel, read_inside(d, rel, problems, f"{label}: {rel}"), why) for rel in files]
+            carried = next((e for e in BUNDLED_NOTICES.get(key[0], ()) if e[0] == key[1]), None)
+            if key[0] in BUNDLED_NOTICES and carried is None:
+                problems.append(f"{label}: BUNDLED_NOTICES in third-party-notices.py has no entry for this "
+                                f"version: look at the notices its sources carry, then list them")
+            elif carried:
+                unlisted_notice_files(d, carried[2], {r for _, rels in carried[1] for r in rels}, problems, label)
+                for kind, rels in carried[1]:
+                    blocks = bundled_notices(d, rels, problems, label, kind)
+                    if blocks:
+                        found.append((f"{len(blocks)} distinct {kind} notices in {rels[0]} to {rels[-1]}, verbatim",
+                                      "\n\n".join(f"[in {', '.join(f.rpartition('/')[2] for f in fs)}]\n"
+                                                   + text for text, fs in blocks) + "\n", NOTICE_KINDS[kind][2]))
             if files:
                 native.append((key, why, found))
     if problems:
@@ -583,12 +719,13 @@ def build(about, src, rust_doc, rustc_version, zig_dir, zig_version):
     w(RULE)
     w("")
     w("These crates carry C or assembly that is compiled into the binaries. The")
-    w("licence files below are theirs, verbatim.")
-    for key, why, found in native:
-        for rel, body in found:
+    w("licence files below are theirs, verbatim, and so are the notices that the")
+    w("source files of that code carry.")
+    for key, _, found in native:
+        for rel, body, reason in found:
             w("")
             w(f"---- {key[0]} {key[1]}: {rel} ----")
-            w(f"({why})")
+            w(f"({reason})")
             w("")
             w(body.rstrip("\n"))
     w("")
