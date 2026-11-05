@@ -382,6 +382,7 @@ class ProcessManager:
                 HostKey /ssh-keys/id_ed25519
                 Subsystem	sftp	/usr/lib/ssh/sftp-server
                 LogLevel DEBUG3
+                MaxSessions 64
                 {extra_config}
                 """
             )

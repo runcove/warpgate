@@ -1075,7 +1075,6 @@ class Test:
         timeout,
         channels: int,
         per_channel: int,
-        target_extra_config='',
     ):
         """Open `channels` sessions on one connection, each running a target
         command that reads no input until a gate file exists, and send each its
@@ -1085,8 +1084,7 @@ class Test:
         Returns (sent while held, total offered, digests the targets computed,
         digests expected)."""
         user, ssh_target = setup_user_and_target(
-            processes, shared_wg, wg_c_ed25519_pubkey,
-            extra_config=target_extra_config,
+            processes, shared_wg, wg_c_ed25519_pubkey
         )
         # Generous: the whole transfer is a few tens of MiB on loopback.
         deadline_s = max(timeout, 10) * 6
@@ -1188,7 +1186,10 @@ class Test:
         # session window of 2 MiB (CHAN_SES_WINDOW_DEFAULT) plus about 64 KiB
         # of pipe buffer. All channels share ONE target connection
         # (RemoteClient.session, client/mod.rs), so sshd's MaxSessions applies
-        # to all of them at once and is raised below.
+        # to all of them at once. The readers plus the gate opener need
+        # channels + 1 = 33 sessions, but stock sshd allows 10, so the default
+        # target config (conftest.py start_ssh_server, and CI's pre-started
+        # target) sets MaxSessions 64.
         #
         #   CHANNEL_INPUT_BUDGET    = 2 MiB   (russh_handler.rs:113)
         #   CONNECTION_INPUT_BUDGET = 16 MiB  (russh_handler.rs:118)
@@ -1216,10 +1217,7 @@ class Test:
             "the bound no longer separates the shared budget from per-channel ones"
         )
         held, offered, digests, expected = self._send_to_late_readers(
-            processes, wg_c_ed25519_pubkey, shared_wg, timeout, channels, per_channel,
-            # Stock sshd allows 10 sessions per connection; the readers plus the
-            # gate opener need channels + 1.
-            target_extra_config="MaxSessions 64",
+            processes, wg_c_ed25519_pubkey, shared_wg, timeout, channels, per_channel
         )
         assert held < bound, (
             f"{held} of {offered} bytes were sent while the targets read none"
