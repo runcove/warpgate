@@ -131,11 +131,11 @@
       "minimumReleaseAgeBehaviour": "timestamp-required"
     },
     {
-      "description": "No pre-releases (alpha, beta, rc, pre, dev): an update waits for the stable release. Renovate's ignoreUnstable does not cover a dependency that is already on a pre-release, as rsa 0.10.0-rc.18 is, so this rule names the versions outright.",
+      "description": "No pre-releases: an update waits for the stable release. Any version with a hyphen suffix before its build metadata is refused (-rc.19, -RC.1, -next, -preview, -beta.2.x), while build metadata alone (openssl-src 300.5.0+3.5.0) is a stable release and passes. Renovate's ignoreUnstable does not cover a dependency that is already on a pre-release, as rsa 0.10.0-rc.18 is, so this rule names the versions outright.",
       "matchPackageNames": [
         "*"
       ],
-      "allowedVersions": "!/-(alpha|beta|rc|pre|dev)([.\\-]?\\d+)*$/"
+      "allowedVersions": "!/^[^+]*-/"
     }
   ],
   "vulnerabilityAlerts": {
