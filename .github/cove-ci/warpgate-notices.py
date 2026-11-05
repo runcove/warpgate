@@ -37,7 +37,9 @@ the same Cargo.lock and toolchain give the same bytes):
      and the licence files of the crates in VERBATIM;
   4. the licence texts, each once, with the crates it applies to;
   5. the licence files of native (C, assembly) code crates bundle and compile
-     in, from NATIVE_CODE below;
+     in, from NATIVE_CODE below, and the notices their C sources carry
+     (zstd's BSD-2-Clause legacy decoders and MIT dictionary builder), from the
+     engine's BUNDLED_NOTICES;
   6. the Rust standard library's notices and licence texts, from the
      toolchain's share/doc/rust, and the musl C library's, compiler runtime's
      and unwinder's, from the zig the build links with.
@@ -56,6 +58,8 @@ IT REFUSES (exit 1, naming every reason, writing nothing) when:
     IN_TREE, each in its own directory of the source tree;
   * a crate that may carry native code has no NATIVE_CODE entry for exactly
     that version from crates.io, or a file its entry names is not there;
+  * a crate the engine's BUNDLED_NOTICES names has no entry there for that
+    version, or a source file it lists lacks the notice the entry says;
   * a crate is taken under MPL-2.0 from anywhere but crates.io (MPL-2.0
     section 3.2: its entry in part 2 names where its source is, a crates.io
     URL of the exact version);
@@ -77,6 +81,16 @@ Usage: warpgate-notices.py --engine FILE --about-json FILE --src DIR
            --rust-doc DIR --rustc-version TEXT --zig-dir DIR --zig-version TEXT
            --out FILE [--target x86_64-unknown-linux-musl|aarch64-unknown-linux-musl]
 Exit: 0 written; 1 refused (the reasons are on stderr); 2 bad usage.
+
+THE LOCK CHECK, BEFORE ANY BUILD. `warpgate-notices.py --check-lock Cargo.lock`
+reads a Cargo.lock and nothing else (no cargo-about, no engine, no packages): it
+refuses, exit 1, a crate the tables above name when none of its pinned versions is in the lock --
+the dependency bump that moves aws-lc-sys or libz-sys is found when the
+candidate is built, not when the release's static and macOS builds reach this
+script (v0.30.2-cove.5, 30 Oct 2026). Exit 0 prints what was compared. It reads
+the tables of THIS file, so it cannot drift from them. It sees only what a lock
+shows: a new crate that bundles native code, or a pinned version whose package
+moved a licence file, is still for the build to find.
 """
 
 import argparse
@@ -94,11 +108,14 @@ import stat
 import sys
 import tarfile
 import time
+import tomllib
 import urllib.error
 import urllib.request
 import zlib
 
 ROOT_CRATE = "warpgate"
+# The two spellings Cargo.lock uses for crates.io itself; any other registry is not crates.io.
+CRATES_IO_SOURCES = ("registry+https://github.com/rust-lang/crates.io-index", "sparse+https://index.crates.io/")
 MUSL = "x86_64-unknown-linux-musl"
 MUSL_ARM = "aarch64-unknown-linux-musl"
 MUSL_TARGETS = (MUSL, MUSL_ARM)
@@ -512,8 +529,21 @@ def build(engine, about, src, rust_doc, rustc_version, zig_dir, zig_version, tar
                             f"or none and why")
             continue
         _, files, why = audited
-        found = [(rel, read(d, rel, problems, f"{label}: {rel}")) for rel in files]
-        if files:
+        found = [(rel, read(d, rel, problems, f"{label}: {rel}"), why) for rel in files]
+        # The notices its C sources carry (the engine's BUNDLED_NOTICES: zstd's
+        # legacy decoders and dictionary builder), laid out as the engine does.
+        carried = next((e for e in engine.BUNDLED_NOTICES.get(key[0], ()) if e[0] == key[1]), None)
+        if key[0] in engine.BUNDLED_NOTICES and carried is None:
+            problems.append(f"{label}: BUNDLED_NOTICES in third-party-notices.py has no entry for this version: "
+                            f"look at the notices its sources carry, then list them")
+        elif carried:
+            for kind, rels in carried[1]:
+                blocks = engine.bundled_notices(d, rels, problems, label, kind)
+                if blocks:
+                    found.append((f"{len(blocks)} distinct {kind} notices in {rels[0]} to {rels[-1]}, verbatim",
+                                  "\n\n".join(f"[in {', '.join(f.rpartition('/')[2] for f in fs)}]\n" + text
+                                               for text, fs in blocks) + "\n", engine.NOTICE_KINDS[kind][2]))
+        if found:
             native.append((key, why, found))
     if problems:
         raise engine.Refused(problems)
@@ -611,11 +641,11 @@ def build(engine, about, src, rust_doc, rustc_version, zig_dir, zig_version, tar
     w("")
     w("These crates carry C or assembly that is compiled into the binary. The")
     w("licence files below are theirs, verbatim.")
-    for key, why, found in native:
-        for rel, body in found:
+    for key, _, found in native:
+        for rel, body, reason in found:
             w("")
             w(f"---- {key[0]} {key[1]}: {rel} ----")
-            w(f"({why})")
+            w(f"({reason})")
             w("")
             w(body.rstrip("\n"))
     w("")
@@ -1143,9 +1173,64 @@ def npm_part(engine, manifest_path, maps_dir, lockfile, reviewed_dir, fetch=None
     return "\n".join(out) + "\n", len(found)
 
 
+def one_line(text):
+    """Text read from a lock, as one log line: every character that is not printable (a newline,
+    a carriage return, a Unicode line separator) is shown escaped. The lock comes from the fork
+    under test, so nothing in it may start a line the runner reads as a workflow command."""
+    return "".join(c if c.isprintable() else c.encode("unicode_escape").decode("ascii") for c in text)
+
+
+def check_lock(lock_path):
+    """(problems, compared) for a Cargo.lock against VERBATIM, NATIVE_CODE and NO_LICENCE_FILE.
+
+    Each table speaks for the versions it lists. A crate of the lock whose name
+    a table holds, with NONE of the listed versions in the lock, is a pin that
+    moved on (aws-lc-sys 0.46.0 -> 0.47.0): a problem. Another version beside a
+    listed one is not: the lock holds crates the target never compiles (nix
+    0.24.3 under wayland-client; curve25519-dalek 5.0.0 beside 4.1.3, which
+    ships its own licence), and v0.30.2-cove.5 and .6 built with both. A listed
+    version that is in the lock from anywhere but crates.io is also a problem."""
+    try:
+        with open(lock_path, "rb") as fh:
+            doc = tomllib.load(fh)
+    except (OSError, tomllib.TOMLDecodeError) as e:
+        return [f"{lock_path} could not be read as TOML ({e.__class__.__name__}: {e})"], 0
+    packages = doc.get("package") if isinstance(doc, dict) else None
+    if not isinstance(packages, list) or not packages:
+        return [f"{lock_path} has no [[package]] entries: it is not a Cargo.lock this check can read"], 0
+    seen = {}
+    for pkg in packages:
+        if isinstance(pkg, dict) and isinstance(pkg.get("name"), str) and isinstance(pkg.get("version"), str):
+            seen.setdefault(pkg["name"], []).append((pkg["version"], pkg.get("source")))
+    nlf = {}
+    for name, version in NO_LICENCE_FILE:
+        nlf.setdefault(name, []).append(version)
+    problems, compared = [], 0
+    for table, held in (("VERBATIM", {n: [e[0]] for n, e in VERBATIM.items()}),
+                        ("NATIVE_CODE", {n: [e[0] for e in es] for n, es in NATIVE_CODE.items()}),
+                        ("NO_LICENCE_FILE", nlf)):
+        for name in sorted(held):
+            entries = seen.get(name, ())
+            compared += len(entries)
+            if not entries:
+                continue
+            ours = [(v, src) for v, src in entries if v in held[name]]
+            if not ours:
+                problems.append(f"{name}: Cargo.lock has {', '.join(sorted(v for v, _ in entries))}, {table} in "
+                                f"warpgate-notices.py holds {', '.join(sorted(held[name]))}: look at the new "
+                                "version's package (licence files, native code), then move the entry")
+            for v, src in ours:
+                if not (isinstance(src, str) and src in CRATES_IO_SOURCES):
+                    problems.append(f"{name} {v}: Cargo.lock takes it from {src or 'the source tree'}, not "
+                                    f"crates.io, which is where {table} in warpgate-notices.py looked")
+    return problems, compared
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
-    ap.add_argument("--engine", required=True, help="ch-ci/scripts/third-party-notices.py")
+    ap.add_argument("--check-lock", metavar="CARGO_LOCK",
+                    help="compare a Cargo.lock with the pinned tables and stop: no --engine, no build, nothing written")
+    ap.add_argument("--engine", help="ch-ci/scripts/third-party-notices.py")
     ap.add_argument("--target", default=MUSL, choices=(MUSL, MUSL_ARM, DARWIN))
     cargo = ap.add_argument_group("parts 1 to 6 (from cargo-about)")
     cargo.add_argument("--about-json")
@@ -1163,8 +1248,23 @@ def main(argv=None):
     npm.add_argument("--npm-maps", help="a directory of the build's dist/**/*.map")
     npm.add_argument("--npm-lockfile", help="warpgate-web/package-lock.json of the decided commit")
     npm.add_argument("--npm-reviewed", help="warpgate-ci/npm-licences")
-    ap.add_argument("--out", required=True)
+    ap.add_argument("--out")
     args = ap.parse_args(argv)
+    if args.check_lock is not None:
+        if any(v is not None for k, v in vars(args).items() if k not in ("check_lock", "target")):
+            ap.error("--check-lock stands alone: it takes no other argument")
+        problems, compared = check_lock(args.check_lock)
+        for p in problems:
+            print(f"warpgate-notices: {one_line(p)}", file=sys.stderr)
+        if problems:
+            print(f"warpgate-notices: REFUSED -- {len(problems)} pinned crate(s) in {one_line(args.check_lock)} are not the "
+                  "versions the notices tables speak for; the release's notices step would refuse.", file=sys.stderr)
+            return 1
+        print(f"warpgate-notices: {one_line(args.check_lock)}: {compared} lock entries of pinned crates, all at the versions "
+              "the tables hold.")
+        return 0
+    if args.engine is None or args.out is None:
+        ap.error("--engine and --out are required (unless --check-lock)")
     musl = args.target in MUSL_TARGETS
     cargo_args = [args.about_json, args.src, args.rust_doc, args.rustc_version]
     if args.base is None:
