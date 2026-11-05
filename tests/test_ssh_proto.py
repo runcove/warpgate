@@ -1075,6 +1075,7 @@ class Test:
         timeout,
         channels: int,
         per_channel: int,
+        target_extra_config='',
     ):
         """Open `channels` sessions on one connection, each running a target
         command that reads no input until a gate file exists, and send each its
@@ -1084,7 +1085,8 @@ class Test:
         Returns (sent while held, total offered, digests the targets computed,
         digests expected)."""
         user, ssh_target = setup_user_and_target(
-            processes, shared_wg, wg_c_ed25519_pubkey
+            processes, shared_wg, wg_c_ed25519_pubkey,
+            extra_config=target_extra_config,
         )
         # Generous: the whole transfer is a few tens of MiB on loopback.
         deadline_s = max(timeout, 10) * 6
@@ -1173,31 +1175,53 @@ class Test:
         timeout,
     ):
         # Many channels on one connection, each sending to a target that reads
-        # nothing. The per-channel budget alone would let every channel send its
-        # own share; the connection's budget holds the client back across
-        # channels, so the total sent while the targets read nothing is bounded
-        # by the connection budget, not by channels x per-channel budget. Once
-        # the targets read, each gets exactly its own stream: nothing is lost
-        # and nothing crosses channels.
+        # nothing. Once the targets read, each gets exactly its own stream:
+        # nothing is lost and nothing crosses channels.
         #
-        # Numbers, from russh_handler.rs: CHANNEL_INPUT_BUDGET = 2 MiB,
-        # CONNECTION_INPUT_BUDGET = 16 MiB. With only per-channel budgets,
-        # 32 channels would hold 32 x 2 = 64 MiB (plus TCP buffers). The
-        # allowance below is 16 MiB shared + 8 MiB slack for TCP buffers and
-        # the window in flight = 24 MiB, so 64 MiB > 24 MiB: losing the shared
-        # budget fails this test. Each channel offers 4 MiB, more than its own
-        # 2 MiB budget, so 32 x 4 = 128 MiB is offered in all.
-        # The target's sshd must allow this many sessions on one connection.
+        # What the client manages to send while the targets read nothing is
+        # not only Warpgate's own budgets: Warpgate forwards to the target as
+        # long as the target's channel window is open, and that frees its
+        # budget again (HeldInput is dropped once written,
+        # russh_handler.rs:113-131; ChannelWriteHalf::data waits only for the
+        # target's window, client/channel_session.rs:88). Per channel, the
+        # target (stock alpine OpenSSH, tests/images/ssh-server) takes its
+        # session window of 2 MiB (CHAN_SES_WINDOW_DEFAULT) plus about 64 KiB
+        # of pipe buffer. All channels share ONE target connection
+        # (RemoteClient.session, client/mod.rs), so sshd's MaxSessions applies
+        # to all of them at once and is raised below.
+        #
+        #   CHANNEL_INPUT_BUDGET    = 2 MiB   (russh_handler.rs:113)
+        #   CONNECTION_INPUT_BUDGET = 16 MiB  (russh_handler.rs:118)
+        #   downstream per channel  = 2 MiB + 64 KiB
+        #
+        #   with the shared budget:    16 + 32 x 2.0625        = 82 MiB
+        #   without it (per-channel):  32 x (2 + 2.0625)       = 130 MiB
+        #   bound = 82 MiB + 12 MiB slack for TCP buffers      = 94 MiB
+        #   per channel offered: 6 MiB (> 2 + 2.0625 + 1 margin), 192 MiB in all.
+        #
+        # So 94 MiB is above the correct case by 12 MiB and below the
+        # no-shared-budget case by 36 MiB.
+        mib = 1024 * 1024
         channels = 32
-        per_channel = 4 * 1024 * 1024
-        channel_budget = 2 * 1024 * 1024
-        connection_budget = 16 * 1024 * 1024
-        allowance = connection_budget + 8 * 1024 * 1024
-        assert channels * channel_budget > allowance
-        held, offered, digests, expected = self._send_to_late_readers(
-            processes, wg_c_ed25519_pubkey, shared_wg, timeout, channels, per_channel
+        channel_budget = 2 * mib
+        connection_budget = 16 * mib
+        downstream = 2 * mib + 64 * 1024
+        slack = 12 * mib
+        per_channel = 6 * mib
+        with_shared = connection_budget + channels * downstream
+        without_shared = channels * (channel_budget + downstream)
+        bound = with_shared + slack
+        assert per_channel >= channel_budget + downstream + mib
+        assert without_shared - bound >= 16 * mib, (
+            "the bound no longer separates the shared budget from per-channel ones"
         )
-        assert held < allowance, (
+        held, offered, digests, expected = self._send_to_late_readers(
+            processes, wg_c_ed25519_pubkey, shared_wg, timeout, channels, per_channel,
+            # Stock sshd allows 10 sessions per connection; the readers plus the
+            # gate opener need channels + 1.
+            target_extra_config="MaxSessions 64",
+        )
+        assert held < bound, (
             f"{held} of {offered} bytes were sent while the targets read none"
         )
         assert digests == expected
