@@ -115,7 +115,7 @@ pub const CHANNEL_INPUT_BUDGET: usize = 2 * 1024 * 1024;
 /// How much input all of one connection's channels together may have on its
 /// way to targets at once. Without it, input spread over many channels would
 /// add up past any single channel's budget.
-pub const CONNECTION_INPUT_BUDGET: usize = 16 * 1024 * 1024;
+pub const CONNECTION_INPUT_BUDGET: usize = 1024 * 1024 * 1024;
 
 /// Input bytes that keep their share of the channel's and the connection's
 /// budgets until the last copy of them is dropped, which is after they were
