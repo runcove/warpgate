@@ -76,6 +76,7 @@ ignore = [
     "RUSTSEC-2024-0449", # unsafe-libyaml is unmaintained - serde_yaml (config) and poem still depend on it
     "RUSTSEC-2026-0381", # emSign roots: matches the webpki-roots 0.26.11 shim (sqlx-core) by version, but the shim re-exports webpki-roots 1.x, locked at the fixed 1.0.10
     "RUSTSEC-2026-0387", # crypto-bigint timing: 0.7 copy is on fixed 0.7.6; only 0.5.5 (elliptic-curve 0.13 via openidconnect, SSO ID-token signature checks on public data) is left and has no fix; drop when one ships
+    "RUSTSEC-2026-0441", # pin-utils 0.1.0 is unmaintained (archived, no fix): only via async-dnssd 0.5.1 <- sspi 0.21.3 <- ironrdp-connector (RDP); unmaintained, not a vulnerability; drop when sspi moves off async-dnssd
 ]
 # If this is true, then cargo deny will use the git executable to fetch advisory database.
 # If this is false, then it uses a built-in git library.
