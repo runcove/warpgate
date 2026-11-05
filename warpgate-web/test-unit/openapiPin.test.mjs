@@ -40,8 +40,10 @@ test('the client scripts go through the checked wrapper and install nothing', ()
     for (const [name, script] of Object.entries(pkg.scripts)) {
         if (name === 'openapi:tests-sdk') continue // not part of the shipped UI
         assert.doesNotMatch(script, /openapi-generator-cli/, name)
-        assert.doesNotMatch(script, /\bnpm (i|install|add)\b/, name)
-        assert.doesNotMatch(script, /\bnpx\b/, name)
+        assert.doesNotMatch(script, /\bnpm (i|install|add|ci)\b/, name)
+        assert.doesNotMatch(script, /\b(pnpm|yarn) (dlx|add|install|i)\b/, name)
+        assert.doesNotMatch(script, /\b(npx|bunx|pnpx)\b/, name)
+        assert.doesNotMatch(script, /\bbun (x|add|install|i)\b/, name)
     }
 })
 
@@ -50,7 +52,10 @@ test('the wrapper verifies the jar and compiles with the locked TypeScript', () 
         .split('\n')
         .filter((line) => !line.trim().startsWith('//'))
         .join('\n')
-    assert.match(wrapper, /verifyJar\(/)
+    // The call sites, not the definition: both the cached jar and a fresh
+    // download are checked against the pin before anything runs them.
+    assert.match(wrapper, /verifyJar\(jarPath, pin\.sha256\)/)
+    assert.match(wrapper, /verifyJar\(partial, pin\.sha256\)/)
     assert.match(wrapper, /node_modules.*typescript.*tsc/s)
     assert.doesNotMatch(wrapper, /\bnpm\b.*\b(install|i)\b/)
     assert.ok(lock.packages['node_modules/typescript'].integrity)
