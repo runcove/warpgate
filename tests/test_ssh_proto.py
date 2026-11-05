@@ -1096,11 +1096,11 @@ class Test:
             f"while [ ! -e {gate} ]; do sleep 0.2; done; sha256sum"
         )
 
+        login = f"{user.username}:{ssh_target.name}"
+        gate_touched = False
         transport = paramiko.Transport(("localhost", shared_wg.ssh_port))
         try:
-            transport.connect(
-                username=f"{user.username}:{ssh_target.name}", password="123"
-            )
+            transport.connect(username=login, password="123")
             sessions = [
                 run_on_target(transport, reader, deadline_s) for _ in range(channels)
             ]
@@ -1130,6 +1130,7 @@ class Test:
                 "a sender finished while the targets read nothing"
             )
 
+            gate_touched = True
             opener = run_on_target(transport, f"touch {gate}", deadline_s)
             assert opener.recv_exit_status() == 0
 
@@ -1146,13 +1147,23 @@ class Test:
                 lines = read_to_eof(session).decode().split()
                 digests.append(lines[0] if lines else None)
 
-            cleanup = run_on_target(transport, f"rm -f {gate}", deadline_s)
-            cleanup.recv_exit_status()
-
             expected = [input_digest(seed, per_channel) for seed in seeds]
             return held, channels * per_channel, digests, expected
         finally:
             transport.close()
+            if gate_touched:
+                # However the test ended, do not leave the gate file in the
+                # target's /tmp. A fresh connection: the first may be wedged
+                # with blocked channels. Best effort, never masks the failure.
+                try:
+                    cleaner = paramiko.Transport(("localhost", shared_wg.ssh_port))
+                    try:
+                        cleaner.connect(username=login, password="123")
+                        run_on_target(cleaner, f"rm -f {gate}", 10).recv_exit_status()
+                    finally:
+                        cleaner.close()
+                except Exception:
+                    pass
 
     def test_input_over_many_channels_shares_one_budget(
         self,
@@ -1161,21 +1172,32 @@ class Test:
         shared_wg: WarpgateProcess,
         timeout,
     ):
-        # Twelve channels on one connection, each sending to a target that
-        # reads nothing. The per-channel budget (2 MiB) alone would let all of
-        # them send; the connection's budget (16 MiB) holds the client back
-        # across channels, so the total sent while the targets read nothing is
-        # well under the total offered. Once the targets read, each gets exactly
-        # its own stream: nothing is lost and nothing crosses channels.
-        channels = 12
-        per_channel = 8 * 1024 * 1024
+        # Many channels on one connection, each sending to a target that reads
+        # nothing. The per-channel budget alone would let every channel send its
+        # own share; the connection's budget holds the client back across
+        # channels, so the total sent while the targets read nothing is bounded
+        # by the connection budget, not by channels x per-channel budget. Once
+        # the targets read, each gets exactly its own stream: nothing is lost
+        # and nothing crosses channels.
+        #
+        # Numbers, from russh_handler.rs: CHANNEL_INPUT_BUDGET = 2 MiB,
+        # CONNECTION_INPUT_BUDGET = 16 MiB. With only per-channel budgets,
+        # 32 channels would hold 32 x 2 = 64 MiB (plus TCP buffers). The
+        # allowance below is 16 MiB shared + 8 MiB slack for TCP buffers and
+        # the window in flight = 24 MiB, so 64 MiB > 24 MiB: losing the shared
+        # budget fails this test. Each channel offers 4 MiB, more than its own
+        # 2 MiB budget, so 32 x 4 = 128 MiB is offered in all.
+        # The target's sshd must allow this many sessions on one connection.
+        channels = 32
+        per_channel = 4 * 1024 * 1024
+        channel_budget = 2 * 1024 * 1024
+        connection_budget = 16 * 1024 * 1024
+        allowance = connection_budget + 8 * 1024 * 1024
+        assert channels * channel_budget > allowance
         held, offered, digests, expected = self._send_to_late_readers(
             processes, wg_c_ed25519_pubkey, shared_wg, timeout, channels, per_channel
         )
-        # The connection budget plus what the windows and TCP buffers in the
-        # path hold for each channel.
-        bound = 16 * 1024 * 1024 + channels * 4 * 1024 * 1024
-        assert held < bound, (
+        assert held < allowance, (
             f"{held} of {offered} bytes were sent while the targets read none"
         )
         assert digests == expected
@@ -1190,6 +1212,9 @@ class Test:
         # The target starts reading only after the client has been held back.
         # It must then receive the whole stream: the SHA-256 of what it read
         # matches that of what was sent, which covers loss, repeats and order.
+        # The held-back assertion only proves the client was not allowed to send
+        # everything at once (input is not accepted without limit); the exact
+        # size of what is held is bounded by the shared-budget test above.
         per_channel = 24 * 1024 * 1024
         held, offered, digests, expected = self._send_to_late_readers(
             processes, wg_c_ed25519_pubkey, shared_wg, timeout, 1, per_channel
