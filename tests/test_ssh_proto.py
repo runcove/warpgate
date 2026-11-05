@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import warnings
 import pytest
 from textwrap import dedent
 
@@ -128,6 +129,30 @@ def read_to_eof(channel: paramiko.Channel) -> bytes:
         if not chunk:
             return data
         data += chunk
+
+
+# The client socket's send buffer. Linux doubles the value, so the kernel holds
+# 128 KiB. Left to autotuning it would hold up to about 4 MiB of what the client
+# "sent", which would be a flaky term in the test's bound.
+CLIENT_SNDBUF = 64 * 1024
+
+
+def connect_with_small_sndbuf(port: int) -> socket.socket:
+    """A TCP connection to localhost:port whose send buffer is pinned before
+    connect, for paramiko.Transport(sock)."""
+    last = None
+    for family, kind, proto, _, addr in socket.getaddrinfo(
+        "localhost", port, type=socket.SOCK_STREAM
+    ):
+        sock = socket.socket(family, kind, proto)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, CLIENT_SNDBUF)
+            sock.connect(addr)
+            return sock
+        except OSError as e:
+            sock.close()
+            last = e
+    raise last
 
 
 def wait_until_held(counters, deadline: float, quiet: float = 3.0):
@@ -1097,13 +1122,14 @@ class Test:
         )
 
         login = f"{user.username}:{ssh_target.name}"
-        gate_touched = False
-        transport = paramiko.Transport(("localhost", shared_wg.ssh_port))
+        readers_may_run = False
+        sessions = []
+        transport = paramiko.Transport(connect_with_small_sndbuf(shared_wg.ssh_port))
         try:
             transport.connect(username=login, password="123")
-            sessions = [
-                run_on_target(transport, reader, deadline_s) for _ in range(channels)
-            ]
+            readers_may_run = True
+            for _ in range(channels):
+                sessions.append(run_on_target(transport, reader, deadline_s))
             seeds = [f"channel-{i}-{uuid4()}".encode() for i in range(channels)]
             counters = [0] * channels
             errors = []
@@ -1130,7 +1156,6 @@ class Test:
                 "a sender finished while the targets read nothing"
             )
 
-            gate_touched = True
             opener = run_on_target(transport, f"touch {gate}", deadline_s)
             assert opener.recv_exit_status() == 0
 
@@ -1150,16 +1175,32 @@ class Test:
             expected = [input_digest(seed, per_channel) for seed in seeds]
             return held, channels * per_channel, digests, expected
         finally:
-            transport.close()
-            if gate_touched:
-                # However the test ended, do not leave the gate file in the
-                # target's /tmp. A fresh connection: the first may be wedged
-                # with blocked channels. Best effort, never masks the failure.
+            for session in sessions:
                 try:
-                    cleaner = paramiko.Transport(("localhost", shared_wg.ssh_port))
+                    session.close()
+                except Exception:
+                    pass
+            transport.close()
+            if readers_may_run:
+                # However the test ended, the readers' poll loops on the target
+                # must end and the gate file must not stay in its /tmp: touch the
+                # gate, give every loop time to see it (they poll every 0.2 s),
+                # then remove it. On a fresh connection, as the first may be
+                # wedged with blocked channels. Best effort, never masks the
+                # failure.
+                try:
+                    cleaner = paramiko.Transport(
+                        connect_with_small_sndbuf(shared_wg.ssh_port)
+                    )
                     try:
                         cleaner.connect(username=login, password="123")
-                        run_on_target(cleaner, f"rm -f {gate}", 10).recv_exit_status()
+                        read_to_eof(
+                            run_on_target(
+                                cleaner,
+                                f"touch {gate}; sleep 1; rm -f {gate}",
+                                15,
+                            )
+                        )
                     finally:
                         cleaner.close()
                 except Exception:
@@ -1171,6 +1212,7 @@ class Test:
         wg_c_ed25519_pubkey,
         shared_wg: WarpgateProcess,
         timeout,
+        record_property,
     ):
         # Many channels on one connection, each sending to a target that reads
         # nothing. Once the targets read, each gets exactly its own stream:
@@ -1197,7 +1239,12 @@ class Test:
         #
         #   with the shared budget:    16 + 32 x 2.0625        = 82 MiB
         #   without it (per-channel):  32 x (2 + 2.0625)       = 130 MiB
-        #   bound = 82 MiB + 12 MiB slack for TCP buffers      = 94 MiB
+        #   bound = 82 MiB + 12 MiB slack                      = 94 MiB
+        #
+        # The slack is for the TCP buffers in the path. The client's send
+        # buffer is pinned (CLIENT_SNDBUF 64 KiB, doubled by Linux to 128 KiB),
+        # so what remains is Warpgate's receive side, autotuned up to about
+        # 6 MiB, plus a packet or two in flight: about 6.5 MiB of the 12 MiB.
         #   per channel offered: 6 MiB (> 2 + 2.0625 + 1 margin), 192 MiB in all.
         #
         # So 94 MiB is above the correct case by 12 MiB and below the
@@ -1219,6 +1266,11 @@ class Test:
         held, offered, digests, expected = self._send_to_late_readers(
             processes, wg_c_ed25519_pubkey, shared_wg, timeout, channels, per_channel
         )
+        print(f"held={held} offered={offered} bound={bound}")
+        record_property("held", held)
+        # Passing tests' output is not shown; a warning is, in the summary.
+        warnings.warn(f"input held while the targets read nothing: held={held} "
+                      f"offered={offered} bound={bound}")
         assert held < bound, (
             f"{held} of {offered} bytes were sent while the targets read none"
         )
