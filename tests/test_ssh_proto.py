@@ -1,4 +1,5 @@
 from uuid import uuid4
+import hashlib
 import http.server
 import os
 import paramiko
@@ -9,6 +10,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import warnings
 import pytest
 from textwrap import dedent
 
@@ -93,6 +95,82 @@ def setup_user_and_target(
         )
         api.add_target_role(ssh_target.id, role.id)
         return user, ssh_target
+
+
+def input_chunks(seed: bytes, total: int, chunk_size: int = 65536):
+    """`total` bytes (a multiple of `chunk_size`) in chunks that all differ and
+    differ between seeds, so a dropped, repeated, reordered or misdirected chunk
+    changes the SHA-256 of the whole stream."""
+    for index in range(total // chunk_size):
+        block = hashlib.sha256(seed + index.to_bytes(8, "big")).digest()
+        yield block * (chunk_size // len(block))
+
+
+def input_digest(seed: bytes, total: int) -> str:
+    digest = hashlib.sha256()
+    for chunk in input_chunks(seed, total):
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
+def run_on_target(transport: paramiko.Transport, command: str, timeout: float):
+    channel = transport.open_session(timeout=timeout)
+    channel.settimeout(timeout)
+    channel.exec_command(command)
+    return channel
+
+
+def read_to_eof(channel: paramiko.Channel) -> bytes:
+    """Everything the channel sends until it ends; the channel's timeout is the
+    deadline."""
+    data = b""
+    while True:
+        chunk = channel.recv(65536)
+        if not chunk:
+            return data
+        data += chunk
+
+
+# The client socket's send buffer. Linux doubles the value, so the kernel holds
+# 128 KiB. Left to autotuning it would hold up to about 4 MiB of what the client
+# "sent", which would be a flaky term in the test's bound.
+CLIENT_SNDBUF = 64 * 1024
+
+
+def connect_with_small_sndbuf(port: int) -> socket.socket:
+    """A TCP connection to localhost:port whose send buffer is pinned before
+    connect, for paramiko.Transport(sock)."""
+    last = None
+    for family, kind, proto, _, addr in socket.getaddrinfo(
+        "localhost", port, type=socket.SOCK_STREAM
+    ):
+        sock = socket.socket(family, kind, proto)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, CLIENT_SNDBUF)
+            sock.connect(addr)
+            return sock
+        except OSError as e:
+            sock.close()
+            last = e
+    raise last
+
+
+def wait_until_held(counters, deadline: float, quiet: float = 3.0):
+    """Wait until the senders have made some progress and then none for `quiet`
+    seconds, that is until every one of them is blocked. This is the one fixed
+    wait: a blocked write cannot be observed from outside, only the absence of
+    progress. Returns the total sent."""
+    last = -1
+    unchanged_since = time.monotonic()
+    while time.monotonic() < deadline:
+        total = sum(counters)
+        if total != last:
+            last = total
+            unchanged_since = time.monotonic()
+        elif total > 0 and time.monotonic() - unchanged_since >= quiet:
+            return total
+        time.sleep(0.25)
+    raise AssertionError(f"the senders did not settle; {last} bytes sent so far")
 
 
 class Test:
@@ -1013,3 +1091,221 @@ class Test:
 
         stdout, _ = ssh_client.communicate(timeout=timeout)
         assert b"123\n" == stdout
+
+    def _send_to_late_readers(
+        self,
+        processes: ProcessManager,
+        wg_c_ed25519_pubkey,
+        shared_wg: WarpgateProcess,
+        timeout,
+        channels: int,
+        per_channel: int,
+    ):
+        """Open `channels` sessions on one connection, each running a target
+        command that reads no input until a gate file exists, and send each its
+        own stream from a thread. Once every sender is blocked, open the gate
+        and collect what each target made of its input.
+
+        Returns (sent while held, total offered, digests the targets computed,
+        digests expected)."""
+        user, ssh_target = setup_user_and_target(
+            processes, shared_wg, wg_c_ed25519_pubkey
+        )
+        # Generous: the whole transfer is a few tens of MiB on loopback.
+        deadline_s = max(timeout, 10) * 6
+        gate = f"/tmp/wg-input-gate-{uuid4()}"
+        # The gate is created through a session on the same target, over a
+        # second connection, so the test does not rely on sharing a filesystem
+        # with the target. The poll
+        # sleep belongs to the target command, not to the test.
+        reader = (
+            f"while [ ! -e {gate} ]; do sleep 0.2; done; sha256sum"
+        )
+
+        login = f"{user.username}:{ssh_target.name}"
+        readers_may_run = False
+        sessions = []
+        transport = paramiko.Transport(connect_with_small_sndbuf(shared_wg.ssh_port))
+        try:
+            transport.connect(username=login, password="123")
+            readers_may_run = True
+            for _ in range(channels):
+                sessions.append(run_on_target(transport, reader, deadline_s))
+            seeds = [f"channel-{i}-{uuid4()}".encode() for i in range(channels)]
+            counters = [0] * channels
+            errors = []
+
+            def send(index):
+                try:
+                    for chunk in input_chunks(seeds[index], per_channel):
+                        sessions[index].sendall(chunk)
+                        counters[index] += len(chunk)
+                    sessions[index].shutdown_write()
+                except Exception as e:
+                    errors.append(f"channel {index}: {e!r}")
+
+            senders = [
+                threading.Thread(target=send, args=(i,), daemon=True)
+                for i in range(channels)
+            ]
+            for sender in senders:
+                sender.start()
+
+            held = wait_until_held(counters, time.monotonic() + deadline_s)
+            assert not errors, errors
+            assert all(s.is_alive() for s in senders), (
+                "a sender finished while the targets read nothing"
+            )
+
+            # On a connection of its own: while Warpgate holds this
+            # connection's input it reads nothing more from its socket, so a
+            # channel open sent on it would wait behind the held data forever
+            # (runs 37714 and 37717 hung exactly there).
+            opener_transport = paramiko.Transport(
+                connect_with_small_sndbuf(shared_wg.ssh_port)
+            )
+            try:
+                opener_transport.connect(username=login, password="123")
+                opener = run_on_target(opener_transport, f"touch {gate}", deadline_s)
+                assert opener.recv_exit_status() == 0
+            finally:
+                opener_transport.close()
+
+            end = time.monotonic() + deadline_s
+            for sender in senders:
+                sender.join(max(0.0, end - time.monotonic()))
+            assert not any(s.is_alive() for s in senders), (
+                f"input did not finish once the targets read: {counters}"
+            )
+            assert not errors, errors
+
+            digests = []
+            for session in sessions:
+                lines = read_to_eof(session).decode().split()
+                digests.append(lines[0] if lines else None)
+
+            expected = [input_digest(seed, per_channel) for seed in seeds]
+            return held, channels * per_channel, digests, expected
+        finally:
+            for session in sessions:
+                try:
+                    session.close()
+                except Exception:
+                    pass
+            transport.close()
+            if readers_may_run:
+                # However the test ended, the readers' poll loops on the target
+                # must end and the gate file must not stay in its /tmp: touch the
+                # gate, give every loop time to see it (they poll every 0.2 s),
+                # then remove it. On a fresh connection, as the first may be
+                # wedged with blocked channels. Best effort, never masks the
+                # failure.
+                try:
+                    cleaner = paramiko.Transport(
+                        connect_with_small_sndbuf(shared_wg.ssh_port)
+                    )
+                    try:
+                        cleaner.connect(username=login, password="123")
+                        read_to_eof(
+                            run_on_target(
+                                cleaner,
+                                f"touch {gate}; sleep 1; rm -f {gate}",
+                                15,
+                            )
+                        )
+                    finally:
+                        cleaner.close()
+                except Exception:
+                    pass
+
+    def test_input_over_many_channels_shares_one_budget(
+        self,
+        processes: ProcessManager,
+        wg_c_ed25519_pubkey,
+        shared_wg: WarpgateProcess,
+        timeout,
+        record_property,
+    ):
+        # Many channels on one connection, each sending to a target that reads
+        # nothing. Once the targets read, each gets exactly its own stream:
+        # nothing is lost and nothing crosses channels.
+        #
+        # What the client manages to send while the targets read nothing is
+        # not only Warpgate's own budgets: Warpgate forwards to the target as
+        # long as the target's channel window is open, and that frees its
+        # budget again (HeldInput is dropped once written,
+        # russh_handler.rs:113-131; ChannelWriteHalf::data waits only for the
+        # target's window, client/channel_session.rs:88). Per channel, the
+        # target (stock alpine OpenSSH, tests/images/ssh-server) takes its
+        # session window of 2 MiB (CHAN_SES_WINDOW_DEFAULT) plus about 64 KiB
+        # of pipe buffer. All channels share ONE target connection
+        # (RemoteClient.session, client/mod.rs), so sshd's MaxSessions applies
+        # to all of them at once. The readers need 32 sessions on it (the gate
+        # opener has a connection of its own), but stock sshd allows 10, so the default
+        # target config (conftest.py start_ssh_server, and CI's pre-started
+        # target) sets MaxSessions 64.
+        #
+        #   CHANNEL_INPUT_BUDGET    = 2 MiB   (russh_handler.rs:113)
+        #   CONNECTION_INPUT_BUDGET = 16 MiB  (russh_handler.rs:118)
+        #   downstream per channel  = 2 MiB + 64 KiB
+        #
+        #   with the shared budget:    16 + 32 x 2.0625        = 82 MiB
+        #   without it (per-channel):  32 x (2 + 2.0625)       = 130 MiB
+        #   bound = 82 MiB + 12 MiB slack                      = 94 MiB
+        #
+        # The slack is for the TCP buffers in the path. The client's send
+        # buffer is pinned (CLIENT_SNDBUF 64 KiB, doubled by Linux to 128 KiB),
+        # so what remains is Warpgate's receive side, autotuned up to about
+        # 6 MiB, plus a packet or two in flight: about 6.5 MiB of the 12 MiB.
+        #   per channel offered: 6 MiB (> 2 + 2.0625 + 1 margin), 192 MiB in all.
+        #
+        # So 94 MiB is above the correct case by 12 MiB and below the
+        # no-shared-budget case by 36 MiB.
+        mib = 1024 * 1024
+        channels = 32
+        channel_budget = 2 * mib
+        connection_budget = 16 * mib
+        downstream = 2 * mib + 64 * 1024
+        slack = 12 * mib
+        per_channel = 6 * mib
+        with_shared = connection_budget + channels * downstream
+        without_shared = channels * (channel_budget + downstream)
+        bound = with_shared + slack
+        assert per_channel >= channel_budget + downstream + mib
+        assert without_shared - bound >= 16 * mib, (
+            "the bound no longer separates the shared budget from per-channel ones"
+        )
+        held, offered, digests, expected = self._send_to_late_readers(
+            processes, wg_c_ed25519_pubkey, shared_wg, timeout, channels, per_channel
+        )
+        print(f"held={held} offered={offered} bound={bound}")
+        record_property("held", held)
+        # Passing tests' output is not shown; a warning is, in the summary.
+        warnings.warn(f"input held while the targets read nothing: held={held} "
+                      f"offered={offered} bound={bound}")
+        assert held < bound, (
+            f"{held} of {offered} bytes were sent while the targets read none"
+        )
+        assert digests == expected
+
+    def test_a_late_reader_gets_every_byte_in_order(
+        self,
+        processes: ProcessManager,
+        wg_c_ed25519_pubkey,
+        shared_wg: WarpgateProcess,
+        timeout,
+    ):
+        # The target starts reading only after the client has been held back.
+        # It must then receive the whole stream: the SHA-256 of what it read
+        # matches that of what was sent, which covers loss, repeats and order.
+        # The held-back assertion only proves the client was not allowed to send
+        # everything at once (input is not accepted without limit); the exact
+        # size of what is held is bounded by the shared-budget test above.
+        per_channel = 24 * 1024 * 1024
+        held, offered, digests, expected = self._send_to_late_readers(
+            processes, wg_c_ed25519_pubkey, shared_wg, timeout, 1, per_channel
+        )
+        assert held < offered, (
+            f"the client was not held back: {held} of {offered} bytes sent early"
+        )
+        assert digests == expected
