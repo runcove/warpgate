@@ -1376,6 +1376,14 @@ class Test:
                 counter, level = _Count(), logger.level
                 logger.addHandler(counter)
                 logger.setLevel(logging.DEBUG)
+                # paramiko's single transport thread answers a CHANNEL_CLOSE
+                # by sending one, and that send blocks while its own key
+                # exchange is open: if Warpgate's close arrives before its
+                # KEXINIT reply the thread waits for itself and dies. Mark
+                # the channel closed on the client side so that no reply is
+                # due; Warpgate still has to close it and then answer the
+                # key exchange for this test to get any further.
+                stuck.closed = True
                 try:
                     transport.renegotiate_keys()
                 finally:
