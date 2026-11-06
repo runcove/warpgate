@@ -1047,6 +1047,11 @@ impl Default for LogConfig {
 #[derive(Debug, Deserialize, Serialize, Clone, Default, JsonSchema)]
 pub struct StepUpIntervalConfig {
     /// Per-pubkey step-up interval for SSH (`credentials_public_key.last_sso_at`).
+    ///
+    /// Also bounds open connections: an SSH connection that logged in with a
+    /// key closes when that key's `last_sso_at` plus this interval passes,
+    /// and the reconnect asks for SSO. The interval is re-read from the live
+    /// config, so a change applies to connections already open.
     #[serde(default, with = "humantime_serde")]
     #[schemars(with = "Option<String>")]
     pub ssh: Option<Duration>,
