@@ -90,13 +90,16 @@ impl Services {
         &self,
         ticket_id: Uuid,
     ) -> Result<(), WarpgateError> {
+        let txn = self.db.begin().await?;
+        // Locked first: a session being registered under this ticket either
+        // committed before this point, so it is collected below, or finds the
+        // ticket gone and is refused.
+        Ticket::lock_for_update(&txn, ticket_id).await?;
         let admitted = TargetSession::open_user_sessions_admitted_by_tickets(
-            &self.db,
+            &txn,
             Ticket::Column::Id.eq(ticket_id),
         )
         .await?;
-
-        let txn = self.db.begin().await?;
         TicketRequest::Entity::delete_many()
             .filter(TicketRequest::Column::TicketId.eq(Some(ticket_id)))
             .exec(&txn)
