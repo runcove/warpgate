@@ -1,10 +1,12 @@
 use std::ops::ControlFlow;
+use std::time::Duration;
 
 use anyhow::Result;
 use bytes::Bytes;
 use russh::client::Msg;
 use russh::{Channel, ChannelReadHalf, ChannelWriteHalf};
 use tokio::sync::mpsc::{Sender, UnboundedReceiver};
+use tokio_util::sync::CancellationToken;
 use tracing::*;
 use uuid::Uuid;
 use warpgate_common::UserSessionId;
@@ -18,6 +20,7 @@ pub struct SessionChannel {
     write_half: ChannelWriteHalf<Msg>,
     channel_id: Uuid,
     ops_rx: UnboundedReceiver<ChannelOperation>,
+    abort: CancellationToken,
     events_tx: Sender<RCEvent>,
     session_id: UserSessionId,
     closed: bool,
@@ -28,6 +31,7 @@ impl SessionChannel {
         client_channel: Channel<Msg>,
         channel_id: Uuid,
         ops_rx: UnboundedReceiver<ChannelOperation>,
+        abort: CancellationToken,
         events_tx: Sender<RCEvent>,
         session_id: UserSessionId,
     ) -> Self {
@@ -37,6 +41,7 @@ impl SessionChannel {
             write_half,
             channel_id,
             ops_rx,
+            abort,
             events_tx,
             session_id,
             closed: false,
@@ -50,9 +55,13 @@ impl SessionChannel {
         pump(
             &self.write_half,
             &mut self.ops_rx,
+            &self.abort,
             forward_target_events(&mut self.read_half, &self.events_tx, self.channel_id),
         )
         .await?;
+        if self.abort.is_cancelled() {
+            close_target_side(&self.write_half, self.channel_id).await;
+        }
         self.close_and_wait().await;
         Ok(())
     }
@@ -147,7 +156,9 @@ impl TargetWriter for ChannelWriteHalf<Msg> {
             ChannelOperation::AgentForward => {
                 self.agent_forward(true).await?;
             }
-            ChannelOperation::Close => return Ok(ControlFlow::Break(())),
+            ChannelOperation::Close | ChannelOperation::Abort => {
+                return Ok(ControlFlow::Break(()));
+            }
         }
         Ok(ControlFlow::Continue(()))
     }
@@ -236,5 +247,19 @@ impl Drop for SessionChannel {
     fn drop(&mut self) {
         let () = self.close();
         info!(channel=%self.channel_id, session=%self.session_id, "Closed");
+    }
+}
+
+/// Closes the target's end of a channel that was aborted, which no longer has
+/// an operation loop to do it. Bounded, as the target may not be answering.
+pub(super) async fn close_target_side(write_half: &ChannelWriteHalf<Msg>, channel_id: Uuid) {
+    match tokio::time::timeout(Duration::from_secs(5), write_half.close()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            debug!(channel=%channel_id, %error, "Could not close the aborted channel at the target")
+        }
+        Err(_) => {
+            debug!(channel=%channel_id, "Closing the aborted channel at the target timed out")
+        }
     }
 }

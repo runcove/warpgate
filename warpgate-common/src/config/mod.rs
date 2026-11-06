@@ -11,9 +11,9 @@ use defaults::{
     _default_audit_retention, _default_cookie_max_age, _default_database_url, _default_false,
     _default_http_listen, _default_kubernetes_listen, _default_mysql_advertised_version,
     _default_mysql_listen, _default_postgres_listen, _default_rdp_listen, _default_recordings_path,
-    _default_retention, _default_session_max_age, _default_ssh_inactivity_timeout,
-    _default_ssh_listen, _default_ssh_target_handshake_timeout, _default_vnc_listen,
-    _default_web_auth_wait_timeout,
+    _default_retention, _default_session_max_age, _default_ssh_channel_stall_timeout,
+    _default_ssh_inactivity_timeout, _default_ssh_listen, _default_ssh_target_handshake_timeout,
+    _default_vnc_listen, _default_web_auth_wait_timeout,
 };
 use poem::http::uri::Authority;
 use poem_openapi::{Object, Union};
@@ -475,6 +475,18 @@ pub struct SshConfig {
     #[schemars(with = "String")]
     pub inactivity_timeout: Duration,
 
+    /// How long one SSH channel may go without the target taking any of its
+    /// input before only that channel is closed. A target that stops reading
+    /// one channel then cannot hold up the connection's other channels. Any
+    /// input the target takes restarts the clock, so a slow but progressing
+    /// target is never closed.
+    #[serde(
+        default = "_default_ssh_channel_stall_timeout",
+        with = "humantime_serde"
+    )]
+    #[schemars(with = "String")]
+    pub channel_stall_timeout: Duration,
+
     #[serde(default, with = "humantime_serde")]
     #[schemars(with = "Option<String>")]
     pub keepalive_interval: Option<Duration>,
@@ -516,6 +528,7 @@ impl Default for SshConfig {
             external_port: None,
             external_host: None,
             inactivity_timeout: _default_ssh_inactivity_timeout(),
+            channel_stall_timeout: _default_ssh_channel_stall_timeout(),
             keepalive_interval: None,
             target_handshake_timeout: _default_ssh_target_handshake_timeout(),
             web_auth_auto_continue: false,

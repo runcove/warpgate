@@ -104,6 +104,7 @@
     "ssh": {
       "$ref": "#/$defs/SshConfig",
       "default": {
+        "channel_stall_timeout": "15s",
         "default_target": null,
         "enable": false,
         "external_host": null,
@@ -491,6 +492,11 @@
     "SshConfig": {
       "type": "object",
       "properties": {
+        "channel_stall_timeout": {
+          "description": "How long one SSH channel may go without the target taking any of its\ninput before only that channel is closed. A target that stops reading\none channel then cannot hold up the connection's other channels. Any\ninput the target takes restarts the clock, so a slow but progressing\ntarget is never closed.",
+          "type": "string",
+          "default": "15s"
+        },
         "default_target": {
           "description": "Default SSH target name when no target is specified (e.g., `ssh warpgate` instead of `ssh user:target@warpgate`)",
           "type": [

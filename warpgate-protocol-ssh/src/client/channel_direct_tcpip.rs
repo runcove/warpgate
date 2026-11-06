@@ -5,11 +5,13 @@ use bytes::Bytes;
 use russh::client::Msg;
 use russh::{Channel, ChannelReadHalf, ChannelWriteHalf};
 use tokio::sync::mpsc::{Sender, UnboundedReceiver};
+use tokio_util::sync::CancellationToken;
 use tracing::*;
 use uuid::Uuid;
 use warpgate_common::UserSessionId;
 
 use super::channel_pump::{TargetWriter, pump};
+use super::channel_session::close_target_side;
 use super::error::SshClientError;
 use crate::{ChannelOperation, RCEvent};
 
@@ -18,6 +20,7 @@ pub struct DirectTCPIPChannel {
     writer: DirectTCPIPWriter,
     channel_id: Uuid,
     ops_rx: UnboundedReceiver<ChannelOperation>,
+    abort: CancellationToken,
     events_tx: Sender<RCEvent>,
     session_id: UserSessionId,
 }
@@ -40,7 +43,9 @@ impl TargetWriter for DirectTCPIPWriter {
             ChannelOperation::Eof => {
                 self.write_half.eof().await?;
             }
-            ChannelOperation::Close => return Ok(ControlFlow::Break(())),
+            ChannelOperation::Close | ChannelOperation::Abort => {
+                return Ok(ControlFlow::Break(()));
+            }
             operation => {
                 warn!(client_channel=%self.channel_id, ?operation, session=%self.session_id, "unexpected client_channel operation");
             }
@@ -54,6 +59,7 @@ impl DirectTCPIPChannel {
         client_channel: Channel<Msg>,
         channel_id: Uuid,
         ops_rx: UnboundedReceiver<ChannelOperation>,
+        abort: CancellationToken,
         events_tx: Sender<RCEvent>,
         session_id: UserSessionId,
     ) -> Self {
@@ -67,6 +73,7 @@ impl DirectTCPIPChannel {
             },
             channel_id,
             ops_rx,
+            abort,
             events_tx,
             session_id,
         }
@@ -82,9 +89,10 @@ impl DirectTCPIPChannel {
     }
 
     async fn pump(&mut self) -> Result<(), SshClientError> {
-        pump(
+        let result = pump(
             &self.writer,
             &mut self.ops_rx,
+            &self.abort,
             forward_target_events(
                 &mut self.read_half,
                 &self.events_tx,
@@ -92,7 +100,11 @@ impl DirectTCPIPChannel {
                 self.session_id,
             ),
         )
-        .await
+        .await;
+        if self.abort.is_cancelled() {
+            close_target_side(&self.writer.write_half, self.channel_id).await;
+        }
+        result
     }
 }
 

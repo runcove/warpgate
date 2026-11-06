@@ -26,6 +26,7 @@ use tokio::sync::mpsc::{
 };
 use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::*;
 use uuid::Uuid;
 use warpgate_aws::AwsError;
@@ -344,11 +345,34 @@ struct Connector {
     requested_by: Option<String>,
 }
 
+/// How the session reaches one channel's operation loop.
+struct ChannelPipe {
+    /// Operations, applied to the target in the order they arrive.
+    ops: UnboundedSender<ChannelOperation>,
+    /// Cancelled to end the channel without waiting for earlier operations.
+    abort: CancellationToken,
+}
+
+impl ChannelPipe {
+    fn new() -> (Self, UnboundedReceiver<ChannelOperation>, CancellationToken) {
+        let (ops, ops_rx) = unbounded_channel();
+        let abort = CancellationToken::new();
+        (
+            Self {
+                ops,
+                abort: abort.clone(),
+            },
+            ops_rx,
+            abort,
+        )
+    }
+}
+
 pub struct RemoteClient {
     id: UserSessionId,
     tx: Sender<RCEvent>,
     session: Option<Arc<Handle<ClientHandler>>>,
-    channel_pipes: Arc<Mutex<HashMap<Uuid, UnboundedSender<ChannelOperation>>>>,
+    channel_pipes: Arc<Mutex<HashMap<Uuid, ChannelPipe>>>,
     pending_ops: Vec<(Uuid, ChannelOperation)>,
     pending_forwards: Vec<(String, u32)>,
     pending_streamlocal_forwards: Vec<String>,
@@ -480,8 +504,12 @@ impl RemoteClient {
             }
             op => {
                 let mut channel_pipes = self.channel_pipes.lock().await;
-                if let Some(tx) = channel_pipes.get(&channel_id) {
-                    if tx.send(op).is_err() {
+                if matches!(op, ChannelOperation::Abort) {
+                    if let Some(pipe) = channel_pipes.remove(&channel_id) {
+                        pipe.abort.cancel();
+                    }
+                } else if let Some(pipe) = channel_pipes.get(&channel_id) {
+                    if pipe.ops.send(op).is_err() {
                         channel_pipes.remove(&channel_id);
                     }
                 } else {
@@ -606,10 +634,11 @@ impl RemoteClient {
     ) -> Result<Uuid, SshClientError> {
         let id = Uuid::new_v4();
 
-        let (tx, rx) = unbounded_channel();
-        self.channel_pipes.lock().await.insert(id, tx);
+        let (pipe, rx, abort) = ChannelPipe::new();
+        self.channel_pipes.lock().await.insert(id, pipe);
 
-        let session_channel = SessionChannel::new(channel, id, rx, self.tx.clone(), self.id);
+        let session_channel =
+            SessionChannel::new(channel, id, rx, abort, self.tx.clone(), self.id);
 
         self.child_tasks.push(
             tokio::task::Builder::new()
@@ -1295,10 +1324,10 @@ impl RemoteClient {
             return Ok(());
         };
 
-        let (ops_tx, ops_rx) = unbounded_channel();
+        let (pipe, ops_rx, abort) = ChannelPipe::new();
         // Registered before the open completes so that operations arriving for
         // this channel meanwhile are buffered instead of reported as unknown.
-        self.channel_pipes.lock().await.insert(channel_id, ops_tx);
+        self.channel_pipes.lock().await.insert(channel_id, pipe);
 
         let channel_pipes = self.channel_pipes.clone();
         let events_tx = self.tx.clone();
@@ -1342,11 +1371,11 @@ impl RemoteClient {
             }
 
             if is_session {
-                SessionChannel::new(channel, channel_id, ops_rx, events_tx, session_id)
+                SessionChannel::new(channel, channel_id, ops_rx, abort, events_tx, session_id)
                     .run()
                     .await
             } else {
-                DirectTCPIPChannel::new(channel, channel_id, ops_rx, events_tx, session_id)
+                DirectTCPIPChannel::new(channel, channel_id, ops_rx, abort, events_tx, session_id)
                     .run()
                     .await
             }

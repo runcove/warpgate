@@ -117,6 +117,10 @@ pub fn _default_ssh_listen() -> ListenEndpoint {
     ListenEndpoint::from(SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 2222))
 }
 
+pub const fn _default_ssh_channel_stall_timeout() -> Duration {
+    Duration::from_secs(15)
+}
+
 pub const fn _default_ssh_inactivity_timeout() -> Duration {
     Duration::from_mins(5)
 }
