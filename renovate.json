@@ -129,6 +129,17 @@
       ],
       "automerge": false,
       "minimumReleaseAgeBehaviour": "timestamp-required"
+    },
+    {
+      "description": "No pre-releases: an update waits for the stable release. Any version with a hyphen suffix before its build metadata is refused (-rc.19, -RC.1, -next, -preview, -beta.2.x), while build metadata alone (openssl-src 300.5.0+3.5.0) is a stable release and passes. Renovate's ignoreUnstable does not cover a dependency that is already on a pre-release, as rsa 0.10.0-rc.18 is, so this rule names the versions outright. Cargo and npm only: Docker tags put their variant after a hyphen (rust:1.94.1-bullseye, debian:bullseye-20260505), so on the dockerfile manager this regex would refuse every newer base image, security fixes included.",
+      "matchManagers": [
+        "cargo",
+        "npm"
+      ],
+      "matchPackageNames": [
+        "*"
+      ],
+      "allowedVersions": "!/^[^+]*-/"
     }
   ],
   "vulnerabilityAlerts": {
