@@ -81,6 +81,9 @@ pub enum ChannelOperation {
     Data(Bytes),
     ExtendedData { data: Bytes, ext: u32 },
     Close,
+    /// Ends the channel at once, dropping whatever input is still waiting to
+    /// be written to the target, where `Close` waits for it to be written.
+    Abort,
     Eof,
     Signal(Sig),
 }

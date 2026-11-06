@@ -2,6 +2,7 @@ use std::future::Future;
 use std::ops::ControlFlow;
 
 use tokio::sync::mpsc::UnboundedReceiver;
+use tokio_util::sync::CancellationToken;
 
 use super::error::SshClientError;
 use crate::ChannelOperation;
@@ -36,10 +37,12 @@ async fn forward_operations<W: TargetWriter>(
 /// They must not share one loop. A write to the target waits for the target's
 /// window, and a target such as `cat` stops reading its input while its output
 /// is not being read; a loop that is parked in that write never reads the
-/// output, so neither side moves. Ends when either direction ends.
+/// output, so neither side moves. Ends when either direction ends, or as soon
+/// as `abort` is cancelled, whatever input is still waiting to be written.
 pub(super) async fn pump<W, R>(
     writer: &W,
     ops_rx: &mut UnboundedReceiver<ChannelOperation>,
+    abort: &CancellationToken,
     target_events: R,
 ) -> Result<(), SshClientError>
 where
@@ -49,6 +52,7 @@ where
     tokio::select! {
         result = forward_operations(writer, ops_rx) => result,
         result = target_events => result,
+        () = abort.cancelled() => Ok(()),
     }
 }
 
@@ -142,10 +146,13 @@ mod tests {
             std::future::pending::<Result<(), SshClientError>>().await
         };
 
-        tokio::time::timeout(TIMEOUT, pump(&*target, &mut ops_rx, events))
-            .await
-            .expect("the channel stalled: output was not read while input waited")
-            .unwrap();
+        tokio::time::timeout(
+            TIMEOUT,
+            pump(&*target, &mut ops_rx, &CancellationToken::new(), events),
+        )
+        .await
+        .expect("the channel stalled: output was not read while input waited")
+        .unwrap();
 
         let written = target.written.lock().unwrap();
         assert_eq!(*written, ["data:a", "data:b", "eof"]);
@@ -164,10 +171,38 @@ mod tests {
             Ok(())
         };
 
-        tokio::time::timeout(TIMEOUT, pump(&*target, &mut ops_rx, events))
-            .await
-            .expect("the channel stayed open after the target closed it")
-            .unwrap();
+        tokio::time::timeout(
+            TIMEOUT,
+            pump(&*target, &mut ops_rx, &CancellationToken::new(), events),
+        )
+        .await
+        .expect("the channel stayed open after the target closed it")
+        .unwrap();
         drop(ops_tx);
+    }
+
+    /// Aborting ends the channel at once although a write to the target never
+    /// completes and a close is queued behind it, and nothing is written.
+    #[tokio::test]
+    async fn aborting_ends_the_channel_while_input_waits_to_be_written() {
+        let (target, _reads_done) = stalled_target();
+        let (ops_tx, mut ops_rx) = mpsc::unbounded_channel();
+        ops_tx.send(data(b"a")).unwrap();
+        ops_tx.send(ChannelOperation::Close).unwrap();
+        let abort = CancellationToken::new();
+        tokio::spawn({
+            let abort = abort.clone();
+            async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                abort.cancel();
+            }
+        });
+
+        let events = std::future::pending::<Result<(), SshClientError>>();
+        tokio::time::timeout(TIMEOUT, pump(&*target, &mut ops_rx, &abort, events))
+            .await
+            .expect("an abort must end the channel despite the stalled write")
+            .unwrap();
+        assert!(target.written.lock().unwrap().is_empty());
     }
 }

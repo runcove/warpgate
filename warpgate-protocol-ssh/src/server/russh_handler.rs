@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fmt::Debug;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -9,7 +10,7 @@ use russh::keys::PublicKey;
 use russh::server::{Auth, ChannelOpenHandle, Handle, Msg, Session};
 use russh::{Channel, ChannelId, Pty, Sig};
 use tokio::sync::mpsc::UnboundedSender;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::*;
 use warpgate_common::Secret;
@@ -50,6 +51,9 @@ pub enum ServerHandlerEvent {
     Data(ServerChannelId, Bytes, oneshot::Sender<()>),
     ExtendedData(ServerChannelId, Bytes, u32, oneshot::Sender<()>),
     ChannelClose(ServerChannelId, oneshot::Sender<()>),
+    /// The target stopped taking this channel's input: end the channel and
+    /// drop the input still waiting for it.
+    ChannelStalled(ServerChannelId, oneshot::Sender<()>),
     ChannelEof(ServerChannelId, oneshot::Sender<()>),
     WindowChangeRequest(ServerChannelId, PtyRequest, oneshot::Sender<()>),
     Signal(ServerChannelId, Sig, oneshot::Sender<()>),
@@ -81,6 +85,7 @@ impl ServerHandlerEvent {
             | Self::Data(channel, ..)
             | Self::ExtendedData(channel, ..)
             | Self::ChannelClose(channel, ..)
+            | Self::ChannelStalled(channel, ..)
             | Self::ChannelEof(channel, ..)
             | Self::WindowChangeRequest(channel, ..)
             | Self::Signal(channel, ..)
@@ -109,7 +114,8 @@ impl ServerHandlerEvent {
 /// (OpenSSH's default channel window). Past it Warpgate stops reading the
 /// connection until the target has taken earlier input, so a slow or stalled
 /// target slows the upload down (TCP holds the client back) instead of
-/// piling it up in memory.
+/// piling it up in memory. A target that takes none of it for the channel
+/// stall timeout has the channel closed, which frees the connection again.
 pub const CHANNEL_INPUT_BUDGET: usize = 2 * 1024 * 1024;
 
 /// How much input all of one connection's channels together may have on its
@@ -117,11 +123,64 @@ pub const CHANNEL_INPUT_BUDGET: usize = 2 * 1024 * 1024;
 /// add up past any single channel's budget.
 pub const CONNECTION_INPUT_BUDGET: usize = 16 * 1024 * 1024;
 
+/// A pool of input room, and a counter that moves whenever room is given back,
+/// so a waiter can tell a target that is slow from one that has stopped.
+#[derive(Clone)]
+struct InputBudget {
+    semaphore: Arc<Semaphore>,
+    progress: Arc<watch::Sender<u64>>,
+    /// Cancelled once the target is taking input for this budget's channel.
+    /// Until then a wait for room is not a stall (the input is queued for a
+    /// target that is still connecting, or waiting for approval), so its clock
+    /// does not run. `None` means always running.
+    live: Option<CancellationToken>,
+}
+
+impl InputBudget {
+    fn new(permits: usize) -> Self {
+        Self {
+            semaphore: Arc::new(Semaphore::new(permits)),
+            progress: Arc::new(watch::channel(0).0),
+            live: None,
+        }
+    }
+
+    /// A budget whose waits only count as stalls once `live` is cancelled.
+    fn gated(permits: usize, live: CancellationToken) -> Self {
+        Self {
+            live: Some(live),
+            ..Self::new(permits)
+        }
+    }
+
+    /// This budget, with waits counted as stalls only once `other` is live.
+    fn gated_on(&self, other: &Self) -> Self {
+        Self {
+            live: other.live.clone(),
+            ..self.clone()
+        }
+    }
+
+    fn is_live(&self) -> bool {
+        self.live
+            .as_ref()
+            .is_none_or(CancellationToken::is_cancelled)
+    }
+
+    /// Room was given back.
+    fn freed(&self) {
+        self.progress
+            .send_modify(|count| *count = count.wrapping_add(1));
+    }
+}
+
 /// Input bytes that keep their share of the channel's and the connection's
 /// budgets until the last copy of them is dropped, which is after they were
-/// written to the target.
+/// written to the target (or dropped with the channel).
 struct HeldInput {
     data: Vec<u8>,
+    channel: InputBudget,
+    connection: InputBudget,
     _channel_permit: OwnedSemaphorePermit,
     _connection_permit: OwnedSemaphorePermit,
 }
@@ -132,39 +191,142 @@ impl AsRef<[u8]> for HeldInput {
     }
 }
 
+impl Drop for HeldInput {
+    fn drop(&mut self) {
+        // Announced before the permits go back (they are dropped after this
+        // returns): a waiter that sees the count move simply restarts its
+        // clock and then takes the room as soon as it is there.
+        self.channel.freed();
+        self.connection.freed();
+    }
+}
+
+/// The outcome of waiting for budget.
+enum Acquired {
+    Permit(OwnedSemaphorePermit),
+    /// No room was given back for the whole stall timeout.
+    Stalled,
+}
+
+/// Waits for `wanted` of the budget. Gives up only when no room at all has
+/// been given back to the budget for `stall`: any room freed restarts the
+/// clock, so a target that is slow but taking input is waited for however long
+/// that takes. The clock starts when the budget goes live (the target opened
+/// the channel), not before. A zero `stall` waits forever.
+async fn acquire_while_progressing(
+    budget: &InputBudget,
+    wanted: u32,
+    stall: Duration,
+) -> anyhow::Result<Acquired> {
+    let mut progress = budget.progress.subscribe();
+    let acquire = budget.semaphore.clone().acquire_many_owned(wanted);
+    tokio::pin!(acquire);
+    if stall.is_zero() {
+        return Ok(Acquired::Permit(
+            acquire.await.context("input budget closed")?,
+        ));
+    }
+    let timer = tokio::time::sleep(stall);
+    tokio::pin!(timer);
+    let mut running = budget.is_live();
+    let live = budget.live.clone().unwrap_or_default();
+    loop {
+        tokio::select! {
+            biased;
+            permit = &mut acquire => {
+                return Ok(Acquired::Permit(permit.context("input budget closed")?));
+            }
+            // The target has opened the channel: the clock starts now.
+            () = live.cancelled(), if !running => {
+                running = true;
+                timer.as_mut().reset(tokio::time::Instant::now() + stall);
+            }
+            // Cannot fail: the sender lives in `budget`, which is borrowed.
+            Ok(()) = progress.changed() => {
+                timer.as_mut().reset(tokio::time::Instant::now() + stall);
+            }
+            () = &mut timer, if running => return Ok(Acquired::Stalled),
+        }
+    }
+}
+
+/// What came of waiting for room for some input.
+enum Held {
+    /// The input, which holds its room until its last copy is dropped.
+    Input(Bytes),
+    /// The target took none of the channel's input for the stall timeout.
+    Stalled,
+    /// While waiting for the connection's room, none of the connection's
+    /// channels was given any back for the stall timeout. The channel that
+    /// waited is not to blame: the ones holding the room are.
+    ConnectionStalled,
+}
+
 /// Waits until both the channel's and the connection's budgets have room
 /// for `data`, then returns it as bytes that hold that room until their last
-/// copy is dropped. The channel's share is taken first; one wait limit covers
-/// both.
+/// copy is dropped. The channel's share is taken first; the stall timeout
+/// applies to each wait on its own budget, and a connection-level stall is
+/// reported apart from the channel's own.
 async fn hold_input(
-    channel_budget: Arc<Semaphore>,
-    connection_budget: Arc<Semaphore>,
+    channel_budget: &InputBudget,
+    connection_budget: &InputBudget,
     data: &[u8],
-    wait_limit: Duration,
-) -> anyhow::Result<Bytes> {
+    stall: Duration,
+) -> anyhow::Result<Held> {
     let wanted =
         u32::try_from(data.len().min(CHANNEL_INPUT_BUDGET)).context("channel input budget")?;
-    let (channel_permit, connection_permit) = tokio::time::timeout(wait_limit, async {
-        let channel_permit = channel_budget.acquire_many_owned(wanted).await?;
-        let connection_permit = connection_budget.acquire_many_owned(wanted).await?;
-        Ok::<_, tokio::sync::AcquireError>((channel_permit, connection_permit))
-    })
-    .await
-    .context("the target did not take the input in time")?
-    .context("input budget closed")?;
-    Ok(Bytes::from_owner(HeldInput {
+    let Acquired::Permit(channel_permit) =
+        acquire_while_progressing(channel_budget, wanted, stall).await?
+    else {
+        return Ok(Held::Stalled);
+    };
+    // The connection's clock is gated on the channel's liveness as well: input
+    // queued for a channel still connecting never counts towards a stall.
+    let connection_budget = &connection_budget.gated_on(channel_budget);
+    let Acquired::Permit(connection_permit) =
+        acquire_while_progressing(connection_budget, wanted, stall).await?
+    else {
+        return Ok(Held::ConnectionStalled);
+    };
+    Ok(Held::Input(Bytes::from_owner(HeldInput {
         data: data.to_vec(),
+        channel: channel_budget.clone(),
+        connection: connection_budget.clone(),
         _channel_permit: channel_permit,
         _connection_permit: connection_permit,
-    }))
+    })))
 }
 
 /// One channel's input state: its budget and a token that is cancelled once
 /// the channel is closed, so input waiting for budget can stop waiting.
 #[derive(Clone)]
 struct ChannelInput {
-    budget: Arc<Semaphore>,
+    budget: InputBudget,
     closed: CancellationToken,
+    /// Cancelled once the target has opened the channel (see
+    /// [`InputBudget::gated`]).
+    live: CancellationToken,
+    /// Set once a long wait has been logged at info, so a slow but steady
+    /// target does not log every packet.
+    long_wait_logged: Arc<AtomicBool>,
+    /// For closing the channel when it is not the one waiting.
+    id: Option<ChannelId>,
+}
+
+impl ChannelInput {
+    fn new(id: Option<ChannelId>, live: bool) -> Self {
+        let token = CancellationToken::new();
+        if live {
+            token.cancel();
+        }
+        Self {
+            budget: InputBudget::gated(CHANNEL_INPUT_BUDGET, token.clone()),
+            closed: CancellationToken::new(),
+            live: token,
+            long_wait_logged: Arc::new(AtomicBool::new(false)),
+            id,
+        }
+    }
 }
 
 /// Every channel's input state on one connection. The handler waits on it
@@ -178,13 +340,62 @@ pub struct ChannelInputs(Arc<Mutex<HashMap<u32, ChannelInput>>>);
 impl ChannelInputs {
     fn get(&self, channel: u32) -> ChannelInput {
         let mut inputs = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        // An entry that is missing was removed by the client's close; input
+        // that still arrives is dropped, so it needs no wait for the target.
         inputs
             .entry(channel)
-            .or_insert_with(|| ChannelInput {
-                budget: Arc::new(Semaphore::new(CHANNEL_INPUT_BUDGET)),
-                closed: CancellationToken::new(),
-            })
+            .or_insert_with(|| ChannelInput::new(None, true))
             .clone()
+    }
+
+    /// [`Self::get`] for a channel whose id is known, so that an entry made
+    /// here (a channel Warpgate opened towards the client, which has no entry
+    /// from [`Self::opened_channel`]) can be closed from another channel's
+    /// wait.
+    fn get_channel(&self, channel: ChannelId) -> ChannelInput {
+        let mut inputs = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        inputs
+            .entry(u32::from(channel))
+            .or_insert_with(|| ChannelInput::new(Some(channel), true))
+            .clone()
+    }
+
+    /// The ids of the channels [`Self::holders_except`] finds that can be
+    /// closed. Empty when the room is held only by channels without a known
+    /// id, in which case the caller must not wait on them for ever.
+    fn stuck_holders_except(&self, except: u32) -> Vec<ChannelId> {
+        self.holders_except(except)
+            .into_iter()
+            .filter_map(|holder| holder.id)
+            .collect()
+    }
+
+    /// The target opened the channel: from now on input that the target does
+    /// not take counts towards a stall. Does nothing for a channel that is
+    /// gone.
+    pub fn live(&self, channel: u32) {
+        let inputs = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(input) = inputs.get(&channel) {
+            input.live.cancel();
+        }
+    }
+
+    /// The channels, other than `except`, that the target has opened and that
+    /// still hold input room. Asked when none of the connection's room has
+    /// been given back for the stall timeout, which makes them the ones the
+    /// target is not reading.
+    fn holders_except(&self, except: u32) -> Vec<ChannelInput> {
+        let inputs = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        inputs
+            .iter()
+            .filter(|(number, input)| {
+                **number != except
+                    && input.budget.is_live()
+                    && !input.closed.is_cancelled()
+                    && input.budget.semaphore.available_permits() < CHANNEL_INPUT_BUDGET
+            })
+            .map(|(_, input)| input.clone())
+            .collect()
     }
 
     /// The target closed the channel: ends any input waiting on its budget
@@ -207,13 +418,23 @@ impl ChannelInputs {
         }
     }
 
-    /// A channel with this number was just opened: forgets any state left by
-    /// an earlier channel of the same number, so the new one starts fresh.
+    /// A channel with this number was just opened by the client: replaces any
+    /// state left by an earlier channel of the same number, so the new one
+    /// starts fresh. Its stall clock does not run until [`Self::live`].
     pub fn opened(&self, channel: u32) {
         self.0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .remove(&channel);
+            .insert(channel, ChannelInput::new(None, false));
+    }
+
+    /// [`Self::opened`], remembering the channel so it can be closed from
+    /// another channel's wait.
+    pub fn opened_channel(&self, channel: ChannelId) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(u32::from(channel), ChannelInput::new(Some(channel), false));
     }
 
     /// The client closed the channel: ends any input waiting on its budget
@@ -233,18 +454,21 @@ impl ChannelInputs {
 /// Like [`hold_input`], but ends with `None` (dropping `data`) as soon as
 /// `closed` is cancelled, releasing any share of the budgets already taken.
 async fn hold_input_until_closed(
-    channel_budget: Arc<Semaphore>,
-    connection_budget: Arc<Semaphore>,
+    channel_budget: &InputBudget,
+    connection_budget: &InputBudget,
     data: &[u8],
-    wait_limit: Duration,
+    stall: Duration,
     closed: &CancellationToken,
-) -> anyhow::Result<Option<Bytes>> {
+) -> anyhow::Result<Option<Held>> {
     tokio::select! {
         biased;
         () = closed.cancelled() => Ok(None),
-        held = hold_input(channel_budget, connection_budget, data, wait_limit) => held.map(Some),
+        held = hold_input(channel_budget, connection_budget, data, stall) => held.map(Some),
     }
 }
+
+/// A wait for room longer than this is logged.
+const LONG_INPUT_WAIT: Duration = Duration::from_secs(1);
 
 pub struct ServerHandler {
     pub event_tx: UnboundedSender<ServerHandlerEvent>,
@@ -253,9 +477,10 @@ pub struct ServerHandler {
     /// Per channel, the input budget still free (see [`CHANNEL_INPUT_BUDGET`]).
     pub channel_inputs: ChannelInputs,
     /// The whole connection's input budget still free (see [`CONNECTION_INPUT_BUDGET`]).
-    pub connection_input_budget: Arc<Semaphore>,
-    /// How long input may wait for budget before the connection is dropped.
-    pub input_wait_limit: Duration,
+    connection_input_budget: InputBudget,
+    /// How long a channel may go without the target taking any of its input
+    /// before the channel is closed.
+    pub channel_stall_timeout: Duration,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -268,35 +493,103 @@ impl ServerHandler {
     pub fn new(
         event_tx: UnboundedSender<ServerHandlerEvent>,
         banner: Option<String>,
-        input_wait_limit: Duration,
+        channel_stall_timeout: Duration,
         channel_inputs: ChannelInputs,
     ) -> Self {
         Self {
             event_tx,
             banner,
             channel_inputs,
-            connection_input_budget: Arc::new(Semaphore::new(CONNECTION_INPUT_BUDGET)),
-            input_wait_limit,
+            connection_input_budget: InputBudget::new(CONNECTION_INPUT_BUDGET),
+            channel_stall_timeout,
         }
     }
 
     /// Waits until the channel's and the connection's budgets have room for
     /// `data`, then returns it as bytes that hold that room until they are
-    /// dropped. `None` means the channel closed meanwhile and `data` is dropped.
+    /// dropped. `None` means the input is dropped: the channel closed
+    /// meanwhile, or the target took none of its input for the stall timeout,
+    /// in which case the channel is closed here and the rest of the connection
+    /// carries on. When the connection's room is full and none of it comes
+    /// back, the channels holding it are closed instead of this one, which
+    /// goes on waiting.
     async fn hold_input(
         &mut self,
         channel: ChannelId,
         data: &[u8],
     ) -> anyhow::Result<Option<Bytes>> {
-        let input = self.channel_inputs.get(u32::from(channel));
-        hold_input_until_closed(
-            input.budget,
-            self.connection_input_budget.clone(),
-            data,
-            self.input_wait_limit,
-            &input.closed,
-        )
-        .await
+        let number = u32::from(channel);
+        let input = self.channel_inputs.get_channel(channel);
+        loop {
+            let started = std::time::Instant::now();
+            let held = hold_input_until_closed(
+                &input.budget,
+                &self.connection_input_budget,
+                data,
+                self.channel_stall_timeout,
+                &input.closed,
+            )
+            .await?;
+            let waited = started.elapsed();
+            if waited > LONG_INPUT_WAIT {
+                // Info once per channel; a slow but steady target would
+                // otherwise log on every packet.
+                let first = !input.long_wait_logged.swap(true, Ordering::Relaxed);
+                let waited_ms = u64::try_from(waited.as_millis()).unwrap_or(u64::MAX);
+                if first || matches!(held, Some(Held::Stalled | Held::ConnectionStalled)) {
+                    info!(
+                        channel = number,
+                        waited_ms,
+                        stalled = matches!(held, Some(Held::Stalled | Held::ConnectionStalled)),
+                        "Input waited for the target to take earlier input"
+                    );
+                } else {
+                    debug!(
+                        channel = number,
+                        waited_ms, "Input waited for the target to take earlier input"
+                    );
+                }
+            }
+            match held {
+                Some(Held::Input(bytes)) => return Ok(Some(bytes)),
+                Some(Held::Stalled) => {
+                    self.close_stalled(channel).await?;
+                    return Ok(None);
+                }
+                Some(Held::ConnectionStalled) => {
+                    // Whoever holds the connection's room and has been given
+                    // none back is stuck. Channels still waiting for their
+                    // target to open are left alone: they are not stalled.
+                    let stuck = self.channel_inputs.stuck_holders_except(number);
+                    if stuck.is_empty() {
+                        // Nothing that can be closed holds the room (only
+                        // channels without a known id, or none at all): close
+                        // this channel instead, so the wait cannot go on for
+                        // ever.
+                        self.close_stalled(channel).await?;
+                        return Ok(None);
+                    }
+                    for id in stuck {
+                        self.close_stalled(id).await?;
+                    }
+                }
+                None => return Ok(None),
+            }
+        }
+    }
+
+    /// Closes only this channel: input still arriving for it is dropped at
+    /// once from now on, and the session ends the channel at the target
+    /// without waiting for the input queued before.
+    async fn close_stalled(&mut self, channel: ChannelId) -> Result<(), ServerHandlerError> {
+        self.channel_inputs.target_closed(u32::from(channel));
+        let (tx, rx) = oneshot::channel();
+        self.send_event(ServerHandlerEvent::ChannelStalled(
+            ServerChannelId(channel),
+            tx,
+        ))?;
+        let _ = rx.await;
+        Ok(())
     }
 
     fn send_event(&self, event: ServerHandlerEvent) -> Result<(), ServerHandlerError> {
@@ -325,7 +618,7 @@ impl russh::server::Handler for ServerHandler {
         reply: ChannelOpenHandle,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        self.channel_inputs.opened(u32::from(channel.id()));
+        self.channel_inputs.opened_channel(channel.id());
         self.send_event(ServerHandlerEvent::ChannelOpenSession(
             ServerChannelId(channel.id()),
             ChannelOpenHandleWrapper(reply),
@@ -652,7 +945,7 @@ impl russh::server::Handler for ServerHandler {
     ) -> Result<(), Self::Error> {
         let host_to_connect = host_to_connect.to_string();
         let originator_address = originator_address.to_string();
-        self.channel_inputs.opened(u32::from(channel.id()));
+        self.channel_inputs.opened_channel(channel.id());
         self.send_event(ServerHandlerEvent::ChannelOpenDirectTcpIp(
             ServerChannelId(channel.id()),
             DirectTCPIPParams {
@@ -674,7 +967,7 @@ impl russh::server::Handler for ServerHandler {
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         let socket_path = socket_path.to_string();
-        self.channel_inputs.opened(u32::from(channel.id()));
+        self.channel_inputs.opened_channel(channel.id());
         self.send_event(ServerHandlerEvent::ChannelOpenDirectStreamlocal(
             ServerChannelId(channel.id()),
             socket_path,
@@ -822,8 +1115,32 @@ mod tests {
 
     const WAIT: Duration = Duration::from_millis(200);
 
-    fn connection() -> Arc<Semaphore> {
-        Arc::new(Semaphore::new(CONNECTION_INPUT_BUDGET))
+    fn connection() -> InputBudget {
+        InputBudget::new(CONNECTION_INPUT_BUDGET)
+    }
+
+    fn channel() -> InputBudget {
+        InputBudget::new(CHANNEL_INPUT_BUDGET)
+    }
+
+    fn available(budget: &InputBudget) -> usize {
+        budget.semaphore.available_permits()
+    }
+
+    /// The held input, failing the test if the wait stalled instead.
+    fn input(held: Held) -> Bytes {
+        match held {
+            Held::Input(bytes) => bytes,
+            Held::Stalled | Held::ConnectionStalled => panic!("the wait stalled"),
+        }
+    }
+
+    fn stalled(held: &Held) -> bool {
+        matches!(held, Held::Stalled)
+    }
+
+    fn connection_stalled(held: &Held) -> bool {
+        matches!(held, Held::ConnectionStalled)
     }
 
     /// Input up to the budget goes straight through; past it the next input
@@ -831,20 +1148,17 @@ mod tests {
     /// gets the same bytes either way.
     #[tokio::test]
     async fn channel_input_past_its_budget_waits_for_the_target() {
-        let budget = Arc::new(Semaphore::new(CHANNEL_INPUT_BUDGET));
-        let first = hold_input(
-            budget.clone(),
-            connection(),
-            &vec![1; CHANNEL_INPUT_BUDGET],
-            WAIT,
-        )
-        .await
-        .unwrap();
-        assert_eq!(budget.available_permits(), 0);
+        let budget = channel();
+        let first = input(
+            hold_input(&budget, &connection(), &vec![1; CHANNEL_INPUT_BUDGET], WAIT)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(available(&budget), 0);
 
         let next = tokio::spawn({
             let budget = budget.clone();
-            async move { hold_input(budget, connection(), b"more", Duration::from_secs(5)).await }
+            async move { hold_input(&budget, &connection(), b"more", Duration::from_secs(5)).await }
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!next.is_finished(), "input past the budget must wait");
@@ -858,35 +1172,154 @@ mod tests {
         );
 
         drop(copy);
-        let next = next.await.unwrap().unwrap();
+        let next = input(next.await.unwrap().unwrap());
         assert_eq!(&next[..], b"more");
         drop(next);
-        assert_eq!(budget.available_permits(), CHANNEL_INPUT_BUDGET);
+        assert_eq!(available(&budget), CHANNEL_INPUT_BUDGET);
     }
 
-    /// Input that the target never takes ends the wait with an error instead
-    /// of holding the connection for ever.
+    /// Input that the target never takes is reported as stalled after the
+    /// stall timeout, instead of holding the connection for ever, and takes
+    /// no share of the budget.
     #[tokio::test]
-    async fn channel_input_gives_up_when_the_target_never_takes_it() {
-        let budget = Arc::new(Semaphore::new(CHANNEL_INPUT_BUDGET));
-        let _held = hold_input(
-            budget.clone(),
-            connection(),
-            &vec![0; CHANNEL_INPUT_BUDGET],
-            WAIT,
-        )
-        .await
-        .unwrap();
-        assert!(hold_input(budget, connection(), b"x", WAIT).await.is_err());
+    async fn channel_input_stalls_when_the_target_never_takes_it() {
+        let budget = channel();
+        let _held = hold_input(&budget, &connection(), &vec![0; CHANNEL_INPUT_BUDGET], WAIT)
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        let held = hold_input(&budget, &connection(), b"x", WAIT)
+            .await
+            .unwrap();
+        assert!(stalled(&held));
+        assert!(started.elapsed() >= WAIT, "it waited the whole timeout");
+        assert_eq!(available(&budget), 0, "a stalled wait keeps no share");
+    }
+
+    /// The clock measures time without progress, not total time: while room
+    /// keeps being given back the wait goes on, far past the stall timeout,
+    /// and ends with the input once there is enough room.
+    #[tokio::test]
+    async fn a_slow_target_that_keeps_taking_input_is_never_stalled() {
+        // A stall timeout of a second against pieces taken every 400 ms: a
+        // wakeup that comes 600 ms late on a busy runner still leaves the
+        // clock restarted in time.
+        let stall = Duration::from_secs(1);
+        let budget = channel();
+        let piece = CHANNEL_INPUT_BUDGET / 4;
+        let mut pieces = Vec::new();
+        for _ in 0..4 {
+            pieces.push(input(
+                hold_input(&budget, &connection(), &vec![0; piece], stall)
+                    .await
+                    .unwrap(),
+            ));
+        }
+        assert_eq!(available(&budget), 0);
+
+        let waiting = tokio::spawn({
+            let budget = budget.clone();
+            async move {
+                hold_input(
+                    &budget,
+                    &connection(),
+                    &vec![1; CHANNEL_INPUT_BUDGET],
+                    stall,
+                )
+                .await
+            }
+        });
+        // Each piece is taken well inside the timeout; all four together take
+        // longer than it (1.6 s against 1 s).
+        for piece in pieces {
+            tokio::time::sleep(stall * 2 / 5).await;
+            assert!(!waiting.is_finished());
+            drop(piece);
+        }
+        let held = waiting.await.unwrap().unwrap();
+        assert!(!stalled(&held), "progress must restart the clock");
+    }
+
+    /// The same wait does stall once the progress stops.
+    #[tokio::test]
+    async fn the_wait_stalls_once_the_target_stops_taking_input() {
+        let stall = Duration::from_secs(1);
+        let budget = channel();
+        let piece = CHANNEL_INPUT_BUDGET / 2;
+        let first = input(
+            hold_input(&budget, &connection(), &vec![0; piece], stall)
+                .await
+                .unwrap(),
+        );
+        let _second = input(
+            hold_input(&budget, &connection(), &vec![0; piece], stall)
+                .await
+                .unwrap(),
+        );
+
+        let started = std::time::Instant::now();
+        let waiting = tokio::spawn({
+            let budget = budget.clone();
+            async move {
+                hold_input(
+                    &budget,
+                    &connection(),
+                    &vec![1; CHANNEL_INPUT_BUDGET],
+                    stall,
+                )
+                .await
+            }
+        });
+        // One piece is taken, which is progress, but the second never is.
+        let progress_after = stall * 2 / 5;
+        tokio::time::sleep(progress_after).await;
+        drop(first);
+        let held = tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("the wait must end")
+            .unwrap()
+            .unwrap();
+        assert!(stalled(&held));
+        assert!(
+            started.elapsed() >= progress_after + stall,
+            "the clock must restart at the progress, not run from the start"
+        );
+    }
+
+    /// A zero stall timeout means no limit: the wait goes on until there is room.
+    #[tokio::test]
+    async fn a_zero_stall_timeout_waits_for_ever() {
+        let budget = channel();
+        let held = input(
+            hold_input(
+                &budget,
+                &connection(),
+                &vec![0; CHANNEL_INPUT_BUDGET],
+                Duration::ZERO,
+            )
+            .await
+            .unwrap(),
+        );
+        let waiting = tokio::spawn({
+            let budget = budget.clone();
+            async move { hold_input(&budget, &connection(), b"x", Duration::ZERO).await }
+        });
+        tokio::time::sleep(WAIT * 2).await;
+        assert!(!waiting.is_finished());
+        drop(held);
+        assert!(!stalled(&waiting.await.unwrap().unwrap()));
     }
 
     /// One packet larger than the whole budget still goes through on an
     /// idle channel rather than waiting for ever.
     #[tokio::test]
     async fn channel_input_larger_than_the_budget_still_passes() {
-        let budget = Arc::new(Semaphore::new(CHANNEL_INPUT_BUDGET));
         let big = vec![7; CHANNEL_INPUT_BUDGET + 1];
-        let held = hold_input(budget, connection(), &big, WAIT).await.unwrap();
+        let held = input(
+            hold_input(&channel(), &connection(), &big, WAIT)
+                .await
+                .unwrap(),
+        );
         assert_eq!(held.len(), big.len());
     }
 
@@ -900,22 +1333,20 @@ mod tests {
         let fits = CONNECTION_INPUT_BUDGET / per_channel;
         let mut held = Vec::new();
         for _ in 0..fits {
-            let channel = Arc::new(Semaphore::new(CHANNEL_INPUT_BUDGET));
-            held.push(
-                hold_input(channel, connection.clone(), &vec![3; per_channel], WAIT)
+            held.push(input(
+                hold_input(&channel(), &connection, &vec![3; per_channel], WAIT)
                     .await
                     .unwrap(),
-            );
+            ));
         }
-        assert!(connection.available_permits() < per_channel);
+        assert!(available(&connection) < per_channel);
 
         let one_more = tokio::spawn({
             let connection = connection.clone();
             async move {
-                let channel = Arc::new(Semaphore::new(CHANNEL_INPUT_BUDGET));
                 hold_input(
-                    channel,
-                    connection,
+                    &channel(),
+                    &connection,
                     &vec![4; per_channel],
                     Duration::from_secs(5),
                 )
@@ -929,47 +1360,49 @@ mod tests {
         );
 
         held.clear();
-        let late = one_more.await.unwrap().unwrap();
+        let late = input(one_more.await.unwrap().unwrap());
         assert_eq!(late.len(), per_channel);
         drop(late);
-        assert_eq!(connection.available_permits(), CONNECTION_INPUT_BUDGET);
+        assert_eq!(available(&connection), CONNECTION_INPUT_BUDGET);
     }
 
-    /// The connection's budget alone also ends a wait that never gets room.
+    /// The connection's budget alone also stalls a wait that never gets room.
     #[tokio::test]
-    async fn input_gives_up_when_the_connection_budget_never_frees() {
-        let connection = Arc::new(Semaphore::new(CHANNEL_INPUT_BUDGET));
+    async fn input_stalls_when_the_connection_budget_never_frees() {
+        let connection = InputBudget::new(CHANNEL_INPUT_BUDGET);
         let _held = hold_input(
-            Arc::new(Semaphore::new(CHANNEL_INPUT_BUDGET)),
-            connection.clone(),
+            &channel(),
+            &connection,
             &vec![0; CHANNEL_INPUT_BUDGET],
             WAIT,
         )
         .await
         .unwrap();
-        let other_channel = Arc::new(Semaphore::new(CHANNEL_INPUT_BUDGET));
+        let other_channel = channel();
+        let held = hold_input(&other_channel, &connection, b"x", WAIT)
+            .await
+            .unwrap();
         assert!(
-            hold_input(other_channel.clone(), connection, b"x", WAIT)
-                .await
-                .is_err()
+            connection_stalled(&held),
+            "the connection's room is to blame, not the waiting channel"
         );
         assert_eq!(
-            other_channel.available_permits(),
+            available(&other_channel),
             CHANNEL_INPUT_BUDGET,
             "a wait that gave up keeps no share of the channel's budget"
         );
     }
 
     /// Input waiting on a full budget stops waiting, and is dropped, as soon
-    /// as its channel closes, long before the wait limit.
+    /// as its channel closes, long before the stall timeout.
     #[tokio::test]
     async fn channel_input_waiting_for_budget_ends_when_the_channel_closes() {
         let inputs = ChannelInputs::default();
-        let channel = 1;
-        let input = inputs.get(channel);
+        let channel_number = 1;
+        let channel_input = inputs.get(channel_number);
         let _held = hold_input(
-            input.budget.clone(),
-            connection(),
+            &channel_input.budget,
+            &connection(),
             &vec![0; CHANNEL_INPUT_BUDGET],
             WAIT,
         )
@@ -977,14 +1410,14 @@ mod tests {
         .unwrap();
 
         let waiting = tokio::spawn({
-            let input = input.clone();
+            let channel_input = channel_input.clone();
             async move {
                 hold_input_until_closed(
-                    input.budget,
-                    connection(),
+                    &channel_input.budget,
+                    &connection(),
                     b"more",
                     Duration::from_secs(30),
-                    &input.closed,
+                    &channel_input.closed,
                 )
                 .await
             }
@@ -992,7 +1425,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!waiting.is_finished(), "input past the budget must wait");
 
-        inputs.close(channel);
+        inputs.close(channel_number);
         let ended = tokio::time::timeout(Duration::from_secs(5), waiting)
             .await
             .expect("a closed channel must end the wait")
@@ -1007,10 +1440,10 @@ mod tests {
     #[tokio::test]
     async fn closing_a_channel_releases_the_budget_its_waiting_input_took() {
         let inputs = ChannelInputs::default();
-        let connection = Arc::new(Semaphore::new(CHANNEL_INPUT_BUDGET));
+        let connection = InputBudget::new(CHANNEL_INPUT_BUDGET);
         let hog = hold_input(
-            Arc::new(Semaphore::new(CHANNEL_INPUT_BUDGET)),
-            connection.clone(),
+            &channel(),
+            &connection,
             &vec![0; CHANNEL_INPUT_BUDGET],
             WAIT,
         )
@@ -1020,17 +1453,17 @@ mod tests {
         // Holds the closing channel's own share, then waits for the
         // connection's.
         let closing = 1;
-        let input = inputs.get(closing);
+        let closing_input = inputs.get(closing);
         let waiting = tokio::spawn({
-            let input = input.clone();
+            let closing_input = closing_input.clone();
             let connection = connection.clone();
             async move {
                 hold_input_until_closed(
-                    input.budget,
-                    connection,
+                    &closing_input.budget,
+                    &connection,
                     b"more",
                     Duration::from_secs(30),
-                    &input.closed,
+                    &closing_input.closed,
                 )
                 .await
             }
@@ -1040,20 +1473,23 @@ mod tests {
 
         inputs.close(closing);
         assert!(waiting.await.unwrap().unwrap().is_none());
-        assert_eq!(input.budget.available_permits(), CHANNEL_INPUT_BUDGET);
+        assert_eq!(available(&closing_input.budget), CHANNEL_INPUT_BUDGET);
 
         drop(hog);
         let other = inputs.get(2);
         let passed = hold_input_until_closed(
-            other.budget,
-            connection.clone(),
+            &other.budget,
+            &connection,
             &vec![5; CHANNEL_INPUT_BUDGET],
             WAIT,
             &other.closed,
         )
         .await
         .unwrap();
-        assert!(passed.is_some(), "another channel must not stay blocked");
+        assert!(
+            matches!(passed, Some(Held::Input(_))),
+            "another channel must not stay blocked"
+        );
     }
 
     /// Input that arrives after the target closed the channel but before the
@@ -1062,35 +1498,35 @@ mod tests {
     #[tokio::test]
     async fn input_after_the_target_closed_is_dropped_at_once() {
         let inputs = ChannelInputs::default();
-        let channel = 1;
+        let channel_number = 1;
         let _held = hold_input(
-            inputs.get(channel).budget,
-            connection(),
+            &inputs.get(channel_number).budget,
+            &connection(),
             &vec![0; CHANNEL_INPUT_BUDGET],
             WAIT,
         )
         .await
         .unwrap();
-        inputs.target_closed(channel);
+        inputs.target_closed(channel_number);
 
-        let input = inputs.get(channel);
+        let channel_input = inputs.get(channel_number);
         let connection = connection();
         let dropped = tokio::time::timeout(
             Duration::from_secs(5),
             hold_input_until_closed(
-                input.budget.clone(),
-                connection.clone(),
+                &channel_input.budget,
+                &connection,
                 b"late",
                 Duration::from_secs(30),
-                &input.closed,
+                &channel_input.closed,
             ),
         )
         .await
         .expect("input after the target's close must not wait")
         .unwrap();
         assert!(dropped.is_none());
-        assert_eq!(input.budget.available_permits(), 0, "nothing more is taken");
-        assert_eq!(connection.available_permits(), CONNECTION_INPUT_BUDGET);
+        assert_eq!(available(&channel_input.budget), 0, "nothing more is taken");
+        assert_eq!(available(&connection), CONNECTION_INPUT_BUDGET);
     }
 
     /// The target's close leaves a cancelled entry only until the client
@@ -1107,7 +1543,7 @@ mod tests {
         assert!(inputs.0.lock().unwrap().is_empty());
         let fresh = inputs.get(channel);
         assert!(!fresh.closed.is_cancelled());
-        assert_eq!(fresh.budget.available_permits(), CHANNEL_INPUT_BUDGET);
+        assert_eq!(available(&fresh.budget), CHANNEL_INPUT_BUDGET);
     }
 
     /// The client's close can run before the session handles the target's
@@ -1134,7 +1570,7 @@ mod tests {
         inputs.opened(channel);
         let fresh = inputs.get(channel);
         assert!(!fresh.closed.is_cancelled());
-        assert_eq!(fresh.budget.available_permits(), CHANNEL_INPUT_BUDGET);
+        assert_eq!(available(&fresh.budget), CHANNEL_INPUT_BUDGET);
     }
 
     /// A close for a channel with no entry must not panic or leave one.
@@ -1143,7 +1579,7 @@ mod tests {
         let inputs = ChannelInputs::default();
         inputs.close(7);
         inputs.target_closed(7);
-        inputs.opened(7);
+        inputs.live(7);
         assert!(inputs.0.lock().unwrap().is_empty());
     }
 
@@ -1160,5 +1596,172 @@ mod tests {
         assert!(first.closed.is_cancelled());
         assert!(!second.closed.is_cancelled());
         assert!(!inputs.get(one).closed.is_cancelled());
+    }
+
+    /// Input waiting for a target that has not opened the channel yet (still
+    /// connecting, or waiting for approval) is not a stall however long it
+    /// takes; the clock starts when the channel goes live.
+    #[tokio::test]
+    async fn the_stall_clock_starts_only_once_the_channel_is_live() {
+        let live = CancellationToken::new();
+        let budget = InputBudget::gated(CHANNEL_INPUT_BUDGET, live.clone());
+        let _held = input(
+            hold_input(&budget, &connection(), &vec![0; CHANNEL_INPUT_BUDGET], WAIT)
+                .await
+                .unwrap(),
+        );
+
+        let waiting = tokio::spawn({
+            let budget = budget.clone();
+            async move { hold_input(&budget, &connection(), b"x", WAIT).await }
+        });
+        // Five times the timeout, and the wait is still not a stall.
+        tokio::time::sleep(WAIT * 5).await;
+        assert!(!waiting.is_finished(), "an unopened channel never stalls");
+
+        let went_live = std::time::Instant::now();
+        live.cancel();
+        let held = tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("the wait must end once the channel is live")
+            .unwrap()
+            .unwrap();
+        assert!(stalled(&held));
+        assert!(
+            went_live.elapsed() >= WAIT,
+            "the whole timeout runs from when the channel went live"
+        );
+    }
+
+    /// A channel the client has just opened is not live until the session says
+    /// the target opened it; one that is missing needs no wait at all.
+    #[tokio::test]
+    async fn a_channel_is_live_only_after_the_target_opened_it() {
+        let inputs = ChannelInputs::default();
+        inputs.opened(1);
+        assert!(!inputs.get(1).budget.is_live());
+        inputs.live(1);
+        assert!(inputs.get(1).budget.is_live());
+
+        assert!(
+            inputs.get(2).budget.is_live(),
+            "an entry made by input alone has no open to wait for"
+        );
+        // Reusing the number starts it all over.
+        inputs.opened(1);
+        assert!(!inputs.get(1).budget.is_live());
+    }
+
+    /// When the connection's room stops coming back, the channels to close are
+    /// the ones the target has opened and that hold room: not the one waiting,
+    /// not one still waiting for its target, not one that holds nothing and
+    /// not one already closed.
+    #[tokio::test]
+    async fn a_connection_stall_picks_the_live_channels_that_hold_input() {
+        let inputs = ChannelInputs::default();
+        let connection = connection();
+        let mut keep = Vec::new();
+        for number in 1..=5 {
+            inputs.opened(number);
+            inputs.live(number);
+        }
+        for number in [1, 2, 3, 5] {
+            keep.push(input(
+                hold_input(&inputs.get(number).budget, &connection, b"data", WAIT)
+                    .await
+                    .unwrap(),
+            ));
+        }
+        // 2 is the waiting channel, 3 is still waiting for its target, 4 holds
+        // nothing, 5 is closed.
+        inputs.opened(3);
+        let three = inputs.get(3);
+        keep.push(input(
+            hold_input(&three.budget, &connection, b"data", WAIT)
+                .await
+                .unwrap(),
+        ));
+        inputs.target_closed(5);
+
+        let holders = inputs.holders_except(2);
+        assert_eq!(holders.len(), 1);
+        assert!(
+            Arc::ptr_eq(
+                &holders[0].budget.semaphore,
+                &inputs.get(1).budget.semaphore
+            ),
+            "only channel 1 qualifies"
+        );
+        let holders = inputs.holders_except(1);
+        assert_eq!(holders.len(), 1);
+        assert!(
+            Arc::ptr_eq(
+                &holders[0].budget.semaphore,
+                &inputs.get(2).budget.semaphore
+            ),
+            "only channel 2 qualifies when 1 is the one waiting"
+        );
+        drop(keep);
+    }
+
+    /// Channels that Warpgate opened towards the client (remote forwarding,
+    /// X11, agent forwarding) have no known id. When only such channels hold
+    /// the connection's room a stall round finds nothing it can close, which
+    /// the handler answers by closing the waiting channel, so the wait never
+    /// goes on for ever.
+    #[tokio::test]
+    async fn a_connection_stall_with_only_id_less_holders_finds_nothing_to_close() {
+        let inputs = ChannelInputs::default();
+        let connection = connection();
+        let mut keep = Vec::new();
+        for number in [1, 2] {
+            // Made by `get`, as for a channel Warpgate opened itself.
+            keep.push(input(
+                hold_input(&inputs.get(number).budget, &connection, b"data", WAIT)
+                    .await
+                    .unwrap(),
+            ));
+        }
+        assert_eq!(
+            inputs.holders_except(3).len(),
+            2,
+            "both hold room and count as holders"
+        );
+        assert!(
+            inputs.stuck_holders_except(3).is_empty(),
+            "without ids there is nothing to close: the caller must fall back"
+        );
+        drop(keep);
+    }
+
+    /// The connection's clock, like the channel's, does not run while the
+    /// channel is still connecting: input queued for it is not a stall.
+    #[tokio::test]
+    async fn a_connection_wait_for_a_connecting_channel_is_not_a_stall() {
+        let connection = InputBudget::new(CHANNEL_INPUT_BUDGET);
+        let _hog = input(
+            hold_input(
+                &channel(),
+                &connection,
+                &vec![0; CHANNEL_INPUT_BUDGET],
+                WAIT,
+            )
+            .await
+            .unwrap(),
+        );
+        let live = CancellationToken::new();
+        let connecting = InputBudget::gated(CHANNEL_INPUT_BUDGET, live.clone());
+        let waiting = tokio::spawn({
+            let connection = connection.clone();
+            async move { hold_input(&connecting, &connection, b"x", WAIT).await }
+        });
+        tokio::time::sleep(WAIT * 3).await;
+        assert!(
+            !waiting.is_finished(),
+            "no stall while the channel is connecting"
+        );
+        live.cancel();
+        let held = waiting.await.unwrap().unwrap();
+        assert!(connection_stalled(&held), "the clock runs once it is live");
     }
 }
