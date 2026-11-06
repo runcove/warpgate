@@ -107,11 +107,25 @@ async fn _handle_connection(
             .map(|text| format!("{}\r\n", text.replace("\r\n", "\n").replace('\n', "\r\n")))
     };
 
-    // Input waiting on a stalled target ends the connection after the same
-    // quiet period as an idle one.
-    let input_wait_limit = services.config.lock().await.store.ssh.inactivity_timeout;
+    // A channel whose target takes none of its input for this long is closed;
+    // the connection's other channels carry on. Zero means the longer
+    // `inactivity_timeout` instead of no limit.
+    let channel_stall_timeout = {
+        let config = services.config.lock().await;
+        let ssh = &config.store.ssh;
+        if ssh.channel_stall_timeout.is_zero() {
+            ssh.inactivity_timeout
+        } else {
+            ssh.channel_stall_timeout
+        }
+    };
     let channel_inputs = ChannelInputs::default();
-    let handler = ServerHandler::new(event_tx, banner, input_wait_limit, channel_inputs.clone());
+    let handler = ServerHandler::new(
+        event_tx,
+        banner,
+        channel_stall_timeout,
+        channel_inputs.clone(),
+    );
 
     let session = match ServerSession::start(
         remote_address,

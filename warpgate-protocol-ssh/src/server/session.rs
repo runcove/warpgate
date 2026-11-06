@@ -2084,6 +2084,11 @@ impl ServerSession {
                 let _ = reply.send(());
             }
 
+            ServerHandlerEvent::ChannelStalled(channel, reply) => {
+                self._channel_stalled(channel);
+                let _ = reply.send(());
+            }
+
             ServerHandlerEvent::ChannelEof(channel, reply) => {
                 self._channel_eof(channel)?;
                 let _ = reply.send(());
@@ -2250,6 +2255,13 @@ impl ServerSession {
                     && let Err(error) = self.channel_writer.write(handle, id, data, slot)
                 {
                     return self.fail_on_channel_writer_error(error).await;
+                }
+            }
+            RCEvent::Opened(channel) => {
+                // From here the target is expected to take the channel's
+                // input, so the stall clock may start.
+                if let Some(server_id) = self.channels.get(&channel).and_then(Channel::server_id) {
+                    self.channel_inputs.live(u32::from(server_id.0));
                 }
             }
             RCEvent::Success(channel) => {
@@ -4014,6 +4026,21 @@ impl ServerSession {
         Ok(())
     }
 
+    /// The target stopped taking this channel's input. Ends the channel at the
+    /// target without waiting for the input queued before it; the target-side
+    /// close that follows closes the client's channel the usual way.
+    fn _channel_stalled(&self, server_channel_id: ServerChannelId) {
+        if self.rc_state == RCState::Disconnected || self.session_handle.is_none() {
+            return;
+        }
+        let Ok(channel_id) = self.map_channel(server_channel_id) else {
+            debug!(channel=%server_channel_id.0, "Stalled channel already closed");
+            return;
+        };
+        warn!(channel=%channel_id, "Closing the channel: the target stopped taking its input");
+        let _ = self.send_command(RCCommand::Channel(channel_id, ChannelOperation::Abort));
+    }
+
     fn _channel_eof(&self, server_channel_id: ServerChannelId) -> Result<()> {
         if self.rc_state == RCState::Disconnected || self.session_handle.is_none() {
             debug!(channel=%server_channel_id.0, "Ignoring eof after backend shutdown");
@@ -4230,6 +4257,7 @@ const fn command_kind(command: &RCCommand) -> &'static str {
             ChannelOperation::RequestSubsystem(_) => "subsystem request",
             ChannelOperation::Data(_) | ChannelOperation::ExtendedData { .. } => "data",
             ChannelOperation::Close => "close",
+            ChannelOperation::Abort => "abort",
             ChannelOperation::Eof => "eof",
             ChannelOperation::Signal(_) => "signal",
         },
