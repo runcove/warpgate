@@ -1,5 +1,6 @@
 from uuid import uuid4
 import hashlib
+import logging
 import http.server
 import os
 import paramiko
@@ -1296,6 +1297,32 @@ class Test:
         shared_wg: WarpgateProcess,
         timeout,
     ):
+        self._stalled_channel_flow(
+            processes, wg_c_ed25519_pubkey, shared_wg, timeout, rekey=False
+        )
+
+    def test_a_rekey_during_a_held_window_keeps_every_byte_and_the_others_flowing(
+        self,
+        processes: ProcessManager,
+        wg_c_ed25519_pubkey,
+        shared_wg: WarpgateProcess,
+        timeout,
+    ):
+        # The same, with a key exchange forced by the client while the first
+        # channel's window is held back: the hold and its later release must
+        # survive it, with nothing lost, repeated or reordered.
+        self._stalled_channel_flow(
+            processes, wg_c_ed25519_pubkey, shared_wg, timeout, rekey=True
+        )
+
+    def _stalled_channel_flow(
+        self,
+        processes: ProcessManager,
+        wg_c_ed25519_pubkey,
+        shared_wg: WarpgateProcess,
+        timeout,
+        rekey: bool,
+    ):
         # One channel whose target reads nothing, with its client blocked by
         # the held-back window, and other channels on the SAME connection.
         # Warpgate keeps reading the connection, so the others open, send,
@@ -1337,6 +1364,30 @@ class Test:
             assert pusher.is_alive(), "the stuck channel's input was all taken"
             assert held < stuck_total
 
+            if rekey:
+                # renegotiate_keys() returns once the new keys are in use;
+                # paramiko logs "Switch to new keys" at that point, which is
+                # counted so the exchange is shown to have happened.
+                switches = []
+
+                class _Count(logging.Handler):
+                    def emit(self, record):
+                        if "Switch to new keys" in record.getMessage():
+                            switches.append(record)
+
+                logger = logging.getLogger("paramiko.transport")
+                counter, level = _Count(), logger.level
+                logger.addHandler(counter)
+                logger.setLevel(logging.DEBUG)
+                try:
+                    transport.renegotiate_keys()
+                finally:
+                    logger.removeHandler(counter)
+                    logger.setLevel(level)
+                assert switches, "the key exchange did not complete"
+                warnings.warn(f"rekey during hold: {len(switches)} key switch(es), held={held}")
+                assert sent[0] == held, "the held channel moved during the rekey"
+
             for index in range(3):
                 seed = f"other-{index}-{uuid4()}".encode()
                 other = run_on_target(transport, "sha256sum", deadline_s)
@@ -1362,6 +1413,7 @@ class Test:
             assert not errors, errors
             lines = read_to_eof(stuck).decode().split()
             assert lines and lines[0] == input_digest(stuck_seed, stuck_total)
+            warnings.warn(f"stuck channel got all {stuck_total} bytes in order, rekey={rekey}")
         finally:
             try:
                 stuck.close()
