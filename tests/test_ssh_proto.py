@@ -1436,8 +1436,9 @@ class Test:
         total = chunks * 65536
         deadline_s = max(timeout, 10) * 6
         reader = (
-            f"n=0; while [ $n -lt {chunks} ]; do head -c 65536; sleep 0.1; "
-            "n=$((n+1)); done | sha256sum"
+            f"f=$(mktemp); n=0; while [ $n -lt {chunks} ]; do "
+            "dd bs=65536 count=1 iflag=fullblock 2>/dev/null; sleep 0.1; "
+            'n=$((n+1)); done > "$f"; sha256sum < "$f"; wc -c < "$f"'
         )
         seed = f"slow-{uuid4()}".encode()
         transport = paramiko.Transport(connect_with_small_sndbuf(stall_wg.ssh_port))
@@ -1452,7 +1453,9 @@ class Test:
             channel.shutdown_write()
             lines = read_to_eof(channel).decode().split()
             elapsed = time.monotonic() - started
-            assert lines and lines[0] == input_digest(seed, total)
+            assert lines and lines[0] == input_digest(seed, total), (
+                f"the target took {lines[-1:]} of {total} bytes"
+            )
             assert elapsed > 6, f"the upload was not slow enough to matter: {elapsed}s"
             assert transport.is_active()
         finally:
