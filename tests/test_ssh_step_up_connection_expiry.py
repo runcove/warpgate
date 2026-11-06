@@ -118,6 +118,9 @@ class TestStepUpConnectionExpiry:
         elapsed = time.monotonic() - started
 
         assert ssh_client.returncode != 0
+        # `started` is taken before the approval that stamps the key, so a
+        # close before the 10s window is up is a regression.
+        assert elapsed >= 10, f"closed after {elapsed:.1f}s, inside the window"
         assert elapsed < 60
         assert CLOSED_LOG in log_path.read_text()
 

@@ -1052,6 +1052,11 @@ pub struct StepUpIntervalConfig {
     /// key closes when that key's `last_sso_at` plus this interval passes,
     /// and the reconnect asks for SSO. The interval is re-read from the live
     /// config, so a change applies to connections already open.
+    ///
+    /// Turning step-up on closes, within about 10 s, every open key connection
+    /// whose key has no SSO stamp inside the interval. A zero interval makes key
+    /// login unusable: the connection closes straight after its SSO. The deadline
+    /// follows the wall clock, so a clock step moves it by the size of the step.
     #[serde(default, with = "humantime_serde")]
     #[schemars(with = "Option<String>")]
     pub ssh: Option<Duration>,
