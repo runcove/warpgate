@@ -2284,6 +2284,193 @@ mod ticket_deletion {
             .is_some()
     }
 
+    async fn bare_user_session(db: &DatabaseConnection) -> UserSessionId {
+        let session_id = UserSessionId(Uuid::new_v4());
+        UserSession::ActiveModel {
+            id: Set(session_id),
+            username: Set(Some("alice".into())),
+            user_id: Set(None),
+            remote_address: Set("127.0.0.1:22".into()),
+            started: Set(OffsetDateTime::now_utc()),
+            ended: Set(None),
+            protocol: Set("HTTP".into()),
+            node_id: Set(None),
+            auth_state_node_id: Set(None),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        session_id
+    }
+
+    /// Registers a target session the way a protocol does once a ticket has
+    /// admitted the connection.
+    async fn open_under_ticket(
+        db: &DatabaseConnection,
+        session_id: UserSessionId,
+        ticket_id: Uuid,
+    ) -> Result<(), WarpgateError> {
+        use warpgate_common::{Target, TargetHTTPOptions, TargetOptions, TargetSessionId, Tls};
+
+        let target = Target {
+            id: Uuid::new_v4(),
+            name: "web".into(),
+            description: String::new(),
+            allow_roles: vec![],
+            options: TargetOptions::Http(TargetHTTPOptions {
+                url: "http://target".into(),
+                tls: Tls::default(),
+                headers: Default::default(),
+                external_host: None,
+                public: false,
+                unix_socket: None,
+            }),
+            rate_limit_bytes_per_second: None,
+            group_id: None,
+            ticket_max_duration_seconds: None,
+            ticket_requests_disabled: false,
+            ticket_require_approval: false,
+            require_approval: false,
+            ticket_max_uses: None,
+        };
+        TargetSession::open_or_lookup(
+            db,
+            TargetSessionId(Uuid::new_v4()),
+            session_id,
+            &target,
+            None,
+            Some(ticket_id),
+            &AuthStateUserInfo {
+                id: Uuid::new_v4(),
+                username: "alice".into(),
+            },
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn target_session_rows(db: &DatabaseConnection, id: UserSessionId) -> usize {
+        TargetSession::Entity::find()
+            .filter(TargetSession::Column::UserSessionId.eq(id))
+            .all(db)
+            .await
+            .unwrap()
+            .len()
+    }
+
+    /// The delete and the open both lock the ticket row, so they run one
+    /// after the other. Run the open second: it must be refused and leave no
+    /// session behind, rather than registering a session whose ticket is gone
+    /// and which the delete, having already collected its sessions, never
+    /// closes.
+    #[tokio::test]
+    async fn a_session_is_not_opened_under_a_ticket_that_was_deleted() {
+        let db = migrated_db().await;
+        let services = super::delivery::test_services(&db).await;
+        let ticket_id = seed_ticket(&db, None, None).await;
+        let session = bare_user_session(&db).await;
+
+        services
+            .delete_ticket_closing_sessions(ticket_id)
+            .await
+            .unwrap();
+
+        let opened = open_under_ticket(&db, session, ticket_id).await;
+        assert!(
+            matches!(opened, Err(WarpgateError::InvalidTicket(id)) if id == ticket_id),
+            "{opened:?}",
+        );
+        assert_eq!(target_session_rows(&db, session).await, 0);
+    }
+
+    /// The other order: the open committed first, so the delete finds the
+    /// session and ends it.
+    #[tokio::test]
+    async fn a_session_opened_under_a_ticket_is_closed_when_the_ticket_is_deleted() {
+        let db = migrated_db().await;
+        let services = super::delivery::test_services(&db).await;
+        let ticket_id = seed_ticket(&db, None, None).await;
+        let session = bare_user_session(&db).await;
+
+        open_under_ticket(&db, session, ticket_id).await.unwrap();
+        assert!(!ended(&db, session).await);
+
+        services
+            .delete_ticket_closing_sessions(ticket_id)
+            .await
+            .unwrap();
+
+        assert!(ended(&db, session).await);
+    }
+
+    /// The race itself: the open and the delete run together, started in both
+    /// orders. Whatever the interleaving, a session that was opened must end
+    /// up closed, and an open that lost must have been refused.
+    ///
+    /// Collecting the admitted sessions before the delete's transaction (the
+    /// shape this replaced) fails this on SQLite, where every transaction
+    /// holds the one connection: the delete collects, the open then commits
+    /// its session, and the delete finds nothing to close. SQLite cannot show
+    /// the row lock itself; that holds on PostgreSQL/MySQL by the same
+    /// argument as `UserSession::lock_for_update`.
+    #[tokio::test]
+    async fn a_session_opened_while_its_ticket_is_deleted_is_closed_or_refused() {
+        let db = migrated_db().await;
+        let services = super::delivery::test_services(&db).await;
+
+        for round in 0..20 {
+            let ticket_id = seed_ticket(&db, None, None).await;
+            let session = bare_user_session(&db).await;
+
+            let (opened, deleted) = if round % 2 == 0 {
+                tokio::join!(
+                    open_under_ticket(&db, session, ticket_id),
+                    services.delete_ticket_closing_sessions(ticket_id),
+                )
+            } else {
+                let (deleted, opened) = tokio::join!(
+                    services.delete_ticket_closing_sessions(ticket_id),
+                    open_under_ticket(&db, session, ticket_id),
+                );
+                (opened, deleted)
+            };
+
+            deleted.unwrap();
+            match opened {
+                Ok(()) => assert!(
+                    ended(&db, session).await,
+                    "round {round}: a session opened under a deleted ticket is still open",
+                ),
+                Err(error) => {
+                    assert!(
+                        matches!(error, WarpgateError::InvalidTicket(_)),
+                        "round {round}: {error:?}",
+                    );
+                    assert_eq!(target_session_rows(&db, session).await, 0);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_session_is_not_opened_under_an_expired_ticket() {
+        let db = migrated_db().await;
+        let ticket_id = seed_ticket(
+            &db,
+            None,
+            Some(OffsetDateTime::now_utc() - time::Duration::seconds(60)),
+        )
+        .await;
+        let session = bare_user_session(&db).await;
+
+        let opened = open_under_ticket(&db, session, ticket_id).await;
+        assert!(
+            matches!(opened, Err(WarpgateError::InvalidTicket(_))),
+            "{opened:?}",
+        );
+        assert_eq!(target_session_rows(&db, session).await, 0);
+    }
+
     #[tokio::test]
     async fn deleting_a_ticket_ends_only_the_sessions_it_opened() {
         let db = migrated_db().await;

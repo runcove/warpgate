@@ -1,3 +1,4 @@
+use sea_orm::DatabaseTransaction;
 use sea_orm::entity::prelude::*;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -51,6 +52,40 @@ impl Related<super::Target::Entity> for Entity {
 }
 
 impl ActiveModelBehavior for ActiveModel {}
+
+/// Locks a ticket row for the rest of the transaction and returns it, or
+/// `None` when it is gone. Deleting a ticket and registering a session that
+/// the ticket admitted both take this lock, so one sees the other's result.
+///
+/// The no-op update is deliberate, as in [`super::UserSession::lock_for_update`]:
+/// PostgreSQL/MySQL take a row lock, while SQLite takes the transaction's
+/// write lock.
+pub async fn lock_for_update(
+    transaction: &DatabaseTransaction,
+    id: Uuid,
+) -> Result<Option<Model>, WarpgateError> {
+    Entity::update_many()
+        .col_expr(Column::Created, Expr::col(Column::Created).into())
+        .filter(Column::Id.eq(id))
+        .exec(transaction)
+        .await?;
+    Ok(Entity::find_by_id(id).one(transaction).await?)
+}
+
+/// [`lock_for_update`] for every ticket of a target, for deleting the target.
+/// Take it before anything else in the transaction, so that it and a single
+/// ticket delete lock in the same order.
+pub async fn lock_all_for_target(
+    transaction: &DatabaseTransaction,
+    target_id: Uuid,
+) -> Result<(), WarpgateError> {
+    Entity::update_many()
+        .col_expr(Column::Created, Expr::col(Column::Created).into())
+        .filter(Column::TargetId.eq(target_id))
+        .exec(transaction)
+        .await?;
+    Ok(())
+}
 
 /// Atomic use spend
 ///

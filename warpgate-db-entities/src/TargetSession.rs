@@ -98,6 +98,21 @@ pub async fn open_or_lookup(
     if parent.ended.is_some() {
         return Err(WarpgateError::UserSessionEnded);
     }
+    // A session a ticket admitted is registered only while the ticket exists
+    // and has not expired. The ticket row is locked until commit, so a delete
+    // of the ticket either already happened (this is refused) or waits and
+    // then finds this session among the ones it closes.
+    if let Some(ticket_id) = ticket_id {
+        let ticket = super::Ticket::lock_for_update(&transaction, ticket_id).await?;
+        let valid = ticket.is_some_and(|ticket| {
+            ticket
+                .expiry
+                .is_none_or(|expiry| expiry > OffsetDateTime::now_utc())
+        });
+        if !valid {
+            return Err(WarpgateError::InvalidTicket(ticket_id));
+        }
+    }
 
     let snapshot = serde_json::to_value(target.redacted())?;
     let model = TargetSession::ActiveModel {

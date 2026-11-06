@@ -128,6 +128,13 @@ pub async fn delete<C: ConnectionTrait + TransactionTrait>(
         .await?
         .ok_or(ResourceError::NotFound)?;
 
+    // The tickets are locked before the sessions they admitted are collected,
+    // so a session being registered under one of them either committed (and
+    // is collected) or finds its ticket gone (and is refused).
+    Ticket::lock_all_for_target(&txn, target.id)
+        .await
+        .map_err(ResourceError::from)?;
+
     TargetRoleAssignment::Entity::delete_many()
         .filter(TargetRoleAssignment::Column::TargetId.eq(target.id))
         .exec(&txn)
