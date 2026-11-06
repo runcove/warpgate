@@ -925,7 +925,7 @@
           "default": null
         },
         "ssh": {
-          "description": "Per-pubkey step-up interval for SSH (`credentials_public_key.last_sso_at`).",
+          "description": "Per-pubkey step-up interval for SSH (`credentials_public_key.last_sso_at`).\n\nAlso bounds open connections: an SSH connection that logged in with a\nkey closes when that key's `last_sso_at` plus this interval passes,\nand the reconnect asks for SSO. The interval is re-read from the live\nconfig, so a change applies to connections already open.\n\nTurning step-up on closes, within about 10 s, every open key connection\nwhose key has no SSO stamp inside the interval. A zero interval makes key\nlogin unusable: the connection closes straight after its SSO. The deadline\nfollows the wall clock, so a clock step moves it by the size of the step.",
           "type": [
             "string",
             "null"

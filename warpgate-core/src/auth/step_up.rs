@@ -44,6 +44,51 @@ pub fn is_fresh(
     now - last <= interval_td
 }
 
+/// Where an open, key-authenticated connection stands against its step-up window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepUpWindow {
+    /// Step-up is off for the protocol: the connection is not time-limited.
+    NotApplicable,
+    /// The window is still open for this long.
+    Remaining(Duration),
+    /// The window has passed (or the key was never stamped): close.
+    Expired,
+}
+
+/// Evaluate an open connection's step-up window.
+///
+/// `interval` is the value read from the live config at evaluation time, so a
+/// shorter interval closes sooner and a longer or removed one extends or
+/// cancels. `last_sso_at` is re-read each time, so a fresh SSO for the key
+/// extends the deadline. The boundary matches [`is_fresh`]: still open at
+/// exactly `last_sso_at + interval`.
+#[must_use]
+pub fn step_up_window(
+    last_sso_at: Option<OffsetDateTime>,
+    interval: Option<Duration>,
+    now: OffsetDateTime,
+) -> StepUpWindow {
+    let Some(interval) = interval else {
+        return StepUpWindow::NotApplicable;
+    };
+    if !is_fresh(last_sso_at, interval, now) {
+        return StepUpWindow::Expired;
+    }
+    // `is_fresh` was true, so `last_sso_at` is `Some` and the sum is in range.
+    let Some(last) = last_sso_at else {
+        return StepUpWindow::Expired;
+    };
+    let Ok(interval_td) = time::Duration::try_from(interval) else {
+        return StepUpWindow::Expired;
+    };
+    // An unrepresentable deadline is so far off the window is effectively open;
+    // report a day so the caller re-reads soon anyway.
+    let Some(deadline) = last.checked_add(interval_td) else {
+        return StepUpWindow::Remaining(Duration::from_secs(86_400));
+    };
+    Duration::try_from(deadline - now).map_or(StepUpWindow::Expired, StepUpWindow::Remaining)
+}
+
 /// Read the `last_sso_at` column for the given pubkey credential row.
 ///
 /// Returns `Ok(None)` if the row exists but was never stamped, or if the row
@@ -151,6 +196,80 @@ mod tests {
         let now = OffsetDateTime::now_utc();
         let last = now - time::Duration::hours(12) - time::Duration::nanoseconds(1);
         assert!(!is_fresh(Some(last), hours(12), now));
+    }
+
+    #[test]
+    fn unit_step_up_window_off_is_not_applicable() {
+        let now = OffsetDateTime::now_utc();
+        assert_eq!(
+            step_up_window(Some(at(now, -3600)), None, now),
+            StepUpWindow::NotApplicable
+        );
+        assert_eq!(step_up_window(None, None, now), StepUpWindow::NotApplicable);
+    }
+
+    #[test]
+    fn unit_step_up_window_is_last_sso_plus_interval() {
+        let now = OffsetDateTime::now_utc();
+        assert_eq!(
+            step_up_window(Some(at(now, -3600)), Some(hours(12)), now),
+            StepUpWindow::Remaining(hours(11))
+        );
+    }
+
+    #[test]
+    fn unit_step_up_window_closes_when_the_window_passes() {
+        let now = OffsetDateTime::now_utc();
+        assert_eq!(
+            step_up_window(Some(at(now, -(12 * 3600 + 1))), Some(hours(12)), now),
+            StepUpWindow::Expired
+        );
+        assert_eq!(
+            step_up_window(Some(at(now, -12 * 3600)), Some(hours(12)), now),
+            StepUpWindow::Remaining(Duration::ZERO)
+        );
+    }
+
+    #[test]
+    fn unit_step_up_window_never_stamped_is_expired() {
+        let now = OffsetDateTime::now_utc();
+        assert_eq!(
+            step_up_window(None, Some(hours(12)), now),
+            StepUpWindow::Expired
+        );
+    }
+
+    #[test]
+    fn unit_step_up_window_follows_an_interval_change() {
+        let now = OffsetDateTime::now_utc();
+        let last = Some(at(now, -2 * 3600));
+        assert_eq!(
+            step_up_window(last, Some(hours(12)), now),
+            StepUpWindow::Remaining(hours(10))
+        );
+        // Shorter interval: the same connection is now past its window.
+        assert_eq!(step_up_window(last, Some(hours(1)), now), StepUpWindow::Expired);
+        // Longer interval extends it; removing it cancels the limit.
+        assert_eq!(
+            step_up_window(last, Some(hours(24)), now),
+            StepUpWindow::Remaining(hours(22))
+        );
+        assert_eq!(step_up_window(last, None, now), StepUpWindow::NotApplicable);
+    }
+
+    #[test]
+    fn unit_step_up_window_fresh_sso_extends_the_deadline() {
+        let now = OffsetDateTime::now_utc();
+        let old = Some(at(now, -(11 * 3600 + 3000)));
+        let refreshed = Some(now);
+        assert_eq!(
+            step_up_window(old, Some(hours(12)), now),
+            StepUpWindow::Remaining(Duration::from_secs(600))
+        );
+        assert_eq!(
+            step_up_window(refreshed, Some(hours(12)), now),
+            StepUpWindow::Remaining(hours(12))
+        );
     }
 
     #[test]

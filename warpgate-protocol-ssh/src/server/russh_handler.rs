@@ -338,6 +338,7 @@ impl ChannelInput {
 pub struct ChannelInputs(Arc<Mutex<HashMap<u32, ChannelInput>>>);
 
 impl ChannelInputs {
+    #[cfg(test)]
     fn get(&self, channel: u32) -> ChannelInput {
         let mut inputs = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         // An entry that is missing was removed by the client's close; input
@@ -418,9 +419,8 @@ impl ChannelInputs {
         }
     }
 
-    /// A channel with this number was just opened by the client: replaces any
-    /// state left by an earlier channel of the same number, so the new one
-    /// starts fresh. Its stall clock does not run until [`Self::live`].
+    /// As [`Self::opened_channel`], for a test that has no russh channel id.
+    #[cfg(test)]
     pub fn opened(&self, channel: u32) {
         self.0
             .lock()
@@ -428,8 +428,11 @@ impl ChannelInputs {
             .insert(channel, ChannelInput::new(None, false));
     }
 
-    /// [`Self::opened`], remembering the channel so it can be closed from
-    /// another channel's wait.
+    /// A channel with this number was just opened by the client: replaces any
+    /// state left by an earlier channel of the same number, so the new one
+    /// starts fresh, and remembers the channel so it can be closed from
+    /// another channel's wait. Its stall clock does not run until
+    /// [`Self::live`].
     pub fn opened_channel(&self, channel: ChannelId) {
         self.0
             .lock()

@@ -35,7 +35,9 @@ use warpgate_common::{
 };
 use warpgate_common_http::ext::{construct_control_plane_url, construct_external_url};
 use warpgate_core::approvals::{GateOutcome, GatedConnection};
-use warpgate_core::auth::step_up::{get_pubkey_last_sso_at, is_fresh, update_pubkey_last_sso_at};
+use warpgate_core::auth::step_up::{
+    StepUpWindow, get_pubkey_last_sso_at, is_fresh, step_up_window, update_pubkey_last_sso_at,
+};
 use warpgate_core::auth::submit_credential;
 use warpgate_core::login_protection::FailedAttemptInfo;
 use warpgate_core::recordings::{self, TerminalRecorder, TrafficConnectionParams, TrafficRecorder};
@@ -72,6 +74,21 @@ const DISCONNECT_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 /// disconnect. A client that reads both in one batch acts on the disconnect
 /// and exits without printing the message.
 const DISCONNECT_NOTICE_GAP: Duration = Duration::from_secs(1);
+
+/// The step-up window is re-read at least this often (live config, fresh SSO),
+/// and no sooner than the minimum, so a boundary never spins the loop.
+const STEP_UP_RECHECK_MAX: Duration = Duration::from_secs(10);
+const STEP_UP_RECHECK_MIN: Duration = Duration::from_millis(250);
+/// Consecutive unreadable checks after which a connection is closed.
+const STEP_UP_MAX_READ_FAILURES: u32 = 6;
+
+/// What the session loop woke for.
+#[allow(clippy::large_enum_variant)]
+enum Woke {
+    Event(Option<Event>),
+    Idle,
+    StepUp,
+}
 
 #[allow(clippy::large_enum_variant)]
 enum TargetSelection {
@@ -308,6 +325,21 @@ pub struct ServerSession {
     auth_state: Option<(Arc<Mutex<AuthState>>, String)>,
     /// A disconnect event used for the approval waiter
     disconnect_token: CancellationToken,
+    /// The distinct public key rows this connection authenticated with, set for
+    /// every key login (step-up may be switched on while it is open). Each key's
+    /// `last_sso_at` plus the live interval bounds the connection; it closes
+    /// when any of them passes, and a key login with no matched row counts as
+    /// expired once step-up applies.
+    step_up_pubkeys: Option<Vec<Uuid>>,
+    /// When to next evaluate the step-up window; `None` when untracked.
+    step_up_recheck: Option<Instant>,
+    /// The earliest deadline seen at the last successful read, kept so a
+    /// failing database cannot extend the connection past it.
+    step_up_known_deadline: Option<OffsetDateTime>,
+    /// Consecutive failed `last_sso_at` reads.
+    step_up_read_failures: u32,
+    /// The reason sent to the client in the SSH disconnect message.
+    disconnect_description: String,
     keyboard_interactive_state: Option<PendingKeyboardInteractiveAuth>,
     cached_successful_ticket_auth: Option<CachedSuccessfulTicketAuth>,
     allowed_auth_methods: MethodSet,
@@ -1044,6 +1076,11 @@ impl ServerSession {
             channel_writer,
             auth_state: None,
             disconnect_token: CancellationToken::new(),
+            step_up_pubkeys: None,
+            step_up_recheck: None,
+            step_up_known_deadline: None,
+            step_up_read_failures: 0,
+            disconnect_description: String::new(),
             keyboard_interactive_state: None,
             cached_successful_ticket_auth: None,
             allowed_auth_methods: get_allowed_auth_methods(services).await?,
@@ -1122,8 +1159,10 @@ impl ServerSession {
         let inactivity_timeout = services.config.lock().await.store.ssh.inactivity_timeout;
 
         Ok(async move {
+            let mut idle_since = Instant::now();
             let result = loop {
                 if let Some(event) = this.pending_events.pop_front() {
+                    idle_since = Instant::now();
                     if let Err(error) = this.handle_event(event).await {
                         break Err(error);
                     }
@@ -1137,24 +1176,50 @@ impl ServerSession {
                 } else {
                     Some(inactivity_timeout)
                 };
+                // The idle deadline is last real activity + timeout and moves
+                // only on a real event, so a step-up recheck never restarts it.
+                let idle_wait = inactivity_timeout
+                    .map(|timeout| (idle_since + timeout).saturating_duration_since(Instant::now()));
+                let step_up_wait = this
+                    .step_up_recheck
+                    .map(|at| at.saturating_duration_since(Instant::now()));
                 let next_event_fut = this.get_next_event();
-                let next_event = match inactivity_timeout {
-                    Some(timeout) => tokio::time::timeout(timeout, next_event_fut).await,
-                    None => Ok(next_event_fut.await),
+                let idle_due = async {
+                    match idle_wait {
+                        Some(wait) => tokio::time::sleep(wait).await,
+                        None => std::future::pending::<()>().await,
+                    }
                 };
-                match next_event {
-                    Ok(Some(event)) => {
+                let step_up_due = async {
+                    match step_up_wait {
+                        Some(wait) => tokio::time::sleep(wait).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                };
+                let woke = tokio::select! {
+                    next_event = next_event_fut => Woke::Event(next_event),
+                    () = idle_due => Woke::Idle,
+                    () = step_up_due => Woke::StepUp,
+                };
+                match woke {
+                    Woke::Event(Some(event)) => {
+                        idle_since = Instant::now();
                         if let Err(error) = this.handle_event(event).await {
                             break Err(error);
                         }
                     }
-                    Ok(None) => break Ok(()),
-                    Err(_) => {
+                    Woke::Event(None) => break Ok(()),
+                    Woke::Idle => {
                         info!("Closing the session due to inactivity");
                         let _ = this.emit_service_message("Closing the session due to inactivity");
                         this.request_disconnect();
                         this.disconnect_server().await;
                         break Ok(());
+                    }
+                    Woke::StepUp => {
+                        if this.enforce_step_up_window().await {
+                            break Ok(());
+                        }
                     }
                 }
             };
@@ -1163,6 +1228,104 @@ impl ServerSession {
             result?;
             Ok::<_, anyhow::Error>(())
         })
+    }
+
+    /// Evaluate this connection's step-up window against the live config and
+    /// the key's current `last_sso_at`, and schedule the next look. Returns
+    /// `true` when the window has passed and the connection was closed.
+    async fn enforce_step_up_window(&mut self) -> bool {
+        let Some(pubkeys) = self.step_up_pubkeys.clone() else {
+            self.step_up_recheck = None;
+            return false;
+        };
+        let interval = {
+            let cfg = self.services.config.lock().await;
+            cfg.store.step_up_interval.as_ref().and_then(|s| s.ssh)
+        };
+        let now = OffsetDateTime::now_utc();
+        let mut window = StepUpWindow::NotApplicable;
+        if interval.is_some() {
+            // A key login with no matched row cannot show a fresh SSO.
+            window = if pubkeys.is_empty() {
+                StepUpWindow::Expired
+            } else {
+                StepUpWindow::Remaining(Duration::MAX)
+            };
+            for pubkey_id in &pubkeys {
+                let last = match get_pubkey_last_sso_at(&self.services.db, *pubkey_id).await {
+                    Ok(last) => last,
+                    Err(error) => {
+                        return self.step_up_read_failed(&error, now).await;
+                    }
+                };
+                window = match (window, step_up_window(last, interval, now)) {
+                    (StepUpWindow::Expired, _) | (_, StepUpWindow::Expired) => {
+                        StepUpWindow::Expired
+                    }
+                    (StepUpWindow::Remaining(a), StepUpWindow::Remaining(b)) => {
+                        StepUpWindow::Remaining(a.min(b))
+                    }
+                    (_, other) => other,
+                };
+            }
+        }
+        self.step_up_read_failures = 0;
+        match window {
+            StepUpWindow::Expired => {
+                self.close_for_step_up("step-up window expired").await;
+                true
+            }
+            StepUpWindow::NotApplicable => {
+                // Step-up is currently off: keep looking at the config, since
+                // it may be switched on while the connection is open.
+                self.step_up_known_deadline = None;
+                self.step_up_recheck = Some(Instant::now() + STEP_UP_RECHECK_MAX);
+                false
+            }
+            StepUpWindow::Remaining(left) => {
+                self.step_up_known_deadline = time::Duration::try_from(left)
+                    .ok()
+                    .and_then(|left| now.checked_add(left));
+                // Capped so a config change or a fresh SSO is seen promptly.
+                self.step_up_recheck = Some(
+                    Instant::now() + left.clamp(STEP_UP_RECHECK_MIN, STEP_UP_RECHECK_MAX),
+                );
+                false
+            }
+        }
+    }
+
+    /// A failed `last_sso_at` read never extends a connection: it closes once
+    /// the last known deadline passes, or after repeated failures, like the
+    /// login gate that refuses when it cannot read the stamp.
+    async fn step_up_read_failed(&mut self, error: &WarpgateError, now: OffsetDateTime) -> bool {
+        self.step_up_read_failures += 1;
+        warn!(
+            %error,
+            failures = self.step_up_read_failures,
+            "Could not read the step-up timestamp"
+        );
+        let past_deadline = self.step_up_known_deadline.is_some_and(|d| now > d);
+        if past_deadline || self.step_up_read_failures >= STEP_UP_MAX_READ_FAILURES {
+            self.close_for_step_up("step-up window unverifiable").await;
+            return true;
+        }
+        self.step_up_recheck = Some(Instant::now() + STEP_UP_RECHECK_MAX);
+        false
+    }
+
+    async fn close_for_step_up(&mut self, why: &str) {
+        let reason = "SSO step-up window expired; reconnect to sign in again";
+        info!(
+            session = %self.id,
+            reason = why,
+            "Closing the connection: its key's step-up window has passed"
+        );
+        let _ = self.emit_service_message(reason);
+        self.disconnect_description = reason.to_owned();
+        self.step_up_recheck = None;
+        self.request_disconnect();
+        self.disconnect_server().await;
     }
 
     async fn get_next_event(&mut self) -> Option<Event> {
@@ -3647,7 +3810,10 @@ impl ServerSession {
                         // Snapshot what the gate needs and drop the AuthState
                         // guard before taking the config lock, so AuthState
                         // stays the innermost lock in this module.
-                        let matched_pubkey_ids = state.matched_public_key_ids();
+                        // The same key listed twice is still one key.
+                        let mut matched_pubkey_ids = state.matched_public_key_ids();
+                        matched_pubkey_ids.sort_unstable();
+                        matched_pubkey_ids.dedup();
                         let valid_kinds = state.valid_credential_kinds();
                         // A `WebUserApproval` that the grace-period bypass
                         // injected from a remembered approval is not proof that
@@ -3660,10 +3826,6 @@ impl ServerSession {
                             let cfg = self.services.config.lock().await;
                             cfg.store.step_up_interval.as_ref().and_then(|s| s.ssh)
                         };
-                        let matched_pubkey_id = match matched_pubkey_ids.as_slice() {
-                            [pubkey_id] => Some(*pubkey_id),
-                            _ => None,
-                        };
                         if let Some(interval) = step_up_ssh {
                             let has_stepup = web_approval_proves_step_up(
                                 valid_kinds.contains(&CredentialKind::WebUserApproval),
@@ -3671,13 +3833,17 @@ impl ServerSession {
                             );
                             let pubkey_used = valid_kinds.contains(&CredentialKind::PublicKey);
                             if pubkey_used && !has_stepup {
-                                let last = match matched_pubkey_id {
-                                    Some(pubkey_id) => {
-                                        get_pubkey_last_sso_at(&self.services.db, pubkey_id).await?
-                                    }
-                                    None => None,
-                                };
-                                if !is_fresh(last, interval, OffsetDateTime::now_utc()) {
+                                // Every matched key must be fresh; no matched
+                                // key at all is stale.
+                                let mut all_fresh = !matched_pubkey_ids.is_empty();
+                                for pubkey_id in &matched_pubkey_ids {
+                                    let last =
+                                        get_pubkey_last_sso_at(&self.services.db, *pubkey_id)
+                                            .await?;
+                                    all_fresh &=
+                                        is_fresh(last, interval, OffsetDateTime::now_utc());
+                                }
+                                if !all_fresh {
                                     info!(
                                         username = %user_info.username,
                                         "SSH step-up required: pubkey last_sso_at is stale or missing"
@@ -3726,6 +3892,14 @@ impl ServerSession {
                         self._auth_accept(user_info.clone(), authorization).await?;
                         self.authentication_type = Some("user".to_string());
 
+                        // Every key login is tracked, so step-up switched on
+                        // later still applies; the check does nothing while
+                        // step-up is off.
+                        if valid_kinds.contains(&CredentialKind::PublicKey) {
+                            self.step_up_pubkeys = Some(matched_pubkey_ids.clone());
+                            self.step_up_recheck = Some(Instant::now());
+                        }
+
                         // Stamp last_sso_at on the exact pubkey row only when
                         // this accept was itself gated on a step-up - i.e. a
                         // real WebUserApproval was presented alongside the
@@ -3740,20 +3914,23 @@ impl ServerSession {
                                 valid_kinds.contains(&CredentialKind::WebUserApproval),
                                 approval_was_bypassed,
                             )
-                            && let Some(pubkey_id) = matched_pubkey_id
-                            && let Err(error) = update_pubkey_last_sso_at(
-                                &self.services.db,
-                                pubkey_id,
-                                OffsetDateTime::now_utc(),
-                            )
-                            .await
                         {
-                            warn!(
-                                %error,
-                                %pubkey_id,
-                                username = %user_info.username,
-                                "Failed to stamp pubkey last_sso_at"
-                            );
+                            for pubkey_id in &matched_pubkey_ids {
+                                if let Err(error) = update_pubkey_last_sso_at(
+                                    &self.services.db,
+                                    *pubkey_id,
+                                    OffsetDateTime::now_utc(),
+                                )
+                                .await
+                                {
+                                    warn!(
+                                        %error,
+                                        %pubkey_id,
+                                        username = %user_info.username,
+                                        "Failed to stamp pubkey last_sso_at"
+                                    );
+                                }
+                            }
                         }
 
                         Ok(AuthResult::Accepted { user_info })
@@ -4007,6 +4184,7 @@ impl ServerSession {
             // (#2520). It goes only to a client that is still reading, and
             // only after `DISCONNECT_NOTICE_GAP`.
             let handle = flushed.then(|| self.session_handle.clone()).flatten();
+            let description = self.disconnect_description.clone();
             tokio::spawn(async move {
                 if let Some(handle) = handle {
                     tokio::time::sleep(DISCONNECT_NOTICE_GAP).await;
@@ -4014,7 +4192,7 @@ impl ServerSession {
                         DISCONNECT_FLUSH_TIMEOUT,
                         handle.disconnect(
                             russh::Disconnect::ByApplication,
-                            String::new(),
+                            description,
                             String::new(),
                         ),
                     )
