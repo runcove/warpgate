@@ -1114,8 +1114,9 @@ class Test:
         # Generous: the whole transfer is a few tens of MiB on loopback.
         deadline_s = max(timeout, 10) * 6
         gate = f"/tmp/wg-input-gate-{uuid4()}"
-        # The gate is created through another session on the same target, so the
-        # test does not rely on sharing a filesystem with the target. The poll
+        # The gate is created through a session on the same target, over a
+        # second connection, so the test does not rely on sharing a filesystem
+        # with the target. The poll
         # sleep belongs to the target command, not to the test.
         reader = (
             f"while [ ! -e {gate} ]; do sleep 0.2; done; sha256sum"
@@ -1156,8 +1157,19 @@ class Test:
                 "a sender finished while the targets read nothing"
             )
 
-            opener = run_on_target(transport, f"touch {gate}", deadline_s)
-            assert opener.recv_exit_status() == 0
+            # On a connection of its own: while Warpgate holds this
+            # connection's input it reads nothing more from its socket, so a
+            # channel open sent on it would wait behind the held data forever
+            # (runs 37714 and 37717 hung exactly there).
+            opener_transport = paramiko.Transport(
+                connect_with_small_sndbuf(shared_wg.ssh_port)
+            )
+            try:
+                opener_transport.connect(username=login, password="123")
+                opener = run_on_target(opener_transport, f"touch {gate}", deadline_s)
+                assert opener.recv_exit_status() == 0
+            finally:
+                opener_transport.close()
 
             end = time.monotonic() + deadline_s
             for sender in senders:
@@ -1228,8 +1240,8 @@ class Test:
         # session window of 2 MiB (CHAN_SES_WINDOW_DEFAULT) plus about 64 KiB
         # of pipe buffer. All channels share ONE target connection
         # (RemoteClient.session, client/mod.rs), so sshd's MaxSessions applies
-        # to all of them at once. The readers plus the gate opener need
-        # channels + 1 = 33 sessions, but stock sshd allows 10, so the default
+        # to all of them at once. The readers need 32 sessions on it (the gate
+        # opener has a connection of its own), but stock sshd allows 10, so the default
         # target config (conftest.py start_ssh_server, and CI's pre-started
         # target) sets MaxSessions 64.
         #
