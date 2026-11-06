@@ -72,6 +72,21 @@ pub async fn lock_for_update(
     Ok(Entity::find_by_id(id).one(transaction).await?)
 }
 
+/// [`lock_for_update`] for every ticket of a target, for deleting the target.
+/// Take it before anything else in the transaction, so that it and a single
+/// ticket delete lock in the same order.
+pub async fn lock_all_for_target(
+    transaction: &DatabaseTransaction,
+    target_id: Uuid,
+) -> Result<(), WarpgateError> {
+    Entity::update_many()
+        .col_expr(Column::Created, Expr::col(Column::Created).into())
+        .filter(Column::TargetId.eq(target_id))
+        .exec(transaction)
+        .await?;
+    Ok(())
+}
+
 /// Atomic use spend
 ///
 /// WarpgateError::InvalidTicket = no uses left

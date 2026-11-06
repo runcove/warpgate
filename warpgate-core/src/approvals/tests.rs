@@ -2403,6 +2403,55 @@ mod ticket_deletion {
         assert!(ended(&db, session).await);
     }
 
+    /// The race itself: the open and the delete run together, started in both
+    /// orders. Whatever the interleaving, a session that was opened must end
+    /// up closed, and an open that lost must have been refused.
+    ///
+    /// Collecting the admitted sessions before the delete's transaction (the
+    /// shape this replaced) fails this on SQLite, where every transaction
+    /// holds the one connection: the delete collects, the open then commits
+    /// its session, and the delete finds nothing to close. SQLite cannot show
+    /// the row lock itself; that holds on PostgreSQL/MySQL by the same
+    /// argument as `UserSession::lock_for_update`.
+    #[tokio::test]
+    async fn a_session_opened_while_its_ticket_is_deleted_is_closed_or_refused() {
+        let db = migrated_db().await;
+        let services = super::delivery::test_services(&db).await;
+
+        for round in 0..20 {
+            let ticket_id = seed_ticket(&db, None, None).await;
+            let session = bare_user_session(&db).await;
+
+            let (opened, deleted) = if round % 2 == 0 {
+                tokio::join!(
+                    open_under_ticket(&db, session, ticket_id),
+                    services.delete_ticket_closing_sessions(ticket_id),
+                )
+            } else {
+                let (deleted, opened) = tokio::join!(
+                    services.delete_ticket_closing_sessions(ticket_id),
+                    open_under_ticket(&db, session, ticket_id),
+                );
+                (opened, deleted)
+            };
+
+            deleted.unwrap();
+            match opened {
+                Ok(()) => assert!(
+                    ended(&db, session).await,
+                    "round {round}: a session opened under a deleted ticket is still open",
+                ),
+                Err(error) => {
+                    assert!(
+                        matches!(error, WarpgateError::InvalidTicket(_)),
+                        "round {round}: {error:?}",
+                    );
+                    assert_eq!(target_session_rows(&db, session).await, 0);
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn a_session_is_not_opened_under_an_expired_ticket() {
         let db = migrated_db().await;
