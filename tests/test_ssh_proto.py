@@ -35,6 +35,17 @@ def stall_wg(processes: ProcessManager):
     yield wg
 
 
+@pytest.fixture
+def slow_stall_wg(processes: ProcessManager):
+    """Like `stall_wg`, with a 5 s timeout: the rekey test needs the key
+    exchange to start well inside the stall, and the time `wait_until_held`
+    spends confirming the senders are blocked counts against it."""
+    wg = processes.start_wg(config_patch={"ssh": {"channel_stall_timeout": "5s"}})
+    wait_port(wg.http_port, for_process=wg.process, recv=False)
+    wait_port(wg.ssh_port, for_process=wg.process)
+    yield wg
+
+
 common_args = [
     "-i",
     "/dev/null",
@@ -164,6 +175,56 @@ def connect_with_small_sndbuf(port: int) -> socket.socket:
             sock.close()
             last = e
     raise last
+
+
+def start_delay_proxy(upstream, delay: float):
+    """A TCP proxy to `upstream` (host, port) that accepts a connection, waits
+    `delay` seconds and only then connects upstream and relays. A target behind
+    it takes `delay` seconds to complete its SSH handshake. Returns the port
+    and a function that stops it."""
+    listener = socket.socket()
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(8)
+
+    def pipe(source, destination):
+        try:
+            while True:
+                data = source.recv(65536)
+                if not data:
+                    break
+                destination.sendall(data)
+        except OSError:
+            pass
+        finally:
+            try:
+                destination.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+
+    def serve(client):
+        time.sleep(delay)
+        try:
+            remote = socket.create_connection(upstream, timeout=10)
+        except OSError:
+            client.close()
+            return
+        remote.settimeout(None)
+        threading.Thread(target=pipe, args=(client, remote), daemon=True).start()
+        pipe(remote, client)
+        client.close()
+        remote.close()
+
+    def accept_loop():
+        while True:
+            try:
+                client, _ = listener.accept()
+            except OSError:
+                return
+            threading.Thread(target=serve, args=(client,), daemon=True).start()
+
+    threading.Thread(target=accept_loop, daemon=True).start()
+    return listener.getsockname()[1], listener.close
 
 
 def wait_until_held(counters, deadline: float, quiet: float = 3.0):
@@ -1314,13 +1375,16 @@ class Test:
         self,
         processes: ProcessManager,
         wg_c_ed25519_pubkey,
-        stall_wg: WarpgateProcess,
+        slow_stall_wg: WarpgateProcess,
         timeout,
     ):
         # The same, with a key exchange forced by the client while the first
         # channel is stalled: the others must still get every byte, in order.
+        # The stall is 5 s so that the key exchange starts inside it: the 1 s
+        # that `wait_until_held` spends confirming the sender is blocked counts
+        # against the stall, and with 2 s the exchange often began after the close.
         self._stalled_channel_flow(
-            processes, wg_c_ed25519_pubkey, stall_wg, timeout, rekey=True
+            processes, wg_c_ed25519_pubkey, slow_stall_wg, timeout, rekey=True
         )
 
     def _stalled_channel_flow(
@@ -1408,8 +1472,14 @@ class Test:
             pusher.join(deadline_s)
             assert not pusher.is_alive(), "the stuck channel's sender is still blocked"
             assert sent[0] < stuck_total, "the stuck channel's input was all taken"
+            # What shows that Warpgate closed the stuck channel is `errors` (its
+            # sender was cut off) together with the other channels completing
+            # on the same connection. `stuck.closed` is only informative when
+            # paramiko set it on receiving the close; the rekey case sets it
+            # itself.
             assert errors, "the stuck channel was not closed"
-            assert stuck.closed
+            if not rekey:
+                assert stuck.closed
             assert transport.is_active()
         finally:
             if stuck is not None:
@@ -1418,6 +1488,149 @@ class Test:
                 except Exception:
                     pass
             transport.close()
+
+    def test_a_healthy_channel_survives_stuck_channels_filling_the_connection(
+        self,
+        processes: ProcessManager,
+        wg_c_ed25519_pubkey,
+        stall_wg: WarpgateProcess,
+        timeout,
+    ):
+        # Several channels whose targets read nothing fill the connection's
+        # whole input budget between them (8 x 2 MiB = 16 MiB). A healthy
+        # channel opened afterwards must not be the one that is closed for it:
+        # the stuck ones are, and the healthy one gets every byte through.
+        # This shows that the connection converges and the healthy channel is
+        # untouched; which stuck channel is the one waiting when the budget is
+        # full is not under the test's control.
+        user, ssh_target = setup_user_and_target(processes, stall_wg, wg_c_ed25519_pubkey)
+        mib = 1024 * 1024
+        stuck_channels = 8
+        stuck_total = 8 * mib
+        other_total = 8 * mib
+        deadline_s = max(timeout, 10) * 6
+        login = f"{user.username}:{ssh_target.name}"
+        sent = [0] * stuck_channels
+        errors = []
+        channels = []
+        transport = paramiko.Transport(connect_with_small_sndbuf(stall_wg.ssh_port))
+        try:
+            transport.connect(username=login, password="123")
+
+            def push(index, channel):
+                try:
+                    for chunk in input_chunks(f"stuck-{index}".encode(), stuck_total):
+                        channel.sendall(chunk)
+                        sent[index] += len(chunk)
+                    channel.shutdown_write()
+                except Exception as e:
+                    errors.append(f"stuck channel {index}: {e!r}")
+
+            pushers = []
+            for index in range(stuck_channels):
+                channel = run_on_target(transport, "sleep 60", deadline_s)
+                channels.append(channel)
+                pushers.append(
+                    threading.Thread(target=push, args=(index, channel), daemon=True)
+                )
+            for pusher in pushers:
+                pusher.start()
+            wait_until_held(sent, time.monotonic() + deadline_s, quiet=1.0)
+
+            seed = f"healthy-{uuid4()}".encode()
+            healthy = run_on_target(transport, "sha256sum", deadline_s)
+            channels.append(healthy)
+            for chunk in input_chunks(seed, other_total):
+                healthy.sendall(chunk)
+            healthy.shutdown_write()
+            lines = read_to_eof(healthy).decode().split()
+            assert lines and lines[0] == input_digest(seed, other_total), (
+                "the healthy channel did not get its own stream through"
+            )
+            assert healthy.recv_exit_status() == 0
+
+            for pusher in pushers:
+                pusher.join(deadline_s)
+            assert not any(p.is_alive() for p in pushers), (
+                "a stuck channel's sender is still blocked"
+            )
+            assert len(errors) == stuck_channels, "a stuck channel was not closed"
+            assert transport.is_active()
+        finally:
+            for channel in channels:
+                try:
+                    channel.close()
+                except Exception:
+                    pass
+            transport.close()
+
+    def test_input_waiting_for_a_connecting_target_is_never_a_stall(
+        self,
+        processes: ProcessManager,
+        wg_c_ed25519_pubkey,
+        stall_wg: WarpgateProcess,
+        timeout,
+    ):
+        # `tar c . | ssh host 'tar x'`: the client sends more than a channel's
+        # budget (2 MiB) while Warpgate is still connecting to the target,
+        # which here takes 6 s, three times the stall timeout (2 s). That wait
+        # is not the target refusing input, so nothing may be closed: the
+        # command must get the whole stream.
+        real_port = processes.start_ssh_server(
+            trusted_keys=[wg_c_ed25519_pubkey.read_text()]
+        )
+        wait_port(real_port)
+        delay = 6.0
+        proxy_port, stop_proxy = start_delay_proxy(
+            (target_host(real_port), real_port), delay
+        )
+        try:
+            user, ssh_target = setup_user_and_target(
+                processes,
+                stall_wg,
+                wg_c_ed25519_pubkey,
+                ssh_port=proxy_port,
+                host="127.0.0.1",
+            )
+            mib = 1024 * 1024
+            total = 8 * mib
+            seed = f"connecting-{uuid4()}".encode()
+            deadline_s = max(timeout, 10) * 6
+            client = processes.start_ssh_client(
+                f"{user.username}:{ssh_target.name}@localhost",
+                "-p",
+                str(stall_wg.ssh_port),
+                *common_args,
+                "sha256sum",
+                password="123",
+            )
+            output = []
+            reader = threading.Thread(
+                target=lambda: output.append(client.stdout.read()), daemon=True
+            )
+            reader.start()
+
+            def feed():
+                try:
+                    for chunk in input_chunks(seed, total):
+                        client.stdin.write(chunk)
+                    client.stdin.close()
+                except Exception as e:
+                    output.append(f"feeding failed: {e!r}".encode())
+
+            started = time.monotonic()
+            feeder = threading.Thread(target=feed, daemon=True)
+            feeder.start()
+            reader.join(deadline_s)
+            assert not reader.is_alive(), "the command did not finish"
+            assert client.wait(timeout=deadline_s) == 0
+            assert time.monotonic() - started >= delay, "the target was not delayed"
+            lines = output[0].decode().split()
+            assert lines and lines[0] == input_digest(seed, total), (
+                "the stream was cut while the target was connecting"
+            )
+        finally:
+            stop_proxy()
 
     def test_a_slow_reader_that_keeps_taking_input_is_never_closed(
         self,

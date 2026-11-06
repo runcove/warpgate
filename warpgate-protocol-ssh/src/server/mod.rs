@@ -108,8 +108,17 @@ async fn _handle_connection(
     };
 
     // A channel whose target takes none of its input for this long is closed;
-    // the connection's other channels carry on.
-    let channel_stall_timeout = services.config.lock().await.store.ssh.channel_stall_timeout;
+    // the connection's other channels carry on. Zero means the longer
+    // `inactivity_timeout` instead of no limit.
+    let channel_stall_timeout = {
+        let config = services.config.lock().await;
+        let ssh = &config.store.ssh;
+        if ssh.channel_stall_timeout.is_zero() {
+            ssh.inactivity_timeout
+        } else {
+            ssh.channel_stall_timeout
+        }
+    };
     let channel_inputs = ChannelInputs::default();
     let handler = ServerHandler::new(
         event_tx,

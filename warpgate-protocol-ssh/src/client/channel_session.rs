@@ -60,6 +60,10 @@ impl SessionChannel {
         )
         .await?;
         if self.abort.is_cancelled() {
+            // Input still queued will never be written: drop it now so it
+            // gives its share of the budget back instead of holding it for the
+            // time the target-side close may take.
+            while self.ops_rx.try_recv().is_ok() {}
             close_target_side(&self.write_half, self.channel_id).await;
         }
         self.close_and_wait().await;

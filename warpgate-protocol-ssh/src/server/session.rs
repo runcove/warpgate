@@ -2094,6 +2094,13 @@ impl ServerSession {
                     return self.fail_on_channel_writer_error(error).await;
                 }
             }
+            RCEvent::Opened(channel) => {
+                // From here the target is expected to take the channel's
+                // input, so the stall clock may start.
+                if let Some(server_id) = self.channels.get(&channel).and_then(Channel::server_id) {
+                    self.channel_inputs.live(u32::from(server_id.0));
+                }
+            }
             RCEvent::Success(channel) => {
                 if let Some((handle, id)) = self.client_channel(&channel)? {
                     self.channel_writer.channel_success(handle, id)?;

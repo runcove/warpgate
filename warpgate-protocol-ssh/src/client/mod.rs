@@ -222,6 +222,8 @@ pub async fn resolve_approved_ssh_chain(
 pub enum RCEvent {
     State(RCState),
     Output(Uuid, Bytes),
+    /// The target opened the channel, so input for it is now being written.
+    Opened(Uuid),
     Success(Uuid),
     ChannelFailure(Uuid),
     Eof(Uuid),
@@ -274,6 +276,8 @@ impl RCEvent {
             | Self::Error(_)
             | Self::ConnectionError(_)
             | Self::HopConnected
+            // Handled at once: it must not wait for the open it reports.
+            | Self::Opened(_)
             | Self::Done
             | Self::HostKeyReceived(..)
             | Self::HostKeyUnknown(..)
@@ -1369,6 +1373,7 @@ impl RemoteClient {
             if let Some(reply) = reply {
                 let _ = reply.send(Ok(()));
             }
+            let _ = events_tx.send(RCEvent::Opened(channel_id)).await;
 
             if is_session {
                 SessionChannel::new(channel, channel_id, ops_rx, abort, events_tx, session_id)

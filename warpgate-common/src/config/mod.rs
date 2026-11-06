@@ -479,7 +479,10 @@ pub struct SshConfig {
     /// input before only that channel is closed. A target that stops reading
     /// one channel then cannot hold up the connection's other channels. Any
     /// input the target takes restarts the clock, so a slow but progressing
-    /// target is never closed.
+    /// target is never closed. The clock starts once the target has opened
+    /// the channel: input waiting for a connecting target, web authentication
+    /// or approval is never counted. `0s` does not mean no limit: it uses
+    /// `inactivity_timeout` instead.
     #[serde(
         default = "_default_ssh_channel_stall_timeout",
         with = "humantime_serde"

@@ -102,6 +102,9 @@ impl DirectTCPIPChannel {
         )
         .await;
         if self.abort.is_cancelled() {
+            // Queued input will never be written: drop it now so it gives its
+            // share of the budget back before the target-side close.
+            while self.ops_rx.try_recv().is_ok() {}
             close_target_side(&self.writer.write_half, self.channel_id).await;
         }
         result
