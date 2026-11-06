@@ -1562,10 +1562,11 @@ class Test:
             assert not any(p.is_alive() for p in pushers), (
                 "a stuck channel's sender is still blocked"
             )
-            # Every stuck channel sent all it meant to, so none was closed by
-            # its own stall (it never had input waiting): any closed one was
-            # closed for the connection's sake. All but the one that waited
-            # for the connection's room hold room that is not given back.
+            # No stuck channel ever holds its own 2 MiB in Warpgate, so none can
+            # be closed by its own stall: any closed one was closed for the
+            # connection's sake (one closed mid-send stops early). All but the
+            # one that waited for the connection's room hold room that is not
+            # given back.
             stuck = channels[:stuck_channels]
             closed_by = time.monotonic() + deadline_s
             while (
