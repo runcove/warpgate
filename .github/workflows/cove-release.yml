@@ -91,8 +91,10 @@ name: cove-release
 #     --source-ref refs/tags/<tag>
 # --source-ref matters: without it any ref carrying a cove-release.yml would verify.
 #
-# BUILD_IMAGE is the forge's digest. The arm job pulls it with
-# --platform linux/arm64 and fails clearly if the digest is single-arch.
+# BUILD_IMAGE is the multi-arch index of the forge's builder base: on x86_64 it
+# resolves to the forge's own digest (408fe880...), and the arm job gets the
+# arm64 image of the same tag. The arm job checks the pulled image's
+# architecture, because docker pull of a single-arch digest only warns.
 on:
   push:
     tags: ['v*-cove.*']
@@ -122,8 +124,10 @@ concurrency:
 permissions: {}
 
 env:
-  # docker/Dockerfile.cove's builder base, the forge's digest (public).
-  BUILD_IMAGE: rust:1.97.1-bookworm@sha256:408fe88047cef61a2087653b0c5255fa51c0f2d6d94ddedd7a2562a9b91a46f6
+  # docker/Dockerfile.cove's builder base (public): the multi-arch index of the
+  # same tag, whose linux/amd64 entry is the forge's digest
+  # sha256:408fe88047cef61a2087653b0c5255fa51c0f2d6d94ddedd7a2562a9b91a46f6.
+  BUILD_IMAGE: rust:1.97.1-bookworm@sha256:0e2bcaef56d041a486784e54104a81aebe0da44bd03019bd70bc0401e42e4a97
   # The image's DB backends without rdp-openssl-tls, the graph's only path to OpenSSL.
   FEATURES: mysql,postgres
   ZIG_VERSION: 0.16.0
@@ -700,9 +704,13 @@ jobs:
           echo "image=${ImageOS:-unknown} ${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
           echo "compile container: $cpus cpus, ${build_mb} MiB (runner ${ImageOS:-unknown} ${ImageVersion:-unknown})"
           docker info >/dev/null
-          # The forge's digest must be a multi-arch index; a single-arch digest fails here, clearly.
+          # BUILD_IMAGE must be a multi-arch index. docker pull of a single-arch digest only
+          # warns, so the pulled image's architecture is checked as well.
           docker pull --quiet --platform "$DOCKER_PLATFORM" "$BUILD_IMAGE" >/dev/null \
             || { echo "::error::the build image could not be pulled for $DOCKER_PLATFORM (is its digest single-arch?)"; exit 1; }
+          arch=$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$BUILD_IMAGE")
+          [ "$arch" = "$DOCKER_PLATFORM" ] \
+            || { echo "::error::the build image is $arch, not $DOCKER_PLATFORM: its digest is single-arch"; exit 1; }
 
       # PART 7 is the same for both targets: `build` already wrote it (from its
       # own compile's evidence, in a clean container) in the final x86_64 file.
