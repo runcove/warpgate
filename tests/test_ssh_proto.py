@@ -1496,17 +1496,26 @@ class Test:
         stall_wg: WarpgateProcess,
         timeout,
     ):
-        # Several channels whose targets read nothing fill the connection's
-        # whole input budget between them (8 x 2 MiB = 16 MiB). A healthy
-        # channel opened afterwards must not be the one that is closed for it:
-        # the stuck ones are, and the healthy one gets every byte through.
-        # This shows that the connection converges and the healthy channel is
-        # untouched; which stuck channel is the one waiting when the budget is
-        # full is not under the test's control.
+        # Many channels whose targets read nothing fill the connection's whole
+        # input budget (16 MiB) between them, while none of them fills its own
+        # (2 MiB). A healthy channel opened afterwards must not be the one that
+        # is closed for it: the stuck ones are, and the healthy one gets every
+        # byte through.
+        #
+        # Each stuck channel sends a fixed amount and then stops, so that it
+        # never has input waiting on its own budget and its per-channel stall
+        # clock never runs. Only the connection-level stall can free the room.
+        # The target takes 2 MiB + about 64 KiB per channel (its session window
+        # and pipe buffer, see test_input_over_many_channels_shares_one_budget),
+        # so 3.5625 MiB sent leaves about 1.5 MiB of each channel in Warpgate's
+        # budget: 16 channels hold about 24 MiB's worth, more than the 16 MiB
+        # the connection has, and no single channel is anywhere near its own
+        # 2 MiB. Which stuck channel is the one that waits for the connection's
+        # room is not under the test's control; the others are closed.
         user, ssh_target = setup_user_and_target(processes, stall_wg, wg_c_ed25519_pubkey)
         mib = 1024 * 1024
-        stuck_channels = 8
-        stuck_total = 8 * mib
+        stuck_channels = 16
+        stuck_total = 57 * 65536  # 3.5625 MiB
         other_total = 8 * mib
         deadline_s = max(timeout, 10) * 6
         login = f"{user.username}:{ssh_target.name}"
@@ -1522,7 +1531,6 @@ class Test:
                     for chunk in input_chunks(f"stuck-{index}".encode(), stuck_total):
                         channel.sendall(chunk)
                         sent[index] += len(chunk)
-                    channel.shutdown_write()
                 except Exception as e:
                     errors.append(f"stuck channel {index}: {e!r}")
 
@@ -1554,7 +1562,21 @@ class Test:
             assert not any(p.is_alive() for p in pushers), (
                 "a stuck channel's sender is still blocked"
             )
-            assert len(errors) == stuck_channels, "a stuck channel was not closed"
+            # Every stuck channel sent all it meant to, so none was closed by
+            # its own stall (it never had input waiting): any closed one was
+            # closed for the connection's sake. All but the one that waited
+            # for the connection's room hold room that is not given back.
+            stuck = channels[:stuck_channels]
+            closed_by = time.monotonic() + deadline_s
+            while (
+                sum(1 for c in stuck if c.closed) < stuck_channels - 1
+                and time.monotonic() < closed_by
+            ):
+                time.sleep(0.25)
+            closed = sum(1 for c in stuck if c.closed)
+            assert closed >= stuck_channels - 1, (
+                f"only {closed} of {stuck_channels} stuck channels were closed"
+            )
             assert transport.is_active()
         finally:
             for channel in channels:

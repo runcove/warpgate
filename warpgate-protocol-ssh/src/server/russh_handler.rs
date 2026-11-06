@@ -153,6 +153,14 @@ impl InputBudget {
         }
     }
 
+    /// This budget, with waits counted as stalls only once `other` is live.
+    fn gated_on(&self, other: &Self) -> Self {
+        Self {
+            live: other.live.clone(),
+            ..self.clone()
+        }
+    }
+
     fn is_live(&self) -> bool {
         self.live
             .as_ref()
@@ -272,6 +280,9 @@ async fn hold_input(
     else {
         return Ok(Held::Stalled);
     };
+    // The connection's clock is gated on the channel's liveness as well: input
+    // queued for a channel still connecting never counts towards a stall.
+    let connection_budget = &connection_budget.gated_on(channel_budget);
     let Acquired::Permit(connection_permit) =
         acquire_while_progressing(connection_budget, wanted, stall).await?
     else {
@@ -335,6 +346,28 @@ impl ChannelInputs {
             .entry(channel)
             .or_insert_with(|| ChannelInput::new(None, true))
             .clone()
+    }
+
+    /// [`Self::get`] for a channel whose id is known, so that an entry made
+    /// here (a channel Warpgate opened towards the client, which has no entry
+    /// from [`Self::opened_channel`]) can be closed from another channel's
+    /// wait.
+    fn get_channel(&self, channel: ChannelId) -> ChannelInput {
+        let mut inputs = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        inputs
+            .entry(u32::from(channel))
+            .or_insert_with(|| ChannelInput::new(Some(channel), true))
+            .clone()
+    }
+
+    /// The ids of the channels [`Self::holders_except`] finds that can be
+    /// closed. Empty when the room is held only by channels without a known
+    /// id, in which case the caller must not wait on them for ever.
+    fn stuck_holders_except(&self, except: u32) -> Vec<ChannelId> {
+        self.holders_except(except)
+            .into_iter()
+            .filter_map(|holder| holder.id)
+            .collect()
     }
 
     /// The target opened the channel: from now on input that the target does
@@ -486,7 +519,7 @@ impl ServerHandler {
         data: &[u8],
     ) -> anyhow::Result<Option<Bytes>> {
         let number = u32::from(channel);
-        let input = self.channel_inputs.get(number);
+        let input = self.channel_inputs.get_channel(channel);
         loop {
             let started = std::time::Instant::now();
             let held = hold_input_until_closed(
@@ -527,10 +560,17 @@ impl ServerHandler {
                     // Whoever holds the connection's room and has been given
                     // none back is stuck. Channels still waiting for their
                     // target to open are left alone: they are not stalled.
-                    for holder in self.channel_inputs.holders_except(number) {
-                        if let Some(id) = holder.id {
-                            self.close_stalled(id).await?;
-                        }
+                    let stuck = self.channel_inputs.stuck_holders_except(number);
+                    if stuck.is_empty() {
+                        // Nothing that can be closed holds the room (only
+                        // channels without a known id, or none at all): close
+                        // this channel instead, so the wait cannot go on for
+                        // ever.
+                        self.close_stalled(channel).await?;
+                        return Ok(None);
+                    }
+                    for id in stuck {
+                        self.close_stalled(id).await?;
                     }
                 }
                 None => return Ok(None),
@@ -1662,5 +1702,66 @@ mod tests {
             "only channel 2 qualifies when 1 is the one waiting"
         );
         drop(keep);
+    }
+
+    /// Channels that Warpgate opened towards the client (remote forwarding,
+    /// X11, agent forwarding) have no known id. When only such channels hold
+    /// the connection's room a stall round finds nothing it can close, which
+    /// the handler answers by closing the waiting channel, so the wait never
+    /// goes on for ever.
+    #[tokio::test]
+    async fn a_connection_stall_with_only_id_less_holders_finds_nothing_to_close() {
+        let inputs = ChannelInputs::default();
+        let connection = connection();
+        let mut keep = Vec::new();
+        for number in [1, 2] {
+            // Made by `get`, as for a channel Warpgate opened itself.
+            keep.push(input(
+                hold_input(&inputs.get(number).budget, &connection, b"data", WAIT)
+                    .await
+                    .unwrap(),
+            ));
+        }
+        assert_eq!(
+            inputs.holders_except(3).len(),
+            2,
+            "both hold room and count as holders"
+        );
+        assert!(
+            inputs.stuck_holders_except(3).is_empty(),
+            "without ids there is nothing to close: the caller must fall back"
+        );
+        drop(keep);
+    }
+
+    /// The connection's clock, like the channel's, does not run while the
+    /// channel is still connecting: input queued for it is not a stall.
+    #[tokio::test]
+    async fn a_connection_wait_for_a_connecting_channel_is_not_a_stall() {
+        let connection = InputBudget::new(CHANNEL_INPUT_BUDGET);
+        let _hog = input(
+            hold_input(
+                &channel(),
+                &connection,
+                &vec![0; CHANNEL_INPUT_BUDGET],
+                WAIT,
+            )
+            .await
+            .unwrap(),
+        );
+        let live = CancellationToken::new();
+        let connecting = InputBudget::gated(CHANNEL_INPUT_BUDGET, live.clone());
+        let waiting = tokio::spawn({
+            let connection = connection.clone();
+            async move { hold_input(&connecting, &connection, b"x", WAIT).await }
+        });
+        tokio::time::sleep(WAIT * 3).await;
+        assert!(
+            !waiting.is_finished(),
+            "no stall while the channel is connecting"
+        );
+        live.cancel();
+        let held = waiting.await.unwrap().unwrap();
+        assert!(connection_stalled(&held), "the clock runs once it is live");
     }
 }
