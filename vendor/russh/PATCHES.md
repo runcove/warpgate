@@ -22,6 +22,23 @@ then closes it at once. Both `CHANNEL_CLOSE` handlers (`server/encrypted.rs`,
 covers both orders of close: the peer closing first, and our own close that had been deferred
 behind pending data. Two unit tests in `src/session.rs` cover them.
 
+## A server cannot hold back one channel's receive window
+
+Not reported upstream yet (draft kept outside the tree). russh replaces a channel's receive
+window itself (`Encrypted::adjust_window_size`, called before `Handler::data`), so a handler
+that cannot take more data on one channel can only await inside `data()`, which stops the
+session loop reading the socket for every channel, or buffer without a limit.
+
+`Handle::hold_window(channel, hold)` starts or ends holding one channel's window. It is a
+`Msg::WindowHold` on the unbounded priority queue, so it never waits and, like every message on
+that queue, is handled outside a key exchange. `Session::held_windows` records the held
+channels; for those, `server/encrypted.rs` calls `adjust_window_size` with a target of 0, which
+uses the window up but never falls below half of it, so no `CHANNEL_WINDOW_ADJUST` is sent.
+Ending the hold calls `adjust_window_size` with no data and the real target, which sends what
+was withheld through the same path as any other adjustment. The window counters are not touched
+by a rekey. Default behaviour is unchanged without a call to `hold_window`. One unit test in
+`src/session.rs`. The caller must end the hold when the channel closes.
+
 ## Manifest
 
 `Cargo.toml` additionally sets `[lints.rust] warnings = { level = "allow", priority = 1 }`

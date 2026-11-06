@@ -13,7 +13,15 @@ diff -ruN orig/src/client/encrypted.rs base/src/client/encrypted.rs
 diff -ruN orig/src/server/encrypted.rs base/src/server/encrypted.rs
 --- orig/src/server/encrypted.rs
 +++ base/src/server/encrypted.rs
-@@ -1449,7 +1449,7 @@
+@@ -837,6 +837,7 @@
+ 
+         Session {
+             target_window_size: config.window_size,
++            held_windows: Default::default(),
+             common: CommonSession {
+                 packet_writer: PacketWriter::clear(),
+                 auth_user: String::new(),
+@@ -1449,7 +1450,7 @@
                  }
                  if let Some(ref mut enc) = self.common.encrypted {
                      // Reply with CHANNEL_CLOSE per RFC 4254 Section 5.3.
@@ -22,6 +30,116 @@ diff -ruN orig/src/server/encrypted.rs base/src/server/encrypted.rs
                  }
                  // Forward the close to the channel before removing it, so that
                  // consumers waiting on `Channel::wait()` receive an explicit
+@@ -1487,7 +1488,13 @@
+                 trace!("handler.data {ext:?} {channel_num:?}");
+                 let data = map_err!(Bytes::decode(r))?;
+                 map_err!(ensure_end(r))?;
+-                let target = self.target_window_size;
++                // A held channel's window is used up but not replenished: a
++                // target of 0 never falls below half of it.
++                let target = if self.held_windows.contains(&channel_num) {
++                    0
++                } else {
++                    self.target_window_size
++                };
+ 
+                 #[allow(clippy::collapsible_if)]
+                 if let Some(ref mut enc) = self.common.encrypted {
+diff -ruN orig/src/server/mod.rs base/src/server/mod.rs
+--- orig/src/server/mod.rs
++++ base/src/server/mod.rs
+@@ -29,7 +29,7 @@
+ //! * Serving `ratatui` based TUI app to clients: [per-client](https://github.com/warp-tech/russh/blob/main/russh/examples/ratatui_app.rs), [shared](https://github.com/warp-tech/russh/blob/main/russh/examples/ratatui_shared_app.rs)
+ 
+ use std;
+-use std::collections::{HashMap, VecDeque};
++use std::collections::{HashMap, HashSet, VecDeque};
+ use std::num::Wrapping;
+ use std::pin::Pin;
+ use std::sync::Arc;
+@@ -1117,6 +1117,7 @@
+     let common = read_ssh_id(config, &mut stream).await?;
+     let mut session = Session {
+         target_window_size: common.config.window_size,
++        held_windows: HashSet::new(),
+         common,
+         priority_receiver,
+         receiver,
+diff -ruN orig/src/server/session.rs base/src/server/session.rs
+--- orig/src/server/session.rs
++++ base/src/server/session.rs
+@@ -1,4 +1,4 @@
+-use std::collections::{HashMap, VecDeque};
++use std::collections::{HashMap, HashSet, VecDeque};
+ use std::io::ErrorKind;
+ use std::sync::Arc;
+ use std::time::Duration;
+@@ -24,6 +24,8 @@
+     pub(crate) priority_receiver: UnboundedReceiver<Msg>,
+     pub(crate) receiver: Receiver<Msg>,
+     pub(crate) target_window_size: u32,
++    /// Channels whose receive window is not replenished (see [`Handle::hold_window`]).
++    pub(crate) held_windows: HashSet<ChannelId>,
+     pub(crate) pending_reads: Vec<Vec<u8>>,
+     pub(crate) pending_len: u32,
+     pub(crate) channels: HashMap<ChannelId, ChannelRef>,
+@@ -84,6 +86,10 @@
+         language_tag: String,
+     },
+     Channel(ChannelId, ChannelMsg),
++    WindowHold {
++        id: ChannelId,
++        hold: bool,
++    },
+     ChannelOpenReply {
+         pending: PendingChannelOpen,
+         result: Result<(), ChannelOpenFailure>,
+@@ -173,6 +179,19 @@
+             .map_err(|_| ())
+     }
+ 
++    /// Starts (`hold`) or ends holding back `id`'s receive window. While it
++    /// is held, data the client sends on the channel still uses up the window
++    /// but the server does not replenish it, so a client that follows the
++    /// window stops sending on that channel only. Ending the hold sends the
++    /// window that was withheld. Never waits: the request goes through the
++    /// session's unbounded priority queue, and is handled once the session is
++    /// not in a key exchange.
++    pub fn hold_window(&self, id: ChannelId, hold: bool) -> Result<(), ()> {
++        self.priority_sender
++            .send(Msg::WindowHold { id, hold })
++            .map_err(|_| ())
++    }
++
+     /// Close a channel.
+     pub async fn close(&self, id: ChannelId) -> Result<(), ()> {
+         self.sender
+@@ -535,6 +554,17 @@
+             Msg::Channel(id, ChannelMsg::WindowAdjusted { new_size }) => {
+                 debug!("window adjusted to {new_size:?} for channel {id:?}");
+             }
++            Msg::WindowHold { id, hold } => {
++                if hold {
++                    self.held_windows.insert(id);
++                } else {
++                    self.held_windows.remove(&id);
++                    let target = self.target_window_size;
++                    if let Some(enc) = self.common.encrypted.as_mut() {
++                        enc.adjust_window_size(id, &[], target)?;
++                    }
++                }
++            }
+             Msg::ChannelOpenAgent { channel_ref } => {
+                 let id = self.channel_open_agent()?;
+                 self.channels.insert(id, channel_ref);
+@@ -1667,6 +1697,7 @@
+             priority_receiver,
+             receiver,
+             target_window_size: config.window_size,
++            held_windows: HashSet::new(),
+             pending_reads: Vec::new(),
+             pending_len: 0,
+             channels: HashMap::new(),
 diff -ruN orig/src/session.rs base/src/session.rs
 --- orig/src/session.rs
 +++ base/src/session.rs
@@ -46,7 +164,7 @@ diff -ruN orig/src/session.rs base/src/session.rs
      pub fn sender_window_size(&self, channel: ChannelId) -> usize {
          if let Some(channel) = self.channels.get(&channel) {
              channel.sender_window_size as usize
-@@ -969,6 +983,46 @@
+@@ -969,6 +983,69 @@
          }
      }
  
@@ -88,6 +206,29 @@ diff -ruN orig/src/session.rs base/src/session.rs
 +
 +        assert_eq!(packet_types(&encrypted.write), vec![msg::CHANNEL_CLOSE]);
 +        assert!(!encrypted.channels.contains_key(&channel_id));
++    }
++
++    #[test]
++    fn a_window_adjusted_with_target_zero_is_used_up_then_replenished_in_full() {
++        let channel_id = ChannelId(11);
++        let mut encrypted = test_encrypted();
++        encrypted
++            .channels
++            .insert(channel_id, test_ready_channel(channel_id, 46));
++
++        // Held (target 0): 600 of 1024 leaves 424, below half of the real
++        // target, yet nothing is sent.
++        assert!(!encrypted.adjust_window_size(channel_id, &[0; 600], 0).unwrap());
++        assert!(encrypted.write.is_empty());
++        assert_eq!(encrypted.sender_window_size(channel_id), 424);
++
++        // Released: exactly what was withheld goes out, once.
++        assert!(encrypted.adjust_window_size(channel_id, &[], 1024).unwrap());
++        assert_eq!(
++            packet_types(&encrypted.write),
++            vec![msg::CHANNEL_WINDOW_ADJUST]
++        );
++        assert_eq!(encrypted.sender_window_size(channel_id), 1024);
 +    }
 +
      // flush_pending (single-channel path)

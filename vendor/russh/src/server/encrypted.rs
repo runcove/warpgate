@@ -837,6 +837,7 @@ mod tests {
 
         Session {
             target_window_size: config.window_size,
+            held_windows: Default::default(),
             common: CommonSession {
                 packet_writer: PacketWriter::clear(),
                 auth_user: String::new(),
@@ -1487,7 +1488,13 @@ impl Session {
                 trace!("handler.data {ext:?} {channel_num:?}");
                 let data = map_err!(Bytes::decode(r))?;
                 map_err!(ensure_end(r))?;
-                let target = self.target_window_size;
+                // A held channel's window is used up but not replenished: a
+                // target of 0 never falls below half of it.
+                let target = if self.held_windows.contains(&channel_num) {
+                    0
+                } else {
+                    self.target_window_size
+                };
 
                 #[allow(clippy::collapsible_if)]
                 if let Some(ref mut enc) = self.common.encrypted {

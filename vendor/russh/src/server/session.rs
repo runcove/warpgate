@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::ErrorKind;
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,6 +24,8 @@ pub struct Session {
     pub(crate) priority_receiver: UnboundedReceiver<Msg>,
     pub(crate) receiver: Receiver<Msg>,
     pub(crate) target_window_size: u32,
+    /// Channels whose receive window is not replenished (see [`Handle::hold_window`]).
+    pub(crate) held_windows: HashSet<ChannelId>,
     pub(crate) pending_reads: Vec<Vec<u8>>,
     pub(crate) pending_len: u32,
     pub(crate) channels: HashMap<ChannelId, ChannelRef>,
@@ -84,6 +86,10 @@ pub enum Msg {
         language_tag: String,
     },
     Channel(ChannelId, ChannelMsg),
+    WindowHold {
+        id: ChannelId,
+        hold: bool,
+    },
     ChannelOpenReply {
         pending: PendingChannelOpen,
         result: Result<(), ChannelOpenFailure>,
@@ -170,6 +176,19 @@ impl Handle {
         self.sender
             .send(Msg::Channel(id, ChannelMsg::Failure))
             .await
+            .map_err(|_| ())
+    }
+
+    /// Starts (`hold`) or ends holding back `id`'s receive window. While it
+    /// is held, data the client sends on the channel still uses up the window
+    /// but the server does not replenish it, so a client that follows the
+    /// window stops sending on that channel only. Ending the hold sends the
+    /// window that was withheld. Never waits: the request goes through the
+    /// session's unbounded priority queue, and is handled once the session is
+    /// not in a key exchange.
+    pub fn hold_window(&self, id: ChannelId, hold: bool) -> Result<(), ()> {
+        self.priority_sender
+            .send(Msg::WindowHold { id, hold })
             .map_err(|_| ())
     }
 
@@ -534,6 +553,17 @@ impl Session {
             }
             Msg::Channel(id, ChannelMsg::WindowAdjusted { new_size }) => {
                 debug!("window adjusted to {new_size:?} for channel {id:?}");
+            }
+            Msg::WindowHold { id, hold } => {
+                if hold {
+                    self.held_windows.insert(id);
+                } else {
+                    self.held_windows.remove(&id);
+                    let target = self.target_window_size;
+                    if let Some(enc) = self.common.encrypted.as_mut() {
+                        enc.adjust_window_size(id, &[], target)?;
+                    }
+                }
             }
             Msg::ChannelOpenAgent { channel_ref } => {
                 let id = self.channel_open_agent()?;
@@ -1667,6 +1697,7 @@ mod tests {
             priority_receiver,
             receiver,
             target_window_size: config.window_size,
+            held_windows: HashSet::new(),
             pending_reads: Vec::new(),
             pending_len: 0,
             channels: HashMap::new(),

@@ -1023,6 +1023,29 @@ mod tests {
         assert!(!encrypted.channels.contains_key(&channel_id));
     }
 
+    #[test]
+    fn a_window_adjusted_with_target_zero_is_used_up_then_replenished_in_full() {
+        let channel_id = ChannelId(11);
+        let mut encrypted = test_encrypted();
+        encrypted
+            .channels
+            .insert(channel_id, test_ready_channel(channel_id, 46));
+
+        // Held (target 0): 600 of 1024 leaves 424, below half of the real
+        // target, yet nothing is sent.
+        assert!(!encrypted.adjust_window_size(channel_id, &[0; 600], 0).unwrap());
+        assert!(encrypted.write.is_empty());
+        assert_eq!(encrypted.sender_window_size(channel_id), 424);
+
+        // Released: exactly what was withheld goes out, once.
+        assert!(encrypted.adjust_window_size(channel_id, &[], 1024).unwrap());
+        assert_eq!(
+            packet_types(&encrypted.write),
+            vec![msg::CHANNEL_WINDOW_ADJUST]
+        );
+        assert_eq!(encrypted.sender_window_size(channel_id), 1024);
+    }
+
     // flush_pending (single-channel path)
 
     #[test]
