@@ -1,0 +1,29 @@
+# Lock-down check (throwaway branch only): the workflow's own token, even with
+# contents: write, must be refused when it creates a release-pattern tag.
+# The tag ruleset on refs/tags/v*-cove.* lets only deploy keys write.
+name: lockcheck-token
+on:
+  push:
+    branches: ['cove/actions-lockdown-check']
+permissions:
+  contents: write
+jobs:
+  tag-create:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: create a release-pattern tag with GITHUB_TOKEN (must be refused)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -u
+          code=$(curl -sS -o body.json -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/$REPO/git/refs" \
+            -d "{\"ref\":\"refs/tags/v0.0.0-cove.lockcheck1\",\"sha\":\"$SHA\"}")
+          echo "HTTP $code"; head -c 400 body.json; echo
+          case "$code" in
+            2??) echo "LOCKDOWN BROKEN - the token created a release-pattern tag"; exit 1 ;;
+            *) echo "REFUSED as expected" ;;
+          esac

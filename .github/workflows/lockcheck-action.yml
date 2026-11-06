@@ -1,0 +1,14 @@
+# Lock-down check (throwaway branch only): an action outside the allowed list
+# must make this run fail before any step runs. The sha below is a real
+# actions/checkout release that is NOT the pinned one on the allowed list.
+name: lockcheck-action
+on:
+  push:
+    branches: ['cove/actions-lockdown-check']
+permissions: {}
+jobs:
+  disallowed:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608
+      - run: echo "LOCKDOWN BROKEN - a disallowed action ran"
