@@ -484,6 +484,9 @@ class ProcessManager:
 
     def start_mysql_server(self, *mysqld_args):
         if prestarted_targets:
+            if mysqld_args == ("--tls-version=",) and "mysql_notls" in prestarted_targets:
+                # The job's MySQL started with TLS off.
+                return prestarted_targets["mysql_notls"][1]
             if mysqld_args:
                 # The pre-started MySQL runs with the job's own flags.
                 _no_prestarted(f"MySQL server with {' '.join(mysqld_args)}")
@@ -545,6 +548,9 @@ class ProcessManager:
 
     def start_postgres_server(self, host_auth_method=None):
         if prestarted_targets:
+            if host_auth_method == "password" and "postgres_cleartext" in prestarted_targets:
+                # The job's Postgres started with cleartext password auth.
+                return prestarted_targets["postgres_cleartext"][1]
             if host_auth_method:
                 # The pre-started Postgres runs with the job's own auth method.
                 _no_prestarted(f"Postgres server with host auth method {host_auth_method}")

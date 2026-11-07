@@ -29,7 +29,7 @@ def _prestarted_targets():
 
     The runcove warpgate-integration job starts an sshd, a MySQL and a Postgres before the
     tests' sandbox, which has no docker, and names them in WARPGATE_E2E_<KIND>_HOST and
-    _PORT. In that mode every one must be set: there is no fallback to localhost. Unset,
+    _PORT (KIND mysql_notls and postgres_cleartext are optional). In that mode every one must be set: there is no fallback to localhost. Unset,
     nothing changes."""
     mode = os.getenv("WARPGATE_E2E_TARGETS", "")
     if mode == "":
@@ -44,6 +44,20 @@ def _prestarted_targets():
             raise RuntimeError(
                 f"WARPGATE_E2E_TARGETS=prestarted, but WARPGATE_E2E_{kind.upper()}_HOST and _PORT "
                 f"are {host!r} and {port!r}, not a host and a port; there is no fallback to localhost"
+            )
+        out[kind] = (host, int(port))
+    # Two more targets the job may also start, each its own way: a MySQL with no TLS
+    # and a Postgres with cleartext password auth (the TLS-downgrade tests). Optional:
+    # a job without them leaves the keys out, and conftest says so when a test asks.
+    for kind in ("mysql_notls", "postgres_cleartext"):
+        host = os.getenv(f"WARPGATE_E2E_{kind.upper()}_HOST", "")
+        port = os.getenv(f"WARPGATE_E2E_{kind.upper()}_PORT", "")
+        if not host and not port:
+            continue
+        if not host or not port.isdigit() or not 0 < int(port) < 65536:
+            raise RuntimeError(
+                f"WARPGATE_E2E_{kind.upper()}_HOST and _PORT are {host!r} and {port!r}: "
+                "set both to a host and a port, or neither"
             )
         out[kind] = (host, int(port))
     if len({p for _, p in out.values()}) != len(out):
