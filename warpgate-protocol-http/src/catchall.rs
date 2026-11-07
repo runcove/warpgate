@@ -593,7 +593,7 @@ mod live_stream_tests {
 
     async fn deregistered(services: &warpgate_core::Services) -> bool {
         for _ in 0..100 {
-            if services.live_streams.in_use().is_empty() {
+            if services.live_streams.in_use().unwrap().is_empty() {
                 return true;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -714,7 +714,7 @@ mod live_stream_tests {
 
         assert!(watched.is_ok());
         assert_eq!(
-            services.live_streams.in_use(),
+            services.live_streams.in_use().unwrap(),
             std::collections::HashSet::from([(Uuid::nil(), target_id, LiveStreamKind::Public)])
         );
     }
@@ -736,7 +736,7 @@ mod live_stream_tests {
         .await;
 
         assert!(watched.is_ok());
-        assert!(services.live_streams.in_use().is_empty());
+        assert!(services.live_streams.in_use().unwrap().is_empty());
     }
 
     /// A logged-in user is watched by role: on a public target they have no
