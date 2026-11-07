@@ -13,7 +13,6 @@ use warpgate_sso::{SsoLoginResponse, SsoProviderConfig};
 
 use crate::cluster::ClusterNotification;
 use crate::live_streams::LiveStreamKind;
-use crate::resources::AdmittedSessions;
 use crate::{ConfigProvider, Services, SessionsFilter, apply_sso_mappings, resolve_sso_username};
 
 /// Whose live sessions an access change can affect.
@@ -29,13 +28,19 @@ pub enum AccessChange {
     All,
 }
 
+/// Most sessions kept waiting for a close retry.
+const MAX_PENDING_CLOSES: usize = 10_000;
+
+/// Sessions closed per attempt in a retry.
+const CLOSE_RETRY_CHUNK: usize = 100;
+
 /// Access changes whose re-check failed, and sessions whose close failed
 /// after the change that ended their admission had committed, both retried by
 /// the expiry sweep.
 #[derive(Clone, Default)]
 pub struct PendingRevocations {
     changes: std::sync::Arc<std::sync::Mutex<Vec<AccessChange>>>,
-    closes: std::sync::Arc<std::sync::Mutex<Vec<UserSessionId>>>,
+    closes: std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<UserSessionId>>>,
 }
 
 impl PendingRevocations {
@@ -47,7 +52,7 @@ impl PendingRevocations {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn lock_closes(&self) -> std::sync::MutexGuard<'_, Vec<UserSessionId>> {
+    fn lock_closes(&self) -> std::sync::MutexGuard<'_, std::collections::BTreeSet<UserSessionId>> {
         self.closes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -61,12 +66,32 @@ impl PendingRevocations {
         std::mem::take(&mut *self.lock())
     }
 
+    /// Queues sessions whose close failed. Ids already queued collapse, and
+    /// the queue holds at most [`MAX_PENDING_CLOSES`]: past that, ids are
+    /// dropped and the drop is logged.
     pub(crate) fn push_closes(&self, ids: Vec<UserSessionId>) {
-        self.lock_closes().extend(ids);
+        let mut queue = self.lock_closes();
+        let mut dropped = 0;
+        for id in ids {
+            if queue.len() >= MAX_PENDING_CLOSES && !queue.contains(&id) {
+                dropped += 1;
+            } else {
+                queue.insert(id);
+            }
+        }
+        if dropped > 0 {
+            warn!(
+                dropped,
+                cap = MAX_PENDING_CLOSES,
+                "Too many sessions waiting for a close retry; dropped some"
+            );
+        }
     }
 
     fn take_closes(&self) -> Vec<UserSessionId> {
         std::mem::take(&mut *self.lock_closes())
+            .into_iter()
+            .collect()
     }
 
     /// Sessions waiting for a close to be retried.
@@ -158,9 +183,34 @@ impl Services {
         for change in self.pending_revocations.take() {
             let _ = self.close_sessions_no_longer_authorised(change).await;
         }
+        self.retry_pending_closes().await;
+    }
+
+    /// Retries queued session closes in chunks. A chunk that fails is retried
+    /// id by id, so one bad id does not hold back the rest; only the ids that
+    /// still fail are queued again. A session already ended is a no-op for the
+    /// close (it only touches open sessions) and is not queued again.
+    async fn retry_pending_closes(&self) {
         let ids = self.pending_revocations.take_closes();
-        if !ids.is_empty() {
-            let _ = self.close_admitted_sessions(AdmittedSessions(ids)).await;
+        for chunk in ids.chunks(CLOSE_RETRY_CHUNK) {
+            if self
+                .close_sessions(SessionsFilter::Sessions {
+                    ids: chunk.to_vec(),
+                })
+                .await
+                .is_ok()
+            {
+                continue;
+            }
+            for id in chunk {
+                if let Err(error) = self
+                    .close_sessions(SessionsFilter::Sessions { ids: vec![*id] })
+                    .await
+                {
+                    warn!(%error, session = ?id, "Could not close a session on retry; keeping it queued");
+                    self.pending_revocations.push_closes(vec![*id]);
+                }
+            }
         }
     }
 
@@ -470,6 +520,92 @@ mod tests {
             .unwrap()
             .ended
             .is_some()
+    }
+
+    async fn open_user_session(db: &DatabaseConnection, username: &str) -> UserSessionId {
+        let id = UserSessionId(Uuid::new_v4());
+        UserSession::ActiveModel {
+            id: Set(id),
+            username: Set(Some(username.into())),
+            user_id: Set(None),
+            remote_address: Set("127.0.0.1:22".into()),
+            started: Set(OffsetDateTime::now_utc()),
+            ended: Set(None),
+            protocol: Set("HTTP".into()),
+            node_id: Set(None),
+            auth_state_node_id: Set(None),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        id
+    }
+
+    /// The same ids queued again collapse into one entry each.
+    #[tokio::test]
+    async fn queued_closes_collapse_duplicates() {
+        let pending = PendingRevocations::default();
+        let ids: Vec<_> = (0..3).map(|_| UserSessionId(Uuid::new_v4())).collect();
+        pending.push_closes(ids.clone());
+        pending.push_closes(ids.clone());
+        pending.push_closes(vec![ids[0], ids[0]]);
+        assert_eq!(pending.closes_len(), 3);
+    }
+
+    /// The queue never holds more than its cap.
+    #[tokio::test]
+    async fn the_close_queue_is_bounded() {
+        let pending = PendingRevocations::default();
+        let ids: Vec<_> = (0..MAX_PENDING_CLOSES + 5)
+            .map(|_| UserSessionId(Uuid::new_v4()))
+            .collect();
+        pending.push_closes(ids.clone());
+        assert_eq!(pending.closes_len(), MAX_PENDING_CLOSES);
+        // Already-queued ids still collapse once full.
+        pending.push_closes(pending.lock_closes().iter().copied().take(3).collect());
+        assert_eq!(pending.closes_len(), MAX_PENDING_CLOSES);
+    }
+
+    /// One session whose close keeps failing does not hold back the others
+    /// queued with it; only it stays queued, and an already-ended session is
+    /// not queued again.
+    #[tokio::test]
+    async fn a_failing_close_does_not_block_the_others() {
+        use sea_orm::ConnectionTrait;
+
+        let db = migrated_db().await;
+        let services = test_services(&db).await;
+        let good_a = open_user_session(&db, "good").await;
+        let bad = open_user_session(&db, "bad").await;
+        let good_b = open_user_session(&db, "good").await;
+        let already_ended = open_user_session(&db, "good").await;
+        warpgate_db_entities::UserSession::revoke(&db, already_ended)
+            .await
+            .unwrap();
+
+        db.execute_unprepared(
+            "CREATE TRIGGER fail_bad BEFORE UPDATE ON user_sessions \
+             WHEN OLD.username = 'bad' \
+             BEGIN SELECT RAISE(ABORT, 'close failed'); END",
+        )
+        .await
+        .unwrap();
+        services
+            .pending_revocations
+            .push_closes(vec![good_a, bad, good_b, already_ended]);
+        services.retry_pending_revocations().await;
+
+        assert!(ended(&db, good_a).await);
+        assert!(ended(&db, good_b).await);
+        assert!(!ended(&db, bad).await);
+        assert_eq!(services.pending_revocations.closes_len(), 1);
+
+        db.execute_unprepared("DROP TRIGGER fail_bad")
+            .await
+            .unwrap();
+        services.retry_pending_revocations().await;
+        assert!(ended(&db, bad).await);
+        assert_eq!(services.pending_revocations.closes_len(), 0);
     }
 
     async fn revoke_user_role(db: &DatabaseConnection, user_id: Uuid, role_id: Uuid) {
