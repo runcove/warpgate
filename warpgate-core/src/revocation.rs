@@ -10,7 +10,9 @@ use time::OffsetDateTime;
 use tracing::{info, warn};
 use uuid::Uuid;
 use warpgate_common::{Protocol, TargetOptions, UserSessionId, WarpgateError};
-use warpgate_db_entities::{TargetSession, User, UserRoleAssignment, UserSession};
+use warpgate_db_entities::{
+    PendingSessionClose, TargetSession, User, UserRoleAssignment, UserSession,
+};
 use warpgate_sso::{SsoLoginResponse, SsoProviderConfig};
 
 use crate::cluster::ClusterNotification;
@@ -264,7 +266,17 @@ impl Services {
     /// One summary line is logged per sweep that had anything to retry, however
     /// many ids failed. Nothing is ever dropped from the queue.
     async fn retry_pending_closes(&self) -> CloseRetryOutcome {
-        let ids = self.pending_revocations.take_closes();
+        let mut ids: std::collections::BTreeSet<UserSessionId> =
+            self.pending_revocations.take_closes().into_iter().collect();
+        // Closes recorded in the database survive a restart, which the
+        // in-memory queue does not.
+        match PendingSessionClose::pending(&self.db).await {
+            Ok(persisted) => ids.extend(persisted),
+            Err(error) => {
+                warn!(%error, "Could not read the sessions waiting to be closed; retrying the queued ones only");
+            }
+        }
+        let ids: Vec<UserSessionId> = ids.into_iter().collect();
         let mut outcome = CloseRetryOutcome {
             retried: ids.len(),
             ..Default::default()
@@ -277,15 +289,19 @@ impl Services {
                 .await
                 .is_ok()
             {
+                self.forget_persisted_closes(chunk).await;
                 continue;
             }
             for id in chunk {
-                if let Err(error) = self
+                match self
                     .close_sessions(SessionsFilter::Sessions { ids: vec![*id] })
                     .await
                 {
-                    outcome.record_failure(*id, &error);
-                    self.pending_revocations.push_closes(vec![*id]);
+                    Ok(()) => self.forget_persisted_closes(&[*id]).await,
+                    Err(error) => {
+                        outcome.record_failure(*id, &error);
+                        self.pending_revocations.push_closes(vec![*id]);
+                    }
                 }
             }
         }
@@ -298,6 +314,15 @@ impl Services {
             }
         }
         outcome
+    }
+
+    /// Removes the database record of closes owed once the sessions are
+    /// closed. A failure is only logged: the record stays, and the next sweep
+    /// closes the (already ended) session again, which is a no-op.
+    pub(crate) async fn forget_persisted_closes(&self, ids: &[UserSessionId]) {
+        if let Err(error) = PendingSessionClose::clear(&self.db, ids).await {
+            warn!(%error, sessions = ids.len(), "Could not clear the record of closed sessions");
+        }
     }
 
     async fn try_close_sessions_no_longer_authorised(

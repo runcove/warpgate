@@ -120,6 +120,9 @@ mod m00059_sso_auto_redirect;
 mod m00080_cove_lp_ip_exempt_cidrs;
 // Indexes on open sessions for the cluster reaper's two 15 s sweeps.
 mod m00089_cove_open_session_indexes;
+// Sessions still to be closed after their ticket was deleted, kept so the close
+// survives a node restart.
+mod m00090_cove_pending_session_closes;
 
 pub(crate) mod helpers;
 
@@ -230,6 +233,7 @@ impl MigratorTrait for Migrator {
             Box::new(m00059_sso_auto_redirect::Migration),
             Box::new(m00080_cove_lp_ip_exempt_cidrs::Migration),
             Box::new(m00089_cove_open_session_indexes::Migration),
+            Box::new(m00090_cove_pending_session_closes::Migration),
         ]
     }
 }
