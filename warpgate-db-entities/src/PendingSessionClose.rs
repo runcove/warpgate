@@ -5,8 +5,13 @@ use time::OffsetDateTime;
 use warpgate_common::{UserSessionId, WarpgateError};
 
 /// Rows deleted per statement, well under every backend's bound-parameter
-/// limit.
+/// limit (one bound parameter per id).
 const DELETE_CHUNK: usize = 500;
+
+/// Rows inserted per statement. Each row binds two parameters (the session id
+/// and the queued time), so 400 rows bind 800, under the 999 limit of older
+/// SQLite builds.
+const INSERT_CHUNK: usize = 400;
 
 /// A session that must be closed because what admitted it (a ticket) has been
 /// deleted. The row is written in the same transaction as the delete, so the
@@ -36,20 +41,22 @@ pub async fn mark<C: ConnectionTrait>(db: &C, ids: &[UserSessionId]) -> Result<(
         return Ok(());
     }
     let now = OffsetDateTime::now_utc();
-    let rows = ids.iter().map(|id| ActiveModel {
-        user_session_id: Set(*id),
-        queued: Set(now),
-    });
-    // The no-op self-assignment is the conflict form every backend renders
-    // validly (see `TargetSession::insert_unless_already_open`).
-    Entity::insert_many(rows)
-        .on_conflict(
-            OnConflict::column(Column::UserSessionId)
-                .update_column(Column::UserSessionId)
-                .to_owned(),
-        )
-        .exec_without_returning(db)
-        .await?;
+    for chunk in ids.chunks(INSERT_CHUNK) {
+        let rows = chunk.iter().map(|id| ActiveModel {
+            user_session_id: Set(*id),
+            queued: Set(now),
+        });
+        // The no-op self-assignment is the conflict form every backend renders
+        // validly (see `TargetSession::insert_unless_already_open`).
+        Entity::insert_many(rows)
+            .on_conflict(
+                OnConflict::column(Column::UserSessionId)
+                    .update_column(Column::UserSessionId)
+                    .to_owned(),
+            )
+            .exec_without_returning(db)
+            .await?;
+    }
     Ok(())
 }
 

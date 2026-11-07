@@ -2485,6 +2485,21 @@ mod ticket_deletion {
         );
     }
 
+    /// A delete can name more open sessions than one statement can bind
+    /// parameters for: the record is written in chunks, and marking an
+    /// overlapping set again neither fails nor duplicates.
+    #[tokio::test]
+    async fn a_large_set_of_pending_closes_is_recorded_in_chunks() {
+        let db = migrated_db().await;
+        let ids: Vec<UserSessionId> = (0..2500).map(|_| UserSessionId(Uuid::new_v4())).collect();
+
+        PendingSessionClose::mark(&db, &ids).await.unwrap();
+        assert_eq!(PendingSessionClose::pending(&db).await.unwrap().len(), 2500);
+
+        PendingSessionClose::mark(&db, &ids[1000..]).await.unwrap();
+        assert_eq!(PendingSessionClose::pending(&db).await.unwrap().len(), 2500);
+    }
+
     /// A session under a ticket that still exists is not touched by a sweep,
     /// and a ticket deleted with no failure leaves no record behind.
     #[tokio::test]
