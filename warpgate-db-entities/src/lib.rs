@@ -49,3 +49,7 @@ macro_rules! declare_modules {
 }
 
 with_every_entity!(declare_modules);
+
+// Not in the list above: the list drives `copy-database`, and these rows are
+// transient (a session close still owed), so they are not copied.
+pub mod PendingSessionClose;

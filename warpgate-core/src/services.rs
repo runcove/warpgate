@@ -17,7 +17,8 @@ use warpgate_common::{
 };
 use warpgate_db_entities::Parameters::MfaEnforcement;
 use warpgate_db_entities::{
-    OtpCredential, Parameters, SsoCredential, TargetSession, Ticket, TicketRequest, UserSession,
+    OtpCredential, Parameters, PendingSessionClose, SsoCredential, TargetSession, Ticket,
+    TicketRequest, UserSession,
 };
 
 use crate::auth_state_store::ApprovalRequestSink;
@@ -88,12 +89,15 @@ impl Services {
             return Ok(());
         }
         let ids = sessions.0.clone();
-        if let Err(error) = self
+        match self
             .close_sessions(SessionsFilter::Sessions { ids: sessions.0 })
             .await
         {
-            warn!(%error, sessions = ids.len(), "Could not close sessions after their admission was deleted; retrying on the next sweep");
-            self.pending_revocations.push_closes(ids);
+            Ok(()) => self.forget_persisted_closes(&ids).await,
+            Err(error) => {
+                warn!(%error, sessions = ids.len(), "Could not close sessions after their admission was deleted; retrying on the next sweep");
+                self.pending_revocations.push_closes(ids);
+            }
         }
         Ok(())
     }
@@ -112,6 +116,9 @@ impl Services {
             Ticket::Column::Id.eq(ticket_id),
         )
         .await?;
+        // Recorded with the delete: if the node stops before the close below
+        // succeeds, the sweep after the restart still finds these sessions.
+        PendingSessionClose::mark(&txn, &admitted).await?;
         TicketRequest::Entity::delete_many()
             .filter(TicketRequest::Column::TicketId.eq(Some(ticket_id)))
             .exec(&txn)
