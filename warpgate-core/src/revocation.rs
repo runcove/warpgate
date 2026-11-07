@@ -1133,6 +1133,36 @@ mod tests {
         assert!(services.pending_revocations.is_empty());
     }
 
+    /// Updating or deleting a target tells the cluster to re-check live
+    /// streams, as a global notification (delivered here and posted to every
+    /// peer), and ends a stream the update left unshared.
+    #[tokio::test]
+    async fn a_target_change_notifies_every_node_and_ends_unshared_streams() {
+        let db = migrated_db().await;
+        let services = test_services(&db).await;
+        let target_id = http_target(&db, false).await;
+        let (_browser_session, browser_close) = tokio::sync::broadcast::channel(1);
+        let mut stream = services.live_streams.watch(
+            browser_close,
+            Uuid::nil(),
+            target_id,
+            LiveStreamKind::Public,
+        );
+        let mut notifications = services.cluster.subscribe();
+
+        services
+            .close_sessions_no_longer_authorised(AccessChange::Targets(vec![target_id]))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            notifications.recv().await,
+            Ok(ClusterNotification::LiveStreamsReauthorize)
+        ));
+        services.reauthorize_live_streams().await.unwrap();
+        assert!(fired(&mut stream).await);
+    }
+
     /// A re-check that cannot run at all is queued for the sweep, not lost,
     /// and the cluster is still told to re-check its streams.
     #[tokio::test]
