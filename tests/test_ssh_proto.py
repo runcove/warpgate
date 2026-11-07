@@ -153,6 +153,17 @@ def read_to_eof(channel: paramiko.Channel) -> bytes:
         data += chunk
 
 
+def exit_status_within(channel: paramiko.Channel, seconds: float) -> int:
+    """The channel's exit status, or a failure after `seconds`. Unlike
+    `recv_exit_status()`, which waits without limit, a channel that never reports
+    an exit fails fast here with a clear message."""
+    deadline = time.monotonic() + seconds
+    while not channel.exit_status_ready():
+        assert time.monotonic() < deadline, f"no exit status within {seconds} s"
+        time.sleep(0.1)
+    return channel.recv_exit_status()
+
+
 # The client socket's send buffer. Linux doubles the value, so the kernel holds
 # 128 KiB. Left to autotuning it would hold up to about 4 MiB of what the client
 # "sent", which would be a flaky term in the test's bound.
@@ -1239,7 +1250,7 @@ class Test:
             try:
                 opener_transport.connect(username=login, password="123")
                 opener = run_on_target(opener_transport, f"touch {gate}", deadline_s)
-                assert opener.recv_exit_status() == 0
+                assert exit_status_within(opener, deadline_s) == 0
             finally:
                 opener_transport.close()
 
@@ -1259,12 +1270,14 @@ class Test:
             expected = [input_digest(seed, per_channel) for seed in seeds]
             return held, channels * per_channel, digests, expected
         finally:
+            # Close the transport first: with channels held, closing each
+            # channel can wait on a connection that is not draining.
+            transport.close()
             for session in sessions:
                 try:
                     session.close()
                 except Exception:
                     pass
-            transport.close()
             if readers_may_run:
                 # However the test ended, the readers' poll loops on the target
                 # must end and the gate file must not stay in its /tmp: touch the
@@ -1465,7 +1478,7 @@ class Test:
                 assert lines and lines[0] == input_digest(seed, other_total), (
                     f"channel {index} did not get its own stream through"
                 )
-                assert other.recv_exit_status() == 0
+                assert exit_status_within(other, deadline_s) == 0
 
             # The stuck channel was closed by Warpgate: its sender gave up
             # without having sent everything, and the connection is still up.
@@ -1482,12 +1495,14 @@ class Test:
                 assert stuck.closed
             assert transport.is_active()
         finally:
+            # Transport first, so that closing the channel cannot wait on a
+            # connection that is not draining.
+            transport.close()
             if stuck is not None:
                 try:
                     stuck.close()
                 except Exception:
                     pass
-            transport.close()
 
     def test_a_healthy_channel_survives_stuck_channels_filling_the_connection(
         self,
@@ -1555,7 +1570,7 @@ class Test:
             assert lines and lines[0] == input_digest(seed, other_total), (
                 "the healthy channel did not get its own stream through"
             )
-            assert healthy.recv_exit_status() == 0
+            assert exit_status_within(healthy, deadline_s) == 0
 
             for pusher in pushers:
                 pusher.join(deadline_s)
@@ -1580,12 +1595,14 @@ class Test:
             )
             assert transport.is_active()
         finally:
+            # Transport first, so that closing a channel cannot wait on a
+            # connection that is not draining.
+            transport.close()
             for channel in channels:
                 try:
                     channel.close()
                 except Exception:
                     pass
-            transport.close()
 
     def test_input_waiting_for_a_connecting_target_is_never_a_stall(
         self,
