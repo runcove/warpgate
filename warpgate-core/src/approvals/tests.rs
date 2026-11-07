@@ -2403,6 +2403,47 @@ mod ticket_deletion {
         assert!(ended(&db, session).await);
     }
 
+    /// The delete commits before the sessions are closed. If the close fails,
+    /// the ticket row is gone and nothing can find the sessions again by it,
+    /// so the close is queued and the sweep's retry ends them.
+    #[tokio::test]
+    async fn a_close_that_fails_after_a_ticket_delete_is_retried() {
+        use sea_orm::ConnectionTrait;
+
+        let db = migrated_db().await;
+        let services = super::delivery::test_services(&db).await;
+        let ticket_id = seed_ticket(&db, None, None).await;
+        let session = bare_user_session(&db).await;
+        open_under_ticket(&db, session, ticket_id).await.unwrap();
+
+        db.execute_unprepared(
+            "CREATE TRIGGER fail_close BEFORE UPDATE ON user_sessions \
+             BEGIN SELECT RAISE(ABORT, 'close failed'); END",
+        )
+        .await
+        .unwrap();
+        services
+            .delete_ticket_closing_sessions(ticket_id)
+            .await
+            .unwrap();
+
+        assert!(!ended(&db, session).await);
+        assert_eq!(services.pending_revocations.closes_len(), 1);
+
+        // Still failing: it stays queued.
+        services.retry_pending_revocations().await;
+        assert!(!ended(&db, session).await);
+        assert_eq!(services.pending_revocations.closes_len(), 1);
+
+        db.execute_unprepared("DROP TRIGGER fail_close")
+            .await
+            .unwrap();
+        services.retry_pending_revocations().await;
+
+        assert!(ended(&db, session).await);
+        assert_eq!(services.pending_revocations.closes_len(), 0);
+    }
+
     /// The race itself: the open and the delete run together, started in both
     /// orders. Whatever the interleaving, a session that was opened must end
     /// up closed, and an open that lost must have been refused.

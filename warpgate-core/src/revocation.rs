@@ -13,6 +13,7 @@ use warpgate_sso::{SsoLoginResponse, SsoProviderConfig};
 
 use crate::cluster::ClusterNotification;
 use crate::live_streams::LiveStreamKind;
+use crate::resources::AdmittedSessions;
 use crate::{ConfigProvider, Services, SessionsFilter, apply_sso_mappings, resolve_sso_username};
 
 /// Whose live sessions an access change can affect.
@@ -28,15 +29,26 @@ pub enum AccessChange {
     All,
 }
 
-/// Access changes whose re-check failed, retried by the expiry sweep.
+/// Access changes whose re-check failed, and sessions whose close failed
+/// after the change that ended their admission had committed, both retried by
+/// the expiry sweep.
 #[derive(Clone, Default)]
-pub struct PendingRevocations(std::sync::Arc<std::sync::Mutex<Vec<AccessChange>>>);
+pub struct PendingRevocations {
+    changes: std::sync::Arc<std::sync::Mutex<Vec<AccessChange>>>,
+    closes: std::sync::Arc<std::sync::Mutex<Vec<UserSessionId>>>,
+}
 
 impl PendingRevocations {
     /// A panic elsewhere must not drop revocations: a poisoned lock is used
     /// as is.
     fn lock(&self) -> std::sync::MutexGuard<'_, Vec<AccessChange>> {
-        self.0
+        self.changes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn lock_closes(&self) -> std::sync::MutexGuard<'_, Vec<UserSessionId>> {
+        self.closes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -47,6 +59,19 @@ impl PendingRevocations {
 
     fn take(&self) -> Vec<AccessChange> {
         std::mem::take(&mut *self.lock())
+    }
+
+    pub(crate) fn push_closes(&self, ids: Vec<UserSessionId>) {
+        self.lock_closes().extend(ids);
+    }
+
+    fn take_closes(&self) -> Vec<UserSessionId> {
+        std::mem::take(&mut *self.lock_closes())
+    }
+
+    /// Sessions waiting for a close to be retried.
+    pub fn closes_len(&self) -> usize {
+        self.lock_closes().len()
     }
 
     pub fn len(&self) -> usize {
@@ -132,6 +157,10 @@ impl Services {
     pub async fn retry_pending_revocations(&self) {
         for change in self.pending_revocations.take() {
             let _ = self.close_sessions_no_longer_authorised(change).await;
+        }
+        let ids = self.pending_revocations.take_closes();
+        if !ids.is_empty() {
+            let _ = self.close_admitted_sessions(AdmittedSessions(ids)).await;
         }
     }
 
