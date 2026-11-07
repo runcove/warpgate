@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+use warpgate_common::WarpgateError;
 
 /// What admitted a live request, and so what must still hold for it to run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -101,17 +102,16 @@ impl LiveStreams {
     }
 
     /// The distinct (user, target, kind) triples with live requests on this
-    /// node.
-    pub fn in_use(&self) -> HashSet<(Uuid, Uuid, LiveStreamKind)> {
-        self.streams
-            .lock()
-            .map(|streams| {
-                streams
-                    .values()
-                    .map(|stream| (stream.user_id, stream.target_id, stream.kind))
-                    .collect()
-            })
-            .unwrap_or_default()
+    /// node. Fails if the registry's lock is poisoned, so a caller that
+    /// re-checks the streams can report that it could not.
+    pub fn in_use(&self) -> Result<HashSet<(Uuid, Uuid, LiveStreamKind)>, WarpgateError> {
+        let streams = self.streams.lock().map_err(|_| {
+            WarpgateError::InconsistentState("the live request registry lock is poisoned".into())
+        })?;
+        Ok(streams
+            .values()
+            .map(|stream| (stream.user_id, stream.target_id, stream.kind))
+            .collect())
     }
 
     /// Ends this node's live requests of `kind` by `user_id` to `target_id`;
@@ -167,7 +167,7 @@ mod tests {
         let mut kept = streams.watch(session_rx, ALICE, KEPT, LiveStreamKind::RoleBased);
         tokio::task::yield_now().await;
         assert_eq!(
-            streams.in_use(),
+            streams.in_use().unwrap(),
             HashSet::from([
                 (ALICE, LOST, LiveStreamKind::RoleBased),
                 (ALICE, KEPT, LiveStreamKind::RoleBased)
@@ -232,10 +232,10 @@ mod tests {
         let streams = LiveStreams::default();
         let (_session_tx, session_rx) = broadcast::channel(1);
         let rx = streams.watch(session_rx, ALICE, KEPT, LiveStreamKind::RoleBased);
-        assert!(!streams.in_use().is_empty());
+        assert!(!streams.in_use().unwrap().is_empty());
         drop(rx);
         for _ in 0..50 {
-            if streams.in_use().is_empty() {
+            if streams.in_use().unwrap().is_empty() {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;

@@ -2234,7 +2234,7 @@ mod polled_gate {
 mod ticket_deletion {
     use sea_orm::ActiveModelTrait;
     use warpgate_common::TargetSessionId;
-    use warpgate_db_entities::{TargetSession, Ticket, UserSession};
+    use warpgate_db_entities::{PendingSessionClose, TargetSession, Ticket, UserSession};
 
     use super::*;
 
@@ -2442,6 +2442,90 @@ mod ticket_deletion {
 
         assert!(ended(&db, session).await);
         assert_eq!(services.pending_revocations.closes_len(), 0);
+    }
+
+    /// The node stops after the delete committed and before the close
+    /// succeeded: the in-memory queue is lost. The first sweep after the
+    /// restart still closes the session, because the delete recorded it.
+    #[tokio::test]
+    async fn a_session_whose_close_was_lost_in_a_restart_is_closed_by_the_first_sweep() {
+        use sea_orm::ConnectionTrait;
+
+        let db = migrated_db().await;
+        let mut services = super::delivery::test_services(&db).await;
+        let ticket_id = seed_ticket(&db, None, None).await;
+        let session = bare_user_session(&db).await;
+        open_under_ticket(&db, session, ticket_id).await.unwrap();
+
+        db.execute_unprepared(
+            "CREATE TRIGGER fail_close BEFORE UPDATE ON user_sessions \
+             BEGIN SELECT RAISE(ABORT, 'close failed'); END",
+        )
+        .await
+        .unwrap();
+        services
+            .delete_ticket_closing_sessions(ticket_id)
+            .await
+            .unwrap();
+        assert!(!ended(&db, session).await);
+
+        // The restart: the queue is empty and the ticket is gone.
+        db.execute_unprepared("DROP TRIGGER fail_close")
+            .await
+            .unwrap();
+        services.pending_revocations = Default::default();
+        assert_eq!(services.pending_revocations.closes_len(), 0);
+
+        services.retry_pending_revocations().await;
+
+        assert!(ended(&db, session).await);
+        assert!(
+            PendingSessionClose::pending(&db).await.unwrap().is_empty(),
+            "the record is cleared once the session is closed",
+        );
+    }
+
+    /// A delete can name more open sessions than one statement can bind
+    /// parameters for: the record is written in chunks, and marking an
+    /// overlapping set again neither fails nor duplicates. 20 000 rows bind
+    /// 40 000 parameters, above the bundled SQLite's limit of 32 766, so a
+    /// single statement would fail here.
+    #[tokio::test]
+    async fn a_large_set_of_pending_closes_is_recorded_in_chunks() {
+        let db = migrated_db().await;
+        let ids: Vec<UserSessionId> = (0..20_000).map(|_| UserSessionId(Uuid::new_v4())).collect();
+
+        PendingSessionClose::mark(&db, &ids).await.unwrap();
+        assert_eq!(PendingSessionClose::pending(&db).await.unwrap().len(), 20_000);
+
+        PendingSessionClose::mark(&db, &ids[5_000..]).await.unwrap();
+        assert_eq!(PendingSessionClose::pending(&db).await.unwrap().len(), 20_000);
+    }
+
+    /// A session under a ticket that still exists is not touched by a sweep,
+    /// and a ticket deleted with no failure leaves no record behind.
+    #[tokio::test]
+    async fn a_session_with_a_live_ticket_is_left_open_by_the_sweep() {
+        let db = migrated_db().await;
+        let services = super::delivery::test_services(&db).await;
+        let live_ticket = seed_ticket(&db, None, None).await;
+        let live = bare_user_session(&db).await;
+        open_under_ticket(&db, live, live_ticket).await.unwrap();
+
+        let gone_ticket = seed_ticket(&db, None, None).await;
+        let gone = bare_user_session(&db).await;
+        open_under_ticket(&db, gone, gone_ticket).await.unwrap();
+        services
+            .delete_ticket_closing_sessions(gone_ticket)
+            .await
+            .unwrap();
+        assert!(ended(&db, gone).await);
+        assert!(PendingSessionClose::pending(&db).await.unwrap().is_empty());
+
+        services.retry_pending_revocations().await;
+
+        assert!(!ended(&db, live).await);
+        assert_eq!(target_session_rows(&db, live).await, 1);
     }
 
     /// The race itself: the open and the delete run together, started in both

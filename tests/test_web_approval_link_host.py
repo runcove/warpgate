@@ -5,6 +5,7 @@ On the layout where the global `external_host` is a bound site, Warpgate's own
 (`http.external_host`), so the link an SSH client is shown must point there.
 """
 
+import os
 import re
 import subprocess
 import threading
@@ -13,6 +14,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 from uuid import uuid4
 
+import pytest
 import requests
 
 from .api_client import admin_client, sdk
@@ -26,20 +28,39 @@ MAIN_HOST = "warpgate.approval-link.test"
 ADMIN_HOST = f"admin.{MAIN_HOST}"
 
 
+# ssh takes a keyboard-interactive answer from a terminal or its askpass helper,
+# never from stdin. This helper records the prompt it is given, then waits for
+# the test to create `go` (after approval) before answering with an empty line.
+_ASKPASS = """#!/bin/sh
+printf '%s\\n' "$1" >> "$WARPGATE_TEST_ASKPASS_DIR/prompts"
+i=0
+while [ ! -e "$WARPGATE_TEST_ASKPASS_DIR/go" ]; do
+    i=$((i + 1))
+    [ "$i" -gt 600 ] && exit 1
+    sleep 0.1
+done
+printf '\\n'
+"""
+
+
+# Both keyboard-interactive shapes show the link: the auto-continue round
+# carries on by itself once approved, the prompted round waits for Enter.
+@pytest.mark.parametrize("auto_continue", [True, False])
 def test_the_ssh_approval_link_points_at_the_control_plane_host(
     processes: ProcessManager,
     wg_c_ed25519_pubkey: Path,
     echo_server_port,
     timeout,
+    auto_continue: bool,
 ):
     wg = processes.start_wg(
         config_patch={
             "external_host": MAIN_HOST,
             "http": {"external_host": ADMIN_HOST},
             # OpenSSH prints a round's instructions (the link) to stderr. An
-            # auto-continue round has no prompt, so the client needs no
-            # terminal to get past it.
-            "ssh": {"web_auth_auto_continue": True},
+            # auto-continue round has no prompt; a prompted one is answered
+            # through the askpass helper below.
+            "ssh": {"web_auth_auto_continue": auto_continue},
         }
     )
     wait_port(wg.http_port, for_process=wg.process, recv=False)
@@ -105,6 +126,20 @@ def test_the_ssh_approval_link_points_at_the_control_plane_host(
         )
         assert response.status_code == 201, response.text
 
+        client_kwargs = {}
+        askpass_dir = processes.ctx.tmpdir / f"askpass-{uuid4()}"
+        if not auto_continue:
+            askpass_dir.mkdir()
+            askpass = askpass_dir / "askpass.sh"
+            askpass.write_text(_ASKPASS)
+            askpass.chmod(0o700)
+            client_kwargs["env"] = {
+                **os.environ,
+                "SSH_ASKPASS": str(askpass),
+                "SSH_ASKPASS_REQUIRE": "force",
+                "WARPGATE_TEST_ASKPASS_DIR": str(askpass_dir),
+            }
+
         ssh_client = processes.start_ssh_client(
             f"{user.username}:{ssh_target.name}@localhost",
             "-p",
@@ -114,6 +149,7 @@ def test_the_ssh_approval_link_points_at_the_control_plane_host(
             "ls",
             "/bin/sh",
             stderr=subprocess.PIPE,
+            **client_kwargs,
         )
 
         # Read stderr as it arrives. The approval request exists from the
@@ -154,8 +190,26 @@ def test_the_ssh_approval_link_points_at_the_control_plane_host(
         )
         assert response.status_code == 200, response.text
 
+        if not auto_continue:
+            # The round's prompt reached the client; now let it answer.
+            prompts = askpass_dir / "prompts"
+            wait_until = time.monotonic() + timeout
+            while not (prompts.exists() and prompts.read_text().strip()):
+                assert time.monotonic() < wait_until, b"".join(stderr_chunks)
+                time.sleep(0.1)
+            (askpass_dir / "go").touch()
+
+        # Wait for exit before reading: the output is a few bytes, and a
+        # stuck client fails here with the stderr seen so far, not at pytest's
+        # overall timeout.
+        try:
+            ssh_client.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            pytest.fail(
+                f"ssh client still running {timeout}s after approval: "
+                f"{b''.join(stderr_chunks)!r}"
+            )
         stdout = ssh_client.stdout.read()
-        ssh_client.wait(timeout=timeout)
         reader.join(timeout=timeout)
         stderr = b"".join(stderr_chunks)
 

@@ -7,7 +7,8 @@ use uuid::Uuid;
 use warpgate_common::{StoredSecrets, TargetOptions, WarpgateError};
 use warpgate_db_entities::Target::TargetKind;
 use warpgate_db_entities::{
-    KnownHost, Target, TargetRoleAssignment, TargetSession, Ticket, TicketRequest,
+    KnownHost, PendingSessionClose, Target, TargetRoleAssignment, TargetSession, Ticket,
+    TicketRequest,
 };
 
 use super::{AdmittedSessions, ResourceError, check_name, name_taken};
@@ -150,6 +151,9 @@ pub async fn delete<C: ConnectionTrait + TransactionTrait>(
         Ticket::Column::TargetId.eq(target.id),
     )
     .await?;
+    // Recorded with the delete, so a close that does not finish before a
+    // restart is picked up by the next sweep.
+    PendingSessionClose::mark(&txn, &admitted).await?;
     Ticket::Entity::delete_many()
         .filter(Ticket::Column::TargetId.eq(target.id))
         .exec(&txn)

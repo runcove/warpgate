@@ -17,7 +17,8 @@ use warpgate_common::{
 };
 use warpgate_db_entities::Parameters::MfaEnforcement;
 use warpgate_db_entities::{
-    OtpCredential, Parameters, SsoCredential, TargetSession, Ticket, TicketRequest, UserSession,
+    OtpCredential, Parameters, PendingSessionClose, SsoCredential, TargetSession, Ticket,
+    TicketRequest, UserSession,
 };
 
 use crate::auth_state_store::ApprovalRequestSink;
@@ -88,12 +89,15 @@ impl Services {
             return Ok(());
         }
         let ids = sessions.0.clone();
-        if let Err(error) = self
+        match self
             .close_sessions(SessionsFilter::Sessions { ids: sessions.0 })
             .await
         {
-            warn!(%error, sessions = ids.len(), "Could not close sessions after their admission was deleted; retrying on the next sweep");
-            self.pending_revocations.push_closes(ids);
+            Ok(()) => self.forget_persisted_closes(&ids).await,
+            Err(error) => {
+                warn!(%error, sessions = ids.len(), "Could not close sessions after their admission was deleted; retrying on the next sweep");
+                self.pending_revocations.push_closes(ids);
+            }
         }
         Ok(())
     }
@@ -112,6 +116,9 @@ impl Services {
             Ticket::Column::Id.eq(ticket_id),
         )
         .await?;
+        // Recorded with the delete: if the node stops before the close below
+        // succeeds, the sweep after the restart still finds these sessions.
+        PendingSessionClose::mark(&txn, &admitted).await?;
         TicketRequest::Entity::delete_many()
             .filter(TicketRequest::Column::TicketId.eq(Some(ticket_id)))
             .exec(&txn)
@@ -244,6 +251,12 @@ impl Services {
                         warn!("Failed to close sessions of expired tickets: {error}");
                     }
                     services.retry_pending_revocations().await;
+                    // The notification that normally triggers this re-check is
+                    // best effort towards other nodes; the sweep makes a missed
+                    // one cost at most one interval.
+                    if let Err(error) = services.reauthorize_live_streams().await {
+                        warn!("Failed to re-check live proxied requests: {error}");
+                    }
                     let now = OffsetDateTime::now_utc();
                     match services
                         .close_sessions_of_expired_role_assignments(role_expiry_swept_until, now)
