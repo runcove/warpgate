@@ -13,6 +13,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 from uuid import uuid4
 
+import pytest
 import requests
 
 from .api_client import admin_client, sdk
@@ -26,20 +27,24 @@ MAIN_HOST = "warpgate.approval-link.test"
 ADMIN_HOST = f"admin.{MAIN_HOST}"
 
 
+# Both keyboard-interactive shapes show the link: the auto-continue round
+# carries on by itself once approved, the prompted round waits for Enter.
+@pytest.mark.parametrize("auto_continue", [True, False])
 def test_the_ssh_approval_link_points_at_the_control_plane_host(
     processes: ProcessManager,
     wg_c_ed25519_pubkey: Path,
     echo_server_port,
     timeout,
+    auto_continue: bool,
 ):
     wg = processes.start_wg(
         config_patch={
             "external_host": MAIN_HOST,
             "http": {"external_host": ADMIN_HOST},
             # OpenSSH prints a round's instructions (the link) to stderr. An
-            # auto-continue round has no prompt, so the client needs no
-            # terminal to get past it.
-            "ssh": {"web_auth_auto_continue": True},
+            # auto-continue round has no prompt; a prompted one is answered
+            # with Enter on stdin below.
+            "ssh": {"web_auth_auto_continue": auto_continue},
         }
     )
     wait_port(wg.http_port, for_process=wg.process, recv=False)
@@ -154,8 +159,21 @@ def test_the_ssh_approval_link_points_at_the_control_plane_host(
         )
         assert response.status_code == 200, response.text
 
+        if not auto_continue:
+            ssh_client.stdin.write(b"\r\n")
+            ssh_client.stdin.flush()
+
+        # Wait for exit before reading: the output is a few bytes, and a
+        # stuck client fails here with the stderr seen so far, not at pytest's
+        # overall timeout.
+        try:
+            ssh_client.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            pytest.fail(
+                f"ssh client still running {timeout}s after approval: "
+                f"{b''.join(stderr_chunks)!r}"
+            )
         stdout = ssh_client.stdout.read()
-        ssh_client.wait(timeout=timeout)
         reader.join(timeout=timeout)
         stderr = b"".join(stderr_chunks)
 
