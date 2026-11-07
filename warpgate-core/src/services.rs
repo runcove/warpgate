@@ -75,6 +75,11 @@ impl Services {
         Ok(())
     }
 
+    /// Closes sessions whose admission ended in a change that has already
+    /// committed (a deleted ticket or target). The change cannot be undone, so
+    /// a close that fails is queued and retried by the expiry sweep rather
+    /// than reported: the sessions would otherwise stay open, because nothing
+    /// else can find them (the ticket row is gone).
     pub async fn close_admitted_sessions(
         &self,
         sessions: AdmittedSessions,
@@ -82,8 +87,15 @@ impl Services {
         if sessions.0.is_empty() {
             return Ok(());
         }
-        self.close_sessions(SessionsFilter::Sessions { ids: sessions.0 })
+        let ids = sessions.0.clone();
+        if let Err(error) = self
+            .close_sessions(SessionsFilter::Sessions { ids: sessions.0 })
             .await
+        {
+            warn!(%error, sessions = ids.len(), "Could not close sessions after their admission was deleted; retrying on the next sweep");
+            self.pending_revocations.push_closes(ids);
+        }
+        Ok(())
     }
 
     pub async fn delete_ticket_closing_sessions(
