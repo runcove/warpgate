@@ -35,6 +35,56 @@ const PENDING_CLOSES_WARN_AT: usize = 10_000;
 /// Sessions closed per attempt in a retry.
 const CLOSE_RETRY_CHUNK: usize = 100;
 
+/// Example ids named in a retry summary line.
+const CLOSE_RETRY_EXAMPLES: usize = 3;
+
+/// What one sweep of the close retry queue did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct CloseRetryOutcome {
+    /// Ids taken from the queue for this sweep.
+    pub retried: usize,
+    /// Ids whose close failed again and went back into the queue.
+    pub failed_count: usize,
+    /// Ids waiting in the queue once the sweep ended (the queue length, which
+    /// also counts anything queued meanwhile).
+    pub queued: usize,
+    /// A few of the failing ids, at most [`CLOSE_RETRY_EXAMPLES`].
+    pub examples: Vec<UserSessionId>,
+    /// The first error seen in the sweep.
+    pub first_error: Option<String>,
+}
+
+impl CloseRetryOutcome {
+    fn record_failure(&mut self, id: UserSessionId, error: &WarpgateError) {
+        self.failed_count += 1;
+        if self.examples.len() < CLOSE_RETRY_EXAMPLES {
+            self.examples.push(id);
+        }
+        if self.first_error.is_none() {
+            self.first_error = Some(error.to_string());
+        }
+    }
+
+    /// The single log line for the sweep: its size does not grow with the
+    /// number of failing ids.
+    pub fn summary(&self) -> String {
+        let closed = self.retried - self.failed_count;
+        let mut line = format!(
+            "Close retry: {} retried, {} closed, {} failed, {} still queued",
+            self.retried, closed, self.failed_count, self.queued
+        );
+        if !self.examples.is_empty() {
+            let ids: Vec<String> = self.examples.iter().map(|id| id.0.to_string()).collect();
+            line.push_str(&format!(" (e.g. {})", ids.join(", ")));
+        }
+        if let Some(error) = &self.first_error {
+            let error = error.replace(['\n', '\r'], " ");
+            line.push_str(&format!("; first error: {error}"));
+        }
+        line
+    }
+}
+
 /// Access changes whose re-check failed, and sessions whose close failed
 /// after the change that ended their admission had committed, both retried by
 /// the expiry sweep.
@@ -183,8 +233,15 @@ impl Services {
     /// id by id, so one bad id does not hold back the rest; only the ids that
     /// still fail are queued again. A session already ended is a no-op for the
     /// close (it only touches open sessions) and is not queued again.
-    async fn retry_pending_closes(&self) {
+    ///
+    /// One summary line is logged per sweep that had anything to retry, however
+    /// many ids failed. Nothing is ever dropped from the queue.
+    async fn retry_pending_closes(&self) -> CloseRetryOutcome {
         let ids = self.pending_revocations.take_closes();
+        let mut outcome = CloseRetryOutcome {
+            retried: ids.len(),
+            ..Default::default()
+        };
         for chunk in ids.chunks(CLOSE_RETRY_CHUNK) {
             if self
                 .close_sessions(SessionsFilter::Sessions {
@@ -200,11 +257,20 @@ impl Services {
                     .close_sessions(SessionsFilter::Sessions { ids: vec![*id] })
                     .await
                 {
-                    warn!(%error, session = ?id, "Could not close a session on retry; keeping it queued");
+                    outcome.record_failure(*id, &error);
                     self.pending_revocations.push_closes(vec![*id]);
                 }
             }
         }
+        outcome.queued = self.pending_revocations.closes_len();
+        if outcome.retried > 0 {
+            if outcome.failed_count > 0 {
+                warn!("{}", outcome.summary());
+            } else {
+                info!("{}", outcome.summary());
+            }
+        }
+        outcome
     }
 
     async fn try_close_sessions_no_longer_authorised(
@@ -600,6 +666,60 @@ mod tests {
         services.retry_pending_revocations().await;
         assert!(ended(&db, bad).await);
         assert_eq!(services.pending_revocations.closes_len(), 0);
+    }
+
+    /// A sweep with many failing ids yields one summary, whose length does not
+    /// depend on how many ids failed, and whose queue length matches the queue.
+    #[test]
+    fn the_retry_summary_is_one_line_however_many_ids_fail() {
+        let mut outcome = CloseRetryOutcome {
+            retried: 5000,
+            queued: 4000,
+            ..Default::default()
+        };
+        let error = WarpgateError::InvalidCredentialType;
+        for _ in 0..4000 {
+            outcome.record_failure(UserSessionId(Uuid::new_v4()), &error);
+        }
+        let line = outcome.summary();
+        assert!(!line.contains('\n'));
+        assert!(line.contains("5000 retried, 1000 closed, 4000 failed, 4000 still queued"));
+        assert_eq!(outcome.examples.len(), CLOSE_RETRY_EXAMPLES);
+        assert_eq!(line.matches("(e.g. ").count(), 1);
+        assert!(
+            line.len() < 400,
+            "summary grew with the ids: {}",
+            line.len()
+        );
+    }
+
+    /// The sweep's reported queue length is the queue's own length.
+    #[tokio::test]
+    async fn the_retry_outcome_reports_the_queue_length() {
+        use sea_orm::ConnectionTrait;
+
+        let db = migrated_db().await;
+        let services = test_services(&db).await;
+        let good = open_user_session(&db, "good").await;
+        let bad_a = open_user_session(&db, "bad").await;
+        let bad_b = open_user_session(&db, "bad").await;
+        db.execute_unprepared(
+            "CREATE TRIGGER fail_bad BEFORE UPDATE ON user_sessions \
+             WHEN OLD.username = 'bad' \
+             BEGIN SELECT RAISE(ABORT, 'close failed'); END",
+        )
+        .await
+        .unwrap();
+        services
+            .pending_revocations
+            .push_closes(vec![good, bad_a, bad_b]);
+        let outcome = services.retry_pending_closes().await;
+        assert_eq!(outcome.retried, 3);
+        assert_eq!(outcome.failed_count, 2);
+        assert_eq!(outcome.queued, 2);
+        assert_eq!(outcome.queued, services.pending_revocations.closes_len());
+        assert!(outcome.summary().contains("2 still queued"));
+        assert!(outcome.summary().contains("1 closed"));
     }
 
     async fn revoke_user_role(db: &DatabaseConnection, user_id: Uuid, role_id: Uuid) {
