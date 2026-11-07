@@ -59,8 +59,11 @@ const CLOSE_RETRY_EXAMPLES: usize = 3;
 
 /// Longest the re-check of live proxied requests waits on one access lookup.
 /// A lookup that takes longer counts as a failed one (the request ends), so a
-/// single hung lookup cannot hold up the rest of the expiry sweep.
-const LIVE_STREAM_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
+/// single hung lookup cannot hold up the rest of the expiry sweep. It is above
+/// the database's own waits (30 s for a busy lock or a pooled connection, see
+/// `db`), so a lookup that is only slow under load returns its own answer or
+/// error first, and an allowed request is not ended for waiting on a lock.
+const LIVE_STREAM_LOOKUP_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// What one sweep of the close retry queue did.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
