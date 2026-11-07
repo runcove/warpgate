@@ -7,8 +7,10 @@ upstream; this fork carries the patches runcove's products need on top of an ups
 
 The maintainers' rules live in the runcove repository, which is private:
 
-- `AGENTS.md` at its root: the house rules every agent follows.
-- `ways-of-working/README.md`, section **Start now**: how work starts, waits and lands.
+- `ways-of-working/core.md`: the short form of every house rule. Read it every session; it
+  outranks anything older.
+- `AGENTS.md` at its root, and `ways-of-working/README.md` (section **Start now** first): the
+  long forms.
 
 ## This repository's own rules
 
