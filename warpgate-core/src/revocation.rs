@@ -2,6 +2,8 @@
 //! change that can take access away.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::time::Duration;
 
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect};
 use time::OffsetDateTime;
@@ -16,6 +18,23 @@ use warpgate_sso::{SsoLoginResponse, SsoProviderConfig};
 use crate::cluster::ClusterNotification;
 use crate::live_streams::LiveStreamKind;
 use crate::{ConfigProvider, Services, SessionsFilter, apply_sso_mappings, resolve_sso_username};
+
+/// Waits up to [`LIVE_STREAM_LOOKUP_TIMEOUT`] for one access lookup of the
+/// live-request re-check. A lookup that does not answer in time is treated as
+/// one that failed, as the lookups themselves do: not allowed (fail closed).
+async fn bounded_lookup(
+    user_id: Uuid,
+    target_id: Uuid,
+    lookup: impl Future<Output = bool>,
+) -> bool {
+    match tokio::time::timeout(LIVE_STREAM_LOOKUP_TIMEOUT, lookup).await {
+        Ok(allowed) => allowed,
+        Err(_) => {
+            warn!(%user_id, %target_id, "Timed out re-checking access of a live proxied request; treating it as revoked");
+            false
+        }
+    }
+}
 
 /// Whose live sessions an access change can affect.
 #[derive(Debug, Clone)]
@@ -39,6 +58,14 @@ const CLOSE_RETRY_CHUNK: usize = 100;
 
 /// Example ids named in a retry summary line.
 const CLOSE_RETRY_EXAMPLES: usize = 3;
+
+/// Longest the re-check of live proxied requests waits on one access lookup.
+/// A lookup that takes longer counts as a failed one (the request ends), so a
+/// single hung lookup cannot hold up the rest of the expiry sweep. It is above
+/// the database's own waits (30 s for a busy lock or a pooled connection, see
+/// `db`), so a lookup that is only slow under load returns its own answer or
+/// error first, and an allowed request is not ended for waiting on a lock.
+const LIVE_STREAM_LOOKUP_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// What one sweep of the close retry queue did.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -406,17 +433,31 @@ impl Services {
     /// ends when the target is no longer public
     /// ([`Self::public_target_still_shared`]), whatever the user's roles. The
     /// browser session that carries them, and its requests to other targets,
-    /// stay. A pair whose check errors is ended too (fail closed).
+    /// stay. A pair whose check errors or takes longer than
+    /// [`LIVE_STREAM_LOOKUP_TIMEOUT`] is ended too (fail closed). Fails if
+    /// the registry of live requests cannot be read.
     pub async fn reauthorize_live_streams(&self) -> Result<(), WarpgateError> {
         // One lookup per target in a pass, however many visitors share it.
         let mut shared: std::collections::HashMap<Uuid, bool> = std::collections::HashMap::new();
-        for (user_id, target_id, kind) in self.live_streams.in_use() {
+        for (user_id, target_id, kind) in self.live_streams.in_use()? {
             let allowed = match kind {
-                LiveStreamKind::RoleBased => self.still_authorised(user_id, target_id).await,
+                LiveStreamKind::RoleBased => {
+                    bounded_lookup(
+                        user_id,
+                        target_id,
+                        self.still_authorised(user_id, target_id),
+                    )
+                    .await
+                }
                 LiveStreamKind::Public => match shared.get(&target_id) {
                     Some(allowed) => *allowed,
                     None => {
-                        let allowed = self.public_target_still_shared(target_id).await;
+                        let allowed = bounded_lookup(
+                            user_id,
+                            target_id,
+                            self.public_target_still_shared(target_id),
+                        )
+                        .await;
                         shared.insert(target_id, allowed);
                         allowed
                     }
@@ -1156,6 +1197,73 @@ mod tests {
 
         assert!(ended(&db, open).await);
         assert!(services.pending_revocations.is_empty());
+    }
+
+    /// Updating or deleting a target tells the cluster to re-check live
+    /// streams, as a global notification (delivered here and posted to every
+    /// peer), and ends a stream the update left unshared.
+    #[tokio::test]
+    async fn a_target_change_notifies_every_node_and_ends_unshared_streams() {
+        let db = migrated_db().await;
+        let services = test_services(&db).await;
+        let target_id = http_target(&db, false).await;
+        let (_browser_session, browser_close) = tokio::sync::broadcast::channel(1);
+        let mut stream = services.live_streams.watch(
+            browser_close,
+            Uuid::nil(),
+            target_id,
+            LiveStreamKind::Public,
+        );
+        let mut notifications = services.cluster.subscribe();
+
+        services
+            .close_sessions_no_longer_authorised(AccessChange::Targets(vec![target_id]))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            notifications.recv().await,
+            Ok(ClusterNotification::LiveStreamsReauthorize)
+        ));
+        services.reauthorize_live_streams().await.unwrap();
+        assert!(fired(&mut stream).await);
+    }
+
+    /// The expiry sweep re-checks live requests on its own: with the access
+    /// change written but no notification ever sent (as on a node that missed
+    /// it), one re-check from the sweep ends the request to the lost target
+    /// and leaves the one to the kept target.
+    #[tokio::test]
+    async fn the_sweep_ends_live_requests_without_a_notification() {
+        let db = migrated_db().await;
+        let services = test_services(&db).await;
+        let (alice, lost, kept) = (user(&db).await, role(&db).await, role(&db).await);
+        let (lost_target, kept_target) = (target(&db).await, target(&db).await);
+        grant_user(&db, alice, lost).await;
+        grant_user(&db, alice, kept).await;
+        grant_target(&db, lost_target, lost).await;
+        grant_target(&db, kept_target, kept).await;
+        let (_browser_session, browser_close) = tokio::sync::broadcast::channel(1);
+        let mut to_lost = services.live_streams.watch(
+            browser_close.resubscribe(),
+            alice,
+            lost_target,
+            LiveStreamKind::RoleBased,
+        );
+        let mut to_kept = services.live_streams.watch(
+            browser_close,
+            alice,
+            kept_target,
+            LiveStreamKind::RoleBased,
+        );
+        let mut notifications = services.cluster.subscribe();
+
+        revoke_user_role(&db, alice, lost).await;
+        services.reauthorize_live_streams().await.unwrap();
+
+        assert!(notifications.try_recv().is_err());
+        assert!(fired(&mut to_lost).await);
+        assert!(!fired(&mut to_kept).await);
     }
 
     /// A re-check that cannot run at all is queued for the sweep, not lost,

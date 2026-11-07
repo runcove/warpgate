@@ -251,6 +251,12 @@ impl Services {
                         warn!("Failed to close sessions of expired tickets: {error}");
                     }
                     services.retry_pending_revocations().await;
+                    // The notification that normally triggers this re-check is
+                    // best effort towards other nodes; the sweep makes a missed
+                    // one cost at most one interval.
+                    if let Err(error) = services.reauthorize_live_streams().await {
+                        warn!("Failed to re-check live proxied requests: {error}");
+                    }
                     let now = OffsetDateTime::now_utc();
                     match services
                         .close_sessions_of_expired_role_assignments(role_expiry_swept_until, now)

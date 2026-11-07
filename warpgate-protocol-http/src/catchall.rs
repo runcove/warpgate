@@ -104,20 +104,9 @@ pub async fn catchall_endpoint(
     // no ticket id, anonymous or logged in) is watched too, and ends when the
     // target stops being public. A real ticket is not role-based: deleting the
     // ticket is what cuts it.
-    let close_rx = match &ctx.auth {
-        RequestAuthorization::Session(SessionAuthorization::User { user_id, .. }) => {
-            watch_live_stream(ctx.services(), close_rx, *user_id, admitted.target().id).await?
-        }
-        RequestAuthorization::Session(SessionAuthorization::Ticket {
-            user_id,
-            ticket_id: None,
-            ..
-        }) => {
-            watch_public_live_stream(ctx.services(), close_rx, *user_id, admitted.target().id)
-                .await?
-        }
-        _ => close_rx,
-    };
+    let close_rx =
+        watch_admitted_live_stream(ctx.services(), &ctx.auth, close_rx, admitted.target().id)
+            .await?;
     let keepalive_guard = Data::<&SessionKeepalive>::from_request_without_body(req)
         .await
         .ok()
@@ -511,6 +500,30 @@ async fn get_target_for_request(
     Ok(None)
 }
 
+/// Registers the request for revocation by the rule that admitted it: a
+/// logged-in user is role-based, a ticket session with no ticket id came
+/// through the public bypass (anonymous or logged in) and is public, and
+/// anything else (a real ticket, a token, a peer) is not watched, as deleting
+/// the ticket is what cuts a ticket session.
+async fn watch_admitted_live_stream(
+    services: &Services,
+    auth: &RequestAuthorization,
+    close_rx: broadcast::Receiver<()>,
+    target_id: Uuid,
+) -> poem::Result<broadcast::Receiver<()>> {
+    match auth {
+        RequestAuthorization::Session(SessionAuthorization::User { user_id, .. }) => {
+            watch_live_stream(services, close_rx, *user_id, target_id).await
+        }
+        RequestAuthorization::Session(SessionAuthorization::Ticket {
+            user_id,
+            ticket_id: None,
+            ..
+        }) => watch_public_live_stream(services, close_rx, *user_id, target_id).await,
+        _ => Ok(close_rx),
+    }
+}
+
 /// Registers a request with [`warpgate_core::live_streams::LiveStreams`], then
 /// checks the user's access to the target again. A revocation either finds
 /// the registration when it re-checks live streams, or was written before this
@@ -567,15 +580,20 @@ mod live_stream_tests {
     //! A proxied request is registered for revocation before its access is
     //! checked again, and refused if that check fails or errors.
 
-    use sea_orm::ConnectionTrait;
+    use sea_orm::ActiveValue::Set;
+    use sea_orm::{ActiveModelTrait, ConnectionTrait, DatabaseConnection};
     use uuid::Uuid;
+    use warpgate_common_http::{RequestAuthorization, SessionAuthorization};
+    use warpgate_core::live_streams::LiveStreamKind;
+    use warpgate_db_entities::Target;
+    use warpgate_db_entities::Target::TargetKind;
 
-    use super::{watch_live_stream, watch_public_live_stream};
+    use super::{watch_admitted_live_stream, watch_live_stream, watch_public_live_stream};
     use crate::test_db::{memory_db, services};
 
     async fn deregistered(services: &warpgate_core::Services) -> bool {
         for _ in 0..100 {
-            if services.live_streams.in_use().is_empty() {
+            if services.live_streams.in_use().unwrap().is_empty() {
                 return true;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -640,6 +658,101 @@ mod live_stream_tests {
 
         let watched =
             watch_public_live_stream(&services, close_rx, Uuid::nil(), Uuid::new_v4()).await;
+
+        assert_eq!(
+            watched.err().map(|e| e.status()),
+            Some(poem::http::StatusCode::FORBIDDEN)
+        );
+        assert!(deregistered(&services).await);
+    }
+
+    /// A public HTTP target, which a role check refuses a user with no role.
+    async fn public_target(db: &DatabaseConnection) -> Uuid {
+        let id = Uuid::new_v4();
+        Target::ActiveModel {
+            id: Set(id),
+            name: Set(format!("target-{id}")),
+            description: Set(String::new()),
+            kind: Set(TargetKind::Http),
+            options: Set(serde_json::json!({"http": {"url": "http://h", "public": true}})),
+            rate_limit_bytes_per_second: Set(None),
+            group_id: Set(None),
+            ticket_max_duration_seconds: Set(None),
+            ticket_requests_disabled: Set(false),
+            ticket_require_approval: Set(false),
+            ticket_max_uses: Set(None),
+            require_approval: Set(false),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        id
+    }
+
+    fn ticket(ticket_id: Option<Uuid>, target_id: Uuid) -> RequestAuthorization {
+        RequestAuthorization::Session(SessionAuthorization::Ticket {
+            user_id: Uuid::nil(),
+            username: "ticket".into(),
+            target_id,
+            ticket_id,
+        })
+    }
+
+    /// A ticket session with no ticket id came through the public bypass: it
+    /// is registered as public and passes the public check, whatever roles it
+    /// has.
+    #[tokio::test]
+    async fn a_ticket_session_without_a_ticket_id_is_watched_as_public() {
+        let db = memory_db().await;
+        let services = services(db.clone()).await;
+        let target_id = public_target(&db).await;
+        let (_session, close_rx) = tokio::sync::broadcast::channel(1);
+
+        let watched =
+            watch_admitted_live_stream(&services, &ticket(None, target_id), close_rx, target_id)
+                .await;
+
+        assert!(watched.is_ok());
+        assert_eq!(
+            services.live_streams.in_use().unwrap(),
+            std::collections::HashSet::from([(Uuid::nil(), target_id, LiveStreamKind::Public)])
+        );
+    }
+
+    /// A request a real ticket admitted is not registered at all: deleting
+    /// the ticket is what cuts it, and no target check applies.
+    #[tokio::test]
+    async fn a_real_ticket_session_is_not_watched() {
+        let services = services(memory_db().await).await;
+        let target_id = Uuid::new_v4();
+        let (_session, close_rx) = tokio::sync::broadcast::channel(1);
+
+        let watched = watch_admitted_live_stream(
+            &services,
+            &ticket(Some(Uuid::new_v4()), target_id),
+            close_rx,
+            target_id,
+        )
+        .await;
+
+        assert!(watched.is_ok());
+        assert!(services.live_streams.in_use().unwrap().is_empty());
+    }
+
+    /// A logged-in user is watched by role: on a public target they have no
+    /// role on, the request is refused, where the public rule would pass it.
+    #[tokio::test]
+    async fn a_user_session_is_watched_by_role() {
+        let db = memory_db().await;
+        let services = services(db.clone()).await;
+        let target_id = public_target(&db).await;
+        let (_session, close_rx) = tokio::sync::broadcast::channel(1);
+        let auth = RequestAuthorization::Session(SessionAuthorization::User {
+            user_id: Uuid::new_v4(),
+            username: "alice".into(),
+        });
+
+        let watched = watch_admitted_live_stream(&services, &auth, close_rx, target_id).await;
 
         assert_eq!(
             watched.err().map(|e| e.status()),
