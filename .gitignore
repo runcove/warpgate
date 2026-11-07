@@ -36,6 +36,7 @@ node_modules
 .github
 !/.github/workflows
 /*.md
+!/AGENTS.md
 .env
 
 rustc-ice-*.txt
