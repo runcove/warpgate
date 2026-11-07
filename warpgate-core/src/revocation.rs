@@ -28,8 +28,9 @@ pub enum AccessChange {
     All,
 }
 
-/// Most sessions kept waiting for a close retry.
-const MAX_PENDING_CLOSES: usize = 10_000;
+/// Queue size past which a warning is logged. Nothing is ever dropped: the
+/// queue is a set of session ids, so it cannot outgrow the real sessions.
+const PENDING_CLOSES_WARN_AT: usize = 10_000;
 
 /// Sessions closed per attempt in a retry.
 const CLOSE_RETRY_CHUNK: usize = 100;
@@ -66,24 +67,16 @@ impl PendingRevocations {
         std::mem::take(&mut *self.lock())
     }
 
-    /// Queues sessions whose close failed. Ids already queued collapse, and
-    /// the queue holds at most [`MAX_PENDING_CLOSES`]: past that, ids are
-    /// dropped and the drop is logged.
+    /// Queues sessions whose close failed. Ids already queued collapse. An
+    /// id is never dropped: a revoked session left open is the fault this
+    /// queue exists to prevent.
     pub(crate) fn push_closes(&self, ids: Vec<UserSessionId>) {
         let mut queue = self.lock_closes();
-        let mut dropped = 0;
-        for id in ids {
-            if queue.len() >= MAX_PENDING_CLOSES && !queue.contains(&id) {
-                dropped += 1;
-            } else {
-                queue.insert(id);
-            }
-        }
-        if dropped > 0 {
+        queue.extend(ids);
+        if queue.len() > PENDING_CLOSES_WARN_AT {
             warn!(
-                dropped,
-                cap = MAX_PENDING_CLOSES,
-                "Too many sessions waiting for a close retry; dropped some"
+                queued = queue.len(),
+                "Many sessions are waiting for a close retry"
             );
         }
     }
@@ -552,18 +545,19 @@ mod tests {
         assert_eq!(pending.closes_len(), 3);
     }
 
-    /// The queue never holds more than its cap.
+    /// However large the queue gets, no id is dropped.
     #[tokio::test]
-    async fn the_close_queue_is_bounded() {
+    async fn the_close_queue_never_drops_an_id() {
         let pending = PendingRevocations::default();
-        let ids: Vec<_> = (0..MAX_PENDING_CLOSES + 5)
+        let ids: Vec<_> = (0..PENDING_CLOSES_WARN_AT + 5)
             .map(|_| UserSessionId(Uuid::new_v4()))
             .collect();
         pending.push_closes(ids.clone());
-        assert_eq!(pending.closes_len(), MAX_PENDING_CLOSES);
-        // Already-queued ids still collapse once full.
-        pending.push_closes(pending.lock_closes().iter().copied().take(3).collect());
-        assert_eq!(pending.closes_len(), MAX_PENDING_CLOSES);
+        pending.push_closes(ids.clone());
+        assert_eq!(pending.closes_len(), ids.len());
+        let taken = pending.take_closes();
+        let taken: std::collections::HashSet<_> = taken.into_iter().collect();
+        assert!(ids.iter().all(|id| taken.contains(id)));
     }
 
     /// One session whose close keeps failing does not hold back the others
