@@ -66,6 +66,10 @@ const MAX_CONCURRENT_LOOKUPS: usize = 4;
 static LOOKUP_TURNS: tokio::sync::Semaphore =
     tokio::sync::Semaphore::const_new(MAX_CONCURRENT_LOOKUPS);
 
+/// Whether the log already says that every lookup slot is taken; cleared when
+/// a lookup next gets a slot, so a burst of refused connections logs once.
+static ALL_BUSY_LOGGED: AtomicBool = AtomicBool::new(false);
+
 /// Finds the OS account owning a TCP socket.
 pub(crate) trait SocketOwnerLookup: Send + Sync + 'static {
     /// The uid owning the TCP socket whose local endpoint is `local` and whose
@@ -207,7 +211,15 @@ pub(crate) async fn check_connection_owner(
     local: SocketAddr,
     remote: SocketAddr,
 ) -> OwnerCheck {
-    check_connection_owner_with(&LOOKUP_TURNS, lookup, our_uid, local, remote).await
+    check_connection_owner_with(
+        &LOOKUP_TURNS,
+        &ALL_BUSY_LOGGED,
+        lookup,
+        our_uid,
+        local,
+        remote,
+    )
+    .await
 }
 
 /// [`check_connection_owner`] taking its turns from `turns`.
@@ -215,10 +227,13 @@ pub(crate) async fn check_connection_owner(
 /// A lookup that hangs (on macOS, a process-table walk stuck in the kernel)
 /// keeps its turn, and so its blocking thread, until it ends. Once every turn
 /// is held that way, a connection that never got a turn is refused with a
-/// message saying so, and logged, rather than taking another thread: the
+/// message saying so, and logged once per spell of being all busy (the flag
+/// `all_busy_logged` is cleared when a lookup next gets a slot), rather than
+/// taking another thread: the
 /// hung lookups are the most that ever pile up.
 async fn check_connection_owner_with(
     turns: &'static tokio::sync::Semaphore,
+    all_busy_logged: &'static AtomicBool,
     lookup: Arc<dyn SocketOwnerLookup>,
     our_uid: u32,
     local: SocketAddr,
@@ -231,6 +246,7 @@ async fn check_connection_owner_with(
         // after the timeout keeps its place until it ends.
         let turn = turns.acquire().await?;
         started_here.store(true, Ordering::Relaxed);
+        all_busy_logged.store(false, Ordering::Relaxed);
         // The client socket's endpoints are the accepted connection's, swapped.
         let task = tokio::task::spawn_blocking(move || {
             let _turn = turn;
@@ -242,9 +258,11 @@ async fn check_connection_owner_with(
     match looked_up {
         Err(_) if started.load(Ordering::Relaxed) => OwnerCheck::LookupFailed("timed out".into()),
         Err(_) => {
-            warn!(
-                "Every socket lookup slot has been taken past the lookup timeout; a lookup may be hung. Refusing loopback connections until one ends"
-            );
+            if !all_busy_logged.swap(true, Ordering::Relaxed) {
+                warn!(
+                    "Every socket lookup slot has been taken past the lookup timeout: lookups are slow or hung. Refusing loopback connections until one ends"
+                );
+            }
             OwnerCheck::LookupFailed(
                 "all socket lookup threads are busy, and none finished in time".into(),
             )
@@ -2318,6 +2336,7 @@ mod tests {
 
         // Its own turns, so hanging them cannot starve other tests.
         static TURNS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+        static LOGGED: AtomicBool = AtomicBool::new(false);
         static STARTED: AtomicUsize = AtomicUsize::new(0);
         static RELEASE: Mutex<bool> = Mutex::new(false);
         static RELEASED: std::sync::Condvar = std::sync::Condvar::new();
@@ -2354,7 +2373,7 @@ mod tests {
         let ask = || {
             let lookup: Arc<dyn SocketOwnerLookup> = Arc::new(HungLookup);
             tokio::spawn(check_connection_owner_with(
-                &TURNS, lookup, 501, local, remote,
+                &TURNS, &LOGGED, lookup, 501, local, remote,
             ))
         };
         // Two lookups take both turns and hang: they are cut off at the
@@ -2374,6 +2393,8 @@ mod tests {
             assert!(reason.contains("busy"), "{reason}");
         }
         assert!(STARTED.load(Ordering::SeqCst) <= 2);
+        // The log line was written for the spell, not for each connection.
+        assert!(LOGGED.load(Ordering::Relaxed));
     }
 
     /// However many connections arrive at once, no more than
