@@ -141,17 +141,20 @@ pub async fn delete<C: ConnectionTrait + TransactionTrait>(
             .exec(&txn)
             .await?;
     }
+    // The tickets are locked before the first read of the transaction, so the
+    // snapshot that MySQL's REPEATABLE READ fixes at that read is taken after
+    // any holder of a ticket lock has committed. A session being registered
+    // under one of the tickets either committed (and is collected below) or
+    // finds its ticket gone (and is refused). Registration locks the user
+    // session and then the ticket and never waits on a target row, so this
+    // order cannot deadlock with it.
+    Ticket::lock_all_for_target(&txn, id)
+        .await
+        .map_err(ResourceError::from)?;
     let target = Target::Entity::find_by_id(id)
         .one(&txn)
         .await?
         .ok_or(ResourceError::NotFound)?;
-
-    // The tickets are locked before the sessions they admitted are collected,
-    // so a session being registered under one of them either committed (and
-    // is collected) or finds its ticket gone (and is refused).
-    Ticket::lock_all_for_target(&txn, target.id)
-        .await
-        .map_err(ResourceError::from)?;
 
     TargetRoleAssignment::Entity::delete_many()
         .filter(TargetRoleAssignment::Column::TargetId.eq(target.id))
