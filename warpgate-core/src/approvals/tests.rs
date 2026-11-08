@@ -2690,7 +2690,7 @@ mod ticket_deletion {
 
         let opened = open_under_ticket(&db, session, ticket_id).await;
         assert!(
-            matches!(opened, Err(WarpgateError::TicketExpired(id) if id == ticket_id)),
+            matches!(opened, Err(WarpgateError::TicketExpired(id)) if id == ticket_id),
             "{opened:?}",
         );
         assert_eq!(target_session_rows(&db, session).await, 0);
