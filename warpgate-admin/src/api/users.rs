@@ -407,6 +407,12 @@ impl DetailApi {
 
         let (user_id, username) = (user.id, user.username.clone());
         let admitted = delete_user_records(db, user).await?;
+        // A login can land between the close above and the commit; the user's
+        // own sessions are closed again now that the delete is final.
+        admin
+            .services()
+            .close_sessions(SessionsFilter::User { user_id })
+            .await?;
         admin.services().close_admitted_sessions(admitted).await?;
 
         AuditEvent::UserDeleted {
@@ -1264,5 +1270,44 @@ mod tests {
             vec![alice_session],
         );
         assert!(!admitted.0.contains(&bob_session));
+    }
+
+    /// A session of the user that is opened after the first close and before
+    /// the delete commits is still matched by the user filter once the delete
+    /// has committed, so closing again after the commit ends it.
+    #[tokio::test]
+    async fn a_session_opened_before_the_delete_commits_is_closed_by_the_second_close() {
+        let db = setup_db().await;
+        let alice = insert_user(&db, "alice").await;
+        let alice_id = alice.id;
+
+        let session_id = warpgate_common::UserSessionId(Uuid::new_v4());
+        warpgate_db_entities::UserSession::ActiveModel {
+            id: Set(session_id),
+            username: Set(Some("alice".into())),
+            user_id: Set(Some(alice_id)),
+            remote_address: Set("127.0.0.1:22".into()),
+            started: Set(OffsetDateTime::now_utc()),
+            ended: Set(None),
+            protocol: Set("HTTP".into()),
+            node_id: Set(None),
+            auth_state_node_id: Set(None),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        delete_user_records(&db, alice).await.unwrap();
+        SessionsFilter::User { user_id: alice_id }
+            .revoke(&db)
+            .await
+            .unwrap();
+
+        let session = warpgate_db_entities::UserSession::Entity::find_by_id(session_id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(session.ended.is_some());
     }
 }

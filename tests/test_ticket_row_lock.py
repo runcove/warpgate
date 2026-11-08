@@ -287,3 +287,45 @@ def test_deleting_waits_for_the_ticket_row_and_closes_the_session_registered_mea
         "SELECT COUNT(*) FROM user_sessions "
         f"WHERE id = {reader.uuid(session_id)} AND ended IS NOT NULL;"
     ) == 1
+
+
+def test_deleting_a_user_closes_a_login_that_lands_before_the_delete_commits(
+    db_wg, sql, echo_server_port
+):
+    """The delete closes the user's sessions, then waits for the ticket row.
+    A session the user opens in that gap must be closed after the commit."""
+    _, _, wg = db_wg
+    url = f"https://localhost:{wg.http_port}"
+    seeded = seed(url, echo_server_port)
+    holder = sql()
+    reader = sql()
+
+    def delete():
+        with admin_client(url) as api:
+            api.delete_user(seeded.user.id)
+
+    lock_ticket(holder, seeded.ticket.id)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            deleting = pool.submit(delete)
+            time.sleep(HOLD_SECONDS)
+            assert not deleting.done(), "the delete did not wait for the ticket row"
+
+            session_id = uuid4()
+            holder.run(
+                "INSERT INTO user_sessions (id, username, user_id, remote_address, "
+                "started, ended, protocol, node_id, auth_state_node_id) VALUES "
+                f"({holder.uuid(session_id)}, 'late', {holder.uuid(seeded.user.id)}, "
+                "'127.0.0.1:22', CURRENT_TIMESTAMP, NULL, 'HTTP', NULL, NULL);\n"
+                "COMMIT;"
+            )
+
+            deleting.result(timeout=60)
+    finally:
+        holder.run("ROLLBACK;")
+
+    # Fails without the second close: the first one ran before this row existed.
+    assert reader.scalar(
+        "SELECT COUNT(*) FROM user_sessions "
+        f"WHERE id = {reader.uuid(session_id)} AND ended IS NOT NULL;"
+    ) == 1
