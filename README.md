@@ -28,6 +28,12 @@
 
 ---
 
+## Contributing
+
+This is runcove's fork of Warpgate. It carries a few patches of our own on `cove-patches-<upstream tag>` branches; everything else is upstream's. Most changes belong upstream: please send them to [warp-tech/warpgate](https://github.com/warp-tech/warpgate). A pull request here that touches one of our own patches is welcome, and we answer within a day. This repository is a copy of our development forge, so nothing is merged here directly: if we take your change, we re-apply it on the forge as our commit, crediting you as its author.
+
+---
+
 Warpgate is a smart & fully transparent SSH, HTTPS, Kubernetes, MySQL, PostgreSQL, RDP and VNC bastion host that doesn't require a client app or an SSH wrapper.
 
 * Set it up in your DMZ, add user accounts and easily assign them to specific hosts and URLs within the network.
