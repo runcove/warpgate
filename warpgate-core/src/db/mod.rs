@@ -92,7 +92,10 @@ const SQLITE_MAX_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
 /// WAL grow without bound. A connection that goes bad in a way the release
 /// guard `connection_is_clean` does not see is therefore replaced at most a
 /// day later, which is 24 closes a day at most, nothing like the churn of the
-/// old 30 minutes.
+/// old 30 minutes. The lifetime only ends connections idle in the pool (sqlx
+/// checks it on acquire and in its reaper): a reader that is checked out and
+/// stuck keeps its snapshot until it is returned. Connections opened together
+/// also expire together, so they are replaced in one burst a day.
 #[cfg(feature = "sqlite")]
 fn sqlite_pool_options(max_lifetime: Option<Duration>) -> sea_orm::sqlx::sqlite::SqlitePoolOptions {
     sea_orm::sqlx::sqlite::SqlitePoolOptions::new()
