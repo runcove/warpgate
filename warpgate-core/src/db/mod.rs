@@ -70,6 +70,39 @@ pub async fn connect_to_db(
 #[cfg(feature = "sqlite")]
 const SQLITE_MAX_CONNECTIONS: u32 = 24;
 
+/// How long a SQLite pool connection lives before it is replaced; see
+/// `sqlite_pool_options`.
+#[cfg(feature = "sqlite")]
+const SQLITE_MAX_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Pool settings for SQLite, without the release guard.
+///
+/// A connection, once opened, is kept: no idle close, and a lifetime of a day
+/// rather than minutes. Every new connection parses the schema and grows a page
+/// cache of up to ~2 MiB in small pieces; closing it frees them, but an
+/// allocator that only returns whole groups (musl's mallocng, in the static
+/// build) keeps most of them resident, pinned by live neighbours. With idle and
+/// short lifetime closes a busy pool kept replacing connections, and the static
+/// build's resident memory kept rising with them. The pool stops at
+/// SQLITE_MAX_CONNECTIONS, so the most it holds is that many caches.
+///
+/// The lifetime is bounded, not removed, because a connection that never ends
+/// can hold a read snapshot for ever: SQLite cannot checkpoint or reset the WAL
+/// past the oldest frame a reader still uses, so one stuck reader makes the
+/// WAL grow without bound. A connection that goes bad in a way the release
+/// guard `connection_is_clean` does not see is therefore replaced at most a
+/// day later, which is 24 closes a day at most, nothing like the churn of the
+/// old 30 minutes.
+#[cfg(feature = "sqlite")]
+fn sqlite_pool_options(max_lifetime: Option<Duration>) -> sea_orm::sqlx::sqlite::SqlitePoolOptions {
+    sea_orm::sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(SQLITE_MAX_CONNECTIONS)
+        .min_connections(1)
+        .acquire_timeout(Duration::from_secs(30))
+        .idle_timeout(None::<Duration>)
+        .max_lifetime(max_lifetime)
+}
+
 /// WAL mode required to allow multiple concurrent writes to wait for each other
 /// instead of failing
 #[cfg(feature = "sqlite")]
@@ -77,9 +110,7 @@ async fn connect_to_sqlite(url: &str) -> Result<DatabaseConnection> {
     use std::str::FromStr;
 
     use sea_orm::SqlxSqliteConnector;
-    use sea_orm::sqlx::sqlite::{
-        SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous,
-    };
+    use sea_orm::sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous};
 
     // NORMAL is durable in WAL mode against an application crash and costs one
     // fsync per checkpoint instead of one per commit; a power loss can lose the
@@ -98,23 +129,9 @@ async fn connect_to_sqlite(url: &str) -> Result<DatabaseConnection> {
     // every 8 s meant up to 100 threads churning constantly; under a burst of
     // sessions the lobby's memory climbed to its limit (glibc arenas fragment
     // under thread churn). A caller waits as long for a connection as a
-    // statement waits for the lock.
-    //
-    // A connection, once opened, is kept: no idle or lifetime close. Every new
-    // connection parses the schema and grows a page cache of up to ~2 MiB in
-    // small pieces; closing it frees them, but an allocator that only returns
-    // whole groups (musl's mallocng, in the static build) keeps most of them
-    // resident, pinned by live neighbours. With idle and lifetime closes a
-    // busy pool kept replacing connections, and the static build's resident
-    // memory kept rising with them. The pool stops at
-    // SQLITE_MAX_CONNECTIONS, so the most it holds is that many caches. A
-    // connection that goes bad is still dropped by `connection_is_clean`.
-    let pool = SqlitePoolOptions::new()
-        .max_connections(SQLITE_MAX_CONNECTIONS)
-        .min_connections(1)
-        .acquire_timeout(Duration::from_secs(30))
-        .idle_timeout(None::<Duration>)
-        .max_lifetime(None::<Duration>)
+    // statement waits for the lock. Lifetime and idle settings are explained at
+    // `sqlite_pool_options`.
+    let pool = sqlite_pool_options(Some(SQLITE_MAX_LIFETIME))
         .after_release(|conn, _meta| Box::pin(connection_is_clean(conn)))
         .connect_with(connect_options)
         .await?;
@@ -360,15 +377,115 @@ mod tests {
         let url = format!("sqlite:{}", dir.join("db.sqlite3").display());
         let db = connect_to_sqlite(&url).await.unwrap();
 
-        // Closing idle or old connections churns SQLite page caches through the
-        // allocator, which the static (musl) build never gives back.
+        // Closing idle connections, or old ones every few minutes, churns SQLite
+        // page caches through the allocator, which the static (musl) build never
+        // gives back. A day-long lifetime is rare enough not to.
         let options = db.get_sqlite_connection_pool().options();
         assert_eq!(options.get_idle_timeout(), None);
-        assert_eq!(options.get_max_lifetime(), None);
+        assert_eq!(options.get_max_lifetime(), Some(SQLITE_MAX_LIFETIME));
         assert_eq!(options.get_max_connections(), SQLITE_MAX_CONNECTIONS);
 
         db.close().await.unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn sqlite_pool_lifetime_ends_a_pinned_read_snapshot_so_the_wal_can_checkpoint() {
+        use sea_orm::sqlx::sqlite::{SqliteConnectOptions, SqliteConnection, SqliteJournalMode};
+        use sea_orm::sqlx::{Connection, Executor};
+
+        /// `PRAGMA wal_checkpoint(TRUNCATE)` on `conn`: true if it was blocked.
+        async fn checkpoint_blocked(conn: &mut SqliteConnection) -> bool {
+            let (busy, _, _): (i64, i64, i64) =
+                sea_orm::sqlx::query_as("PRAGMA wal_checkpoint(TRUNCATE)")
+                    .fetch_one(conn)
+                    .await
+                    .unwrap();
+            busy != 0
+        }
+
+        /// A pooled connection pins a read snapshot, is returned to the pool
+        /// still holding it, and a writer then fills the WAL. Returns whether the
+        /// WAL could be checkpointed once `lifetime` (plus a margin) had passed.
+        async fn checkpoint_after_lifetime(lifetime: Option<Duration>) -> bool {
+            let dir = std::env::temp_dir().join(format!("wg-pool-life-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("db.sqlite3");
+            let options = SqliteConnectOptions::new()
+                .filename(&path)
+                .create_if_missing(true)
+                .journal_mode(SqliteJournalMode::Wal)
+                .busy_timeout(Duration::from_millis(200));
+
+            // The production pool settings, minus the release guard: the guard
+            // would drop a connection that is inside a transaction, and this
+            // test is about the connection the guard does not see.
+            let pool = sqlite_pool_options(lifetime)
+                .max_connections(1)
+                .connect_with(options.clone())
+                .await
+                .unwrap();
+            let mut writer = SqliteConnection::connect_with(&options).await.unwrap();
+            writer
+                .execute("CREATE TABLE t (id INTEGER, pad TEXT)")
+                .await
+                .unwrap();
+            writer
+                .execute("INSERT INTO t VALUES (1, 'x')")
+                .await
+                .unwrap();
+
+            // Pin a snapshot on the pooled connection and hand it back to the pool.
+            let mut pinned = pool.acquire().await.unwrap();
+            pinned.execute("BEGIN").await.unwrap();
+            pinned.execute("SELECT * FROM t").await.unwrap();
+            drop(pinned);
+
+            // Later commits go to the WAL, beyond what the reader may see.
+            for i in 2..50 {
+                sea_orm::sqlx::query("INSERT INTO t VALUES (?, ?)")
+                    .bind(i)
+                    .bind("x".repeat(1000))
+                    .execute(&mut writer)
+                    .await
+                    .unwrap();
+            }
+            assert!(
+                checkpoint_blocked(&mut writer).await,
+                "the pinned snapshot must block the checkpoint, or the test proves nothing"
+            );
+
+            // Past the lifetime the pool replaces the connection when it is next used.
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            drop(pool.acquire().await.unwrap());
+
+            let blocked = checkpoint_blocked(&mut writer).await;
+            let wal_len = std::fs::metadata(dir.join("db.sqlite3-wal"))
+                .map(|m| m.len())
+                .unwrap_or(0);
+            if !blocked {
+                assert_eq!(
+                    wal_len, 0,
+                    "a completed TRUNCATE checkpoint empties the WAL"
+                );
+            }
+
+            writer.close().await.unwrap();
+            pool.close().await;
+            std::fs::remove_dir_all(&dir).unwrap();
+            !blocked
+        }
+
+        // Without a lifetime the stuck snapshot pins the WAL for as long as the
+        // pool lives; with one, the connection is replaced and the WAL resets.
+        assert!(
+            !checkpoint_after_lifetime(None).await,
+            "control: with no lifetime the pinned snapshot keeps blocking checkpoints"
+        );
+        assert!(
+            checkpoint_after_lifetime(Some(Duration::from_millis(300))).await,
+            "a connection past its lifetime is replaced, releasing its snapshot"
+        );
     }
 
     #[tokio::test]
@@ -436,7 +553,10 @@ mod tests {
         let mut tx = conn.begin().await.unwrap();
         (&mut *tx).execute("ROLLBACK").await.unwrap();
         assert!(tx.rollback().await.is_err());
-        assert!(conn.is_in_transaction(), "sqlx must still count the transaction");
+        assert!(
+            conn.is_in_transaction(),
+            "sqlx must still count the transaction"
+        );
 
         assert!(!connection_is_clean(&mut conn).await.unwrap());
 
@@ -444,7 +564,10 @@ mod tests {
         // whose counter starts at 0.
         drop(conn);
         let mut fresh = pool.acquire().await.unwrap();
-        assert!(!fresh.is_in_transaction(), "the pool must replace the desynced connection");
+        assert!(
+            !fresh.is_in_transaction(),
+            "the pool must replace the desynced connection"
+        );
         assert!(connection_is_clean(&mut fresh).await.unwrap());
 
         drop(fresh);
