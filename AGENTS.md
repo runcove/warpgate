@@ -2,6 +2,7 @@
 
 This is runcove's fork of [Warpgate](https://github.com/warp-tech/warpgate). Most changes belong
 upstream; this fork carries the patches runcove's products need on top of an upstream release.
+The README's **Contributing** section says how pull requests here are taken.
 
 ## Read first
 
