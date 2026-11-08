@@ -2577,6 +2577,106 @@ mod ticket_deletion {
         }
     }
 
+    /// Gives the target a ticket was seeded on options that parse, which
+    /// `resources::targets::delete` needs and `seed_ticket` leaves out.
+    async fn give_the_ticket_target_options(db: &DatabaseConnection, ticket_id: Uuid) -> Uuid {
+        use warpgate_common::{TargetHTTPOptions, TargetOptions, Tls};
+        use warpgate_db_entities::Target;
+
+        let ticket = Ticket::Entity::find_by_id(ticket_id)
+            .one(db)
+            .await
+            .unwrap()
+            .unwrap();
+        let options = serde_json::to_value(TargetOptions::Http(TargetHTTPOptions {
+            url: "http://target".into(),
+            tls: Tls::default(),
+            headers: Default::default(),
+            external_host: None,
+            public: false,
+            unix_socket: None,
+        }))
+        .unwrap();
+        Target::ActiveModel {
+            id: Set(ticket.target_id),
+            options: Set(options),
+            ..Default::default()
+        }
+        .update(db)
+        .await
+        .unwrap();
+        ticket.target_id
+    }
+
+    /// The same race as above, with the target deleted instead of the ticket:
+    /// deleting a target removes its tickets and closes the sessions they
+    /// admitted, so a session opened under one of them must end up closed or
+    /// have been refused. Like the test above, this shows both serial orders
+    /// and the collect-before-delete shape on SQLite; the row lock itself is
+    /// shown by the PostgreSQL/MySQL end-to-end test, `tests/test_ticket_row_lock.py`.
+    #[tokio::test]
+    async fn a_session_opened_while_its_target_is_deleted_is_closed_or_refused() {
+        let db = migrated_db().await;
+        let services = super::delivery::test_services(&db).await;
+
+        for round in 0..20 {
+            let ticket_id = seed_ticket(&db, None, None).await;
+            let target_id = give_the_ticket_target_options(&db, ticket_id).await;
+            let session = bare_user_session(&db).await;
+
+            let delete_target = async {
+                let admitted = crate::resources::targets::delete(&db, target_id)
+                    .await
+                    .unwrap();
+                services.close_admitted_sessions(admitted).await.unwrap();
+            };
+
+            let opened = if round % 2 == 0 {
+                let (opened, ()) = tokio::join!(
+                    open_under_ticket(&db, session, ticket_id),
+                    delete_target,
+                );
+                opened
+            } else {
+                let ((), opened) = tokio::join!(
+                    delete_target,
+                    open_under_ticket(&db, session, ticket_id),
+                );
+                opened
+            };
+
+            assert!(
+                warpgate_db_entities::Target::Entity::find_by_id(target_id)
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "round {round}: the target is still there",
+            );
+            assert!(
+                Ticket::Entity::find_by_id(ticket_id)
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "round {round}: the ticket is still there",
+            );
+            match opened {
+                Ok(()) => assert!(
+                    ended(&db, session).await,
+                    "round {round}: a session opened under a deleted target's ticket is still open",
+                ),
+                Err(error) => {
+                    assert!(
+                        matches!(error, WarpgateError::InvalidTicket(_)),
+                        "round {round}: {error:?}",
+                    );
+                    assert_eq!(target_session_rows(&db, session).await, 0);
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn a_session_is_not_opened_under_an_expired_ticket() {
         let db = migrated_db().await;
