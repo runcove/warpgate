@@ -17,6 +17,8 @@ pub enum WarpgateError {
     DatabaseError(#[from] sea_orm::DbErr),
     #[error("ticket not found: {0}")]
     InvalidTicket(Uuid),
+    #[error("ticket expired: {0}")]
+    TicketExpired(Uuid),
     #[error("invalid target")]
     InvalidTarget,
     #[error("invalid credential type")]
@@ -116,6 +118,7 @@ impl UserFacingReason for WarpgateError {
     fn user_facing_reason(&self) -> String {
         match self {
             Self::InvalidTicket(_)
+            | Self::TicketExpired(_)
             | Self::InvalidTarget
             | Self::InvalidCredentialType
             | Self::UserNotFound(_)
@@ -211,6 +214,7 @@ impl ResponseError for WarpgateError {
     fn status(&self) -> poem::http::StatusCode {
         match self {
             Self::InvalidTicket(_)
+            | Self::TicketExpired(_)
             | Self::UserNotFound(_)
             | Self::RoleNotFound(_)
             | Self::IpAddrNotAllowed(..) => poem::http::StatusCode::UNAUTHORIZED,
@@ -259,6 +263,14 @@ mod tests {
         // stopped carrying the text and would prove nothing about the boundary.
         assert!(leaky.to_string().contains("SELECT"));
         assert_eq!(leaky.user_facing_reason(), "Internal Server Error");
+    }
+
+    /// A ticket that expired while the user waited for approval says so,
+    /// instead of reading like a missing ticket.
+    #[test]
+    fn an_expired_ticket_is_reported_as_expired() {
+        let expired = WarpgateError::TicketExpired(uuid::Uuid::nil());
+        assert!(expired.user_facing_reason().contains("ticket expired"));
     }
 
     /// The other half of the split. Without this the test above would also

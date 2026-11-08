@@ -104,13 +104,14 @@ pub async fn open_or_lookup(
     // then finds this session among the ones it closes.
     if let Some(ticket_id) = ticket_id {
         let ticket = super::Ticket::lock_for_update(&transaction, ticket_id).await?;
-        let valid = ticket.is_some_and(|ticket| {
-            ticket
-                .expiry
-                .is_none_or(|expiry| expiry > OffsetDateTime::now_utc())
-        });
-        if !valid {
+        let Some(ticket) = ticket else {
             return Err(WarpgateError::InvalidTicket(ticket_id));
+        };
+        if ticket
+            .expiry
+            .is_some_and(|expiry| expiry <= OffsetDateTime::now_utc())
+        {
+            return Err(WarpgateError::TicketExpired(ticket_id));
         }
     }
 
