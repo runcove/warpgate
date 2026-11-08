@@ -187,22 +187,55 @@ def lock_ticket(db: SqlSession, ticket_id) -> None:
     )
 
 
-def register_session_under_ticket(db: SqlSession, seeded: Seeded):
-    """Inserts, inside the open transaction, what a protocol registers once a
-    ticket has admitted a connection. Returns the user session's id."""
+def create_user_session(db: SqlSession):
+    """Commits the user session a protocol has already registered by the time
+    it opens a target session under a ticket. Returns its id."""
     session_id = uuid4()
     db.run(
         "INSERT INTO user_sessions (id, username, user_id, remote_address, started, "
         "ended, protocol, node_id, auth_state_node_id) VALUES "
         f"({db.uuid(session_id)}, 'alice', NULL, '127.0.0.1:22', CURRENT_TIMESTAMP, "
-        "NULL, 'HTTP', NULL, NULL);\n"
+        "NULL, 'HTTP', NULL, NULL);"
+    )
+    return session_id
+
+
+def begin_open_under_ticket(db: SqlSession, seeded: Seeded, session_id) -> None:
+    """The locking half of `TargetSession::open_or_lookup` (warpgate-db-entities),
+    statement for statement and in its order: the user session's row first
+    (`UserSession::lock_for_update`: a no-op update, then a read), then the
+    ticket's (`Ticket::lock_for_update`, likewise). A real open takes these
+    two locks in this order, so a delete that locks the ticket (and then looks
+    for the sessions admitted by it) is raced against the real sequence. The
+    transaction is left open."""
+    db.run(
+        "BEGIN;\n"
+        f"UPDATE user_sessions SET started = started WHERE id = {db.uuid(session_id)};"
+    )
+    assert db.scalar(
+        f"SELECT COUNT(*) FROM user_sessions WHERE id = {db.uuid(session_id)} "
+        "AND ended IS NULL;"
+    ) == 1
+    db.run(
+        f"UPDATE tickets SET created = created WHERE id = {db.uuid(seeded.ticket.id)};"
+    )
+    # The open is refused if the ticket is gone; it must not be, here.
+    assert db.scalar(
+        f"SELECT COUNT(*) FROM tickets WHERE id = {db.uuid(seeded.ticket.id)};"
+    ) == 1
+
+
+def finish_open_under_ticket(db: SqlSession, seeded: Seeded, session_id) -> None:
+    """The rest of `TargetSession::open_or_lookup`: the target session row
+    (insert unless one exists for the user session and target), then commit."""
+    db.run(
         "INSERT INTO target_sessions (id, user_session_id, target_snapshot, target_id, "
         "started, ended, ticket_id, node_id) VALUES "
         f"({db.uuid(uuid4())}, {db.uuid(session_id)}, '{{\"name\":\"web\"}}', "
         f"{db.uuid(seeded.target.id)}, CURRENT_TIMESTAMP, NULL, "
-        f"{db.uuid(seeded.ticket.id)}, NULL);"
+        f"{db.uuid(seeded.ticket.id)}, NULL);\n"
+        "COMMIT;"
     )
-    return session_id
 
 
 def test_opening_under_a_ticket_waits_for_its_row_and_is_refused_if_it_is_deleted(
@@ -265,17 +298,17 @@ def test_deleting_waits_for_the_ticket_row_and_closes_the_session_registered_mea
             else:
                 api.delete_target(seeded.target.id)
 
-    lock_ticket(holder, seeded.ticket.id)
+    session_id = create_user_session(reader)
+    begin_open_under_ticket(holder, seeded, session_id)
     try:
         with ThreadPoolExecutor(max_workers=1) as pool:
             deleting = pool.submit(delete)
             time.sleep(HOLD_SECONDS)
             assert not deleting.done(), "the delete did not wait for the ticket row"
 
-            # A protocol registers a session under the ticket while the
-            # delete waits, and commits.
-            session_id = register_session_under_ticket(holder, seeded)
-            holder.run("COMMIT;")
+            # The open, already past its locks, registers its session under
+            # the ticket while the delete waits, and commits.
+            finish_open_under_ticket(holder, seeded, session_id)
 
             deleting.result(timeout=60)
     finally:
