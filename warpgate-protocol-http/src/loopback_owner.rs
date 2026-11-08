@@ -37,6 +37,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::bail;
@@ -206,10 +207,30 @@ pub(crate) async fn check_connection_owner(
     local: SocketAddr,
     remote: SocketAddr,
 ) -> OwnerCheck {
+    check_connection_owner_with(&LOOKUP_TURNS, lookup, our_uid, local, remote).await
+}
+
+/// [`check_connection_owner`] taking its turns from `turns`.
+///
+/// A lookup that hangs (on macOS, a process-table walk stuck in the kernel)
+/// keeps its turn, and so its blocking thread, until it ends. Once every turn
+/// is held that way, a connection that never got a turn is refused with a
+/// message saying so, and logged, rather than taking another thread: the
+/// hung lookups are the most that ever pile up.
+async fn check_connection_owner_with(
+    turns: &'static tokio::sync::Semaphore,
+    lookup: Arc<dyn SocketOwnerLookup>,
+    our_uid: u32,
+    local: SocketAddr,
+    remote: SocketAddr,
+) -> OwnerCheck {
+    let started = Arc::new(AtomicBool::new(false));
+    let started_here = started.clone();
     let looked_up = tokio::time::timeout(LOOKUP_TIMEOUT, async move {
         // The turn goes into the blocking task, so a lookup still running
         // after the timeout keeps its place until it ends.
-        let turn = LOOKUP_TURNS.acquire().await?;
+        let turn = turns.acquire().await?;
+        started_here.store(true, Ordering::Relaxed);
         // The client socket's endpoints are the accepted connection's, swapped.
         let task = tokio::task::spawn_blocking(move || {
             let _turn = turn;
@@ -219,7 +240,15 @@ pub(crate) async fn check_connection_owner(
     })
     .await;
     match looked_up {
-        Err(_) => OwnerCheck::LookupFailed("timed out".into()),
+        Err(_) if started.load(Ordering::Relaxed) => OwnerCheck::LookupFailed("timed out".into()),
+        Err(_) => {
+            warn!(
+                "Every socket lookup slot has been taken past the lookup timeout; a lookup may be hung. Refusing loopback connections until one ends"
+            );
+            OwnerCheck::LookupFailed(
+                "all socket lookup threads are busy, and none finished in time".into(),
+            )
+        }
         Ok(Err(error)) => OwnerCheck::LookupFailed(error.to_string()),
         Ok(Ok(looked_up)) => owner_check(looked_up, our_uid),
     }
@@ -2106,6 +2135,72 @@ mod tests {
         let mut truncated = sock_diag_reply(5, AF_INET, established, local, remote, 501, 1);
         truncated.truncate(40);
         assert!(parse(truncated).is_err());
+    }
+
+    /// With every lookup slot held by a hung lookup, further connections are
+    /// refused with a message saying so, and no further thread is taken.
+    #[tokio::test]
+    async fn lookups_hung_in_every_slot_refuse_further_connections_without_new_threads() {
+        use std::sync::atomic::AtomicUsize;
+
+        // Its own turns, so hanging them cannot starve other tests.
+        static TURNS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+        static STARTED: AtomicUsize = AtomicUsize::new(0);
+        static RELEASE: Mutex<bool> = Mutex::new(false);
+        static RELEASED: std::sync::Condvar = std::sync::Condvar::new();
+
+        struct HungLookup;
+
+        impl SocketOwnerLookup for HungLookup {
+            fn owner_uid(
+                &self,
+                _local: SocketAddr,
+                _remote: SocketAddr,
+            ) -> anyhow::Result<Option<u32>> {
+                STARTED.fetch_add(1, Ordering::SeqCst);
+                let mut released = RELEASE.lock().unwrap();
+                while !*released {
+                    released = RELEASED.wait(released).unwrap();
+                }
+                Ok(Some(501))
+            }
+        }
+
+        // Lets the hung lookups end when the test does, even when it fails.
+        struct Release;
+
+        impl Drop for Release {
+            fn drop(&mut self) {
+                *RELEASE.lock().unwrap() = true;
+                RELEASED.notify_all();
+            }
+        }
+        let _release = Release;
+
+        let (local, remote) = (addr("127.0.0.1:8888"), addr("127.0.0.1:50123"));
+        let ask = || {
+            let lookup: Arc<dyn SocketOwnerLookup> = Arc::new(HungLookup);
+            tokio::spawn(check_connection_owner_with(
+                &TURNS, lookup, 501, local, remote,
+            ))
+        };
+        // Two lookups take both turns and hang: they are cut off at the
+        // timeout, their threads still held.
+        for hung in [ask(), ask()] {
+            assert_eq!(
+                hung.await.unwrap(),
+                OwnerCheck::LookupFailed("timed out".into())
+            );
+        }
+        // Later ones are refused for the busy slots, and start no thread.
+        let later: Vec<_> = (0..5).map(|_| ask()).collect();
+        for check in later {
+            let OwnerCheck::LookupFailed(reason) = check.await.unwrap() else {
+                panic!("a connection was let through while every slot was hung");
+            };
+            assert!(reason.contains("busy"), "{reason}");
+        }
+        assert!(STARTED.load(Ordering::SeqCst) <= 2);
     }
 
     /// However many connections arrive at once, no more than
