@@ -574,22 +574,91 @@ mod linux {
             Some(SocketAddr::new(ip, port))
         }
 
-        /// Opens a loopback connection and looks its client socket up: the
-        /// lookup must find it under this process's uid.
+        /// What the self-test found.
+        #[cfg(target_os = "linux")]
+        #[derive(Debug, PartialEq, Eq)]
+        pub(in super::super) enum Probe {
+            /// `sock_diag` found the test connection under this process's uid.
+            Works,
+            /// This kernel cannot serve `sock_diag` lookups: netlink sockets
+            /// of this kind cannot be opened, or the lookup finds nothing
+            /// (how a missing `tcp_diag` answers).
+            Unavailable(String),
+            /// `sock_diag` is there and misbehaves: a send or parse error, a
+            /// wrong uid, or the test connection could not be set up.
+            Broken(String),
+        }
+
+        /// Context of the error for a failed `socket(2)`.
+        #[cfg(target_os = "linux")]
+        const OPEN_CONTEXT: &str = "opening a sock_diag socket";
+
+        /// Sorts the outcome of the self-test's lookup of its own connection
+        /// (`ours` being this process's uid).
+        #[cfg(target_os = "linux")]
+        pub(in super::super) fn classify(lookup: anyhow::Result<Option<u32>>, ours: u32) -> Probe {
+            match lookup {
+                Ok(Some(uid)) if uid == ours => Probe::Works,
+                Ok(Some(uid)) => Probe::Broken(format!(
+                    "a connection of this process was looked up as uid {uid}, not uid {ours}"
+                )),
+                Ok(None) => Probe::Unavailable("the lookup found no such socket".into()),
+                Err(error) => {
+                    let cannot_open = error.to_string() == OPEN_CONTEXT
+                        && error.chain().any(|cause| {
+                            cause
+                                .downcast_ref::<std::io::Error>()
+                                .and_then(std::io::Error::raw_os_error)
+                                .is_some_and(|errno| {
+                                    [
+                                        libc::EPROTONOSUPPORT,
+                                        libc::EAFNOSUPPORT,
+                                        libc::EPERM,
+                                        libc::EACCES,
+                                    ]
+                                    .contains(&errno)
+                                })
+                        });
+                    if cannot_open {
+                        Probe::Unavailable(format!("{error:#}"))
+                    } else {
+                        Probe::Broken(format!("{error:#}"))
+                    }
+                }
+            }
+        }
+
+        /// Opens a loopback connection and looks its client socket up.
+        #[cfg(target_os = "linux")]
+        pub(in super::super) fn probe() -> Probe {
+            let setup = || -> anyhow::Result<_> {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0")
+                    .context("binding a test listener")?;
+                let listen_address = listener.local_addr()?;
+                let client =
+                    std::net::TcpStream::connect(listen_address).context("connecting to it")?;
+                let (server, _) = listener.accept().context("accepting the connection")?;
+                Ok((client.local_addr()?, listen_address, client, server))
+            };
+            let (client_address, listen_address, _client, _server) = match setup() {
+                Ok(setup) => setup,
+                Err(error) => return Probe::Broken(format!("{error:#}")),
+            };
+            let ours = match super::super::effective_uid() {
+                Ok(uid) => uid,
+                Err(error) => return Probe::Broken(format!("{error:#}")),
+            };
+            classify(owner_uid(client_address, listen_address), ours)
+        }
+
+        /// The lookup must find a connection this process has just opened
+        /// under this process's uid.
         #[cfg(target_os = "linux")]
         pub(in super::super) fn self_test() -> anyhow::Result<()> {
-            let listener =
-                std::net::TcpListener::bind("127.0.0.1:0").context("binding a test listener")?;
-            let listen_address = listener.local_addr()?;
-            let client =
-                std::net::TcpStream::connect(listen_address).context("connecting to it")?;
-            let (_server, _) = listener.accept().context("accepting the connection")?;
-            let found = owner_uid(client.local_addr()?, listen_address)?;
-            let ours = super::super::effective_uid()?;
-            if found != Some(ours) {
-                bail!("a connection of this process was looked up as {found:?}, not uid {ours}");
+            match probe() {
+                Probe::Works => Ok(()),
+                Probe::Unavailable(reason) | Probe::Broken(reason) => bail!("{reason}"),
             }
-            Ok(())
         }
 
         /// A libc call's return value as a result: its errno when negative.
@@ -641,7 +710,7 @@ mod linux {
                 )
             };
             if fd < 0 {
-                return Err(std::io::Error::last_os_error()).context("opening a sock_diag socket");
+                return Err(std::io::Error::last_os_error()).context(OPEN_CONTEXT);
             }
             // SAFETY: `fd` is a descriptor just opened that nothing else owns.
             let socket = unsafe { OwnedFd::from_raw_fd(fd) };
@@ -1908,22 +1977,101 @@ mod tests {
     }
 
     /// True, after printing why, when this kernel cannot serve `sock_diag`
-    /// lookups (no `tcp_diag`/`inet_diag` module, netlink filtered in a
-    /// sandbox): the production code falls back to `/proc/net/tcp` there, so
-    /// the tests that need `sock_diag` itself have nothing to check. Run with
-    /// `--nocapture` to see the reason.
+    /// lookups (netlink sockets of the kind cannot be opened, or no
+    /// `tcp_diag`/`inet_diag` module so the lookup finds nothing): the
+    /// production code falls back to `/proc/net/tcp` there, so the tests that
+    /// need `sock_diag` itself have nothing to check. A `sock_diag` that is
+    /// present and misbehaves (wrong uid, send or parse error) fails the
+    /// test, and so does a skip when `WARPGATE_REQUIRE_SOCK_DIAG=1`, which CI
+    /// sets so that a kernel without `sock_diag` cannot pass unnoticed.
     #[cfg(target_os = "linux")]
     fn skip_without_sock_diag(test: &str) -> bool {
-        match linux::sock_diag::self_test() {
-            Ok(()) => false,
-            Err(error) => {
+        let require = std::env::var("WARPGATE_REQUIRE_SOCK_DIAG").is_ok_and(|value| value == "1");
+        skip_or_fail(linux::sock_diag::probe(), require, test)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn skip_or_fail(probe: linux::sock_diag::Probe, require: bool, test: &str) -> bool {
+        use linux::sock_diag::Probe;
+        match probe {
+            Probe::Works => false,
+            Probe::Broken(reason) => panic!("{test}: sock_diag is broken: {reason}"),
+            Probe::Unavailable(reason) if require => {
+                panic!("{test}: sock_diag is required but unavailable: {reason}")
+            }
+            Probe::Unavailable(reason) => {
                 eprintln!(
-                    "SKIPPED {test}: sock_diag is unavailable on this kernel ({error:#}); \
+                    "SKIPPED {test}: sock_diag is unavailable on this kernel ({reason}); \
                      the /proc/net/tcp fallback is covered by the other tests"
                 );
                 true
             }
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sock_diag_self_test_skips_only_when_sock_diag_is_unavailable() {
+        use anyhow::Context;
+        use linux::sock_diag::{Probe, classify};
+
+        let open_error = |errno| {
+            Err::<Option<u32>, _>(std::io::Error::from_raw_os_error(errno))
+                .context("opening a sock_diag socket")
+        };
+        assert_eq!(classify(Ok(Some(501)), 501), Probe::Works);
+        // No tcp_diag: the lookup finds nothing.
+        assert!(matches!(classify(Ok(None), 501), Probe::Unavailable(_)));
+        for errno in [
+            libc::EPROTONOSUPPORT,
+            libc::EAFNOSUPPORT,
+            libc::EPERM,
+            libc::EACCES,
+        ] {
+            assert!(
+                matches!(classify(open_error(errno), 501), Probe::Unavailable(_)),
+                "errno {errno}"
+            );
+        }
+        // Everything else is a fault, not a missing feature.
+        assert!(matches!(classify(Ok(Some(0)), 501), Probe::Broken(_)));
+        assert!(matches!(
+            classify(open_error(libc::EMFILE), 501),
+            Probe::Broken(_)
+        ));
+        let send_denied = Err::<Option<u32>, _>(std::io::Error::from_raw_os_error(libc::EPERM))
+            .context("sending the sock_diag request");
+        assert!(matches!(classify(send_denied, 501), Probe::Broken(_)));
+        let parse_error = Err::<Option<u32>, _>(anyhow::anyhow!("short netlink reply"));
+        assert!(matches!(classify(parse_error, 501), Probe::Broken(_)));
+
+        // Skipping is for an unavailable sock_diag only, and is off when
+        // required.
+        let unavailable = || Probe::Unavailable("no tcp_diag".into());
+        assert!(skip_or_fail(unavailable(), false, "t"));
+        assert!(!skip_or_fail(Probe::Works, true, "t"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[should_panic(expected = "required but unavailable")]
+    fn a_required_sock_diag_that_is_unavailable_fails_the_test() {
+        skip_or_fail(
+            linux::sock_diag::Probe::Unavailable("no tcp_diag".into()),
+            true,
+            "t",
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[should_panic(expected = "sock_diag is broken")]
+    fn a_broken_sock_diag_fails_the_test_even_when_not_required() {
+        skip_or_fail(
+            linux::sock_diag::Probe::Broken("wrong uid".into()),
+            false,
+            "t",
+        );
     }
 
     /// The listening socket is not the client: asked for endpoints whose
