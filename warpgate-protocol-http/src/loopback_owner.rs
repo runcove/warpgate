@@ -483,12 +483,12 @@ mod linux {
             match kind {
                 NLMSG_ERROR => {
                     let error = ne_i32(body, 0).context("short netlink error")?;
-                    if error == -ENOENT {
+                    if error.checked_neg() == Some(ENOENT) {
                         return Ok(None);
                     }
                     bail!(
                         "the kernel refused the socket lookup: {}",
-                        std::io::Error::from_raw_os_error(-error)
+                        std::io::Error::from_raw_os_error(error.saturating_neg())
                     );
                 }
                 SOCK_DIAG_BY_FAMILY => {}
@@ -1913,16 +1913,37 @@ mod tests {
     }
 
     fn sock_diag_error(seq: u32, errno: i32) -> Vec<u8> {
+        sock_diag_error_value(seq, -errno)
+    }
+
+    /// An `NLMSG_ERROR` reply carrying `error` as the kernel would write it
+    /// (a negative errno), whatever its value.
+    fn sock_diag_error_value(seq: u32, error: i32) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&36u32.to_ne_bytes());
         out.extend_from_slice(&2u16.to_ne_bytes());
         out.extend_from_slice(&0u16.to_ne_bytes());
         out.extend_from_slice(&seq.to_ne_bytes());
         out.extend_from_slice(&0u32.to_ne_bytes());
-        out.extend_from_slice(&(-errno).to_ne_bytes());
+        out.extend_from_slice(&error.to_ne_bytes());
         // The request's own header, echoed back.
         out.extend_from_slice(&[0u8; 16]);
         out
+    }
+
+    /// A reply whose error code cannot be negated (`i32::MIN`) fails the
+    /// lookup like any other error; it must not overflow.
+    #[test]
+    fn sock_diag_error_codes_that_cannot_be_negated_fail_the_lookup() {
+        use linux::sock_diag::parse_reply;
+        let (local, remote) = (addr("127.0.0.1:50123"), addr("127.0.0.1:8888"));
+        for error in [i32::MIN, i32::MIN + 1, i32::MAX, 0] {
+            let reply = sock_diag_error_value(5, error);
+            assert!(
+                parse_reply(&reply, 5, local, remote).is_err(),
+                "error code {error}"
+            );
+        }
     }
 
     #[test]
