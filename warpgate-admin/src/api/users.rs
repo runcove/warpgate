@@ -408,12 +408,16 @@ impl DetailApi {
         let (user_id, username) = (user.id, user.username.clone());
         let admitted = delete_user_records(db, user).await?;
         // A login can land between the close above and the commit; the user's
-        // own sessions are closed again now that the delete is final.
-        admin
+        // own sessions are closed again now that the delete is final. Both
+        // closes are attempted even if one fails, then the first error is
+        // returned, so a failure of one never leaves the other sessions open.
+        let admitted_result = admin.services().close_admitted_sessions(admitted).await;
+        let user_result = admin
             .services()
             .close_sessions(SessionsFilter::User { user_id })
-            .await?;
-        admin.services().close_admitted_sessions(admitted).await?;
+            .await;
+        admitted_result?;
+        user_result?;
 
         AuditEvent::UserDeleted {
             user_id,
