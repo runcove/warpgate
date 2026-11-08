@@ -87,6 +87,20 @@ pub async fn lock_all_for_target(
     Ok(())
 }
 
+/// [`lock_for_update`] for every ticket of a user, for deleting the user.
+/// Take it before anything else in the transaction, as for a target delete.
+pub async fn lock_all_for_user(
+    transaction: &DatabaseTransaction,
+    user_id: Uuid,
+) -> Result<(), WarpgateError> {
+    Entity::update_many()
+        .col_expr(Column::Created, Expr::col(Column::Created).into())
+        .filter(Column::UserId.eq(user_id))
+        .exec(transaction)
+        .await?;
+    Ok(())
+}
+
 /// Atomic use spend
 ///
 /// WarpgateError::InvalidTicket = no uses left

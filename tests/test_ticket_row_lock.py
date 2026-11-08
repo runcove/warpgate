@@ -246,7 +246,7 @@ def test_opening_under_a_ticket_waits_for_its_row_and_is_refused_if_it_is_delete
     ) == 0
 
 
-@pytest.mark.parametrize("what", ["ticket", "target"])
+@pytest.mark.parametrize("what", ["ticket", "target", "user"])
 def test_deleting_waits_for_the_ticket_row_and_closes_the_session_registered_meanwhile(
     db_wg, sql, echo_server_port, what
 ):
@@ -260,6 +260,8 @@ def test_deleting_waits_for_the_ticket_row_and_closes_the_session_registered_mea
         with admin_client(url) as api:
             if what == "ticket":
                 api.delete_ticket(seeded.ticket.id)
+            elif what == "user":
+                api.delete_user(seeded.user.id)
             else:
                 api.delete_target(seeded.target.id)
 

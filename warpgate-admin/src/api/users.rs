@@ -14,9 +14,11 @@ use warpgate_common::{
 };
 use warpgate_common_http::errors::{bad_request, invalid_field};
 use warpgate_core::logging::{AuditEvent, format_related_ids};
+use warpgate_core::resources::AdmittedSessions;
 use warpgate_core::{AccessChange, SessionsFilter};
 use warpgate_db_entities::{
-    AdminRole, Role, Ticket, TicketRequest, User, UserAdminRoleAssignment, UserRoleAssignment,
+    AdminRole, PendingSessionClose, Role, TargetSession, Ticket, TicketRequest, User,
+    UserAdminRoleAssignment, UserRoleAssignment,
 };
 
 use super::{AdminContext, guard_user_mutation};
@@ -199,11 +201,16 @@ async fn username_taken(
 /// deleted. The target delete handler clears the same two tables for a target.
 /// A ticket request is removed both by its own `user_id` and by the ticket it
 /// produced, since `ticket_requests.ticket_id` also references `tickets`.
+///
+/// The user's tickets are locked before the first read, as a target delete
+/// does, and the open sessions they admitted are returned (and recorded for
+/// the close sweep) for the caller to close once this has committed.
 async fn delete_user_records(
     db: &DatabaseConnection,
     user: User::Model,
-) -> Result<(), WarpgateError> {
+) -> Result<AdmittedSessions, WarpgateError> {
     let txn = db.begin().await?;
+    Ticket::lock_all_for_user(&txn, user.id).await?;
 
     UserRoleAssignment::Entity::delete_many()
         .filter(UserRoleAssignment::Column::UserId.eq(user.id))
@@ -232,6 +239,12 @@ async fn delete_user_records(
         .exec(&txn)
         .await?;
 
+    let admitted = TargetSession::open_user_sessions_admitted_by_tickets(
+        &txn,
+        Ticket::Column::UserId.eq(user.id),
+    )
+    .await?;
+    PendingSessionClose::mark(&txn, &admitted).await?;
     Ticket::Entity::delete_many()
         .filter(Ticket::Column::UserId.eq(user.id))
         .exec(&txn)
@@ -239,7 +252,7 @@ async fn delete_user_records(
 
     user.delete(&txn).await?;
     txn.commit().await?;
-    Ok(())
+    Ok(AdmittedSessions(admitted))
 }
 
 #[derive(ApiResponse)]
@@ -393,7 +406,8 @@ impl DetailApi {
             .await?;
 
         let (user_id, username) = (user.id, user.username.clone());
-        delete_user_records(db, user).await?;
+        let admitted = delete_user_records(db, user).await?;
+        admin.services().close_admitted_sessions(admitted).await?;
 
         AuditEvent::UserDeleted {
             user_id,
@@ -1141,7 +1155,7 @@ mod tests {
         );
 
         let alice_id = alice.id;
-        delete_user_records(&db, alice).await.unwrap();
+        let _admitted = delete_user_records(&db, alice).await.unwrap();
 
         assert!(
             User::Entity::find_by_id(alice_id)
@@ -1188,5 +1202,67 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    async fn open_session_under(
+        db: &DatabaseConnection,
+        target_id: Uuid,
+        ticket_id: Uuid,
+    ) -> warpgate_common::UserSessionId {
+        let session_id = warpgate_common::UserSessionId(Uuid::new_v4());
+        warpgate_db_entities::UserSession::ActiveModel {
+            id: Set(session_id),
+            username: Set(Some("alice".into())),
+            user_id: Set(None),
+            remote_address: Set("127.0.0.1:22".into()),
+            started: Set(OffsetDateTime::now_utc()),
+            ended: Set(None),
+            protocol: Set("HTTP".into()),
+            node_id: Set(None),
+            auth_state_node_id: Set(None),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        TargetSession::ActiveModel {
+            id: Set(warpgate_common::TargetSessionId(Uuid::new_v4())),
+            user_session_id: Set(session_id),
+            target_snapshot: Set(r#"{"name":"web"}"#.into()),
+            target_id: Set(target_id),
+            started: Set(OffsetDateTime::now_utc()),
+            ended: Set(None),
+            ticket_id: Set(Some(ticket_id)),
+            node_id: Set(None),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        session_id
+    }
+
+    /// Deleting a user removes their tickets, and with them the only record of
+    /// which open sessions those tickets admitted, so the delete must hand
+    /// those sessions back to be closed (and record them for the sweep).
+    /// Another user's sessions are not touched.
+    #[tokio::test]
+    async fn deleting_a_user_returns_the_sessions_their_tickets_admitted() {
+        let db = setup_db().await;
+        let target_id = insert_target(&db).await;
+        let alice = insert_user(&db, "alice").await;
+        let bob = insert_user(&db, "bob").await;
+
+        let alice_ticket = insert_ticket(&db, alice.id, target_id).await;
+        let bob_ticket = insert_ticket(&db, bob.id, target_id).await;
+        let alice_session = open_session_under(&db, target_id, alice_ticket).await;
+        let bob_session = open_session_under(&db, target_id, bob_ticket).await;
+
+        let admitted = delete_user_records(&db, alice).await.unwrap();
+
+        assert_eq!(admitted.0, vec![alice_session]);
+        assert_eq!(
+            PendingSessionClose::pending(&db).await.unwrap(),
+            vec![alice_session],
+        );
+        assert!(!admitted.0.contains(&bob_session));
     }
 }
