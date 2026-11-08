@@ -563,6 +563,27 @@ mod linux {
             Ok(())
         }
 
+        /// A libc call's return value as a result: its errno when negative.
+        #[cfg(target_os = "linux")]
+        fn call_result(returned: isize) -> std::io::Result<usize> {
+            usize::try_from(returned).map_err(|_| std::io::Error::last_os_error())
+        }
+
+        /// Runs a system call, and runs it once more when a signal interrupted
+        /// it: a signal handler anywhere in the process can end a blocking
+        /// `sendto` or `recvfrom` with `EINTR`, which says nothing about the
+        /// lookup and must not refuse the connection. A second interruption
+        /// is returned, so a stream of signals cannot hold the thread.
+        #[cfg(target_os = "linux")]
+        pub(in super::super) fn retry_once_on_eintr<T>(
+            mut call: impl FnMut() -> std::io::Result<T>,
+        ) -> std::io::Result<T> {
+            match call() {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => call(),
+                other => other,
+            }
+        }
+
         /// The uid owning the TCP socket with these endpoints, from one
         /// `sock_diag` request.
         #[cfg(target_os = "linux")]
@@ -624,23 +645,23 @@ mod linux {
             // kernel.
             let mut kernel: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
             kernel.nl_family = libc::AF_NETLINK as libc::sa_family_t;
-            // SAFETY: sendto reads `request` and `kernel` for the lengths
-            // given.
-            let sent = unsafe {
-                libc::sendto(
-                    socket.as_raw_fd(),
-                    request.as_ptr().cast(),
-                    request.len(),
-                    0,
-                    (&raw const kernel).cast(),
-                    std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
-                )
-            };
-            if sent < 0 {
-                return Err(std::io::Error::last_os_error())
-                    .context("sending the sock_diag request");
-            }
-            if sent as usize != request.len() {
+            let sent = retry_once_on_eintr(|| {
+                // SAFETY: sendto reads `request` and `kernel` for the lengths
+                // given.
+                let sent = unsafe {
+                    libc::sendto(
+                        socket.as_raw_fd(),
+                        request.as_ptr().cast(),
+                        request.len(),
+                        0,
+                        (&raw const kernel).cast(),
+                        std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+                    )
+                };
+                call_result(sent)
+            })
+            .context("sending the sock_diag request")?;
+            if sent != request.len() {
                 bail!("the sock_diag request was sent short");
             }
 
@@ -648,26 +669,27 @@ mod linux {
             // SAFETY: as above, all zeroes is a valid sockaddr_nl.
             let mut sender: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
             let mut sender_len = std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t;
-            // SAFETY: recvfrom writes at most `reply.len()` bytes into
-            // `reply` and at most `sender_len` bytes into `sender`.
-            let received = unsafe {
-                libc::recvfrom(
-                    socket.as_raw_fd(),
-                    reply.as_mut_ptr().cast(),
-                    reply.len(),
-                    0,
-                    (&raw mut sender).cast(),
-                    &raw mut sender_len,
-                )
-            };
-            if received < 0 {
-                return Err(std::io::Error::last_os_error()).context("reading the sock_diag reply");
-            }
+            let received = retry_once_on_eintr(|| {
+                // SAFETY: recvfrom writes at most `reply.len()` bytes into
+                // `reply` and at most `sender_len` bytes into `sender`.
+                let received = unsafe {
+                    libc::recvfrom(
+                        socket.as_raw_fd(),
+                        reply.as_mut_ptr().cast(),
+                        reply.len(),
+                        0,
+                        (&raw mut sender).cast(),
+                        &raw mut sender_len,
+                    )
+                };
+                call_result(received)
+            })
+            .context("reading the sock_diag reply")?;
             if sender.nl_pid != 0 {
                 bail!("a sock_diag reply that did not come from the kernel");
             }
             let reply = reply
-                .get(..received as usize)
+                .get(..received)
                 .context("sock_diag reply longer than its buffer")?;
             parse_reply(reply, seq, local, remote)
         }
@@ -1944,6 +1966,44 @@ mod tests {
                 "error code {error}"
             );
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn interrupted_sock_diag_calls_are_retried_once() {
+        use std::io::{Error, ErrorKind};
+
+        use linux::sock_diag::retry_once_on_eintr;
+
+        // Interrupted once: the retry's answer is used.
+        let mut calls = 0;
+        let answer = retry_once_on_eintr(|| {
+            calls += 1;
+            if calls == 1 {
+                Err(Error::from_raw_os_error(libc::EINTR))
+            } else {
+                Ok(calls)
+            }
+        });
+        assert_eq!(answer.unwrap(), 2);
+
+        // Interrupted twice: the error comes back after one retry, not more.
+        let mut calls = 0;
+        let answer: std::io::Result<()> = retry_once_on_eintr(|| {
+            calls += 1;
+            Err(Error::from_raw_os_error(libc::EINTR))
+        });
+        assert_eq!(answer.unwrap_err().kind(), ErrorKind::Interrupted);
+        assert_eq!(calls, 2);
+
+        // Any other error is not retried.
+        let mut calls = 0;
+        let answer: std::io::Result<()> = retry_once_on_eintr(|| {
+            calls += 1;
+            Err(Error::from_raw_os_error(libc::EACCES))
+        });
+        assert!(answer.is_err());
+        assert_eq!(calls, 1);
     }
 
     #[test]
