@@ -37,6 +37,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::bail;
@@ -65,6 +66,10 @@ const MAX_CONCURRENT_LOOKUPS: usize = 4;
 static LOOKUP_TURNS: tokio::sync::Semaphore =
     tokio::sync::Semaphore::const_new(MAX_CONCURRENT_LOOKUPS);
 
+/// Whether the log already says that every lookup slot is taken; cleared when
+/// a lookup next gets a slot, so a burst of refused connections logs once.
+static ALL_BUSY_LOGGED: AtomicBool = AtomicBool::new(false);
+
 /// Finds the OS account owning a TCP socket.
 pub(crate) trait SocketOwnerLookup: Send + Sync + 'static {
     /// The uid owning the TCP socket whose local endpoint is `local` and whose
@@ -87,7 +92,29 @@ impl KernelSocketTable {
     /// when it does not: the kernel answers a lookup it cannot serve (no
     /// `tcp_diag`, a filter on netlink) the way it answers one for a socket
     /// that does not exist, which would refuse every connection.
-    pub(crate) fn detect() -> Self {
+    ///
+    /// The check opens sockets and may wait on the kernel, so it runs on a
+    /// blocking thread rather than the async one.
+    pub(crate) async fn detect() -> Self {
+        match tokio::task::spawn_blocking(Self::detect_blocking).await {
+            Ok(table) => table,
+            Err(error) => {
+                warn!(%error, "The socket lookup self-test did not finish; using the default lookup");
+                Self::fallback()
+            }
+        }
+    }
+
+    /// The lookup used when the self-test could not run: the one that needs
+    /// no kernel module.
+    fn fallback() -> Self {
+        Self {
+            #[cfg(target_os = "linux")]
+            sock_diag: false,
+        }
+    }
+
+    fn detect_blocking() -> Self {
         #[cfg(target_os = "linux")]
         {
             let sock_diag = match linux::sock_diag::self_test() {
@@ -184,10 +211,42 @@ pub(crate) async fn check_connection_owner(
     local: SocketAddr,
     remote: SocketAddr,
 ) -> OwnerCheck {
+    check_connection_owner_with(
+        &LOOKUP_TURNS,
+        &ALL_BUSY_LOGGED,
+        lookup,
+        our_uid,
+        local,
+        remote,
+    )
+    .await
+}
+
+/// [`check_connection_owner`] taking its turns from `turns`.
+///
+/// A lookup that hangs (on macOS, a process-table walk stuck in the kernel)
+/// keeps its turn, and so its blocking thread, until it ends. Once every turn
+/// is held that way, a connection that never got a turn is refused with a
+/// message saying so, and logged once per spell of being all busy (the flag
+/// `all_busy_logged` is cleared when a lookup next gets a slot), rather than
+/// taking another thread: the
+/// hung lookups are the most that ever pile up.
+async fn check_connection_owner_with(
+    turns: &'static tokio::sync::Semaphore,
+    all_busy_logged: &'static AtomicBool,
+    lookup: Arc<dyn SocketOwnerLookup>,
+    our_uid: u32,
+    local: SocketAddr,
+    remote: SocketAddr,
+) -> OwnerCheck {
+    let started = Arc::new(AtomicBool::new(false));
+    let started_here = started.clone();
     let looked_up = tokio::time::timeout(LOOKUP_TIMEOUT, async move {
         // The turn goes into the blocking task, so a lookup still running
         // after the timeout keeps its place until it ends.
-        let turn = LOOKUP_TURNS.acquire().await?;
+        let turn = turns.acquire().await?;
+        started_here.store(true, Ordering::Relaxed);
+        all_busy_logged.store(false, Ordering::Relaxed);
         // The client socket's endpoints are the accepted connection's, swapped.
         let task = tokio::task::spawn_blocking(move || {
             let _turn = turn;
@@ -197,7 +256,17 @@ pub(crate) async fn check_connection_owner(
     })
     .await;
     match looked_up {
-        Err(_) => OwnerCheck::LookupFailed("timed out".into()),
+        Err(_) if started.load(Ordering::Relaxed) => OwnerCheck::LookupFailed("timed out".into()),
+        Err(_) => {
+            if !all_busy_logged.swap(true, Ordering::Relaxed) {
+                warn!(
+                    "Every socket lookup slot has been taken past the lookup timeout: lookups are slow or hung. Refusing loopback connections until one ends"
+                );
+            }
+            OwnerCheck::LookupFailed(
+                "all socket lookup threads are busy, and none finished in time".into(),
+            )
+        }
         Ok(Err(error)) => OwnerCheck::LookupFailed(error.to_string()),
         Ok(Ok(looked_up)) => owner_check(looked_up, our_uid),
     }
@@ -461,12 +530,12 @@ mod linux {
             match kind {
                 NLMSG_ERROR => {
                     let error = ne_i32(body, 0).context("short netlink error")?;
-                    if error == -ENOENT {
+                    if error.checked_neg() == Some(ENOENT) {
                         return Ok(None);
                     }
                     bail!(
                         "the kernel refused the socket lookup: {}",
-                        std::io::Error::from_raw_os_error(-error)
+                        std::io::Error::from_raw_os_error(error.saturating_neg())
                     );
                 }
                 SOCK_DIAG_BY_FAMILY => {}
@@ -523,22 +592,112 @@ mod linux {
             Some(SocketAddr::new(ip, port))
         }
 
-        /// Opens a loopback connection and looks its client socket up: the
-        /// lookup must find it under this process's uid.
+        /// What the self-test found.
+        #[cfg(target_os = "linux")]
+        #[derive(Debug, PartialEq, Eq)]
+        pub(in super::super) enum Probe {
+            /// `sock_diag` found the test connection under this process's uid.
+            Works,
+            /// This kernel cannot serve `sock_diag` lookups: netlink sockets
+            /// of this kind cannot be opened, or the lookup finds nothing
+            /// (how a missing `tcp_diag` answers).
+            Unavailable(String),
+            /// `sock_diag` is there and misbehaves: a send or parse error, a
+            /// wrong uid, or the test connection could not be set up.
+            Broken(String),
+        }
+
+        /// Context of the error for a failed `socket(2)`.
+        #[cfg(target_os = "linux")]
+        const OPEN_CONTEXT: &str = "opening a sock_diag socket";
+
+        /// Sorts the outcome of the self-test's lookup of its own connection
+        /// (`ours` being this process's uid).
+        #[cfg(target_os = "linux")]
+        pub(in super::super) fn classify(lookup: anyhow::Result<Option<u32>>, ours: u32) -> Probe {
+            match lookup {
+                Ok(Some(uid)) if uid == ours => Probe::Works,
+                Ok(Some(uid)) => Probe::Broken(format!(
+                    "a connection of this process was looked up as uid {uid}, not uid {ours}"
+                )),
+                Ok(None) => Probe::Unavailable("the lookup found no such socket".into()),
+                Err(error) => {
+                    let cannot_open = error.to_string() == OPEN_CONTEXT
+                        && error.chain().any(|cause| {
+                            cause
+                                .downcast_ref::<std::io::Error>()
+                                .and_then(std::io::Error::raw_os_error)
+                                .is_some_and(|errno| {
+                                    [
+                                        libc::EPROTONOSUPPORT,
+                                        libc::EAFNOSUPPORT,
+                                        libc::EPERM,
+                                        libc::EACCES,
+                                    ]
+                                    .contains(&errno)
+                                })
+                        });
+                    if cannot_open {
+                        Probe::Unavailable(format!("{error:#}"))
+                    } else {
+                        Probe::Broken(format!("{error:#}"))
+                    }
+                }
+            }
+        }
+
+        /// Opens a loopback connection and looks its client socket up.
+        #[cfg(target_os = "linux")]
+        pub(in super::super) fn probe() -> Probe {
+            let setup = || -> anyhow::Result<_> {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0")
+                    .context("binding a test listener")?;
+                let listen_address = listener.local_addr()?;
+                let client =
+                    std::net::TcpStream::connect(listen_address).context("connecting to it")?;
+                let (server, _) = listener.accept().context("accepting the connection")?;
+                Ok((client.local_addr()?, listen_address, client, server))
+            };
+            let (client_address, listen_address, _client, _server) = match setup() {
+                Ok(setup) => setup,
+                Err(error) => return Probe::Broken(format!("{error:#}")),
+            };
+            let ours = match super::super::effective_uid() {
+                Ok(uid) => uid,
+                Err(error) => return Probe::Broken(format!("{error:#}")),
+            };
+            classify(owner_uid(client_address, listen_address), ours)
+        }
+
+        /// The lookup must find a connection this process has just opened
+        /// under this process's uid.
         #[cfg(target_os = "linux")]
         pub(in super::super) fn self_test() -> anyhow::Result<()> {
-            let listener =
-                std::net::TcpListener::bind("127.0.0.1:0").context("binding a test listener")?;
-            let listen_address = listener.local_addr()?;
-            let client =
-                std::net::TcpStream::connect(listen_address).context("connecting to it")?;
-            let (_server, _) = listener.accept().context("accepting the connection")?;
-            let found = owner_uid(client.local_addr()?, listen_address)?;
-            let ours = super::super::effective_uid()?;
-            if found != Some(ours) {
-                bail!("a connection of this process was looked up as {found:?}, not uid {ours}");
+            match probe() {
+                Probe::Works => Ok(()),
+                Probe::Unavailable(reason) | Probe::Broken(reason) => bail!("{reason}"),
             }
-            Ok(())
+        }
+
+        /// A libc call's return value as a result: its errno when negative.
+        #[cfg(target_os = "linux")]
+        fn call_result(returned: isize) -> std::io::Result<usize> {
+            usize::try_from(returned).map_err(|_| std::io::Error::last_os_error())
+        }
+
+        /// Runs a system call, and runs it once more when a signal interrupted
+        /// it: a signal handler anywhere in the process can end a blocking
+        /// `sendto` or `recvfrom` with `EINTR`, which says nothing about the
+        /// lookup and must not refuse the connection. A second interruption
+        /// is returned, so a stream of signals cannot hold the thread.
+        #[cfg(target_os = "linux")]
+        pub(in super::super) fn retry_once_on_eintr<T>(
+            mut call: impl FnMut() -> std::io::Result<T>,
+        ) -> std::io::Result<T> {
+            match call() {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => call(),
+                other => other,
+            }
         }
 
         /// The uid owning the TCP socket with these endpoints, from one
@@ -569,7 +728,7 @@ mod linux {
                 )
             };
             if fd < 0 {
-                return Err(std::io::Error::last_os_error()).context("opening a sock_diag socket");
+                return Err(std::io::Error::last_os_error()).context(OPEN_CONTEXT);
             }
             // SAFETY: `fd` is a descriptor just opened that nothing else owns.
             let socket = unsafe { OwnedFd::from_raw_fd(fd) };
@@ -602,23 +761,23 @@ mod linux {
             // kernel.
             let mut kernel: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
             kernel.nl_family = libc::AF_NETLINK as libc::sa_family_t;
-            // SAFETY: sendto reads `request` and `kernel` for the lengths
-            // given.
-            let sent = unsafe {
-                libc::sendto(
-                    socket.as_raw_fd(),
-                    request.as_ptr().cast(),
-                    request.len(),
-                    0,
-                    (&raw const kernel).cast(),
-                    std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
-                )
-            };
-            if sent < 0 {
-                return Err(std::io::Error::last_os_error())
-                    .context("sending the sock_diag request");
-            }
-            if sent as usize != request.len() {
+            let sent = retry_once_on_eintr(|| {
+                // SAFETY: sendto reads `request` and `kernel` for the lengths
+                // given.
+                let sent = unsafe {
+                    libc::sendto(
+                        socket.as_raw_fd(),
+                        request.as_ptr().cast(),
+                        request.len(),
+                        0,
+                        (&raw const kernel).cast(),
+                        std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+                    )
+                };
+                call_result(sent)
+            })
+            .context("sending the sock_diag request")?;
+            if sent != request.len() {
                 bail!("the sock_diag request was sent short");
             }
 
@@ -626,26 +785,27 @@ mod linux {
             // SAFETY: as above, all zeroes is a valid sockaddr_nl.
             let mut sender: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
             let mut sender_len = std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t;
-            // SAFETY: recvfrom writes at most `reply.len()` bytes into
-            // `reply` and at most `sender_len` bytes into `sender`.
-            let received = unsafe {
-                libc::recvfrom(
-                    socket.as_raw_fd(),
-                    reply.as_mut_ptr().cast(),
-                    reply.len(),
-                    0,
-                    (&raw mut sender).cast(),
-                    &raw mut sender_len,
-                )
-            };
-            if received < 0 {
-                return Err(std::io::Error::last_os_error()).context("reading the sock_diag reply");
-            }
+            let received = retry_once_on_eintr(|| {
+                // SAFETY: recvfrom writes at most `reply.len()` bytes into
+                // `reply` and at most `sender_len` bytes into `sender`.
+                let received = unsafe {
+                    libc::recvfrom(
+                        socket.as_raw_fd(),
+                        reply.as_mut_ptr().cast(),
+                        reply.len(),
+                        0,
+                        (&raw mut sender).cast(),
+                        &raw mut sender_len,
+                    )
+                };
+                call_result(received)
+            })
+            .context("reading the sock_diag reply")?;
             if sender.nl_pid != 0 {
                 bail!("a sock_diag reply that did not come from the kernel");
             }
             let reply = reply
-                .get(..received as usize)
+                .get(..received)
                 .context("sock_diag reply longer than its buffer")?;
             parse_reply(reply, seq, local, remote)
         }
@@ -1173,7 +1333,7 @@ mod tests {
 
             let our_uid = effective_uid().unwrap();
             let check = check_connection_owner(
-                Arc::new(KernelSocketTable::detect()),
+                Arc::new(KernelSocketTable::detect().await),
                 our_uid,
                 listen_address,
                 peer,
@@ -1184,7 +1344,7 @@ mod tests {
             // An endpoint nobody holds is not found.
             let unused = SocketAddr::new(peer.ip(), 1);
             let check = check_connection_owner(
-                Arc::new(KernelSocketTable::detect()),
+                Arc::new(KernelSocketTable::detect().await),
                 our_uid,
                 listen_address,
                 unused,
@@ -1223,7 +1383,7 @@ mod tests {
             let check = match accepted {
                 Ok(Ok((_server, peer))) => Some(
                     check_connection_owner(
-                        Arc::new(KernelSocketTable::detect()),
+                        Arc::new(KernelSocketTable::detect().await),
                         our_uid,
                         listen_address,
                         peer,
@@ -1243,7 +1403,7 @@ mod tests {
             let (_server, peer) = listener.accept().await.unwrap();
             assert_eq!(peer, client.local_addr().unwrap());
             let check = check_connection_owner(
-                Arc::new(KernelSocketTable::detect()),
+                Arc::new(KernelSocketTable::detect().await),
                 our_uid,
                 listen_address,
                 peer,
@@ -1777,7 +1937,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn sock_diag_and_proc_tables_find_our_own_connection() {
-        assert!(KernelSocketTable::detect().sock_diag);
+        if skip_without_sock_diag("sock_diag_and_proc_tables_find_our_own_connection") {
+            return;
+        }
+        assert!(KernelSocketTable::detect().await.sock_diag);
         let our_uid = effective_uid().unwrap();
         for (bind, connect_from_v6) in [
             ("127.0.0.1:0", false),
@@ -1831,12 +1994,113 @@ mod tests {
         }
     }
 
+    /// True, after printing why, when this kernel cannot serve `sock_diag`
+    /// lookups (netlink sockets of the kind cannot be opened, or no
+    /// `tcp_diag`/`inet_diag` module so the lookup finds nothing): the
+    /// production code falls back to `/proc/net/tcp` there, so the tests that
+    /// need `sock_diag` itself have nothing to check. A `sock_diag` that is
+    /// present and misbehaves (wrong uid, send or parse error) fails the
+    /// test, and so does a skip when `WARPGATE_REQUIRE_SOCK_DIAG=1`, which CI
+    /// sets so that a kernel without `sock_diag` cannot pass unnoticed.
+    #[cfg(target_os = "linux")]
+    fn skip_without_sock_diag(test: &str) -> bool {
+        let require = std::env::var("WARPGATE_REQUIRE_SOCK_DIAG").is_ok_and(|value| value == "1");
+        skip_or_fail(linux::sock_diag::probe(), require, test)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn skip_or_fail(probe: linux::sock_diag::Probe, require: bool, test: &str) -> bool {
+        use linux::sock_diag::Probe;
+        match probe {
+            Probe::Works => false,
+            Probe::Broken(reason) => panic!("{test}: sock_diag is broken: {reason}"),
+            Probe::Unavailable(reason) if require => {
+                panic!("{test}: sock_diag is required but unavailable: {reason}")
+            }
+            Probe::Unavailable(reason) => {
+                eprintln!(
+                    "SKIPPED {test}: sock_diag is unavailable on this kernel ({reason}); \
+                     the /proc/net/tcp fallback is covered by the other tests"
+                );
+                true
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sock_diag_self_test_skips_only_when_sock_diag_is_unavailable() {
+        use anyhow::Context;
+        use linux::sock_diag::{Probe, classify};
+
+        let open_error = |errno| {
+            Err::<Option<u32>, _>(std::io::Error::from_raw_os_error(errno))
+                .context("opening a sock_diag socket")
+        };
+        assert_eq!(classify(Ok(Some(501)), 501), Probe::Works);
+        // No tcp_diag: the lookup finds nothing.
+        assert!(matches!(classify(Ok(None), 501), Probe::Unavailable(_)));
+        for errno in [
+            libc::EPROTONOSUPPORT,
+            libc::EAFNOSUPPORT,
+            libc::EPERM,
+            libc::EACCES,
+        ] {
+            assert!(
+                matches!(classify(open_error(errno), 501), Probe::Unavailable(_)),
+                "errno {errno}"
+            );
+        }
+        // Everything else is a fault, not a missing feature.
+        assert!(matches!(classify(Ok(Some(0)), 501), Probe::Broken(_)));
+        assert!(matches!(
+            classify(open_error(libc::EMFILE), 501),
+            Probe::Broken(_)
+        ));
+        let send_denied = Err::<Option<u32>, _>(std::io::Error::from_raw_os_error(libc::EPERM))
+            .context("sending the sock_diag request");
+        assert!(matches!(classify(send_denied, 501), Probe::Broken(_)));
+        let parse_error = Err::<Option<u32>, _>(anyhow::anyhow!("short netlink reply"));
+        assert!(matches!(classify(parse_error, 501), Probe::Broken(_)));
+
+        // Skipping is for an unavailable sock_diag only, and is off when
+        // required.
+        let unavailable = || Probe::Unavailable("no tcp_diag".into());
+        assert!(skip_or_fail(unavailable(), false, "t"));
+        assert!(!skip_or_fail(Probe::Works, true, "t"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[should_panic(expected = "required but unavailable")]
+    fn a_required_sock_diag_that_is_unavailable_fails_the_test() {
+        skip_or_fail(
+            linux::sock_diag::Probe::Unavailable("no tcp_diag".into()),
+            true,
+            "t",
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[should_panic(expected = "sock_diag is broken")]
+    fn a_broken_sock_diag_fails_the_test_even_when_not_required() {
+        skip_or_fail(
+            linux::sock_diag::Probe::Broken("wrong uid".into()),
+            false,
+            "t",
+        );
+    }
+
     /// The listening socket is not the client: asked for endpoints whose
     /// local one is a listener's, `sock_diag` falls back to the listener,
     /// which is passed over.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn sock_diag_does_not_take_a_listener_for_the_client() {
+        if skip_without_sock_diag("sock_diag_does_not_take_a_listener_for_the_client") {
+            return;
+        }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let listen_address = listener.local_addr().unwrap();
         let elsewhere = addr("127.0.0.1:9");
@@ -1891,16 +2155,75 @@ mod tests {
     }
 
     fn sock_diag_error(seq: u32, errno: i32) -> Vec<u8> {
+        sock_diag_error_value(seq, -errno)
+    }
+
+    /// An `NLMSG_ERROR` reply carrying `error` as the kernel would write it
+    /// (a negative errno), whatever its value.
+    fn sock_diag_error_value(seq: u32, error: i32) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&36u32.to_ne_bytes());
         out.extend_from_slice(&2u16.to_ne_bytes());
         out.extend_from_slice(&0u16.to_ne_bytes());
         out.extend_from_slice(&seq.to_ne_bytes());
         out.extend_from_slice(&0u32.to_ne_bytes());
-        out.extend_from_slice(&(-errno).to_ne_bytes());
+        out.extend_from_slice(&error.to_ne_bytes());
         // The request's own header, echoed back.
         out.extend_from_slice(&[0u8; 16]);
         out
+    }
+
+    /// A reply whose error code cannot be negated (`i32::MIN`) fails the
+    /// lookup like any other error; it must not overflow.
+    #[test]
+    fn sock_diag_error_codes_that_cannot_be_negated_fail_the_lookup() {
+        use linux::sock_diag::parse_reply;
+        let (local, remote) = (addr("127.0.0.1:50123"), addr("127.0.0.1:8888"));
+        for error in [i32::MIN, i32::MIN + 1, i32::MAX, 0] {
+            let reply = sock_diag_error_value(5, error);
+            assert!(
+                parse_reply(&reply, 5, local, remote).is_err(),
+                "error code {error}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn interrupted_sock_diag_calls_are_retried_once() {
+        use std::io::{Error, ErrorKind};
+
+        use linux::sock_diag::retry_once_on_eintr;
+
+        // Interrupted once: the retry's answer is used.
+        let mut calls = 0;
+        let answer = retry_once_on_eintr(|| {
+            calls += 1;
+            if calls == 1 {
+                Err(Error::from_raw_os_error(libc::EINTR))
+            } else {
+                Ok(calls)
+            }
+        });
+        assert_eq!(answer.unwrap(), 2);
+
+        // Interrupted twice: the error comes back after one retry, not more.
+        let mut calls = 0;
+        let answer: std::io::Result<()> = retry_once_on_eintr(|| {
+            calls += 1;
+            Err(Error::from_raw_os_error(libc::EINTR))
+        });
+        assert_eq!(answer.unwrap_err().kind(), ErrorKind::Interrupted);
+        assert_eq!(calls, 2);
+
+        // Any other error is not retried.
+        let mut calls = 0;
+        let answer: std::io::Result<()> = retry_once_on_eintr(|| {
+            calls += 1;
+            Err(Error::from_raw_os_error(libc::EACCES))
+        });
+        assert!(answer.is_err());
+        assert_eq!(calls, 1);
     }
 
     #[test]
@@ -2003,6 +2326,75 @@ mod tests {
         let mut truncated = sock_diag_reply(5, AF_INET, established, local, remote, 501, 1);
         truncated.truncate(40);
         assert!(parse(truncated).is_err());
+    }
+
+    /// With every lookup slot held by a hung lookup, further connections are
+    /// refused with a message saying so, and no further thread is taken.
+    #[tokio::test]
+    async fn lookups_hung_in_every_slot_refuse_further_connections_without_new_threads() {
+        use std::sync::atomic::AtomicUsize;
+
+        // Its own turns, so hanging them cannot starve other tests.
+        static TURNS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+        static LOGGED: AtomicBool = AtomicBool::new(false);
+        static STARTED: AtomicUsize = AtomicUsize::new(0);
+        static RELEASE: Mutex<bool> = Mutex::new(false);
+        static RELEASED: std::sync::Condvar = std::sync::Condvar::new();
+
+        struct HungLookup;
+
+        impl SocketOwnerLookup for HungLookup {
+            fn owner_uid(
+                &self,
+                _local: SocketAddr,
+                _remote: SocketAddr,
+            ) -> anyhow::Result<Option<u32>> {
+                STARTED.fetch_add(1, Ordering::SeqCst);
+                let mut released = RELEASE.lock().unwrap();
+                while !*released {
+                    released = RELEASED.wait(released).unwrap();
+                }
+                Ok(Some(501))
+            }
+        }
+
+        // Lets the hung lookups end when the test does, even when it fails.
+        struct Release;
+
+        impl Drop for Release {
+            fn drop(&mut self) {
+                *RELEASE.lock().unwrap() = true;
+                RELEASED.notify_all();
+            }
+        }
+        let _release = Release;
+
+        let (local, remote) = (addr("127.0.0.1:8888"), addr("127.0.0.1:50123"));
+        let ask = || {
+            let lookup: Arc<dyn SocketOwnerLookup> = Arc::new(HungLookup);
+            tokio::spawn(check_connection_owner_with(
+                &TURNS, &LOGGED, lookup, 501, local, remote,
+            ))
+        };
+        // Two lookups take both turns and hang: they are cut off at the
+        // timeout, their threads still held.
+        for hung in [ask(), ask()] {
+            assert_eq!(
+                hung.await.unwrap(),
+                OwnerCheck::LookupFailed("timed out".into())
+            );
+        }
+        // Later ones are refused for the busy slots, and start no thread.
+        let later: Vec<_> = (0..5).map(|_| ask()).collect();
+        for check in later {
+            let OwnerCheck::LookupFailed(reason) = check.await.unwrap() else {
+                panic!("a connection was let through while every slot was hung");
+            };
+            assert!(reason.contains("busy"), "{reason}");
+        }
+        assert!(STARTED.load(Ordering::SeqCst) <= 2);
+        // The log line was written for the spell, not for each connection.
+        assert!(LOGGED.load(Ordering::Relaxed));
     }
 
     /// However many connections arrive at once, no more than
