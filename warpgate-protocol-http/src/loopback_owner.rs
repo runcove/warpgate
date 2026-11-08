@@ -87,7 +87,29 @@ impl KernelSocketTable {
     /// when it does not: the kernel answers a lookup it cannot serve (no
     /// `tcp_diag`, a filter on netlink) the way it answers one for a socket
     /// that does not exist, which would refuse every connection.
-    pub(crate) fn detect() -> Self {
+    ///
+    /// The check opens sockets and may wait on the kernel, so it runs on a
+    /// blocking thread rather than the async one.
+    pub(crate) async fn detect() -> Self {
+        match tokio::task::spawn_blocking(Self::detect_blocking).await {
+            Ok(table) => table,
+            Err(error) => {
+                warn!(%error, "The socket lookup self-test did not finish; using the default lookup");
+                Self::fallback()
+            }
+        }
+    }
+
+    /// The lookup used when the self-test could not run: the one that needs
+    /// no kernel module.
+    fn fallback() -> Self {
+        Self {
+            #[cfg(target_os = "linux")]
+            sock_diag: false,
+        }
+    }
+
+    fn detect_blocking() -> Self {
         #[cfg(target_os = "linux")]
         {
             let sock_diag = match linux::sock_diag::self_test() {
@@ -1173,7 +1195,7 @@ mod tests {
 
             let our_uid = effective_uid().unwrap();
             let check = check_connection_owner(
-                Arc::new(KernelSocketTable::detect()),
+                Arc::new(KernelSocketTable::detect().await),
                 our_uid,
                 listen_address,
                 peer,
@@ -1184,7 +1206,7 @@ mod tests {
             // An endpoint nobody holds is not found.
             let unused = SocketAddr::new(peer.ip(), 1);
             let check = check_connection_owner(
-                Arc::new(KernelSocketTable::detect()),
+                Arc::new(KernelSocketTable::detect().await),
                 our_uid,
                 listen_address,
                 unused,
@@ -1223,7 +1245,7 @@ mod tests {
             let check = match accepted {
                 Ok(Ok((_server, peer))) => Some(
                     check_connection_owner(
-                        Arc::new(KernelSocketTable::detect()),
+                        Arc::new(KernelSocketTable::detect().await),
                         our_uid,
                         listen_address,
                         peer,
@@ -1243,7 +1265,7 @@ mod tests {
             let (_server, peer) = listener.accept().await.unwrap();
             assert_eq!(peer, client.local_addr().unwrap());
             let check = check_connection_owner(
-                Arc::new(KernelSocketTable::detect()),
+                Arc::new(KernelSocketTable::detect().await),
                 our_uid,
                 listen_address,
                 peer,
@@ -1777,7 +1799,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn sock_diag_and_proc_tables_find_our_own_connection() {
-        assert!(KernelSocketTable::detect().sock_diag);
+        assert!(KernelSocketTable::detect().await.sock_diag);
         let our_uid = effective_uid().unwrap();
         for (bind, connect_from_v6) in [
             ("127.0.0.1:0", false),
