@@ -59,6 +59,9 @@ const CLOSE_RETRY_CHUNK: usize = 100;
 /// Example ids named in a retry summary line.
 const CLOSE_RETRY_EXAMPLES: usize = 3;
 
+/// Longest first error, in characters, named in a retry summary line.
+const CLOSE_RETRY_ERROR_CHARS: usize = 200;
+
 /// Longest the re-check of live proxied requests waits on one access lookup.
 /// A lookup that takes longer counts as a failed one (the request ends), so a
 /// single hung lookup cannot hold up the rest of the expiry sweep. It is above
@@ -108,7 +111,11 @@ impl CloseRetryOutcome {
         }
         if let Some(error) = &self.first_error {
             let error = error.replace(['\n', '\r'], " ");
-            line.push_str(&format!("; first error: {error}"));
+            let mut shown: String = error.chars().take(CLOSE_RETRY_ERROR_CHARS).collect();
+            if error.chars().count() > CLOSE_RETRY_ERROR_CHARS {
+                shown.push_str("...");
+            }
+            line.push_str(&format!("; first error: {shown}"));
         }
         line
     }
@@ -757,6 +764,33 @@ mod tests {
             "summary grew with the ids: {}",
             line.len()
         );
+    }
+
+    /// A long error message is cut, so the summary stays short whatever the
+    /// error says.
+    #[test]
+    fn the_retry_summary_bounds_the_first_error() {
+        let outcome = CloseRetryOutcome {
+            retried: 1,
+            failed_count: 1,
+            queued: 1,
+            first_error: Some("e\u{e9}\n".repeat(5000)),
+            ..Default::default()
+        };
+        let line = outcome.summary();
+        assert!(!line.contains('\n'));
+        assert!(line.ends_with("..."));
+        assert!(
+            line.len() < 1000,
+            "summary grew with the error: {}",
+            line.len()
+        );
+
+        let short = CloseRetryOutcome {
+            first_error: Some("close failed".to_string()),
+            ..outcome
+        };
+        assert!(short.summary().ends_with("; first error: close failed"));
     }
 
     /// The sweep's reported queue length is the queue's own length.

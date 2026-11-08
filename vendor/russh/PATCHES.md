@@ -29,8 +29,9 @@ so this vendored path dependency's warnings don't surface in Warpgate's builds. 
 not in `warpgate.patch` (which covers `src/` and `tests/` only); re-apply it by hand on
 re-vendor.
 
-Drop this fork once russh publishes a release that fixes #789. The window-credit fix we carried
-for 0.64.1 ([russh#790][2]) is in 0.65.0 and later (commit 13c94f0) and is no longer patched. 0.65.1 needed no change to the patch.
+Drop this fork once russh publishes a release that fixes [russh#806][3], the open upstream
+issue for the close path (#789 is closed). The window-credit fix we carried for 0.64.1 ([russh#790][2]) is in 0.65.0 and later (commit 13c94f0) and is no longer patched. 0.65.1 needed no change to the patch.
 
 [1]: https://github.com/Eugeny/russh/issues/789
 [2]: https://github.com/Eugeny/russh/pull/790
+[3]: https://github.com/Eugeny/russh/issues/806
