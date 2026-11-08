@@ -143,6 +143,149 @@ mod tests {
             .len()
     }
 
+    /// A migrated on-disk database in WAL mode, as in production, with a busy
+    /// timeout far longer than any wait in these tests so they wait rather than
+    /// flake. In-memory SQLite has no write lock to contend for.
+    async fn file_db() -> (DatabaseConnection, std::path::PathBuf) {
+        use sea_orm::SqlxSqliteConnector;
+        use sea_orm::sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+
+        set_config_migration_values(ConfigMigrationValues::default());
+        let dir = std::env::temp_dir().join(format!("wg-resources-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let options = SqliteConnectOptions::new()
+            .filename(dir.join("db.sqlite3"))
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(std::time::Duration::from_secs(30));
+        let pool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect_with(options)
+            .await
+            .unwrap();
+        let db = SqlxSqliteConnector::from_sqlx_sqlite_pool(pool);
+        migrate_database(&db).await.unwrap();
+        (db, dir)
+    }
+
+    /// Runs `work` while another connection holds the database's write lock,
+    /// releases the lock after a pause, and checks that `work` waited for it.
+    ///
+    /// This proves a delete takes the write lock before it reads. A transaction
+    /// that reads first and then writes cannot wait for the writer: SQLite fails
+    /// the upgrade at once with "database is locked", whatever the busy timeout,
+    /// so `work` would finish early with an error instead of staying pending
+    /// until the lock is released.
+    async fn waits_for_the_write_lock<F>(db: &DatabaseConnection, work: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let mut holder = db.get_sqlite_connection_pool().acquire().await.unwrap();
+        sea_orm::sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+
+        let task = tokio::spawn(work);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!task.is_finished(), "the delete must wait for the write lock");
+
+        sea_orm::sqlx::query("COMMIT")
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn deleting_a_target_waits_for_the_write_lock() {
+        let (db, dir) = file_db().await;
+        let web = targets::create(&db, &ssh("web")).await.unwrap();
+
+        let deleting = db.clone();
+        let id = web.id;
+        waits_for_the_write_lock(&db, async move {
+            targets::delete(&deleting, id).await.unwrap();
+        })
+        .await;
+
+        assert!(
+            Target::Entity::find_by_id(web.id)
+                .one(&db)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        db.close().await.unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn deleting_a_role_waits_for_the_write_lock() {
+        let (db, dir) = file_db().await;
+        let dba = roles::create(&db, &role("dba", None)).await.unwrap();
+
+        let deleting = db.clone();
+        let id = dba.id;
+        waits_for_the_write_lock(&db, async move {
+            roles::delete(&deleting, id).await.unwrap();
+        })
+        .await;
+
+        assert!(
+            warpgate_db_entities::Role::Entity::find_by_id(dba.id)
+                .one(&db)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        db.close().await.unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn deleting_a_group_waits_for_the_write_lock() {
+        let (db, dir) = file_db().await;
+        let group = TargetGroupDataRequest {
+            name: "prod".into(),
+            description: None,
+            color: None,
+        };
+        let prod = target_groups::create(&db, &group).await.unwrap();
+
+        let deleting = db.clone();
+        let id = prod.id;
+        waits_for_the_write_lock(&db, async move {
+            target_groups::delete(&deleting, id).await.unwrap();
+        })
+        .await;
+
+        assert!(
+            warpgate_db_entities::TargetGroup::Entity::find_by_id(prod.id)
+                .one(&db)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        db.close().await.unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn deleting_a_missing_target_role_or_group_is_not_found() {
+        let (db, dir) = file_db().await;
+
+        let result = targets::delete(&db, Uuid::new_v4()).await;
+        assert!(matches!(result, Err(ResourceError::NotFound)));
+        let result = roles::delete(&db, Uuid::new_v4()).await;
+        assert!(matches!(result, Err(ResourceError::NotFound)));
+        let result = target_groups::delete(&db, Uuid::new_v4()).await;
+        assert!(matches!(result, Err(ResourceError::NotFound)));
+
+        db.close().await.unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[tokio::test]
     async fn targets() {
         let db = db().await;
