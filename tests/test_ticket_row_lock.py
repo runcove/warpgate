@@ -18,7 +18,9 @@ of these fails if the lock is removed.
 """
 
 import os
+import shutil
 import subprocess
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
@@ -56,15 +58,23 @@ class SqlSession:
             ]
         else:
             env["MYSQL_PWD"] = parsed.password
+            # MariaDB's "mysql" name is deprecated and warns on stderr.
+            client = shutil.which("mariadb") or "mysql"
             cmd = [
-                "mysql", f"--user={parsed.username}", f"--host={parsed.hostname}",
+                client, f"--user={parsed.username}", f"--host={parsed.hostname}",
                 f"--port={parsed.port}", "--batch", "--skip-column-names",
                 "--unbuffered", name,
             ]
+        # Results are parsed from stdout only; stderr is kept for messages.
+        self.stderr = tempfile.TemporaryFile()
         self.process = subprocess.Popen(
             cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, env=env,
+            stderr=self.stderr, env=env,
         )
+
+    def errors(self) -> str:
+        self.stderr.seek(0)
+        return self.stderr.read().decode(errors="replace")
 
     def uuid(self, value) -> str:
         """A UUID as an SQL literal: PostgreSQL has a uuid type, sea-orm
@@ -82,8 +92,12 @@ class SqlSession:
         out = read_until(
             self.process.stdout, marker.encode(), time.monotonic() + SQL_TIMEOUT
         ).decode()
-        assert marker in out, f"the SQL client did not finish {sql!r}: {out!r}"
-        assert "ERROR" not in out, f"{sql!r} failed: {out!r}"
+        assert marker in out, (
+            f"the SQL client did not finish {sql!r}: {out!r} {self.errors()!r}"
+        )
+        assert "ERROR" not in out and "ERROR" not in self.errors(), (
+            f"{sql!r} failed: {out!r} {self.errors()!r}"
+        )
         return out
 
     def scalar(self, sql: str) -> int:
@@ -99,6 +113,7 @@ class SqlSession:
         except subprocess.TimeoutExpired:
             self.process.kill()
             self.process.wait()
+        self.stderr.close()
 
 
 @pytest.fixture(scope="module", params=["postgres", "mysql"])
