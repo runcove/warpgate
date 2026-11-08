@@ -409,8 +409,10 @@ mod tests {
 
         /// A pooled connection pins a read snapshot, is returned to the pool
         /// still holding it, and a writer then fills the WAL. Returns whether the
-        /// WAL could be checkpointed once `lifetime` (plus a margin) had passed.
-        async fn checkpoint_after_lifetime(lifetime: Option<Duration>) -> bool {
+        /// WAL could be checkpointed once `lifetime` (plus a margin) had passed,
+        /// or `None` when the setup took longer than `lifetime`: the pool had
+        /// then already replaced the connection, so the run shows nothing.
+        async fn checkpoint_after_lifetime(lifetime: Option<Duration>) -> Option<bool> {
             let dir = std::env::temp_dir().join(format!("wg-pool-life-{}", Uuid::new_v4()));
             std::fs::create_dir_all(&dir).unwrap();
             let path = dir.join("db.sqlite3");
@@ -419,6 +421,10 @@ mod tests {
                 .create_if_missing(true)
                 .journal_mode(SqliteJournalMode::Wal)
                 .busy_timeout(Duration::from_millis(200));
+
+            // Before the connection exists, so the time since this is never
+            // less than the connection's age.
+            let started = std::time::Instant::now();
 
             // The production pool settings, minus the release guard: the guard
             // would drop a connection that is inside a transaction, and this
@@ -453,40 +459,62 @@ mod tests {
                     .await
                     .unwrap();
             }
-            assert!(
-                checkpoint_blocked(&mut writer).await,
-                "the pinned snapshot must block the checkpoint, or the test proves nothing"
-            );
+            let outcome = if checkpoint_blocked(&mut writer).await {
+                // Past the lifetime the pool replaces the connection when it is next used.
+                let margin = Duration::from_millis(300);
+                tokio::time::sleep(lifetime.unwrap_or(Duration::ZERO) + margin).await;
+                drop(pool.acquire().await.unwrap());
 
-            // Past the lifetime the pool replaces the connection when it is next used.
-            tokio::time::sleep(Duration::from_millis(600)).await;
-            drop(pool.acquire().await.unwrap());
-
-            let blocked = checkpoint_blocked(&mut writer).await;
-            let wal_len = std::fs::metadata(dir.join("db.sqlite3-wal"))
-                .map(|m| m.len())
-                .unwrap_or(0);
-            if !blocked {
-                assert_eq!(
-                    wal_len, 0,
-                    "a completed TRUNCATE checkpoint empties the WAL"
+                let blocked = checkpoint_blocked(&mut writer).await;
+                let wal_len = std::fs::metadata(dir.join("db.sqlite3-wal"))
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                if !blocked {
+                    assert_eq!(
+                        wal_len, 0,
+                        "a completed TRUNCATE checkpoint empties the WAL"
+                    );
+                }
+                Some(!blocked)
+            } else {
+                // The pool's reaper closes an idle connection past its lifetime,
+                // so on a slow machine the snapshot can be gone already. Only
+                // then is an unblocked checkpoint no finding.
+                assert!(
+                    lifetime.is_some_and(|lifetime| started.elapsed() >= lifetime),
+                    "the pinned snapshot must block the checkpoint, or the test proves nothing"
                 );
-            }
+                None
+            };
 
             writer.close().await.unwrap();
             pool.close().await;
             std::fs::remove_dir_all(&dir).unwrap();
-            !blocked
+            outcome
         }
 
         // Without a lifetime the stuck snapshot pins the WAL for as long as the
         // pool lives; with one, the connection is replaced and the WAL resets.
-        assert!(
-            !checkpoint_after_lifetime(None).await,
+        assert_eq!(
+            checkpoint_after_lifetime(None).await,
+            Some(false),
             "control: with no lifetime the pinned snapshot keeps blocking checkpoints"
         );
+
+        // A run the machine was too slow for says nothing: try a longer lifetime.
+        let mut lifetime = Duration::from_millis(300);
+        let replaced = loop {
+            if let Some(replaced) = checkpoint_after_lifetime(Some(lifetime)).await {
+                break replaced;
+            }
+            assert!(
+                lifetime < Duration::from_secs(30),
+                "the setup outlasted every lifetime tried, up to {lifetime:?}"
+            );
+            lifetime *= 2;
+        };
         assert!(
-            checkpoint_after_lifetime(Some(Duration::from_millis(300))).await,
+            replaced,
             "a connection past its lifetime is replaced, releasing its snapshot"
         );
     }
