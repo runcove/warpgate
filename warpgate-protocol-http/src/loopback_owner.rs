@@ -1850,6 +1850,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn sock_diag_and_proc_tables_find_our_own_connection() {
+        if skip_without_sock_diag("sock_diag_and_proc_tables_find_our_own_connection") {
+            return;
+        }
         assert!(KernelSocketTable::detect().await.sock_diag);
         let our_uid = effective_uid().unwrap();
         for (bind, connect_from_v6) in [
@@ -1904,12 +1907,34 @@ mod tests {
         }
     }
 
+    /// True, after printing why, when this kernel cannot serve `sock_diag`
+    /// lookups (no `tcp_diag`/`inet_diag` module, netlink filtered in a
+    /// sandbox): the production code falls back to `/proc/net/tcp` there, so
+    /// the tests that need `sock_diag` itself have nothing to check. Run with
+    /// `--nocapture` to see the reason.
+    #[cfg(target_os = "linux")]
+    fn skip_without_sock_diag(test: &str) -> bool {
+        match linux::sock_diag::self_test() {
+            Ok(()) => false,
+            Err(error) => {
+                eprintln!(
+                    "SKIPPED {test}: sock_diag is unavailable on this kernel ({error:#}); \
+                     the /proc/net/tcp fallback is covered by the other tests"
+                );
+                true
+            }
+        }
+    }
+
     /// The listening socket is not the client: asked for endpoints whose
     /// local one is a listener's, `sock_diag` falls back to the listener,
     /// which is passed over.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn sock_diag_does_not_take_a_listener_for_the_client() {
+        if skip_without_sock_diag("sock_diag_does_not_take_a_listener_for_the_client") {
+            return;
+        }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let listen_address = listener.local_addr().unwrap();
         let elsewhere = addr("127.0.0.1:9");
