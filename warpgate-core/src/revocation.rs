@@ -458,15 +458,28 @@ impl Services {
     /// cannot be read; requests opened against the current binding stay. The
     /// browser session that carries them, and its requests to other targets,
     /// stay. A pair whose check errors or takes longer than
-    /// [`LIVE_STREAM_LOOKUP_TIMEOUT`] is ended too (fail closed). Fails if
-    /// the registry of live requests cannot be read.
+    /// [`LIVE_STREAM_LOOKUP_TIMEOUT`] is ended too (fail closed). A request
+    /// admitted by a ticket, a token or a peer has no role or public rule to
+    /// re-check and is held to the host binding alone. Fails if the registry
+    /// of live requests cannot be read.
     pub async fn reauthorize_live_streams(&self) -> Result<(), WarpgateError> {
+        self.reauthorize_live_streams_within(LIVE_STREAM_LOOKUP_TIMEOUT)
+            .await
+    }
+
+    /// [`Self::reauthorize_live_streams`] with the time one host binding
+    /// lookup may take.
+    async fn reauthorize_live_streams_within(
+        &self,
+        binding_timeout: Duration,
+    ) -> Result<(), WarpgateError> {
         // One lookup per target in a pass, however many visitors share it.
         let mut shared: std::collections::HashMap<Uuid, bool> = std::collections::HashMap::new();
         let mut bindings: std::collections::HashMap<Uuid, Option<Option<String>>> =
             std::collections::HashMap::new();
         for (user_id, target_id, kind, opened_binding) in self.live_streams.in_use()? {
             let allowed = match kind {
+                LiveStreamKind::BindingOnly => true,
                 LiveStreamKind::RoleBased => {
                     bounded_lookup(
                         user_id,
@@ -504,7 +517,7 @@ impl Services {
                 Some(current) => current.clone(),
                 None => {
                     let current = match tokio::time::timeout(
-                        LIVE_STREAM_LOOKUP_TIMEOUT,
+                        binding_timeout,
                         self.current_host_binding(target_id),
                     )
                     .await
@@ -1332,6 +1345,133 @@ mod tests {
 
         rebind_target(&db, target_id, "").await;
         services.reauthorize_live_streams().await.unwrap();
+
+        assert!(fired(&mut stream).await);
+    }
+
+    /// A stream admitted by a ticket, a token or a peer has no role or public
+    /// rule: it ends when its target's host binding changes, and stays while
+    /// the binding is the one it opened against.
+    #[tokio::test]
+    async fn a_binding_only_stream_ends_when_the_host_binding_changes() {
+        let db = migrated_db().await;
+        let services = test_services(&db).await;
+        let target_id = http_target(&db, false).await;
+        rebind_target(&db, target_id, "old.example").await;
+        let (_browser_session, browser_close) = tokio::sync::broadcast::channel(1);
+        let mut old = services.live_streams.watch(
+            browser_close.resubscribe(),
+            Uuid::nil(),
+            target_id,
+            LiveStreamKind::BindingOnly,
+            Some("old.example".into()),
+        );
+        let mut new = services.live_streams.watch(
+            browser_close,
+            Uuid::nil(),
+            target_id,
+            LiveStreamKind::BindingOnly,
+            Some("new.example".into()),
+        );
+
+        // Not public, no roles: the binding is the only thing it is held to.
+        rebind_target(&db, target_id, "new.example").await;
+        services.reauthorize_live_streams().await.unwrap();
+
+        assert!(fired(&mut old).await);
+        assert!(!fired(&mut new).await);
+    }
+
+    /// A binding that goes from none to an empty string (or back) is not a
+    /// change: a stream opened with no binding stays.
+    #[tokio::test]
+    async fn an_empty_host_binding_is_the_same_as_none() {
+        let db = migrated_db().await;
+        let services = test_services(&db).await;
+        let target_id = http_target(&db, true).await;
+        let (_browser_session, browser_close) = tokio::sync::broadcast::channel(1);
+        let mut unbound = services.live_streams.watch(
+            browser_close,
+            Uuid::nil(),
+            target_id,
+            LiveStreamKind::Public,
+            None,
+        );
+
+        rebind_target(&db, target_id, "").await;
+        services.reauthorize_live_streams().await.unwrap();
+
+        assert!(!fired(&mut unbound).await);
+    }
+
+    /// A stream opened with no binding ends once the target gets one.
+    #[tokio::test]
+    async fn a_binding_set_after_the_stream_opened_ends_it() {
+        let db = migrated_db().await;
+        let services = test_services(&db).await;
+        let target_id = http_target(&db, true).await;
+        let (_browser_session, browser_close) = tokio::sync::broadcast::channel(1);
+        let mut unbound = services.live_streams.watch(
+            browser_close,
+            Uuid::nil(),
+            target_id,
+            LiveStreamKind::Public,
+            None,
+        );
+
+        rebind_target(&db, target_id, "new.example").await;
+        services.reauthorize_live_streams().await.unwrap();
+
+        assert!(fired(&mut unbound).await);
+    }
+
+    /// A deleted target ends a stream that has no binding and no role or
+    /// public rule to fail first.
+    #[tokio::test]
+    async fn a_binding_only_stream_ends_when_the_target_is_deleted() {
+        let db = migrated_db().await;
+        let services = test_services(&db).await;
+        let target_id = http_target(&db, false).await;
+        let (_browser_session, browser_close) = tokio::sync::broadcast::channel(1);
+        let mut stream = services.live_streams.watch(
+            browser_close,
+            Uuid::nil(),
+            target_id,
+            LiveStreamKind::BindingOnly,
+            None,
+        );
+
+        Target::Entity::delete_by_id(target_id)
+            .exec(&db)
+            .await
+            .unwrap();
+        services.reauthorize_live_streams().await.unwrap();
+
+        assert!(fired(&mut stream).await);
+    }
+
+    /// A binding lookup that does not answer in time ends the stream (fail
+    /// closed), though the binding itself is unchanged and the access rules
+    /// pass. A zero timeout makes every lookup late.
+    #[tokio::test]
+    async fn a_binding_lookup_that_times_out_ends_the_stream() {
+        let db = migrated_db().await;
+        let services = test_services(&db).await;
+        let target_id = http_target(&db, true).await;
+        rebind_target(&db, target_id, "old.example").await;
+        let (_browser_session, browser_close) = tokio::sync::broadcast::channel(1);
+        let mut stream = services.live_streams.watch(
+            browser_close,
+            Uuid::nil(),
+            target_id,
+            LiveStreamKind::Public,
+            Some("old.example".into()),
+        );
+
+        services
+            .reauthorize_live_streams_within(Duration::ZERO)
+            .await
+            .unwrap();
 
         assert!(fired(&mut stream).await);
     }

@@ -102,8 +102,8 @@ pub async fn catchall_endpoint(
     // is still running (a websocket, a streamed body) without closing the
     // browser session. A request admitted by the public bypass (a ticket with
     // no ticket id, anonymous or logged in) is watched too, and ends when the
-    // target stops being public. A real ticket is not role-based: deleting the
-    // ticket is what cuts it.
+    // target stops being public. A real ticket, a token or a peer has no role
+    // or public rule: it is held to the target's host binding alone.
     let close_rx = watch_admitted_live_stream(
         ctx.services(),
         &ctx.auth,
@@ -508,9 +508,11 @@ async fn get_target_for_request(
 /// Registers the request for revocation by the rule that admitted it: a
 /// logged-in user is role-based, a ticket session with no ticket id came
 /// through the public bypass (anonymous or logged in) and is public, and
-/// anything else (a real ticket, a token, a peer) is not watched, as deleting
-/// the ticket is what cuts a ticket session. `opened_binding` is the target's
-/// host binding the request was admitted against.
+/// anything else (a real ticket, a token, a peer) has no role or public rule
+/// and is registered binding-only, so that only a change of the target's host
+/// binding ends it (deleting the ticket or token is what cuts it otherwise).
+/// `opened_binding` is the target's host binding the request was admitted
+/// against.
 async fn watch_admitted_live_stream(
     services: &Services,
     auth: &RequestAuthorization,
@@ -529,8 +531,42 @@ async fn watch_admitted_live_stream(
         }) => {
             watch_public_live_stream(services, close_rx, *user_id, target_id, opened_binding).await
         }
-        _ => Ok(close_rx),
+        RequestAuthorization::Session(SessionAuthorization::Ticket { user_id, .. })
+        | RequestAuthorization::UserToken { user_id, .. } => {
+            watch_binding_only_live_stream(services, close_rx, *user_id, target_id, opened_binding)
+                .await
+        }
+        RequestAuthorization::AdminToken | RequestAuthorization::ClusterPeer => {
+            watch_binding_only_live_stream(
+                services,
+                close_rx,
+                Uuid::nil(),
+                target_id,
+                opened_binding,
+            )
+            .await
+        }
     }
+}
+
+/// [`watch_live_stream`] for a request with no role or public rule to
+/// re-check: registered first, then only the host binding is checked again.
+async fn watch_binding_only_live_stream(
+    services: &Services,
+    close_rx: broadcast::Receiver<()>,
+    user_id: Uuid,
+    target_id: Uuid,
+    opened_binding: Option<String>,
+) -> poem::Result<broadcast::Receiver<()>> {
+    let close_rx = services.live_streams.watch(
+        close_rx,
+        user_id,
+        target_id,
+        LiveStreamKind::BindingOnly,
+        opened_binding.clone(),
+    );
+    ensure_host_binding_unchanged(services, target_id, &opened_binding).await?;
+    Ok(close_rx)
 }
 
 /// Registers a request with [`warpgate_core::live_streams::LiveStreams`], then
@@ -618,8 +654,8 @@ mod live_stream_tests {
     use uuid::Uuid;
     use warpgate_common_http::{RequestAuthorization, SessionAuthorization};
     use warpgate_core::live_streams::LiveStreamKind;
-    use warpgate_db_entities::Target;
     use warpgate_db_entities::Target::TargetKind;
+    use warpgate_db_entities::{Role, Target, TargetRoleAssignment, User, UserRoleAssignment};
 
     use super::{watch_admitted_live_stream, watch_live_stream, watch_public_live_stream};
     use crate::test_db::{memory_db, services};
@@ -789,12 +825,13 @@ mod live_stream_tests {
         assert!(deregistered(&services).await);
     }
 
-    /// A request a real ticket admitted is not registered at all: deleting
-    /// the ticket is what cuts it, and no target check applies.
+    /// A request a real ticket admitted is registered binding-only, under the
+    /// binding it opened against.
     #[tokio::test]
-    async fn a_real_ticket_session_is_not_watched() {
-        let services = services(memory_db().await).await;
-        let target_id = Uuid::new_v4();
+    async fn a_real_ticket_session_is_watched_for_its_host_binding() {
+        let db = migrated_db().await;
+        let services = services(db.clone()).await;
+        let target_id = public_target(&db).await;
         let (_session, close_rx) = tokio::sync::broadcast::channel(1);
 
         let watched = watch_admitted_live_stream(
@@ -807,7 +844,150 @@ mod live_stream_tests {
         .await;
 
         assert!(watched.is_ok());
-        assert!(services.live_streams.in_use().unwrap().is_empty());
+        assert_eq!(
+            services.live_streams.in_use().unwrap(),
+            std::collections::HashSet::from([(
+                Uuid::nil(),
+                target_id,
+                LiveStreamKind::BindingOnly,
+                None
+            )])
+        );
+    }
+
+    /// A token or a peer is registered binding-only too, under its user if it
+    /// has one.
+    #[tokio::test]
+    async fn a_token_or_peer_request_is_watched_for_its_host_binding() {
+        let db = migrated_db().await;
+        let services = services(db.clone()).await;
+        let target_id = public_target(&db).await;
+        let token_user = Uuid::new_v4();
+        let mut kept = Vec::new();
+
+        for (auth, expected_user) in [
+            (
+                RequestAuthorization::UserToken {
+                    user_id: token_user,
+                    username: "alice".into(),
+                },
+                token_user,
+            ),
+            (RequestAuthorization::AdminToken, Uuid::nil()),
+            (RequestAuthorization::ClusterPeer, Uuid::nil()),
+        ] {
+            let (_session, close_rx) = tokio::sync::broadcast::channel(1);
+            let watched =
+                watch_admitted_live_stream(&services, &auth, close_rx, target_id, None).await;
+            assert!(watched.is_ok());
+            kept.push(watched);
+            assert!(services.live_streams.in_use().unwrap().contains(&(
+                expected_user,
+                target_id,
+                LiveStreamKind::BindingOnly,
+                None
+            )));
+        }
+    }
+
+    /// A ticket request admitted against a host binding the target no longer
+    /// has is refused at registration, and leaves no registration behind.
+    #[tokio::test]
+    async fn a_ticket_registration_against_a_changed_host_binding_is_refused() {
+        let db = migrated_db().await;
+        let services = services(db.clone()).await;
+        let target_id = public_target(&db).await;
+        let (_session, close_rx) = tokio::sync::broadcast::channel(1);
+
+        let watched = watch_admitted_live_stream(
+            &services,
+            &ticket(Some(Uuid::new_v4()), target_id),
+            close_rx,
+            target_id,
+            Some("old.example".into()),
+        )
+        .await;
+
+        assert_eq!(
+            watched.err().map(|e| e.status()),
+            Some(poem::http::StatusCode::FORBIDDEN)
+        );
+        assert!(deregistered(&services).await);
+    }
+
+    /// A user who holds a role granting the target is still refused when the
+    /// binding they were admitted against is no longer the target's: the
+    /// access check alone would pass them.
+    #[tokio::test]
+    async fn a_role_based_registration_against_a_changed_host_binding_is_refused() {
+        let db = migrated_db().await;
+        let services = services(db.clone()).await;
+        let target_id = public_target(&db).await;
+        let user_id = Uuid::new_v4();
+        User::ActiveModel {
+            id: Set(user_id),
+            username: Set(format!("user-{user_id}")),
+            description: Set(String::new()),
+            credential_policy: Set(serde_json::Value::Null),
+            rate_limit_bytes_per_second: Set(None),
+            ldap_server_id: Set(None),
+            ldap_object_uuid: Set(None),
+            allowed_ip_ranges: Set(serde_json::Value::Null),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        let role_id = Uuid::new_v4();
+        Role::ActiveModel {
+            id: Set(role_id),
+            name: Set(format!("role-{role_id}")),
+            description: Set(String::new()),
+            is_default: Set(false),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        UserRoleAssignment::ActiveModel {
+            user_id: Set(user_id),
+            role_id: Set(role_id),
+            granted_at: Set(Some(time::OffsetDateTime::now_utc())),
+            expires_at: Set(None),
+            revoked_at: Set(None),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        TargetRoleAssignment::ActiveModel {
+            target_id: Set(target_id),
+            role_id: Set(role_id),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        // The grant holds: the same binding is admitted.
+        let (_session, close_rx) = tokio::sync::broadcast::channel(1);
+        let admitted = watch_live_stream(&services, close_rx, user_id, target_id, None).await;
+        assert!(admitted.is_ok());
+        drop(admitted);
+        assert!(deregistered(&services).await);
+
+        // The target has no binding now; the stream was opened against one.
+        let (_session, close_rx) = tokio::sync::broadcast::channel(1);
+        let watched = watch_live_stream(
+            &services,
+            close_rx,
+            user_id,
+            target_id,
+            Some("old.example".into()),
+        )
+        .await;
+
+        assert_eq!(
+            watched.err().map(|e| e.status()),
+            Some(poem::http::StatusCode::FORBIDDEN)
+        );
+        assert!(deregistered(&services).await);
     }
 
     /// A logged-in user is watched by role: on a public target they have no

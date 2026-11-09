@@ -2,10 +2,12 @@
 //! target it runs for, so a revocation can end it without ending the browser
 //! session that carries it.
 //!
-//! A request is registered either as role-based (its user was admitted by a
-//! role grant) or as public-bypass (admitted because the target is public, with
-//! no role check). A revocation re-checks each kind by the rule that admitted
-//! it, and cancels only that kind.
+//! A request is registered as role-based (its user was admitted by a role
+//! grant), as public-bypass (admitted because the target is public, with no
+//! role check) or as binding-only (admitted by a ticket, a token or a peer,
+//! which have no role or public rule to re-check). A revocation re-checks each
+//! kind by the rule that admitted it, and cancels only that kind. Every kind
+//! is also ended when the target's host binding changes.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -32,6 +34,10 @@ pub enum LiveStreamKind {
     RoleBased,
     /// The target is public, and the request went through the public bypass.
     Public,
+    /// Admitted by a ticket, a token or a cluster peer: only the target's
+    /// host binding is re-checked, as deleting the ticket or token is what
+    /// ends it otherwise.
+    BindingOnly,
 }
 
 struct LiveStream {
@@ -274,6 +280,27 @@ mod tests {
         assert_eq!(streams.cancel(ALICE, KEPT, LiveStreamKind::RoleBased), 1);
         assert!(fired(&mut role).await);
         assert!(!fired(&mut public).await);
+    }
+
+    /// A binding-only stream is kept apart from the other kinds of the same
+    /// user and target.
+    #[tokio::test]
+    async fn cancelling_a_kind_leaves_a_binding_only_stream_running() {
+        let streams = LiveStreams::default();
+        let (_session_tx, session_rx) = broadcast::channel(1);
+        let mut bound = streams.watch(
+            session_rx.resubscribe(),
+            ALICE,
+            LOST,
+            LiveStreamKind::BindingOnly,
+            None,
+        );
+        let mut role = streams.watch(session_rx, ALICE, LOST, LiveStreamKind::RoleBased, None);
+        tokio::task::yield_now().await;
+
+        assert_eq!(streams.cancel(ALICE, LOST, LiveStreamKind::RoleBased), 1);
+        assert!(fired(&mut role).await);
+        assert!(!fired(&mut bound).await);
     }
 
     /// The browser session closing still ends the stream.
