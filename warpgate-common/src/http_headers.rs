@@ -75,3 +75,49 @@ pub fn may_forward_header(header_name: &HeaderName) -> bool {
         && !is_forwarding_header(header_name)
         && !header_name.as_str().starts_with("x-warpgate-")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hop_by_hop_headers_are_not_forwarded() {
+        for name in [
+            "connection",
+            "upgrade",
+            "te",
+            "trailer",
+            "transfer-encoding",
+            "keep-alive",
+            "proxy-authorization",
+            "proxy-connection",
+        ] {
+            assert!(
+                !may_forward_header(&HeaderName::from_static(name)),
+                "{name}"
+            );
+        }
+        assert!(may_forward_header(&HeaderName::from_static("x-custom")));
+    }
+
+    #[test]
+    fn connection_listed_headers_reads_every_token_of_every_line() {
+        let mut headers = http::HeaderMap::new();
+        headers.append(
+            http::header::CONNECTION,
+            "close,  X-One ,, keep-alive".parse().unwrap(),
+        );
+        headers.append(http::header::CONNECTION, "X-TWO".parse().unwrap());
+        let listed = connection_listed_headers(&headers);
+        assert_eq!(
+            listed,
+            [
+                HeaderName::from_static("close"),
+                HeaderName::from_static("x-one"),
+                HeaderName::from_static("keep-alive"),
+                HeaderName::from_static("x-two"),
+            ]
+        );
+        assert!(connection_listed_headers(&http::HeaderMap::new()).is_empty());
+    }
+}

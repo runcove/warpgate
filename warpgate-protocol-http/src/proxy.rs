@@ -1416,6 +1416,100 @@ mod tests {
         }
     }
 
+    /// A WebSocket request sets its own `Connection: Upgrade` and
+    /// `Upgrade: websocket` before the caller's headers are copied. Copying
+    /// leaves those two as they are, adds neither a second value nor any of the
+    /// caller's hop-by-hop headers, and still carries the other headers.
+    #[test]
+    fn websocket_upgrade_headers_survive_copying_the_callers_headers() {
+        let req = Request::builder()
+            .header(http::header::CONNECTION, "keep-alive, Upgrade")
+            .header(http::header::UPGRADE, "websocket")
+            .header(http::header::TE, "trailers")
+            .header("Keep-Alive", "timeout=5")
+            .header(http::header::PROXY_AUTHORIZATION, "Basic dXNlcjpwYXNz")
+            .header("X-Kept", "1")
+            .finish();
+        let builder = http::request::Builder::new()
+            .header(http::header::CONNECTION, "Upgrade")
+            .header(http::header::UPGRADE, "websocket");
+        let copied = copy_server_request(&req, builder).unwrap();
+        let headers = copied.headers_ref().unwrap();
+        let values = |name: &str| {
+            headers
+                .get_all(name)
+                .iter()
+                .map(|v| v.to_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(values("connection"), ["Upgrade"]);
+        assert_eq!(values("upgrade"), ["websocket"]);
+        assert_eq!(values("te"), Vec::<String>::new());
+        assert_eq!(values("keep-alive"), Vec::<String>::new());
+        assert_eq!(values("proxy-authorization"), Vec::<String>::new());
+        assert_eq!(values("x-kept"), ["1"]);
+    }
+
+    /// Names in a `Connection` header are matched without regard to case, and
+    /// across a comma-separated list and several `Connection` header lines;
+    /// tokens that are not header names are ignored.
+    #[test]
+    fn connection_listed_headers_are_not_forwarded_to_the_upstream() {
+        let raw: &[(&str, &[u8])] = &[
+            ("Connection", b"close,  X-HOP-One ,, x-hop-two"),
+            ("connection", b"X-Hop-Three"),
+            ("X-Hop-One", b"1"),
+            ("X-Hop-Two", b"2"),
+            ("X-Hop-Three", b"3"),
+            ("X-Hop-Four", b"4"),
+        ];
+        for name in ["x-hop-one", "x-hop-two", "x-hop-three"] {
+            let name = http::header::HeaderName::from_static(name);
+            for (path, values) in upstream_values(&name, raw) {
+                assert_eq!(values, Vec::<String>::new(), "{path} path, {name}");
+            }
+        }
+        let unlisted = http::header::HeaderName::from_static("x-hop-four");
+        for (path, values) in upstream_values(&unlisted, raw) {
+            assert_eq!(values, ["4"], "{path} path");
+        }
+    }
+
+    /// The same list applies to a response going back to the client: hop-by-hop
+    /// headers and the headers the response's `Connection` header lists are
+    /// dropped, the status and the other headers are kept.
+    #[test]
+    fn hop_by_hop_headers_are_not_copied_to_the_client_response() {
+        let upstream = http::Response::builder()
+            .status(StatusCode::CREATED)
+            .header("Connection", "Close, X-HOP-One")
+            .header("connection", "x-hop-two")
+            .header("X-Hop-One", "1")
+            .header("X-Hop-Two", "2")
+            .header("Keep-Alive", "timeout=5")
+            .header("Transfer-Encoding", "chunked")
+            .header("Trailer", "Expires")
+            .header("Proxy-Authorization", "Basic dXNlcjpwYXNz")
+            .header("X-Kept", "3")
+            .body(())
+            .unwrap();
+        let mut response: Response = "".into();
+        copy_client_response(&upstream, &mut response);
+        for name in [
+            "connection",
+            "x-hop-one",
+            "x-hop-two",
+            "keep-alive",
+            "transfer-encoding",
+            "trailer",
+            "proxy-authorization",
+        ] {
+            assert!(!response.headers().contains_key(name), "{name} was copied");
+        }
+        assert_eq!(response.headers().get("x-kept").unwrap(), "3");
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
     fn forwarded_cookie_header(values: &[&str]) -> Option<String> {
         let mut request = Request::builder();
         for value in values {
