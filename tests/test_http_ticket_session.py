@@ -106,11 +106,13 @@ def test_ticket_session_ends_when_its_ticket_expires(shared_wg, echo_server_port
 
 def _anonymous_after(url, session):
     """The cookie session answers `info` without a username and no longer
-    proxies, and the same holds for the proxied path."""
+    proxies: a request with no auth to a target answers 401 (`page_auth` hands
+    it to `gateway_redirect`, which redirects only navigations, those that
+    accept text/html; requests sends `Accept: */*`, so it gets the 401)."""
     info = session.get(f"{url}/@warpgate/api/info")
     info.raise_for_status()
     assert info.json().get("username") in (None, ""), info.json()
-    assert session.get(f"{url}/some/path", allow_redirects=False).status_code != 200
+    assert session.get(f"{url}/some/path", allow_redirects=False).status_code == 401
 
 
 def test_ticket_session_is_anonymous_for_the_api_after_its_ticket_is_deleted(
@@ -139,7 +141,7 @@ def test_ticket_session_is_anonymous_for_the_api_after_its_ticket_expires(
     shared_wg, echo_server_port
 ):
     url = f"https://localhost:{shared_wg.http_port}"
-    expiry = datetime.now(timezone.utc) + timedelta(seconds=4)
+    expiry = datetime.now(timezone.utc) + timedelta(seconds=6)
     with admin_client(url) as api:
         alice, alice_target = _create_test_user(api, echo_server_port)
         secret = _make_ticket(api, alice, alice_target, expiry=expiry)
@@ -148,5 +150,7 @@ def test_ticket_session_is_anonymous_for_the_api_after_its_ticket_expires(
     assert resp.status_code // 100 in (2, 3)
     assert _info_username(url, session) == alice.username
 
-    time.sleep(6)
+    # Check within 0.3 s of the expiry, so the 5 s expiry sweep has rarely
+    # run yet and the per-request re-check is what ends the session.
+    time.sleep(max(0, (expiry - datetime.now(timezone.utc)).total_seconds()) + 0.3)
     _anonymous_after(url, session)

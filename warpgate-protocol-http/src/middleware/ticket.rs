@@ -1,4 +1,5 @@
 use std::net::IpAddr;
+use std::sync::Arc;
 
 use poem::http::{HeaderValue, Method, StatusCode, header};
 use poem::session::{Session, SessionStatus};
@@ -6,6 +7,7 @@ use poem::web::{Data, FromRequest};
 use poem::{Endpoint, IntoResponse, Middleware, Request, Response};
 use serde::Deserialize;
 use time::OffsetDateTime;
+use tokio::sync::Mutex;
 use tracing::warn;
 use uuid::Uuid;
 use warpgate_common::Secret;
@@ -16,7 +18,9 @@ use warpgate_common_http::{SessionAuthorization, authorization_token};
 use warpgate_core::authorize_and_spend_ticket;
 use warpgate_db_entities::Ticket;
 
-use crate::common::{SessionExt, SessionRotation, is_public_session_authorization};
+use crate::api::common::end_login;
+use crate::common::{SessionExt, SessionRotation};
+use crate::session::SessionStore;
 
 /// Request-data marker for a header-borne ticket: the request runs on a
 /// detached session that is never stored, so the user session registered for
@@ -151,16 +155,30 @@ fn ticket_belongs_to_another_user(
     )
 }
 
-/// The ticket a stored session's authorization depends on, if it needs
-/// re-checking: a ticket session that names a user. The synthetic `<public>`
-/// authorization (nil user) has no ticket behind it.
-fn ticket_to_recheck(auth: &SessionAuthorization) -> Option<Uuid> {
+/// What a stored session's authorization asks of the per-request re-check.
+#[derive(Debug, PartialEq, Eq)]
+enum TicketRecheck {
+    /// Not backed by a ticket, or the synthetic `<public>` authorization (nil
+    /// user id), which has no ticket behind it.
+    Skip,
+    /// A ticket session that records no ticket id (stored by an older
+    /// version): nothing can vouch for it, so it counts as ended.
+    NoTicketId,
+    /// A ticket session to check against this ticket.
+    Check(Uuid),
+}
+
+fn ticket_to_recheck(auth: &SessionAuthorization) -> TicketRecheck {
     match auth {
+        SessionAuthorization::Ticket { user_id, .. } if user_id.is_nil() => TicketRecheck::Skip,
         SessionAuthorization::Ticket {
             ticket_id: Some(ticket_id),
             ..
-        } if !is_public_session_authorization(auth) => Some(*ticket_id),
-        _ => None,
+        } => TicketRecheck::Check(*ticket_id),
+        SessionAuthorization::Ticket {
+            ticket_id: None, ..
+        } => TicketRecheck::NoTicketId,
+        _ => TicketRecheck::Skip,
     }
 }
 
@@ -229,15 +247,26 @@ impl<E: Endpoint> Endpoint for TicketMiddlewareEndpoint<E> {
         let mut rotation = None;
 
         // A browser session that a ticket started lasts as long as the ticket:
-        // once the ticket is deleted or expired, the session is anonymous again
-        // and any ticket presented with this request is judged on its own.
-        if !session_is_temporary
-            && let Some(auth) = session.get_auth()
-            && let Some(session_ticket) = ticket_to_recheck(&auth)
-        {
-            let expiry = Ticket::expiry_by_id(&ctx.services().db, session_ticket).await?;
-            if !ticket_session_is_current(expiry, OffsetDateTime::now_utc()) {
-                session.clear_auth();
+        // once the ticket is deleted or expired, the session ends as at logout
+        // and the request carries on anonymous on a fresh session, with any
+        // ticket presented with it judged on its own.
+        if !session_is_temporary && let Some(auth) = session.get_auth() {
+            let ended = match ticket_to_recheck(&auth) {
+                TicketRecheck::Skip => false,
+                TicketRecheck::NoTicketId => true,
+                TicketRecheck::Check(session_ticket) => {
+                    let expiry = Ticket::expiry_by_id(&ctx.services().db, session_ticket).await?;
+                    !ticket_session_is_current(expiry, OffsetDateTime::now_utc())
+                }
+            };
+            if ended {
+                // As the step-up logout does: the login is ended, then the
+                // browser session is cleared rather than purged, because a
+                // purged session ignores every later write in this request.
+                let session_store =
+                    Data::<&Arc<Mutex<SessionStore>>>::from_request_without_body(&req).await?;
+                end_login(&session, session_store.0, &ctx.services().db).await;
+                session.clear();
             }
         }
 
@@ -423,22 +452,27 @@ mod tests {
         let user = Uuid::new_v4();
         assert_eq!(
             ticket_to_recheck(&ticket(user, "alice", Some(ticket_id))),
-            Some(ticket_id)
+            TicketRecheck::Check(ticket_id)
         );
         assert_eq!(
             ticket_to_recheck(&ticket(Uuid::nil(), "alice", Some(ticket_id))),
-            None
+            TicketRecheck::Skip
         );
         assert_eq!(
-            ticket_to_recheck(&ticket(
-                user,
-                crate::common::PUBLIC_USERNAME,
-                Some(ticket_id)
-            )),
-            None
+            ticket_to_recheck(&ticket(Uuid::nil(), "alice", None)),
+            TicketRecheck::Skip
         );
-        assert_eq!(ticket_to_recheck(&ticket(user, "alice", None)), None);
-        assert_eq!(ticket_to_recheck(&user_auth(user)), None);
+        // A real user may be named like the synthetic public user.
+        assert_eq!(
+            ticket_to_recheck(&ticket(user, "<public>", Some(ticket_id))),
+            TicketRecheck::Check(ticket_id)
+        );
+        // Stored without a ticket id: counts as ended.
+        assert_eq!(
+            ticket_to_recheck(&ticket(user, "alice", None)),
+            TicketRecheck::NoTicketId
+        );
+        assert_eq!(ticket_to_recheck(&user_auth(user)), TicketRecheck::Skip);
     }
 
     /// The refusal is a plain 403 that names the way out.
