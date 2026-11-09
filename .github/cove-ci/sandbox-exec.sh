@@ -42,13 +42,21 @@
 # see and the container needs no further capability. Unset, the check runs as
 # whoever started this script, as before. The variable is unset before the
 # command runs. A value that is not UID:GID, or a setpriv that fails, is 93.
+# The coupling is enforced here, not left to the caller: with SANDBOX_CHECK_AS
+# set, COMMAND must itself be EXACTLY `setpriv --reuid=UID --regid=GID
+# --clear-groups PROG [ARG...]` with the same UID and GID, PROG a program and
+# not an option, or it is 93: any other setpriv option (--keep-groups,
+# --groups, --init-groups, capability or securebits options) would give the
+# command groups or capabilities the check, which ran with --clear-groups and
+# none, never saw.
 #
 # Exit codes, the same as hardened-run.sh's for the same findings:
 #   90  the self-check saw a DOCKER_* variable or a readable key/cert; it
 #       names them (names and paths only) and COMMAND never runs.
 #   93  nothing is known: no sandbox-self-check.sh or fp beside this script,
 #       an fp that could not be deleted, a working directory of /, a self-check that was blind (its 2) or gave
-#       no matching verdict line, or a malformed call. COMMAND never runs.
+#       no matching verdict line, a SANDBOX_CHECK_AS that is not UID:GID or
+#       that the command does not drop to, a setpriv that fails, or a malformed call. COMMAND never runs.
 #   otherwise, COMMAND's own: on a clean check this script `exec`s it, so its
 #       exit status and signals are COMMAND's, untouched.
 #
@@ -89,6 +97,19 @@ if [ -n "$as" ]; then
   esac
   [ "$as" != BAD ] || {
     echo "sandbox-exec: REFUSE -- SANDBOX_CHECK_AS is not UID:GID, so the self-check cannot run as the command's user; the command was NOT run (exit 93)" >&2
+    exit 93; }
+  # The command must become exactly the user the check runs as, with no inherited groups and no
+  # other setpriv option (--keep-groups, --groups, --init-groups, capability or securebits options
+  # would hand it more than the check saw): EXACTLY
+  #   setpriv --reuid=U --regid=G --clear-groups PROG [ARG...]
+  # with PROG a program, not an option.
+  cmd_ok=no
+  if [ "$1" = setpriv ] && [ "${2:-}" = "--reuid=${as%:*}" ] && [ "${3:-}" = "--regid=${as#*:}" ] \
+     && [ "${4:-}" = "--clear-groups" ] && [ -n "${5:-}" ]; then
+    case "$5" in -*) ;; *) cmd_ok=yes ;; esac
+  fi
+  [ "$cmd_ok" = yes ] || {
+    echo "sandbox-exec: REFUSE -- SANDBOX_CHECK_AS=$as but the command does not begin 'setpriv --reuid=${as%:*} --regid=${as#*:} --clear-groups PROG' exactly (PROG a program, no other setpriv option first), so the self-check would vouch for a user, groups or capabilities the command is not; the command was NOT run (exit 93)" >&2
     exit 93; }
   pre="setpriv --reuid=${as%:*} --regid=${as#*:} --clear-groups"
 fi
