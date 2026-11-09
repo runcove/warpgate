@@ -32,6 +32,17 @@
 # (test_workflow_config.py pins that), and a DOCKER_ or /certs token on a
 # `docker create` line is exactly what the djgz sweeps refuse, rightly.
 #
+# THE CHECK RUNS AS THE COMMAND'S USER. A container that starts as root but
+# drops every capability (the smoke container: --cap-drop ALL, SETUID and
+# SETGID kept) has no CAP_DAC_READ_SEARCH, so root there cannot list a 0700
+# directory owned by the user the command becomes (the image's /data), and the
+# check was blind (exit 2, then 93). SANDBOX_CHECK_AS=UID:GID makes this script
+# run the self-check through `setpriv` as that user, after it has read and
+# deleted fp as root, so the check vouches for exactly what the command will
+# see and the container needs no further capability. Unset, the check runs as
+# whoever started this script, as before. The variable is unset before the
+# command runs. A value that is not UID:GID, or a setpriv that fails, is 93.
+#
 # Exit codes, the same as hardened-run.sh's for the same findings:
 #   90  the self-check saw a DOCKER_* variable or a readable key/cert; it
 #       names them (names and paths only) and COMMAND never runs.
@@ -67,10 +78,27 @@ rm -f "$fp_file" && [ ! -e "$fp_file" ] || {
 [ "$PWD" != / ] || {
   echo "sandbox-exec: REFUSE -- the working directory is /, which is not a delivered tree the self-check can search; the command was NOT run (exit 93)" >&2
   exit 93; }
+as=${SANDBOX_CHECK_AS:-}
+unset SANDBOX_CHECK_AS
+pre=""
+if [ -n "$as" ]; then
+  case "$as" in
+    *[!0-9:]*|:*|*:|*:*:*|[!0-9]*) as=BAD ;;
+    *:*) ;;
+    *) as=BAD ;;
+  esac
+  [ "$as" != BAD ] || {
+    echo "sandbox-exec: REFUSE -- SANDBOX_CHECK_AS is not UID:GID, so the self-check cannot run as the command's user; the command was NOT run (exit 93)" >&2
+    exit 93; }
+  pre="setpriv --reuid=${as%:*} --regid=${as#*:} --clear-groups"
+fi
 if [ -d /ci ]; then
-  out=$(SANDBOX_FP=$fp sh "$self_check" --tree "$PWD" --tree /ci 2>&1)
+  # $pre is left unquoted on purpose: it is a command and its options.
+  # shellcheck disable=SC2086
+  out=$(SANDBOX_FP=$fp $pre sh "$self_check" --tree "$PWD" --tree /ci 2>&1)
 else
-  out=$(SANDBOX_FP=$fp sh "$self_check" --tree "$PWD" 2>&1)
+  # shellcheck disable=SC2086
+  out=$(SANDBOX_FP=$fp $pre sh "$self_check" --tree "$PWD" 2>&1)
 fi
 rc=$?
 unset fp

@@ -537,6 +537,8 @@ def build(engine, about, src, rust_doc, rustc_version, zig_dir, zig_version, tar
             problems.append(f"{label}: BUNDLED_NOTICES in third-party-notices.py has no entry for this version: "
                             f"look at the notices its sources carry, then list them")
         elif carried:
+            # A source file with a licence notice that the lists miss is refused, as the engine's own build does.
+            engine.unlisted_notice_files(d, carried[2], {r for _, rels in carried[1] for r in rels}, problems, label)
             for kind, rels in carried[1]:
                 blocks = engine.bundled_notices(d, rels, problems, label, kind)
                 if blocks:
