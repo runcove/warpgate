@@ -301,19 +301,27 @@ impl<E: Endpoint> Endpoint for TicketMiddlewareEndpoint<E> {
             // no use is spent. Nothing about the request tells it apart from
             // one that presents an unknown ticket, so the answer does not
             // confirm that the ticket exists.
-            let belongs_to_another_user = if session_is_temporary {
-                false
-            } else if let Some((ticket_id, ticket_user_id)) = presented_owner {
-                let pending = pending_login_user_id(&req, &ctx).await?;
-                let other =
-                    ticket_belongs_to_another_user(session.get_auth().as_ref(), ticket_user_id)
-                        || pending_login_belongs_to_another_user(pending, ticket_user_id);
-                if other {
-                    warn!(%ticket_id, "Ticket belongs to a different user than this session, ignoring it");
-                }
-                other
+            //
+            // The same lookups run whether the ticket is unknown or belongs to
+            // another user (the owner lookup above, then the part-way login
+            // check), and neither goes on to the sign-in checks, so the two
+            // take the same steps and the same time.
+            let pending = if session_is_temporary {
+                None
             } else {
-                false
+                pending_login_user_id(&req, &ctx).await?
+            };
+            let belongs_to_another_user = match presented_owner {
+                Some((ticket_id, ticket_user_id)) if !session_is_temporary => {
+                    let other =
+                        ticket_belongs_to_another_user(session.get_auth().as_ref(), ticket_user_id)
+                            || pending_login_belongs_to_another_user(pending, ticket_user_id);
+                    if other {
+                        warn!(%ticket_id, "Ticket belongs to a different user than this session, ignoring it");
+                    }
+                    other
+                }
+                _ => false,
             };
 
             // Do not re-spend the ticket if it has authenticated the current session already
@@ -328,7 +336,7 @@ impl<E: Endpoint> Endpoint for TicketMiddlewareEndpoint<E> {
                 ) if session_ticket == presented
             );
 
-            if !already_this_ticket && !belongs_to_another_user {
+            if presented_owner.is_some() && !already_this_ticket && !belongs_to_another_user {
                 let client_ip: Option<IpAddr> = get_client_ip(&req, ctx.services())
                     .await
                     .and_then(|s| s.parse().ok());

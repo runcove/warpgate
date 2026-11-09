@@ -1,7 +1,9 @@
 import time
 from datetime import datetime, timedelta, timezone
 
+import pyotp
 import requests
+from base64 import b64decode
 
 from .api_client import admin_client, sdk
 from .test_http_common import *  # noqa
@@ -19,6 +21,26 @@ def _open_ticket_link(url, secret, session=None):
     s.verify = False
     resp = s.get(f"{url}/some/path?warpgate-ticket={secret}", allow_redirects=False)
     return resp, s
+
+
+def _signed_in(url, user):
+    _, session = _post_login(url, user.username, "correct_password")
+    return session
+
+
+def _same_answer(a, b):
+    """Two responses a client cannot tell apart: status, redirect target,
+    whether a session cookie is set, and the referrer policy."""
+    return _answer_shape(a) == _answer_shape(b)
+
+
+def _answer_shape(resp):
+    return (
+        resp.status_code,
+        resp.headers.get("Location"),
+        "Set-Cookie" in resp.headers,
+        resp.headers.get("Referrer-Policy"),
+    )
 
 
 def _make_ticket(api, user, target, **kwargs):
@@ -40,7 +62,8 @@ def test_ticket_link_does_not_replace_another_users_login(shared_wg, echo_server
     assert _info_username(url, session) == alice.username
 
     resp, _ = _open_ticket_link(url, secret, session)
-    assert resp.status_code != 403
+    unknown, _ = _open_ticket_link(url, "not-a-real-ticket", _signed_in(url, alice))
+    assert _same_answer(resp, unknown)
     assert _info_username(url, session) == alice.username
 
     # The ignored link spent no use: it still opens for someone with no session.
@@ -64,7 +87,8 @@ def test_ticket_link_does_not_replace_another_tickets_session(
     assert _info_username(url, session) == alice.username
 
     resp, _ = _open_ticket_link(url, bob_secret, session)
-    assert resp.status_code != 403
+    resp_unknown, _ = _open_ticket_link(url, "not-a-real-ticket", session)
+    assert _same_answer(resp, resp_unknown)
     assert _info_username(url, session) == alice.username
 
     resp, fresh = _open_ticket_link(url, bob_secret)
@@ -102,18 +126,68 @@ def test_another_users_ticket_is_answered_like_an_unknown_one(
         _, session = _post_login(url, alice.username, "correct_password")
         resp = _page_load_with_ticket(url, secret, session)
         assert _info_username(url, session) == alice.username
-        return resp.status_code, resp.headers.get("Location"), resp.text
+        return _answer_shape(resp), resp.text
 
     assert answer(real) == answer("not-a-real-ticket")
 
     # A browser page load is sent to the address without the ticket, so the
     # other user's unspent ticket stays out of this browser's history.
-    status, location, _ = answer(real)
+    (status, location, _, policy), _ = answer(real)
     assert status == 303
     assert location == "/some/path?a=1"
+    assert policy == "no-referrer"
 
     # No use was spent.
     resp, fresh = _open_ticket_link(url, real)
+    assert resp.status_code // 100 in (2, 3)
+    assert _info_username(url, fresh) == bob.username
+
+
+def test_ticket_link_does_not_replace_a_login_waiting_on_its_second_factor(
+    shared_wg, echo_server_port, otp_key_base32, otp_key_base64
+):
+    """A sign-in that has passed the password and waits for the one-time code
+    is kept when another user's ticket is opened in that browser, and the
+    answer is the one an unknown ticket gets."""
+    url = f"https://localhost:{shared_wg.http_port}"
+    with admin_client(url) as api:
+        alice, _ = _create_test_user(api, echo_server_port)
+        api.create_otp_credential(
+            alice.id,
+            sdk.NewOtpCredential(secret_key=list(b64decode(otp_key_base64))),
+        )
+        api.update_user(
+            alice.id,
+            sdk.UserDataRequest(
+                username=alice.username,
+                credential_policy=sdk.UserRequireCredentialsPolicy(
+                    http=["Password", "Totp"]
+                ),
+            ),
+        )
+        bob, bob_target = _create_test_user(api, echo_server_port)
+        secret = _make_ticket(api, bob, bob_target, number_of_uses=1)
+
+    def waiting_on_code():
+        resp, session = _post_login(url, alice.username, "correct_password")
+        assert resp.status_code // 100 != 2
+        return session
+
+    session = waiting_on_code()
+    resp = _page_load_with_ticket(url, secret, session)
+    other_session = waiting_on_code()
+    unknown = _page_load_with_ticket(url, "not-a-real-ticket", other_session)
+    assert _same_answer(resp, unknown)
+
+    # The sign-in is still waiting, and finishes as its own user.
+    resp = session.post(
+        f"{url}/@warpgate/api/auth/otp", json={"otp": pyotp.TOTP(otp_key_base32).now()}
+    )
+    assert resp.status_code // 100 == 2
+    assert _info_username(url, session) == alice.username
+
+    # No use was spent.
+    resp, fresh = _open_ticket_link(url, secret)
     assert resp.status_code // 100 in (2, 3)
     assert _info_username(url, fresh) == bob.username
 
