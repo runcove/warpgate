@@ -132,15 +132,21 @@ fn clean_address_redirect(req: &Request) -> Response {
     )
 }
 
-/// True when the session is a signed-in user session for someone other than
-/// the user the ticket was issued to.
+/// True when the session already belongs to someone other than the user the
+/// ticket was issued to: a signed-in user session, or a session that another
+/// ticket started. A ticket session that names no one (the nil user) belongs
+/// to nobody and is not protected. A session for the same user is not matched,
+/// so that case behaves as it always has.
 fn ticket_belongs_to_another_user(
     current: Option<&SessionAuthorization>,
     ticket_user_id: Uuid,
 ) -> bool {
     matches!(
         current,
-        Some(SessionAuthorization::User { user_id, .. }) if *user_id != ticket_user_id
+        Some(
+            SessionAuthorization::User { user_id, .. }
+                | SessionAuthorization::Ticket { user_id, .. }
+        ) if !user_id.is_nil() && *user_id != ticket_user_id
     )
 }
 
@@ -310,20 +316,38 @@ mod tests {
         assert!(ticket_belongs_to_another_user(Some(&user_auth(me)), other));
     }
 
-    /// The same user's ticket, no session, and a ticket session are all
-    /// handled as before.
+    fn ticket_auth(user_id: Uuid) -> SessionAuthorization {
+        SessionAuthorization::Ticket {
+            user_id,
+            username: "t".into(),
+            target_id: Uuid::new_v4(),
+            ticket_id: Some(Uuid::new_v4()),
+        }
+    }
+
+    /// A session that another ticket started is kept too.
+    #[test]
+    fn a_ticket_for_another_user_does_not_replace_a_ticket_session() {
+        let me = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        assert!(ticket_belongs_to_another_user(
+            Some(&ticket_auth(me)),
+            other
+        ));
+    }
+
+    /// The same user's ticket, no session, and a ticket session that names no
+    /// one are all handled as before.
     #[test]
     fn other_sessions_do_not_block_a_ticket() {
         let me = Uuid::new_v4();
         assert!(!ticket_belongs_to_another_user(Some(&user_auth(me)), me));
+        assert!(!ticket_belongs_to_another_user(Some(&ticket_auth(me)), me));
         assert!(!ticket_belongs_to_another_user(None, me));
-        let ticket_session = SessionAuthorization::Ticket {
-            user_id: Uuid::new_v4(),
-            username: "t".into(),
-            target_id: Uuid::new_v4(),
-            ticket_id: None,
-        };
-        assert!(!ticket_belongs_to_another_user(Some(&ticket_session), me));
+        assert!(!ticket_belongs_to_another_user(
+            Some(&ticket_auth(Uuid::nil())),
+            me
+        ));
     }
 
     /// The refusal is a plain 403 that names the way out.
