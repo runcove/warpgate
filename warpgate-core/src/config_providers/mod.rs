@@ -377,8 +377,13 @@ pub async fn ticket_user_still_admitted(
     user_id: Uuid,
     remote_ip: Option<IpAddr>,
 ) -> Result<bool, WarpgateError> {
+    // The settings are read once and shared by the address and lockout checks.
+    let settings = login_protection.read_settings().await?;
     if let Some(ip) = remote_ip
-        && login_protection.check_ip_blocked(&ip).await?.is_some()
+        && login_protection
+            .check_ip_blocked_with(&settings, &ip)
+            .await?
+            .is_some()
     {
         warn!("Ticket session continued from a blocked IP: {ip}");
         return Ok(false);
@@ -392,7 +397,13 @@ pub async fn ticket_user_still_admitted(
         warn!(%user_id, "User of a ticket session could not be loaded");
         return Ok(false);
     };
-    crate::auth_state_store::vet_credential_bearer(login_protection, &user, remote_ip).await
+    crate::auth_state_store::vet_credential_bearer_with(
+        login_protection,
+        &settings,
+        &user,
+        remote_ip,
+    )
+    .await
 }
 
 pub async fn validate_ticket(

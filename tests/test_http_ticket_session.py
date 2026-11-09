@@ -291,11 +291,22 @@ def test_ticket_session_is_anonymous_after_its_user_is_restricted_to_other_addre
         assert resp.status_code // 100 in (2, 3)
         assert _info_username(url, session) == alice.username
 
+        # The update replaces every field it carries (absent fields are
+        # cleared), so send back what the user has now with only the ranges
+        # changed.
+        current = api.get_user(alice.id)
+        current = getattr(current, "inner", current)
+        # Still signed in, from loopback, with no ranges set.
+        assert _info_username(url, session) == alice.username
         # A range the test client (loopback) is not in.
         api.update_user(
             alice.id,
             sdk.UserDataRequest(
-                username=alice.username, allowed_ip_ranges=["192.0.2.0/24"]
+                username=current.username,
+                description=current.description,
+                credential_policy=current.credential_policy,
+                rate_limit_bytes_per_second=current.rate_limit_bytes_per_second,
+                allowed_ip_ranges=["192.0.2.0/24"],
             ),
         )
 
@@ -315,6 +326,35 @@ def test_ticket_session_is_anonymous_after_its_user_is_locked(
     assert resp.status_code // 100 in (2, 3)
     assert _info_username(url, session) == alice.username
 
+    # Not locked yet: the session stays signed in across several requests.
+    for _ in range(3):
+        assert _info_username(url, session) == alice.username
+        assert session.get(f"{url}/some/path", allow_redirects=False).status_code != 401
+
+    for _ in range(3):
+        _post_login(url, alice.username, "wrong")
+    time.sleep(0.2)
+
+    _anonymous_after(url, session)
+
+
+def test_ticket_session_is_anonymous_after_its_address_is_blocked(
+    processes: ProcessManager, echo_server_port
+):
+    wg = _lp_wg(processes, ip_max=3, user_max=100)
+    url = f"https://localhost:{wg.http_port}"
+    with admin_client(url) as api:
+        alice, alice_target = _create_test_user(api, echo_server_port)
+        secret = _make_ticket(api, alice, alice_target)
+
+    resp, session = _open_ticket_link(url, secret)
+    assert resp.status_code // 100 in (2, 3)
+    # Not blocked yet: the session stays signed in across several requests.
+    for _ in range(3):
+        assert _info_username(url, session) == alice.username
+
+    # Loopback is not exempt by default, so three failed logins from here
+    # block this address.
     for _ in range(3):
         _post_login(url, alice.username, "wrong")
     time.sleep(0.2)
