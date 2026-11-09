@@ -32,3 +32,6 @@ cdx.xml
 *.cdx.xml
 
 node_modules
+
+# Claude Code local approvals (may hold a command verbatim); never committed
+/.claude/settings.local.json
