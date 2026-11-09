@@ -1477,24 +1477,24 @@ mod tests {
     }
 
     /// A target that cannot be read ends its streams (fail closed): the
-    /// host binding check cannot say they are unchanged.
+    /// host binding check cannot say they are unchanged. A binding-only
+    /// stream has no access rule to fail first, so this reaches the binding
+    /// lookup's error arm. No grant rows reference the targets table, so it
+    /// can be dropped.
     #[tokio::test]
     async fn an_unreadable_target_ends_its_bound_streams() {
         use sea_orm::ConnectionTrait;
 
         let db = migrated_db().await;
         let services = test_services(&db).await;
-        let (alice, granting) = (user(&db).await, role(&db).await);
-        let target_id = http_target(&db, true).await;
+        let target_id = http_target(&db, false).await;
         rebind_target(&db, target_id, "old.example").await;
-        grant_user(&db, alice, granting).await;
-        grant_target(&db, target_id, granting).await;
         let (_browser_session, browser_close) = tokio::sync::broadcast::channel(1);
         let mut stream = services.live_streams.watch(
             browser_close,
-            alice,
+            Uuid::nil(),
             target_id,
-            LiveStreamKind::RoleBased,
+            LiveStreamKind::BindingOnly,
             Some("old.example".into()),
         );
 
