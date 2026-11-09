@@ -16,7 +16,7 @@ use warpgate_db_entities::{
 use warpgate_sso::{SsoLoginResponse, SsoProviderConfig};
 
 use crate::cluster::ClusterNotification;
-use crate::live_streams::LiveStreamKind;
+use crate::live_streams::{LiveStreamKind, host_binding};
 use crate::{ConfigProvider, Services, SessionsFilter, apply_sso_mappings, resolve_sso_username};
 
 /// Waits up to [`LIVE_STREAM_LOOKUP_TIMEOUT`] for one access lookup of the
@@ -433,12 +433,29 @@ impl Services {
         }
     }
 
+    /// The host binding ([`host_binding`]) `target_id` has now. `None` when the
+    /// target is gone or cannot be read, so a caller treats its streams as
+    /// changed (fail closed).
+    pub async fn current_host_binding(&self, target_id: Uuid) -> Option<Option<String>> {
+        match self.config_provider.get_target_by_id(target_id).await {
+            Ok(Some(target)) => Some(host_binding(&target.options)),
+            Ok(None) => None,
+            Err(error) => {
+                warn!(%error, %target_id, "Could not re-read the target's host binding; treating it as changed");
+                None
+            }
+        }
+    }
+
     /// Ends this node's live proxied HTTP requests that may no longer run, by
     /// the rule that admitted each. A role-based request ends when its user
     /// may no longer reach the target, by the same check as
     /// [`Self::close_sessions_no_longer_authorised`]. A public-bypass request
     /// ends when the target is no longer public
-    /// ([`Self::public_target_still_shared`]), whatever the user's roles. The
+    /// ([`Self::public_target_still_shared`]), whatever the user's roles. Any
+    /// request also ends when the target's host binding is no longer the one
+    /// it was opened against ([`host_binding`]), or the target is gone or
+    /// cannot be read; requests opened against the current binding stay. The
     /// browser session that carries them, and its requests to other targets,
     /// stay. A pair whose check errors or takes longer than
     /// [`LIVE_STREAM_LOOKUP_TIMEOUT`] is ended too (fail closed). Fails if
@@ -446,7 +463,9 @@ impl Services {
     pub async fn reauthorize_live_streams(&self) -> Result<(), WarpgateError> {
         // One lookup per target in a pass, however many visitors share it.
         let mut shared: std::collections::HashMap<Uuid, bool> = std::collections::HashMap::new();
-        for (user_id, target_id, kind) in self.live_streams.in_use()? {
+        let mut bindings: std::collections::HashMap<Uuid, Option<Option<String>>> =
+            std::collections::HashMap::new();
+        for (user_id, target_id, kind, opened_binding) in self.live_streams.in_use()? {
             let allowed = match kind {
                 LiveStreamKind::RoleBased => {
                     bounded_lookup(
@@ -478,6 +497,38 @@ impl Services {
                     ended,
                     ?kind,
                     "Ended live proxied requests to a target the user may no longer reach"
+                );
+                continue;
+            }
+            let current = match bindings.get(&target_id) {
+                Some(current) => current.clone(),
+                None => {
+                    let current = match tokio::time::timeout(
+                        LIVE_STREAM_LOOKUP_TIMEOUT,
+                        self.current_host_binding(target_id),
+                    )
+                    .await
+                    {
+                        Ok(current) => current,
+                        Err(_) => {
+                            warn!(%target_id, "Timed out re-reading the target's host binding; treating it as changed");
+                            None
+                        }
+                    };
+                    bindings.insert(target_id, current.clone());
+                    current
+                }
+            };
+            if current.as_ref() != Some(&opened_binding) {
+                let ended =
+                    self.live_streams
+                        .cancel_bound(user_id, target_id, kind, &opened_binding);
+                info!(
+                    %user_id,
+                    %target_id,
+                    ended,
+                    ?kind,
+                    "Ended live proxied requests opened against a different host binding of the target"
                 );
             }
         }
@@ -1016,12 +1067,14 @@ mod tests {
             alice,
             lost_target,
             LiveStreamKind::RoleBased,
+            None,
         );
         let mut to_kept = services.live_streams.watch(
             browser_close,
             alice,
             kept_target,
             LiveStreamKind::RoleBased,
+            None,
         );
         let mut notifications = services.cluster.subscribe();
 
@@ -1077,11 +1130,15 @@ mod tests {
             Uuid::nil(),
             target_id,
             LiveStreamKind::Public,
+            None,
         );
-        let mut logged_in =
-            services
-                .live_streams
-                .watch(browser_close, alice, target_id, LiveStreamKind::Public);
+        let mut logged_in = services.live_streams.watch(
+            browser_close,
+            alice,
+            target_id,
+            LiveStreamKind::Public,
+            None,
+        );
 
         services.reauthorize_live_streams().await.unwrap();
         assert!(!fired(&mut anonymous).await);
@@ -1114,6 +1171,7 @@ mod tests {
             Uuid::nil(),
             target_id,
             LiveStreamKind::Public,
+            None,
         );
 
         let mut gated: Target::ActiveModel = Target::Entity::find_by_id(target_id)
@@ -1143,6 +1201,7 @@ mod tests {
             Uuid::nil(),
             target_id,
             LiveStreamKind::Public,
+            None,
         );
 
         db.execute_unprepared("DROP TABLE targets").await.unwrap();
@@ -1163,6 +1222,7 @@ mod tests {
             Uuid::nil(),
             target_id,
             LiveStreamKind::Public,
+            None,
         );
 
         Target::Entity::delete_by_id(target_id)
@@ -1172,6 +1232,136 @@ mod tests {
         services.reauthorize_live_streams().await.unwrap();
 
         assert!(fired(&mut anonymous).await);
+    }
+
+    /// Rebinds `target_id` to `host` (an empty string clears the binding).
+    async fn rebind_target(db: &DatabaseConnection, target_id: Uuid, host: &str) {
+        let mut model: Target::ActiveModel = Target::Entity::find_by_id(target_id)
+            .one(db)
+            .await
+            .unwrap()
+            .unwrap()
+            .into();
+        model.options = Set(serde_json::json!({
+            "http": {"url": "http://h", "public": true, "external_host": host}
+        }));
+        model.update(db).await.unwrap();
+    }
+
+    /// The re-check also compares the target's host binding: a stream opened
+    /// against a binding the target no longer has ends, a stream opened
+    /// against the current binding stays, and the user keeps their access
+    /// throughout.
+    #[tokio::test]
+    async fn a_changed_host_binding_ends_the_streams_opened_against_the_old_one() {
+        let db = migrated_db().await;
+        let services = test_services(&db).await;
+        let (alice, granting) = (user(&db).await, role(&db).await);
+        let target_id = http_target(&db, true).await;
+        rebind_target(&db, target_id, "old.example").await;
+        grant_user(&db, alice, granting).await;
+        grant_target(&db, target_id, granting).await;
+        let (_browser_session, browser_close) = tokio::sync::broadcast::channel(1);
+        let mut old = services.live_streams.watch(
+            browser_close.resubscribe(),
+            alice,
+            target_id,
+            LiveStreamKind::RoleBased,
+            Some("old.example".into()),
+        );
+        let mut new = services.live_streams.watch(
+            browser_close,
+            alice,
+            target_id,
+            LiveStreamKind::RoleBased,
+            Some("new.example".into()),
+        );
+
+        rebind_target(&db, target_id, "new.example").await;
+        services.reauthorize_live_streams().await.unwrap();
+
+        assert!(fired(&mut old).await);
+        assert!(!fired(&mut new).await);
+    }
+
+    /// A target whose host binding did not change keeps its streams, bound or
+    /// not, whichever kind admitted them.
+    #[tokio::test]
+    async fn an_unchanged_host_binding_keeps_the_streams() {
+        let db = migrated_db().await;
+        let services = test_services(&db).await;
+        let (bound, unbound) = (http_target(&db, true).await, http_target(&db, true).await);
+        rebind_target(&db, bound, "bound.example").await;
+        let (_browser_session, browser_close) = tokio::sync::broadcast::channel(1);
+        let mut to_bound = services.live_streams.watch(
+            browser_close.resubscribe(),
+            Uuid::nil(),
+            bound,
+            LiveStreamKind::Public,
+            Some("bound.example".into()),
+        );
+        let mut to_unbound = services.live_streams.watch(
+            browser_close,
+            Uuid::nil(),
+            unbound,
+            LiveStreamKind::Public,
+            None,
+        );
+
+        services.reauthorize_live_streams().await.unwrap();
+
+        assert!(!fired(&mut to_bound).await);
+        assert!(!fired(&mut to_unbound).await);
+    }
+
+    /// A binding cleared after the stream opened counts as a change.
+    #[tokio::test]
+    async fn a_cleared_host_binding_ends_the_stream_opened_against_it() {
+        let db = migrated_db().await;
+        let services = test_services(&db).await;
+        let target_id = http_target(&db, true).await;
+        rebind_target(&db, target_id, "old.example").await;
+        let (_browser_session, browser_close) = tokio::sync::broadcast::channel(1);
+        let mut stream = services.live_streams.watch(
+            browser_close,
+            Uuid::nil(),
+            target_id,
+            LiveStreamKind::Public,
+            Some("old.example".into()),
+        );
+
+        rebind_target(&db, target_id, "").await;
+        services.reauthorize_live_streams().await.unwrap();
+
+        assert!(fired(&mut stream).await);
+    }
+
+    /// A target that cannot be read ends its streams (fail closed): the
+    /// host binding check cannot say they are unchanged.
+    #[tokio::test]
+    async fn an_unreadable_target_ends_its_bound_streams() {
+        use sea_orm::ConnectionTrait;
+
+        let db = migrated_db().await;
+        let services = test_services(&db).await;
+        let (alice, granting) = (user(&db).await, role(&db).await);
+        let target_id = http_target(&db, true).await;
+        rebind_target(&db, target_id, "old.example").await;
+        grant_user(&db, alice, granting).await;
+        grant_target(&db, target_id, granting).await;
+        let (_browser_session, browser_close) = tokio::sync::broadcast::channel(1);
+        let mut stream = services.live_streams.watch(
+            browser_close,
+            alice,
+            target_id,
+            LiveStreamKind::RoleBased,
+            Some("old.example".into()),
+        );
+
+        db.execute_unprepared("DROP TABLE targets").await.unwrap();
+        services.reauthorize_live_streams().await.unwrap();
+
+        assert!(fired(&mut stream).await);
     }
 
     /// A re-check that errors ends the stream (fail closed), and the loop
@@ -1193,11 +1383,15 @@ mod tests {
             alice,
             target_id,
             LiveStreamKind::RoleBased,
+            None,
         );
-        let mut second =
-            services
-                .live_streams
-                .watch(browser_close, bob, target_id, LiveStreamKind::RoleBased);
+        let mut second = services.live_streams.watch(
+            browser_close,
+            bob,
+            target_id,
+            LiveStreamKind::RoleBased,
+            None,
+        );
 
         db.execute_unprepared("DROP TABLE user_roles")
             .await
@@ -1247,6 +1441,7 @@ mod tests {
             Uuid::nil(),
             target_id,
             LiveStreamKind::Public,
+            None,
         );
         let mut notifications = services.cluster.subscribe();
 
@@ -1283,12 +1478,14 @@ mod tests {
             alice,
             lost_target,
             LiveStreamKind::RoleBased,
+            None,
         );
         let mut to_kept = services.live_streams.watch(
             browser_close,
             alice,
             kept_target,
             LiveStreamKind::RoleBased,
+            None,
         );
         let mut notifications = services.cluster.subscribe();
 

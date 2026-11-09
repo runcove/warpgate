@@ -14,7 +14,7 @@ use warpgate_common_http::auth::UnauthenticatedRequestContext;
 use warpgate_common_http::{
     AuthenticatedRequestContext, RequestAuthorization, SessionAuthorization, SessionKeepalive,
 };
-use warpgate_core::live_streams::LiveStreamKind;
+use warpgate_core::live_streams::{LiveStreamKind, host_binding};
 use warpgate_core::{
     ConfigProvider, ConfigProviderEnum, Services, TargetAuthorization, TargetSessionStart,
     authorize_for_target,
@@ -104,9 +104,14 @@ pub async fn catchall_endpoint(
     // no ticket id, anonymous or logged in) is watched too, and ends when the
     // target stops being public. A real ticket is not role-based: deleting the
     // ticket is what cuts it.
-    let close_rx =
-        watch_admitted_live_stream(ctx.services(), &ctx.auth, close_rx, admitted.target().id)
-            .await?;
+    let close_rx = watch_admitted_live_stream(
+        ctx.services(),
+        &ctx.auth,
+        close_rx,
+        admitted.target().id,
+        host_binding(&admitted.target().options),
+    )
+    .await?;
     let keepalive_guard = Data::<&SessionKeepalive>::from_request_without_body(req)
         .await
         .ok()
@@ -504,22 +509,26 @@ async fn get_target_for_request(
 /// logged-in user is role-based, a ticket session with no ticket id came
 /// through the public bypass (anonymous or logged in) and is public, and
 /// anything else (a real ticket, a token, a peer) is not watched, as deleting
-/// the ticket is what cuts a ticket session.
+/// the ticket is what cuts a ticket session. `opened_binding` is the target's
+/// host binding the request was admitted against.
 async fn watch_admitted_live_stream(
     services: &Services,
     auth: &RequestAuthorization,
     close_rx: broadcast::Receiver<()>,
     target_id: Uuid,
+    opened_binding: Option<String>,
 ) -> poem::Result<broadcast::Receiver<()>> {
     match auth {
         RequestAuthorization::Session(SessionAuthorization::User { user_id, .. }) => {
-            watch_live_stream(services, close_rx, *user_id, target_id).await
+            watch_live_stream(services, close_rx, *user_id, target_id, opened_binding).await
         }
         RequestAuthorization::Session(SessionAuthorization::Ticket {
             user_id,
             ticket_id: None,
             ..
-        }) => watch_public_live_stream(services, close_rx, *user_id, target_id).await,
+        }) => {
+            watch_public_live_stream(services, close_rx, *user_id, target_id, opened_binding).await
+        }
         _ => Ok(close_rx),
     }
 }
@@ -534,11 +543,16 @@ async fn watch_live_stream(
     close_rx: broadcast::Receiver<()>,
     user_id: Uuid,
     target_id: Uuid,
+    opened_binding: Option<String>,
 ) -> poem::Result<broadcast::Receiver<()>> {
-    let close_rx =
-        services
-            .live_streams
-            .watch(close_rx, user_id, target_id, LiveStreamKind::RoleBased);
+    let close_rx = services.live_streams.watch(
+        close_rx,
+        user_id,
+        target_id,
+        LiveStreamKind::RoleBased,
+        opened_binding.clone(),
+    );
+    ensure_host_binding_unchanged(services, target_id, &opened_binding).await?;
     match services
         .config_provider
         .authorize_target_by_id(user_id, target_id)
@@ -553,6 +567,20 @@ async fn watch_live_stream(
     }
 }
 
+/// Refuses a request registered against a host binding the target no longer
+/// has (or whose target cannot be read), as the re-check would end it later.
+async fn ensure_host_binding_unchanged(
+    services: &Services,
+    target_id: Uuid,
+    opened_binding: &Option<String>,
+) -> poem::Result<()> {
+    if services.current_host_binding(target_id).await.as_ref() == Some(opened_binding) {
+        Ok(())
+    } else {
+        Err(poem::Error::from_status(poem::http::StatusCode::FORBIDDEN))
+    }
+}
+
 /// [`watch_live_stream`] for a request the public bypass admitted: registered
 /// first, then the target is checked again to still be public (HTTP, `public`,
 /// no approval required), by the same rule as the revocation that ends it
@@ -563,11 +591,16 @@ async fn watch_public_live_stream(
     close_rx: broadcast::Receiver<()>,
     user_id: Uuid,
     target_id: Uuid,
+    opened_binding: Option<String>,
 ) -> poem::Result<broadcast::Receiver<()>> {
-    let close_rx =
-        services
-            .live_streams
-            .watch(close_rx, user_id, target_id, LiveStreamKind::Public);
+    let close_rx = services.live_streams.watch(
+        close_rx,
+        user_id,
+        target_id,
+        LiveStreamKind::Public,
+        opened_binding.clone(),
+    );
+    ensure_host_binding_unchanged(services, target_id, &opened_binding).await?;
     if services.public_target_still_shared(target_id).await {
         Ok(close_rx)
     } else {
@@ -606,7 +639,8 @@ mod live_stream_tests {
         let services = services(memory_db().await).await;
         let (_session, close_rx) = tokio::sync::broadcast::channel(1);
 
-        let watched = watch_live_stream(&services, close_rx, Uuid::new_v4(), Uuid::new_v4()).await;
+        let watched =
+            watch_live_stream(&services, close_rx, Uuid::new_v4(), Uuid::new_v4(), None).await;
 
         assert_eq!(
             watched.err().map(|e| e.status()),
@@ -624,7 +658,8 @@ mod live_stream_tests {
             .unwrap();
         let (_session, close_rx) = tokio::sync::broadcast::channel(1);
 
-        let watched = watch_live_stream(&services, close_rx, Uuid::new_v4(), Uuid::new_v4()).await;
+        let watched =
+            watch_live_stream(&services, close_rx, Uuid::new_v4(), Uuid::new_v4(), None).await;
 
         assert_eq!(
             watched.err().map(|e| e.status()),
@@ -640,7 +675,7 @@ mod live_stream_tests {
 
         // No such target: nothing shares it.
         let watched =
-            watch_public_live_stream(&services, close_rx, Uuid::nil(), Uuid::new_v4()).await;
+            watch_public_live_stream(&services, close_rx, Uuid::nil(), Uuid::new_v4(), None).await;
 
         assert_eq!(
             watched.err().map(|e| e.status()),
@@ -657,7 +692,7 @@ mod live_stream_tests {
         let (_session, close_rx) = tokio::sync::broadcast::channel(1);
 
         let watched =
-            watch_public_live_stream(&services, close_rx, Uuid::nil(), Uuid::new_v4()).await;
+            watch_public_live_stream(&services, close_rx, Uuid::nil(), Uuid::new_v4(), None).await;
 
         assert_eq!(
             watched.err().map(|e| e.status()),
@@ -708,15 +743,50 @@ mod live_stream_tests {
         let target_id = public_target(&db).await;
         let (_session, close_rx) = tokio::sync::broadcast::channel(1);
 
-        let watched =
-            watch_admitted_live_stream(&services, &ticket(None, target_id), close_rx, target_id)
-                .await;
+        let watched = watch_admitted_live_stream(
+            &services,
+            &ticket(None, target_id),
+            close_rx,
+            target_id,
+            None,
+        )
+        .await;
 
         assert!(watched.is_ok());
         assert_eq!(
             services.live_streams.in_use().unwrap(),
-            std::collections::HashSet::from([(Uuid::nil(), target_id, LiveStreamKind::Public)])
+            std::collections::HashSet::from([(
+                Uuid::nil(),
+                target_id,
+                LiveStreamKind::Public,
+                None
+            )])
         );
+    }
+
+    /// A request admitted against a host binding the target no longer has is
+    /// refused at registration, and leaves no registration behind.
+    #[tokio::test]
+    async fn a_registration_against_a_changed_host_binding_is_refused() {
+        let db = memory_db().await;
+        let services = services(db.clone()).await;
+        let target_id = public_target(&db).await;
+        let (_session, close_rx) = tokio::sync::broadcast::channel(1);
+
+        let watched = watch_public_live_stream(
+            &services,
+            close_rx,
+            Uuid::nil(),
+            target_id,
+            Some("old.example".into()),
+        )
+        .await;
+
+        assert_eq!(
+            watched.err().map(|e| e.status()),
+            Some(poem::http::StatusCode::FORBIDDEN)
+        );
+        assert!(deregistered(&services).await);
     }
 
     /// A request a real ticket admitted is not registered at all: deleting
@@ -732,6 +802,7 @@ mod live_stream_tests {
             &ticket(Some(Uuid::new_v4()), target_id),
             close_rx,
             target_id,
+            None,
         )
         .await;
 
@@ -752,7 +823,7 @@ mod live_stream_tests {
             username: "alice".into(),
         });
 
-        let watched = watch_admitted_live_stream(&services, &auth, close_rx, target_id).await;
+        let watched = watch_admitted_live_stream(&services, &auth, close_rx, target_id, None).await;
 
         assert_eq!(
             watched.err().map(|e| e.status()),
