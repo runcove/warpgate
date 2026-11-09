@@ -40,10 +40,10 @@ def test_ticket_link_does_not_replace_another_users_login(shared_wg, echo_server
     assert _info_username(url, session) == alice.username
 
     resp, _ = _open_ticket_link(url, secret, session)
-    assert resp.status_code == 403
+    assert resp.status_code != 403
     assert _info_username(url, session) == alice.username
 
-    # The refused link spent no use: it still opens for someone with no session.
+    # The ignored link spent no use: it still opens for someone with no session.
     resp, fresh = _open_ticket_link(url, secret)
     assert resp.status_code // 100 in (2, 3)
     assert _info_username(url, fresh) == bob.username
@@ -64,10 +64,56 @@ def test_ticket_link_does_not_replace_another_tickets_session(
     assert _info_username(url, session) == alice.username
 
     resp, _ = _open_ticket_link(url, bob_secret, session)
-    assert resp.status_code == 403
+    assert resp.status_code != 403
     assert _info_username(url, session) == alice.username
 
     resp, fresh = _open_ticket_link(url, bob_secret)
+    assert resp.status_code // 100 in (2, 3)
+    assert _info_username(url, fresh) == bob.username
+
+
+PAGE_LOAD = {
+    "Accept": "text/html",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Dest": "document",
+}
+
+
+def _page_load_with_ticket(url, secret, session):
+    return session.get(
+        f"{url}/some/path?a=1&warpgate-ticket={secret}",
+        headers=PAGE_LOAD,
+        allow_redirects=False,
+    )
+
+
+def test_another_users_ticket_is_answered_like_an_unknown_one(
+    shared_wg, echo_server_port
+):
+    """A signed-in browser opening a real ticket of someone else gets the
+    answer an unknown ticket gets, so the page does not confirm the ticket."""
+    url = f"https://localhost:{shared_wg.http_port}"
+    with admin_client(url) as api:
+        alice, _ = _create_test_user(api, echo_server_port)
+        bob, bob_target = _create_test_user(api, echo_server_port)
+        real = _make_ticket(api, bob, bob_target, number_of_uses=1)
+
+    def answer(secret):
+        _, session = _post_login(url, alice.username, "correct_password")
+        resp = _page_load_with_ticket(url, secret, session)
+        assert _info_username(url, session) == alice.username
+        return resp.status_code, resp.headers.get("Location"), resp.text
+
+    assert answer(real) == answer("not-a-real-ticket")
+
+    # A browser page load is sent to the address without the ticket, so the
+    # other user's unspent ticket stays out of this browser's history.
+    status, location, _ = answer(real)
+    assert status == 303
+    assert location == "/some/path?a=1"
+
+    # No use was spent.
+    resp, fresh = _open_ticket_link(url, real)
     assert resp.status_code // 100 in (2, 3)
     assert _info_username(url, fresh) == bob.username
 

@@ -138,11 +138,7 @@ pub async fn for_secret(
     db: &DatabaseConnection,
     secret: &Secret<String>,
 ) -> Result<Option<Uuid>, WarpgateError> {
-    Ok(Entity::find()
-        .filter(Column::SecretHash.eq(hash_secret(secret.expose_secret())))
-        .one(db)
-        .await?
-        .map(|ticket| ticket.id))
+    Ok(owner_for_secret(db, secret).await?.map(|(id, _)| id))
 }
 
 /// The ticket id and the id of the user it was issued to, for a secret, without

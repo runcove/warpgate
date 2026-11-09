@@ -11,6 +11,7 @@ use tokio::sync::Mutex;
 use tracing::warn;
 use uuid::Uuid;
 use warpgate_common::Secret;
+use warpgate_common::auth::AuthResult;
 use warpgate_common_http::auth::UnauthenticatedRequestContext;
 use warpgate_common_http::logging::get_client_ip;
 use warpgate_common_http::ticket_query::without_ticket_query_param;
@@ -19,7 +20,7 @@ use warpgate_core::authorize_and_spend_ticket;
 use warpgate_db_entities::Ticket;
 
 use crate::api::common::end_login;
-use crate::common::{SessionExt, SessionRotation};
+use crate::common::{SessionExt, SessionRotation, get_auth_state_for_request};
 use crate::session::SessionStore;
 
 /// Request-data marker for a header-borne ticket: the request runs on a
@@ -199,15 +200,33 @@ fn ticket_session_is_current(
     }
 }
 
-/// The answer to a ticket link opened in a browser signed in as another user.
-fn ticket_for_another_user_response() -> Response {
-    Response::builder()
-        .status(StatusCode::FORBIDDEN)
-        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
-        .body(
-            "This ticket was issued to a different user than the one signed in here. \
-             Sign out first, or open the link in another browser profile or a private window.",
-        )
+/// True when a sign-in that is still under way on the session (for example a
+/// password accepted and a second factor awaited) is for someone other than
+/// the user the ticket was issued to. Such a session has no authorization yet,
+/// so [`ticket_belongs_to_another_user`] cannot see it. `pending_user_id` is
+/// `None` when no sign-in is under way, and the nil id names no one.
+fn pending_login_belongs_to_another_user(
+    pending_user_id: Option<Uuid>,
+    ticket_user_id: Uuid,
+) -> bool {
+    matches!(pending_user_id, Some(id) if !id.is_nil() && id != ticket_user_id)
+}
+
+/// The user a sign-in that is still under way on this session is for, if any.
+/// A sign-in that has been rejected can never complete and counts as none.
+async fn pending_login_user_id(
+    req: &Request,
+    ctx: &UnauthenticatedRequestContext,
+) -> poem::Result<Option<Uuid>> {
+    let Some(state) = get_auth_state_for_request(req, ctx).await? else {
+        return Ok(None);
+    };
+    let state = state.lock().await;
+    Ok(if matches!(state.verify(), AuthResult::Rejected) {
+        None
+    } else {
+        Some(state.user_info().id)
+    })
 }
 
 #[derive(Deserialize)]
@@ -230,7 +249,6 @@ impl<E: Endpoint> Endpoint for TicketMiddlewareEndpoint<E> {
         // would otherwise keep it and send it on.
         let ticket_in_address = params.ticket.is_some();
         let mut ticket_value = params.ticket;
-        let mut ticket_authenticated = false;
 
         if let Some(token_value) = authorization_token(&req, "Warpgate") {
             ticket_value = Some(token_value.to_string());
@@ -277,14 +295,27 @@ impl<E: Endpoint> Endpoint for TicketMiddlewareEndpoint<E> {
                 Ticket::owner_for_secret(&ctx.services().db, &ticket_secret).await?;
             let presented = presented_owner.map(|(ticket_id, _)| ticket_id);
 
-            // A browser already signed in as one user keeps that session when
-            // it opens a ticket issued to another user. The ticket is not spent.
-            if !session_is_temporary
-                && let Some((_, ticket_user_id)) = presented_owner
-                && ticket_belongs_to_another_user(session.get_auth().as_ref(), ticket_user_id)
-            {
-                return Ok(with_no_referrer(ticket_for_another_user_response()));
-            }
+            // A ticket issued to a different user than the one this browser
+            // session belongs to (signed in, started by another ticket, or
+            // part-way through signing in) is ignored: the session is kept and
+            // no use is spent. Nothing about the request tells it apart from
+            // one that presents an unknown ticket, so the answer does not
+            // confirm that the ticket exists.
+            let belongs_to_another_user = if session_is_temporary {
+                false
+            } else if let Some((ticket_id, ticket_user_id)) = presented_owner {
+                let pending = pending_login_user_id(&req, &ctx).await?;
+                let other =
+                    ticket_belongs_to_another_user(session.get_auth().as_ref(), ticket_user_id)
+                        || pending_login_belongs_to_another_user(pending, ticket_user_id);
+                if other {
+                    warn!(%ticket_id, "Ticket belongs to a different user than this session, ignoring it");
+                }
+                other
+            } else {
+                false
+            };
+
             // Do not re-spend the ticket if it has authenticated the current session already
             let already_this_ticket = matches!(
                 (session.get_auth(), presented),
@@ -297,8 +328,7 @@ impl<E: Endpoint> Endpoint for TicketMiddlewareEndpoint<E> {
                 ) if session_ticket == presented
             );
 
-            ticket_authenticated = already_this_ticket;
-            if !already_this_ticket {
+            if !already_this_ticket && !belongs_to_another_user {
                 let client_ip: Option<IpAddr> = get_client_ip(&req, ctx.services())
                     .await
                     .and_then(|s| s.parse().ok());
@@ -320,21 +350,19 @@ impl<E: Endpoint> Endpoint for TicketMiddlewareEndpoint<E> {
                     if !session_is_temporary {
                         rotation = SessionRotation::for_request(&req).await?;
                     }
-                    ticket_authenticated = true;
                 }
             }
         }
 
         // A header ticket takes precedence over a query one and never sits in
-        // an address, so only a query ticket that authenticated the request is
-        // redirected away.
-        if ticket_in_address
-            && !session_is_temporary
-            && ticket_authenticated
-            && should_redirect_to_clean_address(&req)
-        {
+        // an address, so only a query ticket is redirected away. This holds
+        // whether or not the ticket authenticated: a ticket that did not
+        // (unknown, expired, used up, or issued to another user) is answered
+        // the same way for each of those, and its address leaves the browser's
+        // history too.
+        if ticket_in_address && !session_is_temporary && should_redirect_to_clean_address(&req) {
             let response = clean_address_redirect(&req);
-            // Nothing is proxied on this path, so the rotated id is written
+            // Nothing is proxied on this path, so a rotated id is written
             // back by the session middleware on this very response.
             apply_session_rotation(rotation, &session).await;
             return Ok(response);
@@ -475,11 +503,20 @@ mod tests {
         assert_eq!(ticket_to_recheck(&user_auth(user)), TicketRecheck::Skip);
     }
 
-    /// The refusal is a plain 403 that names the way out.
+    /// A sign-in under way for someone else keeps the session from being
+    /// taken over by a ticket for a different user; one for the ticket's own
+    /// user, none at all, and a nil user id do not.
     #[test]
-    fn the_refusal_is_a_forbidden_page() {
-        let response = ticket_for_another_user_response();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    fn a_sign_in_under_way_is_kept_from_another_users_ticket() {
+        let me = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        assert!(pending_login_belongs_to_another_user(Some(me), other));
+        assert!(!pending_login_belongs_to_another_user(Some(me), me));
+        assert!(!pending_login_belongs_to_another_user(None, me));
+        assert!(!pending_login_belongs_to_another_user(
+            Some(Uuid::nil()),
+            me
+        ));
     }
 
     const BROWSER_ACCEPT: &str = "text/html,application/xhtml+xml,*/*;q=0.8";
