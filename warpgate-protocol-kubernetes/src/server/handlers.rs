@@ -36,15 +36,15 @@ use crate::server::auth::{
 /// `Impersonate-Group`, `Impersonate-Uid`, `Impersonate-Extra-*`). These let a
 /// caller assume another identity on the cluster and must never be forwarded,
 /// recorded, or logged.
+fn is_impersonation_header(name: &str) -> bool {
+    name.to_ascii_lowercase().starts_with("impersonate-")
+}
+
 /// Request-header filter for the Kubernetes API: the shared forwarding rules
 /// (hop-by-hop, `Connection`-listed and framing headers are dropped), except
 /// that `Accept-Encoding` is kept.
 fn should_forward_to_cluster(filter: &ForwardFilter, name: &http::HeaderName) -> bool {
     name == http::header::ACCEPT_ENCODING || filter.allows(name)
-}
-
-fn is_impersonation_header(name: &str) -> bool {
-    name.to_ascii_lowercase().starts_with("impersonate-")
 }
 
 /// Headers whose values are secrets or identity-spoofing vectors and so must
@@ -515,7 +515,11 @@ async fn _handle_normal_request_inner(
     let mut poem_response = Response::builder().status(status);
 
     // Copy response headers
+    let response_filter = ForwardFilter::new(&response_headers);
     for (name, value) in &response_headers {
+        if !response_filter.allows(name) {
+            continue;
+        }
         if let Ok(poem_name) = poem::http::HeaderName::from_bytes(name.as_str().as_bytes())
             && let Ok(poem_value) = poem::http::HeaderValue::from_bytes(value.as_bytes())
         {
@@ -781,6 +785,30 @@ mod tests {
         assert!(!forwarded("content-length"));
         assert!(forwarded("x-keep"));
         assert!(forwarded("accept-encoding"));
+    }
+
+    #[test]
+    fn upstream_response_headers_follow_the_shared_forwarding_rules() {
+        let mut headers = http::HeaderMap::new();
+        headers.append(http::header::CONNECTION, "close, X-Hop".parse().unwrap());
+        headers.append("x-hop", "1".parse().unwrap());
+        headers.append("x-keep", "1".parse().unwrap());
+        headers.append(
+            http::header::CONTENT_TYPE,
+            "application/json".parse().unwrap(),
+        );
+        headers.append(http::header::TRANSFER_ENCODING, "chunked".parse().unwrap());
+        headers.append(http::header::CONTENT_LENGTH, "5".parse().unwrap());
+        let filter = ForwardFilter::new(&headers);
+        let allowed = |name: &http::HeaderName| filter.allows(name);
+        let forwarded: Vec<&str> = headers
+            .keys()
+            .filter(|n| allowed(n))
+            .map(|n| n.as_str())
+            .collect();
+        assert_eq!(forwarded.len(), 2);
+        assert!(forwarded.contains(&"x-keep"));
+        assert!(forwarded.contains(&"content-type"));
     }
 
     #[test]

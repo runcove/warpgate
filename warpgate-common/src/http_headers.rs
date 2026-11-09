@@ -18,6 +18,7 @@ static DONT_FORWARD_HEADERS: LazyLock<HashSet<HeaderName>> = LazyLock::new(|| {
     s.insert(http::header::UPGRADE);
     s.insert(http::header::HOST);
     s.insert(http::header::CONNECTION);
+    s.insert(http::header::PROXY_AUTHENTICATE);
     s.insert(http::header::PROXY_AUTHORIZATION);
     s.insert(http::header::TE);
     s.insert(http::header::TRAILER);
@@ -58,15 +59,17 @@ pub static X_WARPGATE_CLUSTER_CLIENT_PROTO: HeaderName =
     HeaderName::from_static("x-warpgate-cluster-client-proto");
 
 /// The header names a message lists in its `Connection` header: they describe
-/// that connection only and are not forwarded. Tokens that are not valid header
-/// names (such as `close`) are ignored.
+/// that connection only and are not forwarded. The value is split on commas as
+/// bytes, so a value that is not valid UTF-8 still names its other tokens.
+/// Tokens are trimmed and matched ASCII case-insensitively. Tokens that are not
+/// valid header names are ignored; `close` is collected like any other token
+/// (it is harmless, since no such header is forwarded).
 pub fn connection_listed_headers(headers: &http::HeaderMap) -> Vec<HeaderName> {
     headers
         .get_all(http::header::CONNECTION)
         .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(','))
-        .filter_map(|token| HeaderName::from_bytes(token.trim().as_bytes()).ok())
+        .flat_map(|v| v.as_bytes().split(|b| *b == b','))
+        .filter_map(|token| HeaderName::from_bytes(token.trim_ascii()).ok())
         .collect()
 }
 
@@ -117,6 +120,7 @@ mod tests {
             "trailer",
             "transfer-encoding",
             "keep-alive",
+            "proxy-authenticate",
             "proxy-authorization",
             "proxy-connection",
         ] {
@@ -159,6 +163,32 @@ mod tests {
         assert!(!filter.allows(&HeaderName::from_static("x-hop")));
         assert!(!filter.allows(&http::header::CONNECTION));
         assert!(filter.allows(&HeaderName::from_static("x-keep")));
+    }
+
+    #[test]
+    fn connection_listed_headers_survive_a_non_utf8_value() {
+        let mut headers = http::HeaderMap::new();
+        headers.append(
+            http::header::CONNECTION,
+            http::HeaderValue::from_bytes(b"\xff, X-Hop").unwrap(),
+        );
+        headers.append("x-hop", "1".parse().unwrap());
+        let filter = ForwardFilter::new(&headers);
+        assert!(!filter.allows(&HeaderName::from_static("x-hop")));
+    }
+
+    #[test]
+    fn forward_filter_matches_tokens_across_lines_and_case() {
+        let mut headers = http::HeaderMap::new();
+        headers.append(http::header::CONNECTION, "X-ONE".parse().unwrap());
+        headers.append(
+            http::header::CONNECTION,
+            " x-Two ,keep-alive".parse().unwrap(),
+        );
+        let filter = ForwardFilter::new(&headers);
+        assert!(!filter.allows(&HeaderName::from_static("x-one")));
+        assert!(!filter.allows(&HeaderName::from_static("x-two")));
+        assert!(filter.allows(&HeaderName::from_static("x-three")));
     }
 
     #[test]
