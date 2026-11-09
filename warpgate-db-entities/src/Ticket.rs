@@ -157,3 +157,15 @@ pub async fn owner_for_secret(
         .await?
         .map(|ticket| (ticket.id, ticket.user_id)))
 }
+
+/// The expiry of the ticket with this id: `None` when there is no such ticket
+/// any more, `Some(None)` for one that never expires. Spends no use.
+pub async fn expiry_by_id(
+    db: &DatabaseConnection,
+    ticket_id: Uuid,
+) -> Result<Option<Option<OffsetDateTime>>, WarpgateError> {
+    Ok(Entity::find_by_id(ticket_id)
+        .one(db)
+        .await?
+        .map(|ticket| ticket.expiry))
+}

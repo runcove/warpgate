@@ -102,3 +102,51 @@ def test_ticket_session_ends_when_its_ticket_expires(shared_wg, echo_server_port
         time.sleep(1)
         status = session.get(f"{url}/some/path", allow_redirects=False).status_code
     assert status != 200, "the session outlived its ticket"
+
+
+def _anonymous_after(url, session):
+    """The cookie session answers `info` without a username and no longer
+    proxies, and the same holds for the proxied path."""
+    info = session.get(f"{url}/@warpgate/api/info")
+    info.raise_for_status()
+    assert info.json().get("username") in (None, ""), info.json()
+    assert session.get(f"{url}/some/path", allow_redirects=False).status_code != 200
+
+
+def test_ticket_session_is_anonymous_for_the_api_after_its_ticket_is_deleted(
+    shared_wg, echo_server_port
+):
+    url = f"https://localhost:{shared_wg.http_port}"
+    with admin_client(url) as api:
+        alice, alice_target = _create_test_user(api, echo_server_port)
+        ticket = api.create_ticket(
+            sdk.CreateTicketRequest(
+                target_name=alice_target.name, username=alice.username
+            )
+        )
+
+        resp, session = _open_ticket_link(url, ticket.secret)
+        assert resp.status_code // 100 in (2, 3)
+        assert _info_username(url, session) == alice.username
+
+        api.delete_ticket(ticket.ticket.id)
+
+    # Straight away, with no wait for the sweep.
+    _anonymous_after(url, session)
+
+
+def test_ticket_session_is_anonymous_for_the_api_after_its_ticket_expires(
+    shared_wg, echo_server_port
+):
+    url = f"https://localhost:{shared_wg.http_port}"
+    expiry = datetime.now(timezone.utc) + timedelta(seconds=4)
+    with admin_client(url) as api:
+        alice, alice_target = _create_test_user(api, echo_server_port)
+        secret = _make_ticket(api, alice, alice_target, expiry=expiry)
+
+    resp, session = _open_ticket_link(url, secret)
+    assert resp.status_code // 100 in (2, 3)
+    assert _info_username(url, session) == alice.username
+
+    time.sleep(6)
+    _anonymous_after(url, session)

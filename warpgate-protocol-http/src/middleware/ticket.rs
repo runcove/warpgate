@@ -5,6 +5,7 @@ use poem::session::{Session, SessionStatus};
 use poem::web::{Data, FromRequest};
 use poem::{Endpoint, IntoResponse, Middleware, Request, Response};
 use serde::Deserialize;
+use time::OffsetDateTime;
 use tracing::warn;
 use uuid::Uuid;
 use warpgate_common::Secret;
@@ -15,7 +16,7 @@ use warpgate_common_http::{SessionAuthorization, authorization_token};
 use warpgate_core::authorize_and_spend_ticket;
 use warpgate_db_entities::Ticket;
 
-use crate::common::{SessionExt, SessionRotation};
+use crate::common::{SessionExt, SessionRotation, is_public_session_authorization};
 
 /// Request-data marker for a header-borne ticket: the request runs on a
 /// detached session that is never stored, so the user session registered for
@@ -150,6 +151,36 @@ fn ticket_belongs_to_another_user(
     )
 }
 
+/// The ticket a stored session's authorization depends on, if it needs
+/// re-checking: a ticket session that names a user. The synthetic `<public>`
+/// authorization (nil user) has no ticket behind it.
+fn ticket_to_recheck(auth: &SessionAuthorization) -> Option<Uuid> {
+    match auth {
+        SessionAuthorization::Ticket {
+            ticket_id: Some(ticket_id),
+            ..
+        } if !is_public_session_authorization(auth) => Some(*ticket_id),
+        _ => None,
+    }
+}
+
+/// True when a ticket session may keep serving requests: its ticket still
+/// exists and has not expired. `ticket_expiry` is `None` for a ticket that is
+/// gone, `Some(None)` for one that never expires.
+///
+/// Uses left do not matter here: a use is spent when the ticket starts the
+/// session, and the session then carries on after the last one is spent.
+fn ticket_session_is_current(
+    ticket_expiry: Option<Option<OffsetDateTime>>,
+    now: OffsetDateTime,
+) -> bool {
+    match ticket_expiry {
+        None => false,
+        Some(None) => true,
+        Some(Some(expiry)) => expiry >= now,
+    }
+}
+
 /// The answer to a ticket link opened in a browser signed in as another user.
 fn ticket_for_another_user_response() -> Response {
     Response::builder()
@@ -196,6 +227,19 @@ impl<E: Endpoint> Endpoint for TicketMiddlewareEndpoint<E> {
         }
         let session = <&Session>::from_request_without_body(&req).await?.clone();
         let mut rotation = None;
+
+        // A browser session that a ticket started lasts as long as the ticket:
+        // once the ticket is deleted or expired, the session is anonymous again
+        // and any ticket presented with this request is judged on its own.
+        if !session_is_temporary
+            && let Some(auth) = session.get_auth()
+            && let Some(session_ticket) = ticket_to_recheck(&auth)
+        {
+            let expiry = Ticket::expiry_by_id(&ctx.services().db, session_ticket).await?;
+            if !ticket_session_is_current(expiry, OffsetDateTime::now_utc()) {
+                session.clear_auth();
+            }
+        }
 
         if let Some(ticket) = ticket_value {
             let ticket_secret = Secret::new(ticket);
@@ -348,6 +392,53 @@ mod tests {
             Some(&ticket_auth(Uuid::nil())),
             me
         ));
+    }
+
+    /// A ticket session goes on while its ticket exists and has not expired,
+    /// and ends when the ticket is gone or past its expiry.
+    #[test]
+    fn a_ticket_session_follows_its_ticket() {
+        let now = OffsetDateTime::now_utc();
+        let hour = time::Duration::hours(1);
+        assert!(ticket_session_is_current(Some(None), now));
+        assert!(ticket_session_is_current(Some(Some(now + hour)), now));
+        assert!(ticket_session_is_current(Some(Some(now)), now));
+        assert!(!ticket_session_is_current(Some(Some(now - hour)), now));
+        assert!(!ticket_session_is_current(None, now));
+    }
+
+    /// Only a ticket session that names a user is re-checked against its
+    /// ticket: a nil user id or the reserved public name has no ticket behind
+    /// it, and a user login has none either.
+    #[test]
+    fn only_a_ticket_session_naming_a_user_is_rechecked() {
+        let ticket_id = Uuid::new_v4();
+        let ticket =
+            |user_id: Uuid, username: &str, ticket_id: Option<Uuid>| SessionAuthorization::Ticket {
+                user_id,
+                username: username.into(),
+                target_id: Uuid::new_v4(),
+                ticket_id,
+            };
+        let user = Uuid::new_v4();
+        assert_eq!(
+            ticket_to_recheck(&ticket(user, "alice", Some(ticket_id))),
+            Some(ticket_id)
+        );
+        assert_eq!(
+            ticket_to_recheck(&ticket(Uuid::nil(), "alice", Some(ticket_id))),
+            None
+        );
+        assert_eq!(
+            ticket_to_recheck(&ticket(
+                user,
+                crate::common::PUBLIC_USERNAME,
+                Some(ticket_id)
+            )),
+            None
+        );
+        assert_eq!(ticket_to_recheck(&ticket(user, "alice", None)), None);
+        assert_eq!(ticket_to_recheck(&user_auth(user)), None);
     }
 
     /// The refusal is a plain 403 that names the way out.

@@ -272,6 +272,8 @@ pub trait SessionExt {
     fn set_target_name(&self, target_name: String);
     fn get_auth(&self) -> Option<SessionAuthorization>;
     fn set_auth(&self, auth: SessionAuthorization);
+    /// Drops the session's authorization, leaving it anonymous.
+    fn clear_auth(&self);
     /// The Warpgate session id of this browser session, once one has been
     /// registered for it. Unlike [`session_id_for_login`] this never creates
     /// one.
@@ -296,6 +298,10 @@ impl SessionExt for Session {
 
     fn set_auth(&self, auth: SessionAuthorization) {
         self.set(AUTH_SESSION_KEY, auth);
+    }
+
+    fn clear_auth(&self) {
+        self.remove(AUTH_SESSION_KEY);
     }
 
     fn get_session_id(&self) -> Option<UserSessionId> {
@@ -592,7 +598,7 @@ enum PublicBypassOutcome {
 }
 
 /// The username an anonymous public-target request is served under.
-const PUBLIC_USERNAME: &str = "<public>";
+pub(crate) const PUBLIC_USERNAME: &str = "<public>";
 
 /// The identity an anonymous public-target request is served under.
 /// `Uuid::nil()` and `"<public>"` are reachable through no credential path, so
@@ -672,20 +678,14 @@ fn onto_public_target_session(req: Request, target_id: Uuid) -> (Request, Sessio
                 ticket_id: None,
             },
         ),
-        Some(SessionAuthorization::Ticket {
-            user_id,
-            username,
-            target_id: ticket_target_id,
-            ticket_id,
-        }) if !user_id.is_nil() && ticket_target_id == target_id => (
-            req,
-            SessionAuthorization::Ticket {
-                user_id,
-                username,
-                target_id,
-                ticket_id,
+        Some(
+            auth @ SessionAuthorization::Ticket {
+                target_id: ticket_target_id,
+                ..
             },
-        ),
+        ) if !is_public_session_authorization(&auth) && ticket_target_id == target_id => {
+            (req, auth)
+        }
         _ => (
             onto_throwaway_public_session(req, target_id),
             public_session_authorization(target_id),
@@ -2005,6 +2005,36 @@ mod public_session_tests {
                 warpgate_headers(&upstream),
                 Vec::<String>::new(),
                 "header: {from_header}"
+            );
+        }
+    }
+
+    /// A ticket session for the nil user, or under the reserved public name,
+    /// names no one: it is served on the shared `<public>` session, from a
+    /// header or from the query.
+    #[tokio::test]
+    async fn a_ticket_session_that_names_no_one_is_served_as_anonymous() {
+        for (user_id, username) in [
+            (Uuid::nil(), "someone"),
+            (user_id_of("alice"), PUBLIC_USERNAME),
+        ] {
+            let session = Session::default();
+            session.set_auth(SessionAuthorization::Ticket {
+                user_id,
+                username: username.into(),
+                target_id: TARGET,
+                ticket_id: Some(TICKET),
+            });
+            let mut req = Request::builder().finish();
+            req.extensions_mut().insert(session);
+
+            let (req, auth) = onto_public_target_session(req, TARGET);
+
+            assert!(auth.user_id().is_nil(), "{username}: {auth:?}");
+            assert_eq!(
+                session_key(&req),
+                Some((Uuid::nil(), TARGET, None)),
+                "{username}"
             );
         }
     }
