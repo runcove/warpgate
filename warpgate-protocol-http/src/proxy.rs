@@ -333,8 +333,8 @@ fn cookie_header_for_target(req: &Request) -> Result<Option<String>> {
 }
 
 /// True for an `Authorization` value in Warpgate's own `Warpgate <ticket>`
-/// scheme: the first whitespace-separated token, after any
-/// leading whitespace, compared without regard to case.
+/// scheme: the first whitespace-separated token, after any leading whitespace,
+/// compared without regard to case.
 ///
 /// The set this drops is deliberately WIDER than the one `TicketMiddleware`
 /// spends. The middleware reads a ticket from `Authorization` only, and only
@@ -353,11 +353,11 @@ fn is_warpgate_authorization(value: &str) -> bool {
 }
 
 /// The caller's `Authorization` header (`name`) as the target receives it:
-/// every value except those in the `Warpgate` scheme, and except any value that is not valid text (dropped, never forwarded on a
-/// guess about what it holds). A ticket presented that way is a credential for
-/// Warpgate, spent here to authenticate the caller, and is never the target's
-/// to see. Any other scheme (`Basic`, `Bearer`, ...) is the target's own and is
-/// forwarded unchanged.
+/// every value except those in the `Warpgate` scheme, and except any value that
+/// is not valid text (dropped, never forwarded on a guess about what it holds).
+/// A ticket presented that way is a credential for Warpgate, spent here to
+/// authenticate the caller, and is never the target's to see. Any other scheme
+/// (`Basic`, `Bearer`, ...) is the target's own and is forwarded unchanged.
 fn credentials_header_for_target(req: &Request, name: &HeaderName) -> Option<String> {
     let values = req
         .headers()
