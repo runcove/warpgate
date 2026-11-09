@@ -7,7 +7,8 @@ from base64 import b64decode
 
 from .api_client import admin_client, sdk
 from .test_http_common import *  # noqa
-from .test_login_protection import _create_test_user, _post_login
+from .conftest import ProcessManager
+from .test_login_protection import _create_test_user, _lp_wg, _post_login
 
 
 def _info_username(url, session):
@@ -273,4 +274,49 @@ def test_ticket_session_is_anonymous_for_the_api_after_its_ticket_expires(
     # Check within 0.3 s of the expiry, so the 5 s expiry sweep has rarely
     # run yet and the per-request re-check is what ends the session.
     time.sleep(max(0, (expiry - datetime.now(timezone.utc)).total_seconds()) + 0.3)
+    _anonymous_after(url, session)
+
+
+def test_ticket_session_is_anonymous_after_its_user_is_restricted_to_other_addresses(
+    shared_wg, echo_server_port
+):
+    """The user's allowed IP ranges are judged on each request of a ticket
+    session, as they were when the session started."""
+    url = f"https://localhost:{shared_wg.http_port}"
+    with admin_client(url) as api:
+        alice, alice_target = _create_test_user(api, echo_server_port)
+        secret = _make_ticket(api, alice, alice_target)
+
+        resp, session = _open_ticket_link(url, secret)
+        assert resp.status_code // 100 in (2, 3)
+        assert _info_username(url, session) == alice.username
+
+        # A range the test client (loopback) is not in.
+        api.update_user(
+            alice.id,
+            sdk.UserDataRequest(
+                username=alice.username, allowed_ip_ranges=["192.0.2.0/24"]
+            ),
+        )
+
+    _anonymous_after(url, session)
+
+
+def test_ticket_session_is_anonymous_after_its_user_is_locked(
+    processes: ProcessManager, echo_server_port
+):
+    wg = _lp_wg(processes, ip_max=100, user_max=3)
+    url = f"https://localhost:{wg.http_port}"
+    with admin_client(url) as api:
+        alice, alice_target = _create_test_user(api, echo_server_port)
+        secret = _make_ticket(api, alice, alice_target)
+
+    resp, session = _open_ticket_link(url, secret)
+    assert resp.status_code // 100 in (2, 3)
+    assert _info_username(url, session) == alice.username
+
+    for _ in range(3):
+        _post_login(url, alice.username, "wrong")
+    time.sleep(0.2)
+
     _anonymous_after(url, session)

@@ -16,7 +16,7 @@ use warpgate_common_http::auth::UnauthenticatedRequestContext;
 use warpgate_common_http::logging::get_client_ip;
 use warpgate_common_http::ticket_query::without_ticket_query_param;
 use warpgate_common_http::{SessionAuthorization, authorization_token};
-use warpgate_core::authorize_and_spend_ticket;
+use warpgate_core::{authorize_and_spend_ticket, ticket_user_still_admitted};
 use warpgate_db_entities::Ticket;
 
 use crate::api::common::end_login;
@@ -165,17 +165,21 @@ enum TicketRecheck {
     /// A ticket session that records no ticket id (stored by an older
     /// version): nothing can vouch for it, so it counts as ended.
     NoTicketId,
-    /// A ticket session to check against this ticket.
-    Check(Uuid),
+    /// A ticket session to check against this ticket and its user.
+    Check { ticket_id: Uuid, user_id: Uuid },
 }
 
 fn ticket_to_recheck(auth: &SessionAuthorization) -> TicketRecheck {
     match auth {
         SessionAuthorization::Ticket { user_id, .. } if user_id.is_nil() => TicketRecheck::Skip,
         SessionAuthorization::Ticket {
+            user_id,
             ticket_id: Some(ticket_id),
             ..
-        } => TicketRecheck::Check(*ticket_id),
+        } => TicketRecheck::Check {
+            ticket_id: *ticket_id,
+            user_id: *user_id,
+        },
         SessionAuthorization::Ticket {
             ticket_id: None, ..
         } => TicketRecheck::NoTicketId,
@@ -264,17 +268,34 @@ impl<E: Endpoint> Endpoint for TicketMiddlewareEndpoint<E> {
         let session = <&Session>::from_request_without_body(&req).await?.clone();
         let mut rotation = None;
 
-        // A browser session that a ticket started lasts as long as the ticket:
-        // once the ticket is deleted or expired, the session ends as at logout
-        // and the request carries on anonymous on a fresh session, with any
-        // ticket presented with it judged on its own.
+        // A browser session that a ticket started lasts as long as the ticket
+        // and as long as its user may sign in from where the request comes
+        // from: once the ticket is deleted or expired, or the user is locked,
+        // outside their allowed IP ranges or on a blocked address, the session
+        // ends as at logout and the request carries on anonymous on a fresh
+        // session, with any ticket presented with it judged on its own.
         if !session_is_temporary && let Some(auth) = session.get_auth() {
             let ended = match ticket_to_recheck(&auth) {
                 TicketRecheck::Skip => false,
                 TicketRecheck::NoTicketId => true,
-                TicketRecheck::Check(session_ticket) => {
-                    let expiry = Ticket::expiry_by_id(&ctx.services().db, session_ticket).await?;
-                    !ticket_session_is_current(expiry, OffsetDateTime::now_utc())
+                TicketRecheck::Check { ticket_id, user_id } => {
+                    let expiry = Ticket::expiry_by_id(&ctx.services().db, ticket_id).await?;
+                    if ticket_session_is_current(expiry, OffsetDateTime::now_utc()) {
+                        // Only for a ticket that is still current: the user
+                        // is judged by the rules the session started under.
+                        let client_ip = get_client_ip(&req, ctx.services())
+                            .await
+                            .and_then(|s| s.parse().ok());
+                        !ticket_user_still_admitted(
+                            &ctx.services().db,
+                            &ctx.services().login_protection,
+                            user_id,
+                            client_ip,
+                        )
+                        .await?
+                    } else {
+                        true
+                    }
                 }
             };
             if ended {
@@ -294,6 +315,10 @@ impl<E: Endpoint> Endpoint for TicketMiddlewareEndpoint<E> {
             let presented_owner =
                 Ticket::owner_for_secret(&ctx.services().db, &ticket_secret).await?;
             let presented = presented_owner.map(|(ticket_id, _)| ticket_id);
+            if presented_owner.is_none() {
+                // The fact only: the secret is never logged.
+                warn!("Ticket not found");
+            }
 
             // A ticket issued to a different user than the one this browser
             // session belongs to (signed in, started by another ticket, or
@@ -488,7 +513,10 @@ mod tests {
         let user = Uuid::new_v4();
         assert_eq!(
             ticket_to_recheck(&ticket(user, "alice", Some(ticket_id))),
-            TicketRecheck::Check(ticket_id)
+            TicketRecheck::Check {
+                ticket_id,
+                user_id: user
+            }
         );
         assert_eq!(
             ticket_to_recheck(&ticket(Uuid::nil(), "alice", Some(ticket_id))),
@@ -501,7 +529,10 @@ mod tests {
         // A real user may be named like the synthetic public user.
         assert_eq!(
             ticket_to_recheck(&ticket(user, "<public>", Some(ticket_id))),
-            TicketRecheck::Check(ticket_id)
+            TicketRecheck::Check {
+                ticket_id,
+                user_id: user
+            }
         );
         // Stored without a ticket id: counts as ended.
         assert_eq!(

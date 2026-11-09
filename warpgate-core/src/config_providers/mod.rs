@@ -365,6 +365,36 @@ impl ValidatedTicket {
     }
 }
 
+/// Whether the user a ticket session was started for is still admitted to
+/// sign in from `remote_ip`: the address is not blocked, the user exists and
+/// is not locked, and the user's allowed IP ranges admit the address. These are
+/// the checks [`validate_ticket`] makes when the session starts, for a
+/// session that is re-checked on later requests. A user that cannot be loaded
+/// is not admitted.
+pub async fn ticket_user_still_admitted(
+    db: &DatabaseConnection,
+    login_protection: &LoginProtectionService,
+    user_id: Uuid,
+    remote_ip: Option<IpAddr>,
+) -> Result<bool, WarpgateError> {
+    if let Some(ip) = remote_ip
+        && login_protection.check_ip_blocked(&ip).await?.is_some()
+    {
+        warn!("Ticket session continued from a blocked IP: {ip}");
+        return Ok(false);
+    }
+
+    let Some(user) = e::User::Entity::find_by_id(user_id).one(db).await? else {
+        warn!(%user_id, "User of a ticket session not found");
+        return Ok(false);
+    };
+    let Ok(user) = User::try_from(user) else {
+        warn!(%user_id, "User of a ticket session could not be loaded");
+        return Ok(false);
+    };
+    crate::auth_state_store::vet_credential_bearer(login_protection, &user, remote_ip).await
+}
+
 pub async fn validate_ticket(
     db: &DatabaseConnection,
     login_protection: &LoginProtectionService,
@@ -578,6 +608,50 @@ mod tests {
             ticket_id,
             Secret::new("t1cket".to_string()),
         )
+    }
+
+    /// The user of a ticket session is judged by the rules the session started
+    /// under: gone, or outside their allowed IP ranges, ends it.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn a_ticket_sessions_user_is_vetted_again() {
+        use sea_orm::ActiveValue::Set;
+        use sea_orm::{ActiveModelTrait, IntoActiveModel};
+
+        let (db, login_protection, _target, ticket_id, _secret) = ticket_fixture(false, None).await;
+        let ticket = e::Ticket::Entity::find_by_id(ticket_id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        let user_id = ticket.user_id;
+        let inside: Option<IpAddr> = Some("10.1.2.3".parse().unwrap());
+        let outside: Option<IpAddr> = Some("192.0.2.1".parse().unwrap());
+        let admitted = |ip| ticket_user_still_admitted(&db, &login_protection, user_id, ip);
+
+        // No ranges set: admitted from anywhere.
+        assert!(admitted(inside).await.unwrap());
+        assert!(admitted(outside).await.unwrap());
+        assert!(admitted(None).await.unwrap());
+
+        let mut user = e::User::Entity::find_by_id(user_id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap()
+            .into_active_model();
+        user.allowed_ip_ranges = Set(serde_json::json!(["10.0.0.0/8"]));
+        user.update(&db).await.unwrap();
+
+        assert!(admitted(inside).await.unwrap());
+        assert!(!admitted(outside).await.unwrap());
+
+        // A user that is gone (or never was) is not admitted.
+        assert!(
+            !ticket_user_still_admitted(&db, &login_protection, Uuid::new_v4(), inside)
+                .await
+                .unwrap()
+        );
     }
 
     /// A ticket's spend is atomic with its authorization, gated target or not:
