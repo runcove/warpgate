@@ -512,22 +512,27 @@ async fn _handle_normal_request_inner(
         warn!("Failed to record Kubernetes response: {}", e);
     }
 
-    let mut poem_response = Response::builder().status(status);
+    let mut poem_response = Response::builder().status(status).body(response_body);
+    copy_upstream_response_headers(&response_headers, poem_response.headers_mut());
 
-    // Copy response headers
-    let response_filter = ForwardFilter::new(&response_headers);
-    for (name, value) in &response_headers {
-        if !response_filter.allows(name) {
+    Ok(poem_response)
+}
+
+/// Copies the upstream response's headers onto the response sent to the
+/// client, leaving out those the shared forwarding rules drop (hop-by-hop
+/// headers, and framing headers the body is re-framed without).
+fn copy_upstream_response_headers(src: &http::HeaderMap, dst: &mut poem::http::HeaderMap) {
+    let filter = ForwardFilter::new(src);
+    for (name, value) in src {
+        if !filter.allows(name) {
             continue;
         }
         if let Ok(poem_name) = poem::http::HeaderName::from_bytes(name.as_str().as_bytes())
             && let Ok(poem_value) = poem::http::HeaderValue::from_bytes(value.as_bytes())
         {
-            poem_response = poem_response.header(poem_name, poem_value);
+            dst.append(poem_name, poem_value);
         }
     }
-
-    Ok(poem_response.body(response_body))
 }
 
 async fn run_websocket_recording(recorder: TerminalRecorder, mut rx: mpsc::Receiver<Vec<u8>>) {
@@ -759,8 +764,8 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        ForwardFilter, is_impersonation_header, named_target_path, redact_headers,
-        should_forward_to_cluster,
+        ForwardFilter, copy_upstream_response_headers, is_impersonation_header, named_target_path,
+        redact_headers, should_forward_to_cluster,
     };
 
     #[test]
@@ -793,22 +798,19 @@ mod tests {
         headers.append(http::header::CONNECTION, "close, X-Hop".parse().unwrap());
         headers.append("x-hop", "1".parse().unwrap());
         headers.append("x-keep", "1".parse().unwrap());
+        headers.append("x-keep", "2".parse().unwrap());
         headers.append(
             http::header::CONTENT_TYPE,
             "application/json".parse().unwrap(),
         );
         headers.append(http::header::TRANSFER_ENCODING, "chunked".parse().unwrap());
         headers.append(http::header::CONTENT_LENGTH, "5".parse().unwrap());
-        let filter = ForwardFilter::new(&headers);
-        let allowed = |name: &http::HeaderName| filter.allows(name);
-        let forwarded: Vec<&str> = headers
-            .keys()
-            .filter(|n| allowed(n))
-            .map(|n| n.as_str())
-            .collect();
-        assert_eq!(forwarded.len(), 2);
-        assert!(forwarded.contains(&"x-keep"));
-        assert!(forwarded.contains(&"content-type"));
+        let mut copied = poem::http::HeaderMap::new();
+        copy_upstream_response_headers(&headers, &mut copied);
+        let mut names: Vec<&str> = copied.keys().map(|n| n.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["content-type", "x-keep"]);
+        assert_eq!(copied.get_all("x-keep").iter().count(), 2);
     }
 
     #[test]

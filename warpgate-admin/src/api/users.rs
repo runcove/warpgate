@@ -98,6 +98,13 @@ impl ListApi {
             )));
         }
 
+        if is_reserved_username(&body.username) {
+            return Ok(CreateUserResponse::BadRequest(invalid_field(
+                "username",
+                RESERVED_USERNAME_MESSAGE,
+            )));
+        }
+
         let db = &admin.services().db;
 
         // Usernames are matched case-insensitively, so a name differing from an
@@ -333,6 +340,14 @@ impl DetailApi {
             return Ok(UpdateUserResponse::BadRequest(invalid_field(
                 "username",
                 "username is empty",
+            )));
+        }
+
+        // An account that already has the name may keep it.
+        if body.username != user.username && is_reserved_username(&body.username) {
+            return Ok(UpdateUserResponse::BadRequest(invalid_field(
+                "username",
+                RESERVED_USERNAME_MESSAGE,
             )));
         }
 
@@ -1009,6 +1024,14 @@ impl RolesApi {
     }
 }
 
+/// The name the public-target bypass's throwaway session is served under.
+const RESERVED_USERNAME: &str = "<public>";
+const RESERVED_USERNAME_MESSAGE: &str = "this username is reserved";
+
+fn is_reserved_username(username: &str) -> bool {
+    username.eq_ignore_ascii_case(RESERVED_USERNAME)
+}
+
 #[cfg(test)]
 mod tests {
     use sea_orm::Database;
@@ -1018,6 +1041,15 @@ mod tests {
     use warpgate_db_migrations::migrate_database;
 
     use super::*;
+
+    #[test]
+    fn the_public_session_name_is_reserved() {
+        assert!(is_reserved_username("<public>"));
+        assert!(is_reserved_username("<PUBLIC>"));
+        assert!(!is_reserved_username("public"));
+        assert!(!is_reserved_username("alice"));
+        assert!(!is_reserved_username(""));
+    }
 
     async fn setup_db() -> DatabaseConnection {
         set_config_migration_values(ConfigMigrationValues::default());

@@ -611,10 +611,10 @@ fn public_session_authorization(target_id: Uuid) -> SessionAuthorization {
 /// sends no identity headers for it, as it sent none for an anonymous public
 /// request before 0.29.1 (an app must never see `<public>` as a user).
 ///
-/// Recognised by construction, the nil user id no credential path produces,
-/// and, failing closed, by the reserved username as well.
+/// Decided on the nil user id alone, which no credential path produces. The
+/// username is not consulted: a real user may carry the name `<public>`.
 pub(crate) fn is_public_session_authorization(auth: &SessionAuthorization) -> bool {
-    auth.user_id().is_nil() || auth.username() == PUBLIC_USERNAME
+    auth.user_id().is_nil()
 }
 
 /// Moves a public-target request onto a throwaway session that is never
@@ -1743,8 +1743,7 @@ mod public_session_tests {
     }
 
     /// The public session is recognised by construction (a ticket for the
-    /// nil user, whatever its name) and by its reserved name (whatever the
-    /// id): neither sends an identity header upstream.
+    /// nil user, whatever its name) and sends no identity header upstream.
     #[tokio::test]
     async fn the_public_session_sends_no_identity_headers() {
         for auth in [
@@ -1755,15 +1754,23 @@ mod public_session_tests {
                 target_id: TARGET,
                 ticket_id: None,
             },
-            SessionAuthorization::Ticket {
-                user_id: user_id_of("alice"),
-                username: "<public>".into(),
-                target_id: TARGET,
-                ticket_id: None,
-            },
         ] {
             assert_eq!(identity_headers(&auth).await, (None, None), "{auth:?}");
         }
+    }
+
+    /// A real user named `<public>` is not the public session.
+    #[tokio::test]
+    async fn a_real_user_named_public_gets_identity_headers() {
+        let auth = SessionAuthorization::Ticket {
+            user_id: user_id_of("alice"),
+            username: "<public>".into(),
+            target_id: TARGET,
+            ticket_id: None,
+        };
+        let (username, kind) = identity_headers(&auth).await;
+        assert_eq!(username.as_deref(), Some("<public>"));
+        assert_eq!(kind.as_deref(), Some("ticket"));
     }
 
     fn header_values(headers: &http::HeaderMap, name: &str) -> Vec<String> {
