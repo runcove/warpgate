@@ -41,3 +41,6 @@ node_modules
 
 rustc-ice-*.txt
 .zed
+
+# Claude Code local approvals (may hold a command verbatim); never committed
+/.claude/settings.local.json
