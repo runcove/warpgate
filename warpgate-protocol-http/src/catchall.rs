@@ -536,6 +536,9 @@ async fn watch_admitted_live_stream(
             watch_binding_only_live_stream(services, close_rx, *user_id, target_id, opened_binding)
                 .await
         }
+        // No user: the nil id is one shared bucket for these. Only the host
+        // binding check cancels a binding-only stream, so no per-user cancel
+        // reaches it.
         RequestAuthorization::AdminToken | RequestAuthorization::ClusterPeer => {
             watch_binding_only_live_stream(
                 services,
@@ -760,9 +763,12 @@ mod live_stream_tests {
         id
     }
 
-    fn ticket(ticket_id: Option<Uuid>, target_id: Uuid) -> RequestAuthorization {
+    /// The user a real ticket session runs as in these tests.
+    const TICKET_USER: Uuid = Uuid::from_u128(7);
+
+    fn ticket(user_id: Uuid, ticket_id: Option<Uuid>, target_id: Uuid) -> RequestAuthorization {
         RequestAuthorization::Session(SessionAuthorization::Ticket {
-            user_id: Uuid::nil(),
+            user_id,
             username: "ticket".into(),
             target_id,
             ticket_id,
@@ -781,7 +787,7 @@ mod live_stream_tests {
 
         let watched = watch_admitted_live_stream(
             &services,
-            &ticket(None, target_id),
+            &ticket(Uuid::nil(), None, target_id),
             close_rx,
             target_id,
             None,
@@ -825,8 +831,8 @@ mod live_stream_tests {
         assert!(deregistered(&services).await);
     }
 
-    /// A request a real ticket admitted is registered binding-only, under the
-    /// binding it opened against.
+    /// A request a real ticket admitted is registered binding-only, under its
+    /// own user and the binding it opened against.
     #[tokio::test]
     async fn a_real_ticket_session_is_watched_for_its_host_binding() {
         let db = migrated_db().await;
@@ -836,7 +842,7 @@ mod live_stream_tests {
 
         let watched = watch_admitted_live_stream(
             &services,
-            &ticket(Some(Uuid::new_v4()), target_id),
+            &ticket(TICKET_USER, Some(Uuid::new_v4()), target_id),
             close_rx,
             target_id,
             None,
@@ -847,7 +853,7 @@ mod live_stream_tests {
         assert_eq!(
             services.live_streams.in_use().unwrap(),
             std::collections::HashSet::from([(
-                Uuid::nil(),
+                TICKET_USER,
                 target_id,
                 LiveStreamKind::BindingOnly,
                 None
@@ -901,7 +907,7 @@ mod live_stream_tests {
 
         let watched = watch_admitted_live_stream(
             &services,
-            &ticket(Some(Uuid::new_v4()), target_id),
+            &ticket(TICKET_USER, Some(Uuid::new_v4()), target_id),
             close_rx,
             target_id,
             Some("old.example".into()),
