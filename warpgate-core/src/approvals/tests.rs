@@ -2725,4 +2725,44 @@ mod ticket_deletion {
                 .is_none()
         );
     }
+
+    #[tokio::test]
+    async fn an_expired_ticket_ends_only_the_sessions_it_opened() {
+        let db = migrated_db().await;
+        let services = super::delivery::test_services(&db).await;
+        let expired = seed_ticket(
+            &db,
+            None,
+            Some(OffsetDateTime::now_utc() - time::Duration::seconds(60)),
+        )
+        .await;
+        let current = seed_ticket(
+            &db,
+            None,
+            Some(OffsetDateTime::now_utc() + time::Duration::hours(1)),
+        )
+        .await;
+        let expired_target = Ticket::Entity::find_by_id(expired)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap()
+            .target_id;
+        let current_target = Ticket::Entity::find_by_id(current)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap()
+            .target_id;
+
+        let under_expired = session_with_target_session(&db, expired_target, Some(expired)).await;
+        let under_current = session_with_target_session(&db, current_target, Some(current)).await;
+        let without = session_with_target_session(&db, expired_target, None).await;
+
+        services.close_sessions_of_expired_tickets().await.unwrap();
+
+        assert!(ended(&db, under_expired).await);
+        assert!(!ended(&db, under_current).await);
+        assert!(!ended(&db, without).await);
+    }
 }
