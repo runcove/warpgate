@@ -25,8 +25,7 @@ use tracing::{Instrument, debug, error, warn};
 use url::{Url, form_urlencoded};
 use warpgate_common::helpers::websocket::pump_websocket;
 use warpgate_common::http_headers::{
-    X_FORWARDED_FOR, X_FORWARDED_HOST, X_FORWARDED_PROTO, connection_listed_headers,
-    may_forward_header,
+    ForwardFilter, X_FORWARDED_FOR, X_FORWARDED_HOST, X_FORWARDED_PROTO,
 };
 use warpgate_common::{TargetHTTPOptions, WarpgateError, try_block};
 use warpgate_common_http::logging::{get_client_ip, log_request_result, upstream_uri_for_log};
@@ -181,9 +180,9 @@ fn copy_client_response<R: SomeResponse>(
     server_response: &mut poem::Response,
 ) {
     let mut headers = client_response.headers().clone();
-    let listed = connection_listed_headers(client_response.headers());
+    let filter = ForwardFilter::new(client_response.headers());
     for h in client_response.headers() {
-        if (!may_forward_header(h.0) || listed.contains(h.0))
+        if !filter.allows(h.0)
             && let http::header::Entry::Occupied(e) = headers.entry(h.0)
         {
             e.remove_entry();
@@ -387,11 +386,12 @@ fn referer_header_for_target(req: &Request) -> Option<String> {
 }
 
 fn copy_server_request<B: SomeRequestBuilder>(req: &Request, mut target: B) -> Result<B> {
-    let listed = connection_listed_headers(req.headers());
+    let filter = ForwardFilter::new(req.headers());
     for k in req.headers().keys() {
-        // Hop-by-hop headers, and any header the caller's `Connection` header
-        // lists, describe the caller's connection and are not forwarded.
-        if !may_forward_header(k) || listed.contains(k) {
+        // Hop-by-hop headers, any header the caller's `Connection` header
+        // lists, and a `Content-Length` that accompanied `Transfer-Encoding`
+        // describe the caller's connection and are not forwarded.
+        if !filter.allows(k) {
             continue;
         }
         if k == http::header::AUTHORIZATION {
@@ -1384,6 +1384,40 @@ mod tests {
         for (path, values) in upstream_values(&kept, raw) {
             assert_eq!(values, ["2"], "{path} path");
         }
+    }
+
+    /// When the caller sent `Transfer-Encoding`, its `Content-Length` is not
+    /// forwarded either (RFC 9112 section 6.1); without `Transfer-Encoding`
+    /// the `Content-Length` is forwarded.
+    #[test]
+    fn content_length_is_not_forwarded_with_transfer_encoding() {
+        let both: &[(&str, &[u8])] = &[("Transfer-Encoding", b"chunked"), ("Content-Length", b"5")];
+        for (path, values) in upstream_values(&http::header::CONTENT_LENGTH, both) {
+            assert_eq!(values, Vec::<String>::new(), "{path} path");
+        }
+        let only_length: &[(&str, &[u8])] = &[("Content-Length", b"5")];
+        for (path, values) in upstream_values(&http::header::CONTENT_LENGTH, only_length) {
+            assert_eq!(values, ["5"], "{path} path");
+        }
+    }
+
+    /// The same rule applies to a response going back to the client.
+    #[test]
+    fn content_length_is_not_copied_to_the_client_with_transfer_encoding() {
+        let copy = |builder: http::response::Builder| {
+            let mut response: Response = "".into();
+            copy_client_response(&builder.body(()).unwrap(), &mut response);
+            response
+        };
+        let response = copy(
+            http::Response::builder()
+                .header("Transfer-Encoding", "chunked")
+                .header("Content-Length", "5"),
+        );
+        assert!(!response.headers().contains_key("content-length"));
+        assert!(!response.headers().contains_key("transfer-encoding"));
+        let response = copy(http::Response::builder().header("Content-Length", "5"));
+        assert_eq!(response.headers().get("content-length").unwrap(), "5");
     }
 
     /// The edges of "the scheme is Warpgate": a tab as the separator, a bare

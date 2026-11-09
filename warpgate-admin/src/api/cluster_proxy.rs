@@ -27,7 +27,7 @@ use tokio_tungstenite::{Connector, client_async_tls_with_config, tungstenite};
 use uuid::Uuid;
 use warpgate_ca::CLUSTER_TLS_SNI_NAME;
 use warpgate_common::helpers::websocket::pump_websocket;
-use warpgate_common::http_headers::may_forward_header;
+use warpgate_common::http_headers::ForwardFilter;
 use warpgate_common_http::auth::UnauthenticatedRequestContext;
 use warpgate_common_http::logging::get_client_ip;
 use warpgate_common_http::{
@@ -198,8 +198,9 @@ async fn forward_http_inner(
     reject_second_hop(req)?;
 
     let mut headers = poem::http::HeaderMap::new();
+    let filter = ForwardFilter::new(req.headers());
     for (name, value) in req.headers() {
-        if should_forward(name) || (identity.forwards_cookie() && name == COOKIE) {
+        if should_forward(&filter, name) || (identity.forwards_cookie() && name == COOKIE) {
             headers.insert(name.clone(), value.clone());
         }
     }
@@ -238,8 +239,9 @@ async fn forward_http_inner(
     let response = request.send().await.map_err(poem::error::BadGateway)?;
 
     let mut builder = Response::builder().status(response.status());
+    let filter = ForwardFilter::new(response.headers());
     for (name, value) in response.headers() {
-        if should_forward(name) {
+        if should_forward(&filter, name) {
             builder = builder.header(name, value);
         }
     }
@@ -328,11 +330,8 @@ fn path_and_query(req: &Request) -> String {
 /// TLS identity alone. The client's own forwarding headers and any
 /// `x-warpgate-cluster-*` header are dropped; the peer gets the host, scheme
 /// and address this node resolved, in cluster-only headers.
-fn should_forward(name: &HeaderName) -> bool {
-    may_forward_header(name)
-        && name != CONTENT_LENGTH
-        && name != TRANSFER_ENCODING
-        && name != COOKIE
+fn should_forward(filter: &ForwardFilter, name: &HeaderName) -> bool {
+    filter.allows(name) && name != CONTENT_LENGTH && name != TRANSFER_ENCODING && name != COOKIE
 }
 
 pub trait ReparseForwardedResponse: Sized {
@@ -379,7 +378,13 @@ mod tests {
         X_WARPGATE_CLUSTER_CLIENT_PROTO, X_WARPGATE_CLUSTER_IDENTITY,
     };
 
-    use super::should_forward;
+    use poem::http::HeaderMap;
+
+    use super::{ForwardFilter, should_forward as should_forward_with};
+
+    fn should_forward(name: &HeaderName) -> bool {
+        should_forward_with(&ForwardFilter::new(&HeaderMap::new()), name)
+    }
 
     #[test]
     fn should_forward_drops_the_clients_forwarding_headers() {
@@ -409,5 +414,25 @@ mod tests {
     #[test]
     fn should_forward_keeps_ordinary_headers() {
         assert!(should_forward(&HeaderName::from_static("accept")));
+    }
+
+    #[test]
+    fn should_forward_drops_connection_listed_headers() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            poem::http::header::CONNECTION,
+            "close, X-Hop-One".parse().unwrap(),
+        );
+        headers.append("x-hop-one", "1".parse().unwrap());
+        headers.append("x-other", "1".parse().unwrap());
+        let filter = ForwardFilter::new(&headers);
+        assert!(!should_forward_with(
+            &filter,
+            &HeaderName::from_static("x-hop-one")
+        ));
+        assert!(should_forward_with(
+            &filter,
+            &HeaderName::from_static("x-other")
+        ));
     }
 }

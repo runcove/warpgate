@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error, warn};
 use url::Url;
 use warpgate_common::helpers::websocket::pump_websocket;
-use warpgate_common::http_headers::may_forward_header;
+use warpgate_common::http_headers::ForwardFilter;
 use warpgate_common::{TargetKubernetesOptions, WarpgateError};
 use warpgate_common_http::auth::UnauthenticatedRequestContext;
 use warpgate_common_http::logging::{
@@ -36,6 +36,13 @@ use crate::server::auth::{
 /// `Impersonate-Group`, `Impersonate-Uid`, `Impersonate-Extra-*`). These let a
 /// caller assume another identity on the cluster and must never be forwarded,
 /// recorded, or logged.
+/// Request-header filter for the Kubernetes API: the shared forwarding rules
+/// (hop-by-hop, `Connection`-listed and framing headers are dropped), except
+/// that `Accept-Encoding` is kept.
+fn should_forward_to_cluster(filter: &ForwardFilter, name: &http::HeaderName) -> bool {
+    name == http::header::ACCEPT_ENCODING || filter.allows(name)
+}
+
 fn is_impersonation_header(name: &str) -> bool {
     name.to_ascii_lowercase().starts_with("impersonate-")
 }
@@ -312,6 +319,7 @@ async fn _handle_normal_request_inner(
 
     // Extract headers
     let mut headers = HashMap::new();
+    let filter = ForwardFilter::new(req.headers());
     for (name, value) in req.headers() {
         // Client-supplied impersonation must never reach the cluster (nor be
         // recorded or logged), so drop it at the point of ingestion.
@@ -319,7 +327,7 @@ async fn _handle_normal_request_inner(
             continue;
         }
         // Still forward Accept-Encoding to allow for chunked encoding
-        if !may_forward_header(name) && name != http::header::ACCEPT_ENCODING {
+        if !should_forward_to_cluster(&filter, name) {
             continue;
         }
         if let Ok(mut value_str) = value.to_str().map(ToString::to_string) {
@@ -746,7 +754,34 @@ async fn _handle_websocket_request_inner(
 mod tests {
     use std::collections::HashMap;
 
-    use super::{is_impersonation_header, named_target_path, redact_headers};
+    use super::{
+        ForwardFilter, is_impersonation_header, named_target_path, redact_headers,
+        should_forward_to_cluster,
+    };
+
+    #[test]
+    fn cluster_headers_follow_the_shared_forwarding_rules() {
+        let mut headers = http::HeaderMap::new();
+        headers.append(http::header::CONNECTION, "close, X-Hop".parse().unwrap());
+        headers.append("x-hop", "1".parse().unwrap());
+        headers.append("x-keep", "1".parse().unwrap());
+        headers.append(http::header::ACCEPT_ENCODING, "gzip".parse().unwrap());
+        headers.append(http::header::TRANSFER_ENCODING, "chunked".parse().unwrap());
+        headers.append(http::header::CONTENT_LENGTH, "5".parse().unwrap());
+        let filter = ForwardFilter::new(&headers);
+        let forwarded = |name: &str| {
+            should_forward_to_cluster(
+                &filter,
+                &http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+            )
+        };
+        assert!(!forwarded("x-hop"));
+        assert!(!forwarded("connection"));
+        assert!(!forwarded("transfer-encoding"));
+        assert!(!forwarded("content-length"));
+        assert!(forwarded("x-keep"));
+        assert!(forwarded("accept-encoding"));
+    }
 
     #[test]
     fn named_routes_decode_only_the_target_selector() {

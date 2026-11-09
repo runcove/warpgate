@@ -70,6 +70,34 @@ pub fn connection_listed_headers(headers: &http::HeaderMap) -> Vec<HeaderName> {
         .collect()
 }
 
+/// Decides which headers of one message may be forwarded. It combines the
+/// static deny-list, the headers the message's own `Connection` header lists,
+/// and the RFC 9112 framing rule: when `Transfer-Encoding` was present the
+/// `Content-Length` is dropped too, so the next hop recomputes the framing
+/// and never receives both.
+///
+/// Every proxy path (HTTP proxy, cluster hop, Kubernetes) builds one from the
+/// message it is copying so they apply the same rules.
+pub struct ForwardFilter {
+    listed: Vec<HeaderName>,
+    has_transfer_encoding: bool,
+}
+
+impl ForwardFilter {
+    pub fn new(headers: &http::HeaderMap) -> Self {
+        Self {
+            listed: connection_listed_headers(headers),
+            has_transfer_encoding: headers.contains_key(http::header::TRANSFER_ENCODING),
+        }
+    }
+
+    pub fn allows(&self, header_name: &HeaderName) -> bool {
+        may_forward_header(header_name)
+            && !self.listed.contains(header_name)
+            && !(self.has_transfer_encoding && header_name == http::header::CONTENT_LENGTH)
+    }
+}
+
 pub fn may_forward_header(header_name: &HeaderName) -> bool {
     !DONT_FORWARD_HEADERS.contains(header_name)
         && !is_forwarding_header(header_name)
@@ -119,5 +147,29 @@ mod tests {
             ]
         );
         assert!(connection_listed_headers(&http::HeaderMap::new()).is_empty());
+    }
+
+    #[test]
+    fn forward_filter_drops_connection_listed_headers() {
+        let mut headers = http::HeaderMap::new();
+        headers.append(http::header::CONNECTION, "close, X-Hop".parse().unwrap());
+        headers.append("x-hop", "1".parse().unwrap());
+        headers.append("x-keep", "1".parse().unwrap());
+        let filter = ForwardFilter::new(&headers);
+        assert!(!filter.allows(&HeaderName::from_static("x-hop")));
+        assert!(!filter.allows(&http::header::CONNECTION));
+        assert!(filter.allows(&HeaderName::from_static("x-keep")));
+    }
+
+    #[test]
+    fn forward_filter_drops_content_length_only_with_transfer_encoding() {
+        let mut headers = http::HeaderMap::new();
+        headers.append(http::header::CONTENT_LENGTH, "5".parse().unwrap());
+        assert!(ForwardFilter::new(&headers).allows(&http::header::CONTENT_LENGTH));
+
+        headers.append(http::header::TRANSFER_ENCODING, "chunked".parse().unwrap());
+        let filter = ForwardFilter::new(&headers);
+        assert!(!filter.allows(&http::header::CONTENT_LENGTH));
+        assert!(!filter.allows(&http::header::TRANSFER_ENCODING));
     }
 }
