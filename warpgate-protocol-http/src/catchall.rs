@@ -835,7 +835,7 @@ mod live_stream_tests {
     /// own user and the binding it opened against.
     #[tokio::test]
     async fn a_real_ticket_session_is_watched_for_its_host_binding() {
-        let db = migrated_db().await;
+        let db = memory_db().await;
         let services = services(db.clone()).await;
         let target_id = public_target(&db).await;
         let (_session, close_rx) = tokio::sync::broadcast::channel(1);
@@ -865,7 +865,7 @@ mod live_stream_tests {
     /// has one.
     #[tokio::test]
     async fn a_token_or_peer_request_is_watched_for_its_host_binding() {
-        let db = migrated_db().await;
+        let db = memory_db().await;
         let services = services(db.clone()).await;
         let target_id = public_target(&db).await;
         let token_user = Uuid::new_v4();
@@ -900,7 +900,7 @@ mod live_stream_tests {
     /// has is refused at registration, and leaves no registration behind.
     #[tokio::test]
     async fn a_ticket_registration_against_a_changed_host_binding_is_refused() {
-        let db = migrated_db().await;
+        let db = memory_db().await;
         let services = services(db.clone()).await;
         let target_id = public_target(&db).await;
         let (_session, close_rx) = tokio::sync::broadcast::channel(1);
@@ -926,7 +926,7 @@ mod live_stream_tests {
     /// access check alone would pass them.
     #[tokio::test]
     async fn a_role_based_registration_against_a_changed_host_binding_is_refused() {
-        let db = migrated_db().await;
+        let db = memory_db().await;
         let services = services(db.clone()).await;
         let target_id = public_target(&db).await;
         let user_id = Uuid::new_v4();
