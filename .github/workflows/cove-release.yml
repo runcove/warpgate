@@ -190,7 +190,6 @@ jobs:
           INPUT_X86_ONLY: ${{ inputs.x86_64_only }}
           VERSION_SH: ${{ github.workspace }}/.github/cove-ci/version.sh
           RELEASE_BRANCH_PY: ${{ github.workspace }}/.github/cove-ci/release_branch.py
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           refuse() { echo "REFUSING: $*" >&2; exit 64; }
@@ -250,10 +249,6 @@ jobs:
             # fast-forward (cove.13). So the branch is re-read from GitHub, for a bounded
             # time (WAIT_SECS, 10 minutes), and the run refuses only if the commit is STILL
             # not on it. A tag genuinely off the branch waits the full time, then refuses.
-            # The fetch is authenticated through the environment, never a command line.
-            export GIT_CONFIG_COUNT=1
-            export GIT_CONFIG_KEY_0="http.https://github.com/.extraheader"
-            export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
             WAIT_SECS=600; STEP=15; WAITED=0
             while :; do
               if git fetch --quiet --no-tags origin "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH" 2>"$RUNNER_TEMP/fetch.err"; then
@@ -266,7 +261,6 @@ jobs:
               echo "waiting for the mirror: $WHY (${WAITED}s of ${WAIT_SECS}s)"
               sleep "$STEP"; WAITED=$((WAITED + STEP))
             done
-            unset GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
             VERSION="$TAG"; LTO=thin; IS_RELEASE=true; REF="refs/tags/$TAG"
           else
             [ "${N:-0}" -eq 0 ] || refuse "$SHA carries the release tag $(printf '%s' "$RELEASE_TAGS"); a proof build is for commits without one."
