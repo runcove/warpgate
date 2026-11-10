@@ -1110,6 +1110,10 @@ pub struct StepUpIntervalConfig {
     /// key fingerprints (and, when `targets` is given, for one of those
     /// targets). Anything else is checked as usual. Tickets, other protocols
     /// and users not listed here are not affected.
+    ///
+    /// A connection admitted this way ends within about 10 s when a key it
+    /// signed in with is deleted or replaced, or when the user gains an SSO or
+    /// password credential, as well as when the config stops covering it.
     #[serde(default, deserialize_with = "deserialize_exempt_users")]
     pub exempt_users: Vec<StepUpExemptUser>,
 

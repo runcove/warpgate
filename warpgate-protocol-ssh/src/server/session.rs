@@ -36,8 +36,9 @@ use warpgate_common::{
 use warpgate_common_http::ext::{construct_control_plane_url, construct_external_url};
 use warpgate_core::approvals::{GateOutcome, GatedConnection};
 use warpgate_core::auth::step_up::{
-    StepUpWindow, exemption_still_listed, get_pubkey_last_sso_at, is_fresh,
-    matched_key_fingerprints, ssh_step_up_exemption, step_up_window, update_pubkey_last_sso_at,
+    ExemptCredentialChange, StepUpWindow, exempt_credential_change, exemption_still_listed,
+    get_pubkey_last_sso_at, is_fresh, matched_key_fingerprints, ssh_step_up_exemption,
+    step_up_window, update_pubkey_last_sso_at,
 };
 use warpgate_core::auth::submit_credential;
 use warpgate_core::login_protection::FailedAttemptInfo;
@@ -432,6 +433,10 @@ fn is_reserved_env_name(name: &str) -> bool {
 #[derive(Debug, Clone)]
 struct ExemptGrant {
     username: String,
+    user_id: Uuid,
+    /// The public key rows the sign-in matched.
+    pubkey_ids: Vec<Uuid>,
+    /// Their fingerprints when the grant was made.
     fingerprints: Vec<String>,
     target: String,
     granted_at: Instant,
@@ -443,6 +448,8 @@ enum ExemptVerdict {
     Keep(Duration),
     NoLongerListed,
     MaxLifetime,
+    /// The database no longer matches what the grant was made on.
+    CredentialsChanged(ExemptCredentialChange),
 }
 
 fn exempt_verdict(
@@ -458,6 +465,41 @@ fn exempt_verdict(
         return ExemptVerdict::MaxLifetime;
     }
     ExemptVerdict::Keep((max - elapsed).clamp(STEP_UP_RECHECK_MIN, STEP_UP_RECHECK_MAX))
+}
+
+/// One look at a connection admitted through `exempt_users`: the live config
+/// and the lifetime first, then, when those still cover it, the database (a
+/// deleted or replaced key, or a new SSO or password credential, ends it as
+/// it would end a normal connection). A database error is returned, never
+/// read as "still covered".
+async fn exempt_recheck(
+    grant: &ExemptGrant,
+    step_up: Option<&warpgate_common::StepUpIntervalConfig>,
+    db: &sea_orm::DatabaseConnection,
+    elapsed: Duration,
+) -> Result<ExemptVerdict, WarpgateError> {
+    let verdict = exempt_verdict(grant, step_up, elapsed);
+    if !matches!(verdict, ExemptVerdict::Keep(_)) {
+        return Ok(verdict);
+    }
+    Ok(
+        match exempt_credential_change(db, grant.user_id, &grant.pubkey_ids, &grant.fingerprints)
+            .await?
+        {
+            Some(change) => ExemptVerdict::CredentialsChanged(change),
+            None => verdict,
+        },
+    )
+}
+
+/// Whether one more unreadable check ends a connection: it has no known
+/// deadline left, or this was the last failure it is allowed.
+fn read_failure_closes(
+    failures: u32,
+    known_deadline: Option<OffsetDateTime>,
+    now: OffsetDateTime,
+) -> bool {
+    known_deadline.is_some_and(|d| now > d) || failures >= STEP_UP_MAX_READ_FAILURES
 }
 
 const fn web_approval_proves_step_up(approval_present: bool, approval_was_bypassed: bool) -> bool {
@@ -546,11 +588,13 @@ mod tests {
     use warpgate_common::eventhub::EventHub;
 
     use super::{
-        ChannelOperation, EventIntake, ExemptGrant, ExemptVerdict, exempt_verdict, MAX_WEB_AUTH_WAITS, PendingCommand,
-        PendingKeyboardInteractiveAuth, RCCommand, SshClientError, TARGET_FORWARD_OPEN_TIMEOUT,
-        TARGET_REPLY_TIMEOUT, WebApprovalWait, WebAuthStep, bump_waits, carry_forward,
-        is_reserved_env_name, next_web_auth_step, reject_with_allowed_auth_methods, reply_limit,
-        round_creates_wait, wait_for_reply, wait_for_state,
+        ChannelOperation, EventIntake, ExemptGrant, ExemptVerdict, MAX_WEB_AUTH_WAITS,
+        PendingCommand, PendingKeyboardInteractiveAuth, RCCommand, STEP_UP_MAX_READ_FAILURES,
+        SshClientError, TARGET_FORWARD_OPEN_TIMEOUT, TARGET_REPLY_TIMEOUT, WebApprovalWait,
+        WebAuthStep, bump_waits, carry_forward, exempt_recheck, exempt_verdict,
+        is_reserved_env_name, next_web_auth_step, read_failure_closes,
+        reject_with_allowed_auth_methods, reply_limit, round_creates_wait, wait_for_reply,
+        wait_for_state,
     };
 
     /// A client cannot set the variables Warpgate injects about the user;
@@ -577,6 +621,8 @@ mod tests {
     fn grant(user: &str, fps: &[&str], target: &str) -> ExemptGrant {
         ExemptGrant {
             username: user.into(),
+            user_id: Uuid::nil(),
+            pubkey_ids: vec![],
             fingerprints: fps.iter().map(|f| (*f).to_owned()).collect(),
             target: target.into(),
             granted_at: Instant::now(),
@@ -652,6 +698,228 @@ mod tests {
             exempt_verdict(&g, Some(&shorter), Duration::from_secs(30)),
             ExemptVerdict::MaxLifetime
         );
+    }
+
+    mod exempt_recheck_against_the_database {
+        use sea_orm::{
+            ActiveModelTrait, ColumnTrait, ConnectionTrait, Database, DatabaseConnection,
+            EntityTrait, QueryFilter, Set,
+        };
+        use warpgate_db_entities as entities;
+        use warpgate_db_entities::Parameters::{
+            ConfigMigrationValues, set_config_migration_values,
+        };
+        use warpgate_db_migrations::migrate_database;
+
+        use super::super::ExemptCredentialChange;
+        use super::*;
+
+        const KEY_A: &str =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPu/YbG0OTn/9QBTFDjJBQQhHk5XIRPXKYWNHm21np1q";
+        const FP_A: &str = "SHA256:dCsd+OZuerpGdJl7d6JN1z8Qe4jKnWrhUHtPhQ2Ghtg";
+        const KEY_B: &str =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINlugWu1+DBB3PR2myFjhALc5Jug2vLAzEBjnb0SUe9o";
+
+        const MAX: Duration = Duration::from_secs(3600);
+
+        struct Admitted {
+            db: DatabaseConnection,
+            user_id: Uuid,
+            key_id: Uuid,
+            grant: ExemptGrant,
+            cfg: warpgate_common::StepUpIntervalConfig,
+        }
+
+        /// A service user with one listed key, admitted the way the login does.
+        async fn admitted() -> Admitted {
+            set_config_migration_values(ConfigMigrationValues::default());
+            let db = Database::connect("sqlite::memory:").await.unwrap();
+            migrate_database(&db).await.unwrap();
+            let user_id = Uuid::new_v4();
+            let username = format!("qa-{user_id}");
+            entities::User::ActiveModel {
+                id: Set(user_id),
+                username: Set(username.clone()),
+                description: Set(String::new()),
+                credential_policy: Set(sea_orm::JsonValue::Object(Default::default())),
+                rate_limit_bytes_per_second: Set(None),
+                ldap_server_id: Set(None),
+                ldap_object_uuid: Set(None),
+                allowed_ip_ranges: Set(sea_orm::JsonValue::Null),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+            let key_id = add_key(&db, user_id, KEY_A).await;
+            Admitted {
+                grant: ExemptGrant {
+                    username: username.clone(),
+                    user_id,
+                    pubkey_ids: vec![key_id],
+                    fingerprints: vec![FP_A.to_owned()],
+                    target: "staging".into(),
+                    granted_at: Instant::now(),
+                },
+                cfg: exempt_cfg(&username, &[FP_A], None, MAX),
+                db,
+                user_id,
+                key_id,
+            }
+        }
+
+        async fn add_key(db: &DatabaseConnection, user_id: Uuid, openssh: &str) -> Uuid {
+            let id = Uuid::new_v4();
+            entities::PublicKeyCredential::ActiveModel {
+                id: Set(id),
+                user_id: Set(user_id),
+                label: Set("test".into()),
+                date_added: Set(None),
+                last_used: Set(None),
+                last_sso_at: Set(None),
+                openssh_public_key: Set(openssh.into()),
+            }
+            .insert(db)
+            .await
+            .unwrap();
+            id
+        }
+
+        async fn recheck(a: &Admitted) -> Result<ExemptVerdict, warpgate_common::WarpgateError> {
+            exempt_recheck(&a.grant, Some(&a.cfg), &a.db, Duration::from_secs(5)).await
+        }
+
+        fn closes(change: ExemptCredentialChange) -> Result<ExemptVerdict, ()> {
+            Ok(ExemptVerdict::CredentialsChanged(change))
+        }
+
+        #[tokio::test]
+        async fn a_connection_that_is_still_covered_survives() {
+            let a = admitted().await;
+            assert!(matches!(recheck(&a).await, Ok(ExemptVerdict::Keep(_))));
+            // Another key added to the user later is not this connection's key.
+            add_key(&a.db, a.user_id, KEY_B).await;
+            assert!(matches!(recheck(&a).await, Ok(ExemptVerdict::Keep(_))));
+        }
+
+        #[tokio::test]
+        async fn deleting_the_key_row_ends_the_connection() {
+            let a = admitted().await;
+            entities::PublicKeyCredential::Entity::delete_by_id(a.key_id)
+                .exec(&a.db)
+                .await
+                .unwrap();
+            assert_eq!(
+                recheck(&a).await.map_err(|_| ()),
+                closes(ExemptCredentialChange::KeyChanged)
+            );
+        }
+
+        #[tokio::test]
+        async fn replacing_the_key_ends_the_connection() {
+            // The admin endpoints rewrite a key row in place, keeping its id.
+            let a = admitted().await;
+            entities::PublicKeyCredential::Entity::update_many()
+                .set(entities::PublicKeyCredential::ActiveModel {
+                    openssh_public_key: Set(KEY_B.into()),
+                    ..Default::default()
+                })
+                .filter(entities::PublicKeyCredential::Column::Id.eq(a.key_id))
+                .exec(&a.db)
+                .await
+                .unwrap();
+            assert_eq!(
+                recheck(&a).await.map_err(|_| ()),
+                closes(ExemptCredentialChange::KeyChanged)
+            );
+        }
+
+        #[tokio::test]
+        async fn replacing_the_row_with_a_new_one_ends_the_connection() {
+            let a = admitted().await;
+            entities::PublicKeyCredential::Entity::delete_by_id(a.key_id)
+                .exec(&a.db)
+                .await
+                .unwrap();
+            add_key(&a.db, a.user_id, KEY_A).await;
+            assert_eq!(
+                recheck(&a).await.map_err(|_| ()),
+                closes(ExemptCredentialChange::KeyChanged),
+                "the grant is for the row the sign-in matched"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_new_password_credential_ends_the_connection() {
+            let a = admitted().await;
+            entities::PasswordCredential::ActiveModel {
+                id: Set(Uuid::new_v4()),
+                user_id: Set(a.user_id),
+                argon_hash: Set("not-a-real-hash".into()),
+            }
+            .insert(&a.db)
+            .await
+            .unwrap();
+            assert_eq!(
+                recheck(&a).await.map_err(|_| ()),
+                closes(ExemptCredentialChange::PasswordCredentialAdded)
+            );
+        }
+
+        #[tokio::test]
+        async fn a_new_sso_credential_ends_the_connection() {
+            let a = admitted().await;
+            entities::SsoCredential::ActiveModel {
+                id: Set(Uuid::new_v4()),
+                user_id: Set(a.user_id),
+                provider: Set(None),
+                email: Set("qa@example.com".into()),
+            }
+            .insert(&a.db)
+            .await
+            .unwrap();
+            assert_eq!(
+                recheck(&a).await.map_err(|_| ()),
+                closes(ExemptCredentialChange::SsoCredentialAdded)
+            );
+        }
+
+        #[tokio::test]
+        async fn a_config_that_stops_listing_the_user_ends_it_without_the_database() {
+            let a = admitted().await;
+            a.db.execute_unprepared("DROP TABLE credentials_sso")
+                .await
+                .unwrap();
+            let none = exempt_cfg("someone-else", &[FP_A], None, MAX);
+            let got = exempt_recheck(&a.grant, Some(&none), &a.db, Duration::ZERO).await;
+            assert!(matches!(got, Ok(ExemptVerdict::NoLongerListed)), "{got:?}");
+        }
+
+        #[tokio::test]
+        async fn a_database_error_is_an_error_and_repeated_ones_end_the_connection() {
+            let a = admitted().await;
+            a.db.execute_unprepared("DROP TABLE credentials_sso")
+                .await
+                .unwrap();
+            // Never read as "still covered" ...
+            assert!(recheck(&a).await.is_err());
+
+            // ... and the session counts it like an unreadable step-up stamp:
+            // the connection has no known deadline, so it ends with the last
+            // failure it is allowed.
+            let now = time::OffsetDateTime::now_utc();
+            for failures in 1..STEP_UP_MAX_READ_FAILURES {
+                assert!(!read_failure_closes(failures, None, now), "{failures}");
+            }
+            assert!(read_failure_closes(STEP_UP_MAX_READ_FAILURES, None, now));
+            // A deadline already passed ends it at the first failure.
+            let past = now - time::Duration::seconds(1);
+            assert!(read_failure_closes(1, Some(past), now));
+            assert!(!read_failure_closes(
+                1,
+                Some(now + time::Duration::seconds(60)),
+                now
+            ));
+        }
     }
 
     #[test]
@@ -1354,16 +1622,28 @@ impl ServerSession {
     /// `true` when the window has passed and the connection was closed.
     async fn enforce_step_up_window(&mut self) -> bool {
         if let Some(grant) = self.step_up_exempt.clone() {
-            let verdict = {
+            let step_up = {
                 let cfg = self.services.config.lock().await;
-                exempt_verdict(
-                    &grant,
-                    cfg.store.step_up_interval.as_ref(),
-                    grant.granted_at.elapsed(),
-                )
+                cfg.store.step_up_interval.clone()
+            };
+            let verdict = match exempt_recheck(
+                &grant,
+                step_up.as_ref(),
+                &self.services.db,
+                grant.granted_at.elapsed(),
+            )
+            .await
+            {
+                Ok(verdict) => verdict,
+                Err(error) => {
+                    return self
+                        .step_up_read_failed(&error, OffsetDateTime::now_utc())
+                        .await;
+                }
             };
             return match verdict {
                 ExemptVerdict::Keep(next) => {
+                    self.step_up_read_failures = 0;
                     self.step_up_recheck = Some(Instant::now() + next);
                     false
                 }
@@ -1375,6 +1655,10 @@ impl ServerSession {
                 ExemptVerdict::MaxLifetime => {
                     self.close_for_exemption(&grant, "maximum lifetime reached")
                         .await;
+                    true
+                }
+                ExemptVerdict::CredentialsChanged(change) => {
+                    self.close_for_exemption(&grant, change.reason()).await;
                     true
                 }
             };
@@ -1440,19 +1724,25 @@ impl ServerSession {
         }
     }
 
-    /// A failed `last_sso_at` read never extends a connection: it closes once
-    /// the last known deadline passes, or after repeated failures, like the
-    /// login gate that refuses when it cannot read the stamp.
+    /// A failed read of the step-up state (the `last_sso_at` stamp, or for an
+    /// exempt connection its key and credential rows) never extends a
+    /// connection: it closes once the last known deadline passes, or after
+    /// repeated failures, like the login gate that refuses when it cannot read
+    /// the stamp.
     async fn step_up_read_failed(&mut self, error: &WarpgateError, now: OffsetDateTime) -> bool {
         self.step_up_read_failures += 1;
         warn!(
             %error,
             failures = self.step_up_read_failures,
-            "Could not read the step-up timestamp"
+            "Could not read the step-up state"
         );
-        let past_deadline = self.step_up_known_deadline.is_some_and(|d| now > d);
-        if past_deadline || self.step_up_read_failures >= STEP_UP_MAX_READ_FAILURES {
-            self.close_for_step_up("step-up window unverifiable").await;
+        if read_failure_closes(self.step_up_read_failures, self.step_up_known_deadline, now) {
+            if let Some(grant) = self.step_up_exempt.clone() {
+                self.close_for_exemption(&grant, "the exemption could not be verified")
+                    .await;
+            } else {
+                self.close_for_step_up("step-up window unverifiable").await;
+            }
             return true;
         }
         self.step_up_recheck = Some(Instant::now() + STEP_UP_RECHECK_MAX);
@@ -4102,6 +4392,8 @@ impl ServerSession {
                         if step_up_exempt {
                             self.step_up_exempt = Some(ExemptGrant {
                                 username: user_info.username.clone(),
+                                user_id: user_info.id,
+                                pubkey_ids: matched_pubkey_ids.clone(),
                                 fingerprints: exempt_fingerprints,
                                 target: resolved_target_name.clone(),
                                 granted_at: Instant::now(),

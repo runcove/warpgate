@@ -240,20 +240,11 @@ async fn listed_user_outcome(
     matched_pubkey_ids: &[Uuid],
     target_name: &str,
 ) -> Result<Result<Vec<String>, StepUpExemptionIgnored>, WarpgateError> {
-    if entities::SsoCredential::Entity::find()
-        .filter(entities::SsoCredential::Column::UserId.eq(user_id))
-        .one(db)
-        .await?
-        .is_some()
-    {
+    let (has_sso, has_password) = sso_and_password_credentials(db, user_id).await?;
+    if has_sso {
         return Ok(Err(StepUpExemptionIgnored::HasSsoCredential));
     }
-    if entities::PasswordCredential::Entity::find()
-        .filter(entities::PasswordCredential::Column::UserId.eq(user_id))
-        .one(db)
-        .await?
-        .is_some()
-    {
+    if has_password {
         return Ok(Err(StepUpExemptionIgnored::HasPasswordCredential));
     }
 
@@ -273,6 +264,77 @@ async fn listed_user_outcome(
         Ok(Ok(fingerprints))
     } else {
         Ok(Err(StepUpExemptionIgnored::TargetNotListed))
+    }
+}
+
+/// Whether the user has an SSO credential and whether it has a password
+/// credential (the two kinds that make an `exempt_users` entry not apply).
+async fn sso_and_password_credentials(
+    db: &DatabaseConnection,
+    user_id: Uuid,
+) -> Result<(bool, bool), WarpgateError> {
+    let has_sso = entities::SsoCredential::Entity::find()
+        .filter(entities::SsoCredential::Column::UserId.eq(user_id))
+        .one(db)
+        .await?
+        .is_some();
+    let has_password = entities::PasswordCredential::Entity::find()
+        .filter(entities::PasswordCredential::Column::UserId.eq(user_id))
+        .one(db)
+        .await?
+        .is_some();
+    Ok((has_sso, has_password))
+}
+
+/// What changed in the database under a connection admitted through
+/// `exempt_users`, so that the grant it was admitted on no longer holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExemptCredentialChange {
+    /// The user now has an SSO credential.
+    SsoCredentialAdded,
+    /// The user now has a password credential.
+    PasswordCredentialAdded,
+    /// A key the connection signed in with was deleted, replaced by another
+    /// key, or no longer shows the fingerprint it was admitted with.
+    KeyChanged,
+}
+
+impl ExemptCredentialChange {
+    #[must_use]
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Self::SsoCredentialAdded => "the user gained an SSO credential",
+            Self::PasswordCredentialAdded => "the user gained a password credential",
+            Self::KeyChanged => "a key the connection signed in with was removed or replaced",
+        }
+    }
+}
+
+/// Re-read from the database what an exemption was granted on: the user has
+/// still no SSO or password credential, and the public key rows the sign-in
+/// matched still exist, still belong to the user and still show the
+/// fingerprints the grant recorded.
+///
+/// `Ok(None)` means the grant still holds. A database error is returned and
+/// is never read as "still holds".
+pub async fn exempt_credential_change(
+    db: &DatabaseConnection,
+    user_id: Uuid,
+    pubkey_ids: &[Uuid],
+    granted_fingerprints: &[String],
+) -> Result<Option<ExemptCredentialChange>, WarpgateError> {
+    let (has_sso, has_password) = sso_and_password_credentials(db, user_id).await?;
+    if has_sso {
+        return Ok(Some(ExemptCredentialChange::SsoCredentialAdded));
+    }
+    if has_password {
+        return Ok(Some(ExemptCredentialChange::PasswordCredentialAdded));
+    }
+    let current = matched_key_fingerprints(db, user_id, pubkey_ids).await?;
+    if current.as_deref() == Some(granted_fingerprints) && !granted_fingerprints.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(ExemptCredentialChange::KeyChanged))
     }
 }
 
@@ -328,16 +390,7 @@ pub async fn warn_exempt_users_with_credentials(
         else {
             continue;
         };
-        let has_sso = entities::SsoCredential::Entity::find()
-            .filter(entities::SsoCredential::Column::UserId.eq(user.id))
-            .one(db)
-            .await?
-            .is_some();
-        let has_password = entities::PasswordCredential::Entity::find()
-            .filter(entities::PasswordCredential::Column::UserId.eq(user.id))
-            .one(db)
-            .await?
-            .is_some();
+        let (has_sso, has_password) = sso_and_password_credentials(db, user.id).await?;
         if has_sso || has_password {
             warn!(
                 username = %entry.user,
@@ -1018,6 +1071,136 @@ mod tests {
             .unwrap();
 
         let got = ssh_step_up_exemption(&db, &config, user_id, &username, &[key], "prod").await;
+        assert!(got.is_err(), "{got:?}");
+    }
+
+    #[tokio::test]
+    async fn unit_credential_change_none_while_the_grant_still_holds() {
+        let db = setup_db().await;
+        let (user_id, _) = service_user(&db).await;
+        let key = add_key(&db, user_id, KEY_A).await;
+        let fps = vec![FP_A.to_owned()];
+
+        let got = exempt_credential_change(&db, user_id, &[key], &fps)
+            .await
+            .unwrap();
+        assert_eq!(got, None);
+
+        // A key added to the user later is not this sign-in's key.
+        add_key(&db, user_id, KEY_B).await;
+        let got = exempt_credential_change(&db, user_id, &[key], &fps)
+            .await
+            .unwrap();
+        assert_eq!(got, None);
+    }
+
+    #[tokio::test]
+    async fn unit_credential_change_deleting_the_key_row() {
+        let db = setup_db().await;
+        let (user_id, _) = service_user(&db).await;
+        let key = add_key(&db, user_id, KEY_A).await;
+        entities::PublicKeyCredential::Entity::delete_by_id(key)
+            .exec(&db)
+            .await
+            .unwrap();
+
+        let got = exempt_credential_change(&db, user_id, &[key], &[FP_A.to_owned()])
+            .await
+            .unwrap();
+        assert_eq!(got, Some(ExemptCredentialChange::KeyChanged));
+    }
+
+    #[tokio::test]
+    async fn unit_credential_change_replacing_the_key() {
+        let db = setup_db().await;
+        let (user_id, _) = service_user(&db).await;
+        let key = add_key(&db, user_id, KEY_A).await;
+        let fps = vec![FP_A.to_owned()];
+
+        // Rewritten in place, keeping its id (what the admin endpoints do).
+        entities::PublicKeyCredential::Entity::update_many()
+            .set(entities::PublicKeyCredential::ActiveModel {
+                openssh_public_key: Set(KEY_B.into()),
+                ..Default::default()
+            })
+            .filter(entities::PublicKeyCredential::Column::Id.eq(key))
+            .exec(&db)
+            .await
+            .unwrap();
+        let got = exempt_credential_change(&db, user_id, &[key], &fps)
+            .await
+            .unwrap();
+        assert_eq!(got, Some(ExemptCredentialChange::KeyChanged));
+
+        // A row that now belongs to someone else, or no longer parses.
+        let (other_user, _) = service_user(&db).await;
+        let theirs = add_key(&db, other_user, KEY_A).await;
+        let got = exempt_credential_change(&db, user_id, &[theirs], &fps)
+            .await
+            .unwrap();
+        assert_eq!(got, Some(ExemptCredentialChange::KeyChanged));
+        let garbled = add_key(&db, user_id, "ssh-ed25519 AAAA").await;
+        let got = exempt_credential_change(&db, user_id, &[garbled], &fps)
+            .await
+            .unwrap();
+        assert_eq!(got, Some(ExemptCredentialChange::KeyChanged));
+    }
+
+    #[tokio::test]
+    async fn unit_credential_change_nothing_recorded_never_holds() {
+        let db = setup_db().await;
+        let (user_id, _) = service_user(&db).await;
+        let key = add_key(&db, user_id, KEY_A).await;
+
+        for (ids, fps) in [(vec![], vec![]), (vec![key], vec![])] {
+            let got = exempt_credential_change(&db, user_id, &ids, &fps)
+                .await
+                .unwrap();
+            assert_eq!(got, Some(ExemptCredentialChange::KeyChanged));
+        }
+    }
+
+    #[tokio::test]
+    async fn unit_credential_change_password_or_sso_added() {
+        let db = setup_db().await;
+        let (pw, _) = service_user(&db).await;
+        let pw_key = add_key(&db, pw, KEY_A).await;
+        let (sso, _) = service_user(&db).await;
+        let sso_key = add_key(&db, sso, KEY_A).await;
+        let fps = vec![FP_A.to_owned()];
+        assert_eq!(
+            exempt_credential_change(&db, pw, &[pw_key], &fps)
+                .await
+                .unwrap(),
+            None
+        );
+
+        add_password(&db, pw).await;
+        add_sso(&db, sso).await;
+
+        assert_eq!(
+            exempt_credential_change(&db, pw, &[pw_key], &fps)
+                .await
+                .unwrap(),
+            Some(ExemptCredentialChange::PasswordCredentialAdded)
+        );
+        assert_eq!(
+            exempt_credential_change(&db, sso, &[sso_key], &fps)
+                .await
+                .unwrap(),
+            Some(ExemptCredentialChange::SsoCredentialAdded)
+        );
+    }
+
+    #[tokio::test]
+    async fn unit_credential_change_a_database_error_is_an_error() {
+        let db = setup_db().await;
+        let (user_id, _) = service_user(&db).await;
+        let key = add_key(&db, user_id, KEY_A).await;
+        db.execute_unprepared("DROP TABLE credentials_public_key")
+            .await
+            .unwrap();
+        let got = exempt_credential_change(&db, user_id, &[key], &[FP_A.to_owned()]).await;
         assert!(got.is_err(), "{got:?}");
     }
 
