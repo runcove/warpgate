@@ -12,10 +12,12 @@
 //!   (see `warpgate-protocol-http::step_up`).
 use std::time::Duration;
 
+use russh::keys::{HashAlg, PublicKey};
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
 use time::OffsetDateTime;
+use tracing::{info, warn};
 use uuid::Uuid;
-use warpgate_common::WarpgateError;
+use warpgate_common::{StepUpExemptUser, StepUpIntervalConfig, WarpgateError};
 use warpgate_db_entities as entities;
 
 /// Decide whether a credential's last SSO handshake is still "fresh" for the
@@ -137,9 +139,177 @@ pub async fn update_pubkey_last_sso_at(
     Ok(result.rows_affected)
 }
 
+/// Why a listed user's `exempt_users` entry did not apply to a sign-in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepUpExemptionIgnored {
+    HasSsoCredential,
+    HasPasswordCredential,
+    KeyNotListed,
+    TargetNotListed,
+}
+
+impl StepUpExemptionIgnored {
+    #[must_use]
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Self::HasSsoCredential => "the user has an SSO credential",
+            Self::HasPasswordCredential => "the user has a password credential",
+            Self::KeyNotListed => "the sign-in key is not one of the listed keys",
+            Self::TargetNotListed => "the target is not one of the listed targets",
+        }
+    }
+}
+
+/// How `step_up_interval.exempt_users` applies to one SSH public-key sign-in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepUpExemption {
+    /// The user is not listed.
+    NotListed,
+    /// The sign-in skips the step-up check.
+    Applies,
+    /// The user is listed but the entry does not cover this sign-in.
+    Ignored(StepUpExemptionIgnored),
+}
+
+impl StepUpExemption {
+    #[must_use]
+    pub const fn applies(self) -> bool {
+        matches!(self, Self::Applies)
+    }
+}
+
+/// Decide whether an SSH public-key sign-in skips the step-up check because
+/// of `step_up_interval.exempt_users`, and log the outcome (one info line when
+/// it applies, one warning when a listed user's entry does not).
+///
+/// An entry applies only if all of these hold:
+/// - the username equals the entry's `user` exactly;
+/// - the user has no SSO credential and no password credential (read from the
+///   same tables the MFA checks in `Services` use);
+/// - every public key row the sign-in matched has an OpenSSH SHA256
+///   fingerprint listed in the entry's `keys`, so a key added to the user
+///   later is not covered;
+/// - the entry has no `targets`, or `target_name` is one of them. An empty
+///   `target_name` (no target chosen yet) is not one of them.
+///
+/// A database error is returned, never read as an exemption.
+pub async fn ssh_step_up_exemption(
+    db: &DatabaseConnection,
+    step_up: &StepUpIntervalConfig,
+    user_id: Uuid,
+    username: &str,
+    matched_pubkey_ids: &[Uuid],
+    target_name: &str,
+) -> Result<StepUpExemption, WarpgateError> {
+    let entries: Vec<&StepUpExemptUser> = step_up.exempt_entries_for(username).collect();
+    if entries.is_empty() {
+        return Ok(StepUpExemption::NotListed);
+    }
+
+    let outcome =
+        match listed_user_outcome(db, &entries, user_id, matched_pubkey_ids, target_name).await? {
+            None => StepUpExemption::Applies,
+            Some(ignored) => StepUpExemption::Ignored(ignored),
+        };
+
+    match outcome {
+        StepUpExemption::Applies => {
+            info!(username = %username, "SSH sign-in allowed by step-up exemption");
+        }
+        StepUpExemption::Ignored(ignored) => {
+            warn!(
+                username = %username,
+                "step-up exemption ignored: {}",
+                ignored.reason()
+            );
+        }
+        StepUpExemption::NotListed => {}
+    }
+    Ok(outcome)
+}
+
+/// `None` when the exemption applies, otherwise why not.
+async fn listed_user_outcome(
+    db: &DatabaseConnection,
+    entries: &[&StepUpExemptUser],
+    user_id: Uuid,
+    matched_pubkey_ids: &[Uuid],
+    target_name: &str,
+) -> Result<Option<StepUpExemptionIgnored>, WarpgateError> {
+    if entities::SsoCredential::Entity::find()
+        .filter(entities::SsoCredential::Column::UserId.eq(user_id))
+        .one(db)
+        .await?
+        .is_some()
+    {
+        return Ok(Some(StepUpExemptionIgnored::HasSsoCredential));
+    }
+    if entities::PasswordCredential::Entity::find()
+        .filter(entities::PasswordCredential::Column::UserId.eq(user_id))
+        .one(db)
+        .await?
+        .is_some()
+    {
+        return Ok(Some(StepUpExemptionIgnored::HasPasswordCredential));
+    }
+
+    let Some(fingerprints) = matched_key_fingerprints(db, user_id, matched_pubkey_ids).await?
+    else {
+        return Ok(Some(StepUpExemptionIgnored::KeyNotListed));
+    };
+    let covering_keys: Vec<&&StepUpExemptUser> = entries
+        .iter()
+        .filter(|entry| fingerprints.iter().all(|fp| entry.keys.contains(fp)))
+        .collect();
+    if covering_keys.is_empty() {
+        return Ok(Some(StepUpExemptionIgnored::KeyNotListed));
+    }
+    if covering_keys.iter().any(|entry| {
+        entry
+            .targets
+            .as_ref()
+            .is_none_or(|targets| targets.iter().any(|t| t == target_name))
+    }) {
+        Ok(None)
+    } else {
+        Ok(Some(StepUpExemptionIgnored::TargetNotListed))
+    }
+}
+
+/// The OpenSSH SHA256 fingerprint of each given public key row of the user.
+///
+/// `None` when there is no row to show a key for: no ids, a row that is gone
+/// or belongs to someone else, or a stored key that does not parse.
+async fn matched_key_fingerprints(
+    db: &DatabaseConnection,
+    user_id: Uuid,
+    pubkey_ids: &[Uuid],
+) -> Result<Option<Vec<String>>, WarpgateError> {
+    if pubkey_ids.is_empty() {
+        return Ok(None);
+    }
+    let mut fingerprints = Vec::with_capacity(pubkey_ids.len());
+    for pubkey_id in pubkey_ids {
+        let Some(row) = entities::PublicKeyCredential::Entity::find_by_id(*pubkey_id)
+            .one(db)
+            .await?
+        else {
+            return Ok(None);
+        };
+        if row.user_id != user_id {
+            return Ok(None);
+        }
+        let Ok(key) = PublicKey::from_openssh(&row.openssh_public_key) else {
+            return Ok(None);
+        };
+        fingerprints.push(key.fingerprint(HashAlg::Sha256).to_string());
+    }
+    Ok(Some(fingerprints))
+}
+
 #[cfg(all(test, feature = "sqlite"))]
 mod tests {
-    use sea_orm::{ActiveModelTrait, Database};
+    use sea_orm::{ActiveModelTrait, ConnectionTrait, Database};
     use warpgate_db_entities::Parameters::{ConfigMigrationValues, set_config_migration_values};
     use warpgate_db_migrations::migrate_database;
 
@@ -248,7 +418,10 @@ mod tests {
             StepUpWindow::Remaining(hours(10))
         );
         // Shorter interval: the same connection is now past its window.
-        assert_eq!(step_up_window(last, Some(hours(1)), now), StepUpWindow::Expired);
+        assert_eq!(
+            step_up_window(last, Some(hours(1)), now),
+            StepUpWindow::Expired
+        );
         // Longer interval extends it; removing it cancels the limit.
         assert_eq!(
             step_up_window(last, Some(hours(24)), now),
@@ -370,5 +543,401 @@ mod tests {
 
         let rows_affected = update_pubkey_last_sso_at(&db, missing, now).await.unwrap();
         assert_eq!(rows_affected, 0);
+    }
+
+    // --- `step_up_interval.exempt_users` -----------------------------------
+
+    const KEY_A: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPu/YbG0OTn/9QBTFDjJBQQhHk5XIRPXKYWNHm21np1q";
+    const FP_A: &str = "SHA256:dCsd+OZuerpGdJl7d6JN1z8Qe4jKnWrhUHtPhQ2Ghtg";
+    const KEY_B: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINlugWu1+DBB3PR2myFjhALc5Jug2vLAzEBjnb0SUe9o";
+    const FP_B: &str = "SHA256:AhPclk0CCWxTYKmTC3eRTLDlONSTMyVg6sOgAoV+Kwc";
+
+    /// A service user that has no credentials yet; the name is unique per
+    /// test so log lines can be told apart in the shared capture.
+    async fn service_user(db: &DatabaseConnection) -> (Uuid, String) {
+        let user_id = Uuid::new_v4();
+        let username = format!("qa-{user_id}");
+        entities::User::ActiveModel {
+            id: Set(user_id),
+            username: Set(username.clone()),
+            description: Set(String::new()),
+            credential_policy: Set(serde_json::json!({})),
+            rate_limit_bytes_per_second: Set(None),
+            ldap_server_id: Set(None),
+            ldap_object_uuid: Set(None),
+            allowed_ip_ranges: Set(serde_json::Value::Null),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        (user_id, username)
+    }
+
+    async fn add_key(db: &DatabaseConnection, user_id: Uuid, openssh: &str) -> Uuid {
+        let id = Uuid::new_v4();
+        entities::PublicKeyCredential::ActiveModel {
+            id: Set(id),
+            user_id: Set(user_id),
+            label: Set("test".into()),
+            date_added: Set(None),
+            last_used: Set(None),
+            last_sso_at: Set(None),
+            openssh_public_key: Set(openssh.into()),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        id
+    }
+
+    async fn add_password(db: &DatabaseConnection, user_id: Uuid) {
+        entities::PasswordCredential::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            user_id: Set(user_id),
+            argon_hash: Set("not-a-real-hash".into()),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+    }
+
+    async fn add_sso(db: &DatabaseConnection, user_id: Uuid) {
+        entities::SsoCredential::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            user_id: Set(user_id),
+            provider: Set(None),
+            email: Set("qa@example.com".into()),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+    }
+
+    fn exempt_entry(user: &str, keys: &[&str], targets: Option<&[&str]>) -> StepUpExemptUser {
+        StepUpExemptUser {
+            user: user.into(),
+            keys: keys.iter().map(|k| (*k).to_owned()).collect(),
+            targets: targets.map(|t| t.iter().map(|t| (*t).to_owned()).collect()),
+        }
+    }
+
+    fn exempt_config(entries: Vec<StepUpExemptUser>) -> StepUpIntervalConfig {
+        StepUpIntervalConfig {
+            ssh: Some(hours(12)),
+            exempt_users: entries,
+            ..Default::default()
+        }
+    }
+
+    /// Log lines this test binary captured for one username.
+    fn logged_for(username: &str) -> Vec<std::collections::HashMap<&'static str, String>> {
+        crate::approvals::tests::audit_events()
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|values| values.get("username").map(String::as_str) == Some(username))
+            .cloned()
+            .collect()
+    }
+
+    fn message_of<'a>(values: &'a std::collections::HashMap<&'static str, String>) -> &'a str {
+        values.get("message").map_or("", String::as_str)
+    }
+
+    #[tokio::test]
+    async fn unit_exempt_user_with_only_a_listed_key_passes_and_is_logged() {
+        let db = setup_db().await;
+        let (user_id, username) = service_user(&db).await;
+        let key = add_key(&db, user_id, KEY_A).await;
+        let config = exempt_config(vec![exempt_entry(&username, &[FP_A], None)]);
+        crate::approvals::tests::audit_events();
+
+        let got = ssh_step_up_exemption(&db, &config, user_id, &username, &[key], "prod")
+            .await
+            .unwrap();
+
+        assert_eq!(got, StepUpExemption::Applies);
+        let logged = logged_for(&username);
+        assert_eq!(logged.len(), 1, "exactly one line: {logged:?}");
+        assert!(
+            message_of(&logged[0]).contains("step-up exemption"),
+            "{logged:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unit_exempt_user_with_a_password_credential_is_not_exempt() {
+        let db = setup_db().await;
+        let (user_id, username) = service_user(&db).await;
+        let key = add_key(&db, user_id, KEY_A).await;
+        add_password(&db, user_id).await;
+        let config = exempt_config(vec![exempt_entry(&username, &[FP_A], None)]);
+        crate::approvals::tests::audit_events();
+
+        let got = ssh_step_up_exemption(&db, &config, user_id, &username, &[key], "prod")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            got,
+            StepUpExemption::Ignored(StepUpExemptionIgnored::HasPasswordCredential)
+        );
+        let logged = logged_for(&username);
+        assert_eq!(logged.len(), 1, "exactly one line: {logged:?}");
+        assert!(
+            message_of(&logged[0]).contains("step-up exemption ignored")
+                && message_of(&logged[0]).contains("password credential"),
+            "{logged:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unit_exempt_user_with_an_sso_credential_is_not_exempt() {
+        let db = setup_db().await;
+        let (user_id, username) = service_user(&db).await;
+        let key = add_key(&db, user_id, KEY_A).await;
+        add_sso(&db, user_id).await;
+        let config = exempt_config(vec![exempt_entry(&username, &[FP_A], None)]);
+        crate::approvals::tests::audit_events();
+
+        let got = ssh_step_up_exemption(&db, &config, user_id, &username, &[key], "prod")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            got,
+            StepUpExemption::Ignored(StepUpExemptionIgnored::HasSsoCredential)
+        );
+        let logged = logged_for(&username);
+        assert_eq!(logged.len(), 1, "exactly one line: {logged:?}");
+        assert!(
+            message_of(&logged[0]).contains("step-up exemption ignored")
+                && message_of(&logged[0]).contains("SSO credential"),
+            "{logged:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unit_user_not_on_the_list_is_not_exempt_and_nothing_is_logged() {
+        let db = setup_db().await;
+        let (user_id, username) = service_user(&db).await;
+        let key = add_key(&db, user_id, KEY_A).await;
+        let config = exempt_config(vec![exempt_entry("someone-else", &[FP_A], None)]);
+        crate::approvals::tests::audit_events();
+
+        let got = ssh_step_up_exemption(&db, &config, user_id, &username, &[key], "prod")
+            .await
+            .unwrap();
+        assert_eq!(got, StepUpExemption::NotListed);
+        assert!(logged_for(&username).is_empty());
+
+        // Off by default: an empty list exempts nobody.
+        let got = ssh_step_up_exemption(
+            &db,
+            &exempt_config(vec![]),
+            user_id,
+            &username,
+            &[key],
+            "prod",
+        )
+        .await
+        .unwrap();
+        assert_eq!(got, StepUpExemption::NotListed);
+    }
+
+    #[tokio::test]
+    async fn unit_username_must_match_exactly() {
+        let db = setup_db().await;
+        let (user_id, username) = service_user(&db).await;
+        let key = add_key(&db, user_id, KEY_A).await;
+        for listed in [
+            username.to_uppercase(),
+            format!("{username} "),
+            format!("{username}2"),
+        ] {
+            let config = exempt_config(vec![exempt_entry(&listed, &[FP_A], None)]);
+            let got = ssh_step_up_exemption(&db, &config, user_id, &username, &[key], "prod")
+                .await
+                .unwrap();
+            assert_eq!(got, StepUpExemption::NotListed, "listed as {listed:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn unit_a_key_that_is_not_listed_is_not_exempt() {
+        let db = setup_db().await;
+        let (user_id, username) = service_user(&db).await;
+        let listed = add_key(&db, user_id, KEY_A).await;
+        let config = exempt_config(vec![exempt_entry(&username, &[FP_A], None)]);
+
+        // Signing in with a key the entry does not list.
+        let other = add_key(&db, user_id, KEY_B).await;
+        let got = ssh_step_up_exemption(&db, &config, user_id, &username, &[other], "prod")
+            .await
+            .unwrap();
+        assert_eq!(
+            got,
+            StepUpExemption::Ignored(StepUpExemptionIgnored::KeyNotListed)
+        );
+
+        // A key added after the entry was written is covered by nothing, even
+        // when it signs in next to the listed one.
+        let got = ssh_step_up_exemption(&db, &config, user_id, &username, &[listed, other], "prod")
+            .await
+            .unwrap();
+        assert_eq!(
+            got,
+            StepUpExemption::Ignored(StepUpExemptionIgnored::KeyNotListed)
+        );
+
+        // The listed one alone still passes.
+        let got = ssh_step_up_exemption(&db, &config, user_id, &username, &[listed], "prod")
+            .await
+            .unwrap();
+        assert_eq!(got, StepUpExemption::Applies);
+    }
+
+    #[tokio::test]
+    async fn unit_replacing_a_listed_key_with_another_stops_the_exemption() {
+        // The admin endpoints rewrite a key row in place, keeping its id.
+        let db = setup_db().await;
+        let (user_id, username) = service_user(&db).await;
+        let key = add_key(&db, user_id, KEY_A).await;
+        let config = exempt_config(vec![exempt_entry(&username, &[FP_A], None)]);
+        entities::PublicKeyCredential::Entity::update_many()
+            .set(entities::PublicKeyCredential::ActiveModel {
+                openssh_public_key: Set(KEY_B.into()),
+                ..Default::default()
+            })
+            .filter(entities::PublicKeyCredential::Column::Id.eq(key))
+            .exec(&db)
+            .await
+            .unwrap();
+
+        let got = ssh_step_up_exemption(&db, &config, user_id, &username, &[key], "prod")
+            .await
+            .unwrap();
+        assert_eq!(
+            got,
+            StepUpExemption::Ignored(StepUpExemptionIgnored::KeyNotListed)
+        );
+    }
+
+    #[tokio::test]
+    async fn unit_no_matched_key_or_an_unreadable_one_is_not_exempt() {
+        let db = setup_db().await;
+        let (user_id, username) = service_user(&db).await;
+        let config = exempt_config(vec![exempt_entry(&username, &[FP_A], None)]);
+        let ignored = StepUpExemption::Ignored(StepUpExemptionIgnored::KeyNotListed);
+
+        let got = ssh_step_up_exemption(&db, &config, user_id, &username, &[], "prod")
+            .await
+            .unwrap();
+        assert_eq!(got, ignored, "no matched key row");
+
+        let got =
+            ssh_step_up_exemption(&db, &config, user_id, &username, &[Uuid::new_v4()], "prod")
+                .await
+                .unwrap();
+        assert_eq!(got, ignored, "key row that is gone");
+
+        let garbled = add_key(&db, user_id, "ssh-ed25519 AAAA").await;
+        let got = ssh_step_up_exemption(&db, &config, user_id, &username, &[garbled], "prod")
+            .await
+            .unwrap();
+        assert_eq!(got, ignored, "stored key that does not parse");
+
+        // Someone else's key row is not this user's key.
+        let (other_user, _) = service_user(&db).await;
+        let theirs = add_key(&db, other_user, KEY_A).await;
+        let got = ssh_step_up_exemption(&db, &config, user_id, &username, &[theirs], "prod")
+            .await
+            .unwrap();
+        assert_eq!(got, ignored, "key row of another user");
+    }
+
+    #[tokio::test]
+    async fn unit_targets_limit_where_the_exemption_applies() {
+        let db = setup_db().await;
+        let (user_id, username) = service_user(&db).await;
+        let key = add_key(&db, user_id, KEY_A).await;
+        let config = exempt_config(vec![exempt_entry(
+            &username,
+            &[FP_A],
+            Some(&["staging", "build-1"]),
+        )]);
+        let check = |target: &'static str| {
+            let (db, config, username) = (&db, &config, &username);
+            async move {
+                ssh_step_up_exemption(db, config, user_id, username, &[key], target)
+                    .await
+                    .unwrap()
+            }
+        };
+
+        assert_eq!(check("staging").await, StepUpExemption::Applies);
+        assert_eq!(check("build-1").await, StepUpExemption::Applies);
+        let refused = StepUpExemption::Ignored(StepUpExemptionIgnored::TargetNotListed);
+        assert_eq!(check("prod").await, refused);
+        assert_eq!(check("Staging").await, refused, "names are exact");
+        assert_eq!(check("staging2").await, refused);
+        assert_eq!(check("").await, refused, "no target chosen yet");
+    }
+
+    #[tokio::test]
+    async fn unit_without_targets_every_target_is_covered() {
+        let db = setup_db().await;
+        let (user_id, username) = service_user(&db).await;
+        let key = add_key(&db, user_id, KEY_A).await;
+        let config = exempt_config(vec![exempt_entry(&username, &[FP_A], None)]);
+        for target in ["prod", "staging", ""] {
+            let got = ssh_step_up_exemption(&db, &config, user_id, &username, &[key], target)
+                .await
+                .unwrap();
+            assert_eq!(got, StepUpExemption::Applies, "target {target:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn unit_two_entries_for_one_user_apply_on_their_own() {
+        let db = setup_db().await;
+        let (user_id, username) = service_user(&db).await;
+        let key_a = add_key(&db, user_id, KEY_A).await;
+        let key_b = add_key(&db, user_id, KEY_B).await;
+        let config = exempt_config(vec![
+            exempt_entry(&username, &[FP_A], Some(&["staging"])),
+            exempt_entry(&username, &[FP_B], None),
+        ]);
+        let run = |key: Uuid, target: &'static str| {
+            let (db, config, username) = (&db, &config, &username);
+            async move {
+                ssh_step_up_exemption(db, config, user_id, username, &[key], target)
+                    .await
+                    .unwrap()
+            }
+        };
+
+        assert_eq!(run(key_a, "staging").await, StepUpExemption::Applies);
+        assert_eq!(run(key_b, "prod").await, StepUpExemption::Applies);
+        assert_eq!(
+            run(key_a, "prod").await,
+            StepUpExemption::Ignored(StepUpExemptionIgnored::TargetNotListed)
+        );
+    }
+
+    #[tokio::test]
+    async fn unit_a_database_error_is_an_error_not_an_exemption() {
+        let db = setup_db().await;
+        let (user_id, username) = service_user(&db).await;
+        let key = add_key(&db, user_id, KEY_A).await;
+        let config = exempt_config(vec![exempt_entry(&username, &[FP_A], None)]);
+        db.execute_unprepared("DROP TABLE credentials_sso")
+            .await
+            .unwrap();
+
+        let got = ssh_step_up_exemption(&db, &config, user_id, &username, &[key], "prod").await;
+        assert!(got.is_err(), "{got:?}");
     }
 }

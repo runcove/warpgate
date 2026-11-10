@@ -1101,6 +1101,124 @@ pub struct StepUpIntervalConfig {
     #[serde(default, with = "humantime_serde")]
     #[schemars(with = "Option<String>")]
     pub postgres: Option<Duration>,
+
+    /// Service users whose SSH public-key sign-in skips the `ssh` step-up
+    /// check. Empty by default.
+    ///
+    /// An entry applies only while the user has no SSO and no password
+    /// credential, and only for a sign-in made with one of the entry's listed
+    /// key fingerprints (and, when `targets` is given, for one of those
+    /// targets). Anything else is checked as usual. Tickets, other protocols
+    /// and users not listed here are not affected.
+    #[serde(default, deserialize_with = "deserialize_exempt_users")]
+    pub exempt_users: Vec<StepUpExemptUser>,
+}
+
+/// One entry of `step_up_interval.exempt_users`.
+///
+/// All names are matched exactly (no wildcards, no patterns).
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StepUpExemptUser {
+    /// Exact username of the service user.
+    pub user: String,
+
+    /// OpenSSH SHA256 fingerprints (`SHA256:...`, as printed by
+    /// `ssh-keygen -lf`) of the keys the exemption covers. Required and
+    /// non-empty. A key added to the user later is not covered.
+    pub keys: Vec<String>,
+
+    /// Exact target names the exemption is limited to. When omitted the
+    /// exemption applies to every target. When given it must not be empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub targets: Option<Vec<String>>,
+}
+
+impl StepUpExemptUser {
+    /// Reject an entry that could not be matched exactly, with a message that
+    /// names the problem.
+    pub fn check(&self) -> Result<(), String> {
+        check_exact_name("user", &self.user)?;
+        if self.keys.is_empty() {
+            return Err(format!(
+                "`keys` is required for user `{}` and must list at least one SHA256 key fingerprint",
+                self.user
+            ));
+        }
+        for key in &self.keys {
+            check_sha256_fingerprint(key)?;
+        }
+        if let Some(targets) = &self.targets {
+            if targets.is_empty() {
+                return Err(format!(
+                    "`targets` for user `{}` is empty: list the target names or leave `targets` out to cover every target",
+                    self.user
+                ));
+            }
+            for target in targets {
+                check_exact_name("targets", target)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Names in `exempt_users` are compared as written, so a value that looks
+/// like a pattern (or is blank) is refused instead of being quietly taken
+/// literally.
+fn check_exact_name(field: &str, value: &str) -> Result<(), String> {
+    if value.trim().is_empty() {
+        return Err(format!("`{field}` must not be empty"));
+    }
+    if value.contains(['*', '?']) {
+        return Err(format!(
+            "`{field}` value `{value}` contains a wildcard; names must be written out exactly"
+        ));
+    }
+    Ok(())
+}
+
+/// Accepts exactly the form `ssh-keygen -lf` prints: `SHA256:` and 43
+/// unpadded base64 characters.
+fn check_sha256_fingerprint(value: &str) -> Result<(), String> {
+    use russh::keys::HashAlg;
+    use russh::keys::ssh_key::Fingerprint;
+
+    match value.parse::<Fingerprint>() {
+        Ok(fingerprint)
+            if fingerprint.algorithm() == HashAlg::Sha256 && fingerprint.to_string() == value =>
+        {
+            Ok(())
+        }
+        _ => Err(format!(
+            "`keys` value `{value}` is not an OpenSSH SHA256 fingerprint (expected `SHA256:` followed by 43 base64 characters, as printed by `ssh-keygen -lf`)"
+        )),
+    }
+}
+
+fn deserialize_exempt_users<'de, D>(deserializer: D) -> Result<Vec<StepUpExemptUser>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let entries = Vec::<StepUpExemptUser>::deserialize(deserializer)?;
+    for (index, entry) in entries.iter().enumerate() {
+        entry.check().map_err(|message| {
+            serde::de::Error::custom(format!("step_up_interval.exempt_users[{index}]: {message}"))
+        })?;
+    }
+    Ok(entries)
+}
+
+impl StepUpIntervalConfig {
+    /// The `exempt_users` entries naming exactly this user.
+    pub fn exempt_entries_for<'a>(
+        &'a self,
+        username: &'a str,
+    ) -> impl Iterator<Item = &'a StepUpExemptUser> + 'a {
+        self.exempt_users
+            .iter()
+            .filter(move |entry| entry.user == username)
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, JsonSchema)]
@@ -1235,6 +1353,24 @@ impl WarpgateConfig {
             if step_up.postgres.is_some() {
                 emit_config_warning("`step_up_interval.postgres` is accepted but currently no-ops (Postgres is password-only upstream, no SSO path).".to_owned());
             }
+            let mut seen_users = std::collections::HashSet::new();
+            for entry in &step_up.exempt_users {
+                if !seen_users.insert(entry.user.as_str()) {
+                    emit_config_warning(format!(
+                        "`step_up_interval.exempt_users` lists `{}` more than once; each entry is applied on its own.",
+                        entry.user
+                    ));
+                }
+                let mut seen_keys = std::collections::HashSet::new();
+                for key in &entry.keys {
+                    if !seen_keys.insert(key.as_str()) {
+                        emit_config_warning(format!(
+                            "`step_up_interval.exempt_users` entry for `{}` lists the key `{key}` more than once.",
+                            entry.user
+                        ));
+                    }
+                }
+            }
         }
 
         if self.store.ssh.web_auth_wait_timeout > MAX_WEB_AUTH_WAIT_TIMEOUT {
@@ -1259,8 +1395,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        HttpConfig, MAX_WEB_AUTH_WAIT_TIMEOUT, SshConfig, StepUpIntervalConfig, WarpgateConfig,
-        WarpgateConfigStore,
+        HttpConfig, MAX_WEB_AUTH_WAIT_TIMEOUT, SshConfig, StepUpExemptUser, StepUpIntervalConfig,
+        WarpgateConfig, WarpgateConfigStore,
     };
 
     #[test]
@@ -1395,6 +1531,181 @@ step_up_interval: {}
         assert!(s.kubernetes.is_none());
         assert!(s.mysql.is_none());
         assert!(s.postgres.is_none());
+    }
+
+    const KEY_A: &str = "SHA256:dCsd+OZuerpGdJl7d6JN1z8Qe4jKnWrhUHtPhQ2Ghtg";
+    const KEY_B: &str = "SHA256:AhPclk0CCWxTYKmTC3eRTLDlONSTMyVg6sOgAoV+Kwc";
+
+    fn step_up_yaml(exempt_users: &str) -> String {
+        format!("step_up_interval:\n  ssh: 12h\n  exempt_users:\n{exempt_users}")
+    }
+
+    fn parse_exempt(exempt_users: &str) -> Result<Vec<StepUpExemptUser>, String> {
+        serde_yaml::from_str::<WarpgateConfigStore>(&step_up_yaml(exempt_users))
+            .map(|store| store.step_up_interval.unwrap().exempt_users)
+            .map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn unit_step_up_exempt_users_default_is_empty() {
+        assert!(StepUpIntervalConfig::default().exempt_users.is_empty());
+        let parsed: WarpgateConfigStore =
+            serde_yaml::from_str("step_up_interval:\n  ssh: 12h\n").unwrap();
+        assert!(parsed.step_up_interval.unwrap().exempt_users.is_empty());
+        let explicit: WarpgateConfigStore =
+            serde_yaml::from_str("step_up_interval:\n  exempt_users: []\n").unwrap();
+        assert!(explicit.step_up_interval.unwrap().exempt_users.is_empty());
+    }
+
+    #[test]
+    fn unit_step_up_exempt_users_parses_a_valid_list() {
+        let users = parse_exempt(&format!(
+            "    - user: qa\n      keys: [\"{KEY_A}\"]\n    - user: ci\n      keys: [\"{KEY_A}\", \"{KEY_B}\"]\n      targets: [staging, build-1]\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            users,
+            vec![
+                StepUpExemptUser {
+                    user: "qa".into(),
+                    keys: vec![KEY_A.into()],
+                    targets: None,
+                },
+                StepUpExemptUser {
+                    user: "ci".into(),
+                    keys: vec![KEY_A.into(), KEY_B.into()],
+                    targets: Some(vec!["staging".into(), "build-1".into()]),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn unit_step_up_exempt_users_refuses_a_wildcard_user() {
+        for user in ["*", "qa*", "q?", "?"] {
+            let error = parse_exempt(&format!("    - user: \"{user}\"\n      keys: [{KEY_A}]\n"))
+                .unwrap_err();
+            assert!(error.contains("wildcard"), "{user}: {error}");
+            assert!(error.contains("exempt_users[0]"), "{user}: {error}");
+        }
+    }
+
+    #[test]
+    fn unit_step_up_exempt_users_refuses_an_empty_user() {
+        for user in ["", "   "] {
+            let error = parse_exempt(&format!("    - user: \"{user}\"\n      keys: [{KEY_A}]\n"))
+                .unwrap_err();
+            assert!(error.contains("must not be empty"), "{user:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn unit_step_up_exempt_users_refuses_missing_or_empty_keys() {
+        let missing = parse_exempt("    - user: qa\n").unwrap_err();
+        assert!(missing.contains("keys"), "{missing}");
+
+        let empty = parse_exempt("    - user: qa\n      keys: []\n").unwrap_err();
+        assert!(empty.contains("`keys` is required"), "{empty}");
+    }
+
+    #[test]
+    fn unit_step_up_exempt_users_refuses_a_malformed_fingerprint() {
+        for key in [
+            "",
+            "dCsd+OZuerpGdJl7d6JN1z8Qe4jKnWrhUHtPhQ2Ghtg",
+            "SHA256:",
+            "SHA256:dCsd+OZuerp",
+            "sha256:dCsd+OZuerpGdJl7d6JN1z8Qe4jKnWrhUHtPhQ2Ghtg",
+            "SHA256:dCsd+OZuerpGdJl7d6JN1z8Qe4jKnWrhUHtPhQ2Ghtg=",
+            "MD5:dCsd+OZuerpGdJl7d6JN1z8Qe4jKnWrhUHtPhQ2Ghtg",
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPu/YbG0OTn/9QBTFDjJBQQhHk5XIRPXKYWNHm21np1q",
+        ] {
+            let error =
+                parse_exempt(&format!("    - user: qa\n      keys: [\"{key}\"]\n")).unwrap_err();
+            assert!(
+                error.contains("not an OpenSSH SHA256 fingerprint"),
+                "{key}: {error}"
+            );
+        }
+
+        // One bad entry among good ones still refuses the whole list.
+        let error = parse_exempt(&format!(
+            "    - user: qa\n      keys: [\"{KEY_A}\", \"SHA256:nope\"]\n"
+        ))
+        .unwrap_err();
+        assert!(error.contains("SHA256:nope"), "{error}");
+    }
+
+    #[test]
+    fn unit_step_up_exempt_users_refuses_bad_targets_and_unknown_keys() {
+        let empty = parse_exempt(&format!(
+            "    - user: qa\n      keys: [{KEY_A}]\n      targets: []\n"
+        ))
+        .unwrap_err();
+        assert!(empty.contains("`targets`"), "{empty}");
+
+        let wildcard = parse_exempt(&format!(
+            "    - user: qa\n      keys: [{KEY_A}]\n      targets: [\"stag*\"]\n"
+        ))
+        .unwrap_err();
+        assert!(wildcard.contains("wildcard"), "{wildcard}");
+
+        // A misspelt `targets` must not silently widen the exemption.
+        let typo = parse_exempt(&format!(
+            "    - user: qa\n      keys: [{KEY_A}]\n      target: [staging]\n"
+        ))
+        .unwrap_err();
+        assert!(typo.contains("unknown field `target`"), "{typo}");
+    }
+
+    #[test]
+    fn unit_step_up_exempt_users_warns_on_a_duplicate() {
+        let user = format!("dup-{}", uuid::Uuid::new_v4());
+        let entry = StepUpExemptUser {
+            user: user.clone(),
+            keys: vec![KEY_A.into(), KEY_A.into()],
+            targets: None,
+        };
+        let mut config = WarpgateConfig {
+            store: WarpgateConfigStore {
+                step_up_interval: Some(StepUpIntervalConfig {
+                    exempt_users: vec![entry.clone(), entry],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        };
+        config.validate();
+
+        let warnings = super::warnings();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains(&format!("lists `{user}` more than once"))),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains(&format!("entry for `{user}` lists the key"))),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn unit_step_up_exempt_entries_match_the_exact_username_only() {
+        let config = StepUpIntervalConfig {
+            exempt_users: vec![StepUpExemptUser {
+                user: "qa".into(),
+                keys: vec![KEY_A.into()],
+                targets: None,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(config.exempt_entries_for("qa").count(), 1);
+        assert_eq!(config.exempt_entries_for("QA").count(), 0);
+        assert_eq!(config.exempt_entries_for("qa2").count(), 0);
+        assert_eq!(config.exempt_entries_for("").count(), 0);
     }
 
     #[test]

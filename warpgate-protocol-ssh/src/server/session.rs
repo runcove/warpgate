@@ -36,7 +36,8 @@ use warpgate_common::{
 use warpgate_common_http::ext::{construct_control_plane_url, construct_external_url};
 use warpgate_core::approvals::{GateOutcome, GatedConnection};
 use warpgate_core::auth::step_up::{
-    StepUpWindow, get_pubkey_last_sso_at, is_fresh, step_up_window, update_pubkey_last_sso_at,
+    StepUpWindow, get_pubkey_last_sso_at, is_fresh, ssh_step_up_exemption, step_up_window,
+    update_pubkey_last_sso_at,
 };
 use warpgate_core::auth::submit_credential;
 use warpgate_core::login_protection::FailedAttemptInfo;
@@ -1178,8 +1179,9 @@ impl ServerSession {
                 };
                 // The idle deadline is last real activity + timeout and moves
                 // only on a real event, so a step-up recheck never restarts it.
-                let idle_wait = inactivity_timeout
-                    .map(|timeout| (idle_since + timeout).saturating_duration_since(Instant::now()));
+                let idle_wait = inactivity_timeout.map(|timeout| {
+                    (idle_since + timeout).saturating_duration_since(Instant::now())
+                });
                 let step_up_wait = this
                     .step_up_recheck
                     .map(|at| at.saturating_duration_since(Instant::now()));
@@ -1287,9 +1289,8 @@ impl ServerSession {
                     .ok()
                     .and_then(|left| now.checked_add(left));
                 // Capped so a config change or a fresh SSO is seen promptly.
-                self.step_up_recheck = Some(
-                    Instant::now() + left.clamp(STEP_UP_RECHECK_MIN, STEP_UP_RECHECK_MAX),
-                );
+                self.step_up_recheck =
+                    Some(Instant::now() + left.clamp(STEP_UP_RECHECK_MIN, STEP_UP_RECHECK_MAX));
                 false
             }
         }
@@ -3822,17 +3823,39 @@ impl ServerSession {
                         let approval_was_bypassed = state.web_approval_from_grace_bypass();
                         drop(state);
 
-                        let step_up_ssh = {
+                        let step_up_config = {
                             let cfg = self.services.config.lock().await;
-                            cfg.store.step_up_interval.as_ref().and_then(|s| s.ssh)
+                            cfg.store.step_up_interval.clone()
                         };
-                        if let Some(interval) = step_up_ssh {
+                        let step_up_ssh = step_up_config.as_ref().and_then(|s| s.ssh);
+                        // Set when `step_up_interval.exempt_users` lets this
+                        // key sign-in skip the check below.
+                        let mut step_up_exempt = false;
+                        if let (Some(interval), Some(step_up_config)) =
+                            (step_up_ssh, step_up_config.as_ref())
+                        {
                             let has_stepup = web_approval_proves_step_up(
                                 valid_kinds.contains(&CredentialKind::WebUserApproval),
                                 approval_was_bypassed,
                             );
                             let pubkey_used = valid_kinds.contains(&CredentialKind::PublicKey);
-                            if pubkey_used && !has_stepup {
+                            // The exemption is looked at only for a key
+                            // sign-in that would otherwise face the check; it
+                            // reads the user's credentials from the database
+                            // and logs its outcome.
+                            step_up_exempt = pubkey_used
+                                && !has_stepup
+                                && ssh_step_up_exemption(
+                                    &self.services.db,
+                                    step_up_config,
+                                    user_info.id,
+                                    &user_info.username,
+                                    &matched_pubkey_ids,
+                                    &resolved_target_name,
+                                )
+                                .await?
+                                .applies();
+                            if pubkey_used && !has_stepup && !step_up_exempt {
                                 // Every matched key must be fresh; no matched
                                 // key at all is stale.
                                 let mut all_fresh = !matched_pubkey_ids.is_empty();
@@ -3895,7 +3918,10 @@ impl ServerSession {
                         // Every key login is tracked, so step-up switched on
                         // later still applies; the check does nothing while
                         // step-up is off.
-                        if valid_kinds.contains(&CredentialKind::PublicKey) {
+                        //
+                        // An exempt sign-in is not tracked: the connection has
+                        // no SSO stamp to expire against.
+                        if valid_kinds.contains(&CredentialKind::PublicKey) && !step_up_exempt {
                             self.step_up_pubkeys = Some(matched_pubkey_ids.clone());
                             self.step_up_recheck = Some(Instant::now());
                         }
