@@ -4677,6 +4677,13 @@ impl ServerSession {
                             // it returns are kept to end the connection if a
                             // reload stops listing it or a key changes.
                             if pubkey_used && !has_stepup {
+                                // Deliberate defence in depth: the exemption
+                                // check re-verifies the same condition inside
+                                // `presented_keys_match_rows` (step_up.rs).
+                                // This gate is unit-tested only as a pure
+                                // function; the e2e test
+                                // `tests/test_ssh_step_up_exempt_users.py`
+                                // covers its wiring here.
                                 if !presented_keys_recorded(
                                     &matched_pubkey_ids,
                                     &self.authenticated_pubkeys,
