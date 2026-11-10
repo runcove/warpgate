@@ -206,43 +206,47 @@ pub async fn ssh_step_up_exemption(
         return Ok(StepUpExemption::NotListed);
     }
 
-    let outcome =
-        match listed_user_outcome(db, &entries, user_id, matched_pubkey_ids, target_name).await? {
-            None => StepUpExemption::Applies,
-            Some(ignored) => StepUpExemption::Ignored(ignored),
-        };
-
-    match outcome {
-        StepUpExemption::Applies => {
-            info!(username = %username, "SSH sign-in allowed by step-up exemption");
+    match listed_user_outcome(db, &entries, user_id, matched_pubkey_ids, target_name).await? {
+        Ok(fingerprints) => {
+            let target = if target_name.is_empty() {
+                "unknown"
+            } else {
+                target_name
+            };
+            info!(
+                username = %username,
+                key_fingerprint = %fingerprints.join(","),
+                target = %target,
+                "SSH sign-in allowed by step-up exemption"
+            );
+            Ok(StepUpExemption::Applies)
         }
-        StepUpExemption::Ignored(ignored) => {
+        Err(ignored) => {
             warn!(
                 username = %username,
                 "step-up exemption ignored: {}",
                 ignored.reason()
             );
+            Ok(StepUpExemption::Ignored(ignored))
         }
-        StepUpExemption::NotListed => {}
     }
-    Ok(outcome)
 }
 
-/// `None` when the exemption applies, otherwise why not.
+/// The sign-in key fingerprints when the exemption applies, otherwise why not.
 async fn listed_user_outcome(
     db: &DatabaseConnection,
     entries: &[&StepUpExemptUser],
     user_id: Uuid,
     matched_pubkey_ids: &[Uuid],
     target_name: &str,
-) -> Result<Option<StepUpExemptionIgnored>, WarpgateError> {
+) -> Result<Result<Vec<String>, StepUpExemptionIgnored>, WarpgateError> {
     if entities::SsoCredential::Entity::find()
         .filter(entities::SsoCredential::Column::UserId.eq(user_id))
         .one(db)
         .await?
         .is_some()
     {
-        return Ok(Some(StepUpExemptionIgnored::HasSsoCredential));
+        return Ok(Err(StepUpExemptionIgnored::HasSsoCredential));
     }
     if entities::PasswordCredential::Entity::find()
         .filter(entities::PasswordCredential::Column::UserId.eq(user_id))
@@ -250,19 +254,19 @@ async fn listed_user_outcome(
         .await?
         .is_some()
     {
-        return Ok(Some(StepUpExemptionIgnored::HasPasswordCredential));
+        return Ok(Err(StepUpExemptionIgnored::HasPasswordCredential));
     }
 
     let Some(fingerprints) = matched_key_fingerprints(db, user_id, matched_pubkey_ids).await?
     else {
-        return Ok(Some(StepUpExemptionIgnored::KeyNotListed));
+        return Ok(Err(StepUpExemptionIgnored::KeyNotListed));
     };
     let covering_keys: Vec<&&StepUpExemptUser> = entries
         .iter()
         .filter(|entry| fingerprints.iter().all(|fp| entry.keys.contains(fp)))
         .collect();
     if covering_keys.is_empty() {
-        return Ok(Some(StepUpExemptionIgnored::KeyNotListed));
+        return Ok(Err(StepUpExemptionIgnored::KeyNotListed));
     }
     if covering_keys.iter().any(|entry| {
         entry
@@ -270,9 +274,9 @@ async fn listed_user_outcome(
             .as_ref()
             .is_none_or(|targets| targets.iter().any(|t| t == target_name))
     }) {
-        Ok(None)
+        Ok(Ok(fingerprints))
     } else {
-        Ok(Some(StepUpExemptionIgnored::TargetNotListed))
+        Ok(Err(StepUpExemptionIgnored::TargetNotListed))
     }
 }
 
@@ -418,10 +422,7 @@ mod tests {
             StepUpWindow::Remaining(hours(10))
         );
         // Shorter interval: the same connection is now past its window.
-        assert_eq!(
-            step_up_window(last, Some(hours(1)), now),
-            StepUpWindow::Expired
-        );
+        assert_eq!(step_up_window(last, Some(hours(1)), now), StepUpWindow::Expired);
         // Longer interval extends it; removing it cancels the limit.
         assert_eq!(
             step_up_window(last, Some(hours(24)), now),
@@ -665,6 +666,11 @@ mod tests {
             message_of(&logged[0]).contains("step-up exemption"),
             "{logged:?}"
         );
+        assert_eq!(
+            logged[0].get("key_fingerprint").map(String::as_str),
+            Some(FP_A)
+        );
+        assert_eq!(logged[0].get("target").map(String::as_str), Some("prod"));
     }
 
     #[tokio::test]
