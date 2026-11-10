@@ -93,10 +93,7 @@ impl SessionChannel {
 }
 
 impl TargetWriter for ChannelWriteHalf<Msg> {
-    async fn apply(
-        &self,
-        operation: ChannelOperation,
-    ) -> Result<ControlFlow<()>, SshClientError> {
+    async fn apply(&self, operation: ChannelOperation) -> Result<ControlFlow<()>, SshClientError> {
         match operation {
             ChannelOperation::Data(data) => {
                 self.data(&*data).await?;
@@ -226,9 +223,7 @@ async fn forward_target_events(
                     .await
                     .map_err(|_| SshClientError::MpscError)?;
             }
-            Some(
-                russh::ChannelMsg::WindowAdjusted { .. } | russh::ChannelMsg::XonXoff { .. },
-            ) => {}
+            Some(russh::ChannelMsg::WindowAdjusted { .. } | russh::ChannelMsg::XonXoff { .. }) => {}
             Some(russh::ChannelMsg::ExtendedData { data, ext }) => {
                 let data: &[u8] = &data;
                 events_tx

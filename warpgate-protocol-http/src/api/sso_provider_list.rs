@@ -624,9 +624,10 @@ impl Api {
         .await?;
 
         if !outcome.is_valid() {
-            return Ok(Err(
-                rejected_credential_failure(services, client_ip, &username, &return_to).await,
-            ));
+            return Ok(Err(rejected_credential_failure(
+                services, client_ip, &username, &return_to,
+            )
+            .await));
         }
 
         // Stored before any remaining factor so back-channel logout and SLO

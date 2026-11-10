@@ -641,8 +641,7 @@ impl RemoteClient {
         let (pipe, rx, abort) = ChannelPipe::new();
         self.channel_pipes.lock().await.insert(id, pipe);
 
-        let session_channel =
-            SessionChannel::new(channel, id, rx, abort, self.tx.clone(), self.id);
+        let session_channel = SessionChannel::new(channel, id, rx, abort, self.tx.clone(), self.id);
 
         self.child_tasks.push(
             tokio::task::Builder::new()

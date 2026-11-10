@@ -83,7 +83,10 @@ where
         match receiver.recv().await {
             Ok(log_entry) => store(log_entry).await,
             Err(RecvError::Lagged(skipped)) => {
-                warn!(skipped, "Database logger fell behind, log entries were dropped");
+                warn!(
+                    skipped,
+                    "Database logger fell behind, log entries were dropped"
+                );
             }
             Err(RecvError::Closed) => break,
         }

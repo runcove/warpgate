@@ -188,7 +188,10 @@ mod tests {
 
         let task = tokio::spawn(work);
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        assert!(!task.is_finished(), "the delete must wait for the write lock");
+        assert!(
+            !task.is_finished(),
+            "the delete must wait for the write lock"
+        );
 
         sea_orm::sqlx::query("COMMIT")
             .execute(&mut *holder)

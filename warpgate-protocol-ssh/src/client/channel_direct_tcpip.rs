@@ -32,10 +32,7 @@ struct DirectTCPIPWriter {
 }
 
 impl TargetWriter for DirectTCPIPWriter {
-    async fn apply(
-        &self,
-        operation: ChannelOperation,
-    ) -> Result<ControlFlow<()>, SshClientError> {
+    async fn apply(&self, operation: ChannelOperation) -> Result<ControlFlow<()>, SshClientError> {
         match operation {
             ChannelOperation::Data(data) => {
                 self.write_half.data(&*data).await?;

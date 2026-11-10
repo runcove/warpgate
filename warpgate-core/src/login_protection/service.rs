@@ -350,8 +350,7 @@ impl LoginProtectionService {
                 .count(&txn)
                 .await?;
             if ip_count >= u64::from(config.ip_rate_limit.max_attempts) {
-                new_block =
-                    Self::create_or_update_ip_block(&txn, &remote_ip, now, &config).await?;
+                new_block = Self::create_or_update_ip_block(&txn, &remote_ip, now, &config).await?;
             }
         }
 

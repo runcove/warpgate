@@ -68,7 +68,10 @@ pub async fn delete<C: ConnectionTrait + TransactionTrait>(
     // locks next, which is not the order they are locked in today.
     if db.get_database_backend() == DbBackend::Sqlite {
         TargetGroup::Entity::update_many()
-            .col_expr(TargetGroup::Column::Id, Expr::col(TargetGroup::Column::Id).into())
+            .col_expr(
+                TargetGroup::Column::Id,
+                Expr::col(TargetGroup::Column::Id).into(),
+            )
             .filter(TargetGroup::Column::Id.eq(id))
             .exec(&txn)
             .await?;

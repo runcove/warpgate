@@ -2496,10 +2496,16 @@ mod ticket_deletion {
         let ids: Vec<UserSessionId> = (0..20_000).map(|_| UserSessionId(Uuid::new_v4())).collect();
 
         PendingSessionClose::mark(&db, &ids).await.unwrap();
-        assert_eq!(PendingSessionClose::pending(&db).await.unwrap().len(), 20_000);
+        assert_eq!(
+            PendingSessionClose::pending(&db).await.unwrap().len(),
+            20_000
+        );
 
         PendingSessionClose::mark(&db, &ids[5_000..]).await.unwrap();
-        assert_eq!(PendingSessionClose::pending(&db).await.unwrap().len(), 20_000);
+        assert_eq!(
+            PendingSessionClose::pending(&db).await.unwrap().len(),
+            20_000
+        );
     }
 
     /// A session under a ticket that still exists is not touched by a sweep,
@@ -2632,16 +2638,12 @@ mod ticket_deletion {
             };
 
             let opened = if round % 2 == 0 {
-                let (opened, ()) = tokio::join!(
-                    open_under_ticket(&db, session, ticket_id),
-                    delete_target,
-                );
+                let (opened, ()) =
+                    tokio::join!(open_under_ticket(&db, session, ticket_id), delete_target,);
                 opened
             } else {
-                let ((), opened) = tokio::join!(
-                    delete_target,
-                    open_under_ticket(&db, session, ticket_id),
-                );
+                let ((), opened) =
+                    tokio::join!(delete_target, open_under_ticket(&db, session, ticket_id),);
                 opened
             };
 

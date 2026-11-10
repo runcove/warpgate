@@ -22,8 +22,8 @@ impl MigrationTrait for Migration {
 #[cfg(all(test, feature = "sqlite"))]
 mod tests {
     use sea_orm::{ConnectionTrait, Database, Statement};
-    use sea_orm_migration::{MigrationName, MigratorTrait};
     use sea_orm_migration::prelude::{Alias, Query};
+    use sea_orm_migration::{MigrationName, MigratorTrait};
     use uuid::Uuid;
     use warpgate_db_entities::Parameters::{ConfigMigrationValues, set_config_migration_values};
 
