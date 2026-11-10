@@ -238,7 +238,10 @@ enum CloseStage {
 /// retryable, and again once it is committed, so a login admitted under the
 /// old ranges in between is closed too. A failure of the second close cannot
 /// be retried by the admin (the edit is saved), so it is queued for the
-/// expiry sweep and the update succeeds.
+/// expiry sweep and the update succeeds. If it cannot be queued in the
+/// database either, a restart would forget it, so the update returns that
+/// error; the user is still queued in memory, so a repeat of the edit closes
+/// the sessions first while this process runs.
 ///
 /// `close` runs the close for a stage; it is a parameter so tests can make a
 /// chosen stage fail.
@@ -254,8 +257,9 @@ where
     Fut: std::future::Future<Output = Result<(), WarpgateError>>,
 {
     let user_id = user.id;
-    // A repeat of an edit whose follow-up close could not even be queued
-    // closes now, whether or not the stored ranges already match.
+    // A repeat of an edit whose follow-up close is still queued (in memory or
+    // recorded, or whose record cannot be read) closes now, whether or not
+    // the stored ranges already match.
     let close_needed = allowed_ranges_changed(&user.allowed_ip_ranges, parsed_ranges.as_deref())
         || services.user_close_pending(user_id).await;
 
@@ -282,23 +286,26 @@ where
     let user = model.update(&services.db).await?;
 
     if close_needed {
-        queue_if_close_failed(services, user_id, close(CloseStage::AfterWrite).await).await;
+        queue_if_close_failed(services, user_id, close(CloseStage::AfterWrite).await).await?;
     }
 
     Ok(user)
 }
 
 /// A close that follows a committed change cannot be retried by the admin, so
-/// its failure is queued for the expiry sweep instead of being reported.
+/// its failure is queued for the expiry sweep instead of being reported. If
+/// the queueing fails too, that error is returned: the close would be lost
+/// by a restart, and the request must not report success for it.
 async fn queue_if_close_failed(
     services: &warpgate_core::Services,
     user_id: Uuid,
     result: Result<(), WarpgateError>,
-) {
+) -> Result<(), WarpgateError> {
     if let Err(error) = result {
         tracing::warn!(%error, %user_id, "Could not close the user's sessions after saving a change; retrying on the next sweep");
-        services.queue_user_session_closes(user_id).await;
+        services.queue_user_session_closes(user_id).await?;
     }
+    Ok(())
 }
 
 /// Deletes the user's records, then closes the sessions. `close` closes the
@@ -321,10 +328,13 @@ where
     // own sessions are closed again now that the delete is final. Both
     // closes are attempted even if one fails. The user's own close cannot be
     // retried by the admin (the user is gone), so its failure is queued for
-    // the expiry sweep; a failure to close the admitted sessions is returned.
+    // the expiry sweep; a failure to close the admitted sessions is returned,
+    // and so is a failure to queue the user's close.
     let admitted_result = services.close_admitted_sessions(admitted).await;
-    queue_if_close_failed(services, user_id, close(CloseStage::AfterWrite).await).await;
-    admitted_result
+    let queued =
+        queue_if_close_failed(services, user_id, close(CloseStage::AfterWrite).await).await;
+    admitted_result?;
+    queued
 }
 
 /// Whether another account already uses this username, compared case-insensitively.
@@ -1905,8 +1915,7 @@ mod tests {
     }
 
     /// The after-write close fails and the database cannot take the record of
-    /// it: the update still succeeds and the in-memory entry lets the sweep end
-    /// the user's session.
+    /// it: the in-memory entry still lets the sweep end the user's session.
     #[tokio::test]
     async fn a_failed_queue_write_falls_back_to_the_in_memory_entry() {
         let db = setup_db().await;
@@ -1926,7 +1935,7 @@ mod tests {
         )
         .await;
 
-        result.unwrap();
+        assert!(result.is_err());
         let session = late.unwrap();
         assert!(!session_ended(&db, session).await);
         assert_eq!(services.pending_revocations.user_closes_len(), 1);
@@ -1937,6 +1946,98 @@ mod tests {
         assert_eq!(services.pending_revocations.user_closes_len(), 0);
     }
 
+    /// The after-write close fails and so does the write of its record: a
+    /// restart would forget the close, so the update returns the database
+    /// error instead of reporting success. The edit itself is already saved.
+    #[tokio::test]
+    async fn an_update_whose_close_cannot_be_queued_returns_an_error() {
+        let db = setup_db().await;
+        let services = services(&db).await;
+        let alice = insert_user(&db, "alice").await;
+        db.execute_unprepared("DROP TABLE pending_user_closes")
+            .await
+            .unwrap();
+
+        let (result, stages, _) = save_failing_close(
+            &services,
+            alice.clone(),
+            &edit("alice", Some(&["10.0.0.0/8"])),
+            CloseStage::AfterWrite,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(WarpgateError::DatabaseError(_))),
+            "expected the database error of the queue write"
+        );
+        assert_eq!(
+            stages,
+            vec![CloseStage::BeforeWrite, CloseStage::AfterWrite]
+        );
+        let stored = User::Entity::find_by_id(alice.id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.allowed_ip_ranges, serde_json::json!(["10.0.0.0/8"]));
+    }
+
+    /// A delete whose after-commit close fails and cannot be queued returns the
+    /// database error too, though the user is already gone.
+    #[tokio::test]
+    async fn a_delete_whose_close_cannot_be_queued_returns_an_error() {
+        let db = setup_db().await;
+        let services = services(&db).await;
+        let alice = insert_user(&db, "alice").await;
+        db.execute_unprepared("DROP TABLE pending_user_closes")
+            .await
+            .unwrap();
+
+        let result = delete_user_and_close(&services, alice.clone(), |stage| async move {
+            match stage {
+                CloseStage::BeforeWrite => Ok(()),
+                CloseStage::AfterWrite => {
+                    Err(WarpgateError::InvalidNetworkAddress("injected".into()))
+                }
+            }
+        })
+        .await;
+
+        assert!(
+            matches!(result, Err(WarpgateError::DatabaseError(_))),
+            "expected the database error of the queue write"
+        );
+        assert!(
+            User::Entity::find_by_id(alice.id)
+                .one(&db)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(services.pending_revocations.user_closes_len(), 1);
+    }
+
+    /// A restart leaves an empty in-memory queue, and the queue in the database
+    /// cannot be read: the close still counts as pending, so a repeat of an
+    /// edit that leaves the ranges as they are closes the user's session.
+    #[tokio::test]
+    async fn an_unreadable_queue_counts_as_pending_after_a_restart() {
+        let db = setup_db().await;
+        let services = services(&db).await;
+        let alice = insert_user(&db, "alice").await;
+        let session = open_session_of(&db, &alice).await;
+        assert!(!services.user_close_pending(alice.id).await);
+
+        db.execute_unprepared("DROP TABLE pending_user_closes")
+            .await
+            .unwrap();
+        assert_eq!(services.pending_revocations.user_closes_len(), 0);
+        assert!(services.user_close_pending(alice.id).await);
+
+        save(&services, alice, &edit("alice", None)).await.unwrap();
+        assert!(session_ended(&db, session).await);
+    }
+
     /// A restart loses the in-memory queue; the recorded row still lets the
     /// next process's sweep end the user's session.
     #[tokio::test]
@@ -1945,7 +2046,7 @@ mod tests {
         let before = services(&db).await;
         let alice = insert_user(&db, "alice").await;
         let session = open_session_of(&db, &alice).await;
-        before.queue_user_session_closes(alice.id).await;
+        before.queue_user_session_closes(alice.id).await.unwrap();
         drop(before);
 
         let after = services(&db).await;
@@ -2019,8 +2120,8 @@ mod tests {
         assert!(PendingUserClose::pending(&db).await.unwrap().is_empty());
     }
 
-    /// Repeating an edit whose close could not be queued closes the user's
-    /// sessions even though the stored ranges already match.
+    /// Repeating an edit whose close could only be queued in memory closes the
+    /// user's sessions even though the stored ranges already match.
     #[tokio::test]
     async fn a_repeated_update_forces_the_close_that_was_never_queued() {
         let db = setup_db().await;
@@ -2037,7 +2138,12 @@ mod tests {
             CloseStage::AfterWrite,
         )
         .await;
-        let saved = result.unwrap();
+        assert!(result.is_err());
+        let saved = User::Entity::find_by_id(alice.id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
         let session = late.unwrap();
         assert!(services.user_close_pending(alice.id).await);
 

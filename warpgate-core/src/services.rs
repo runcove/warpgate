@@ -105,17 +105,25 @@ impl Services {
     /// Queues a close of all of a user's open sessions for the expiry sweep,
     /// for when the close that follows a saved change failed. The record names
     /// the user, so no lookup of the sessions is needed and one opened later is
-    /// closed too. It is also kept in memory, so the sweep in this process still
-    /// acts if the database write fails.
-    pub async fn queue_user_session_closes(&self, user_id: Uuid) {
-        if let Err(error) = PendingUserClose::mark(&self.db, user_id).await {
-            error!(%error, %user_id, "Could not record the user whose sessions are waiting to be closed; queued in memory only, so repeat the change to retry it");
-        }
+    /// closed too.
+    ///
+    /// The user is always kept in memory too, so the sweep in this process acts
+    /// even if the database write fails. That write's error is returned all the
+    /// same: without the record a restart forgets the close, so the caller must
+    /// not report success for it.
+    pub async fn queue_user_session_closes(&self, user_id: Uuid) -> Result<(), WarpgateError> {
         self.pending_revocations.push_user_close(user_id);
+        PendingUserClose::mark(&self.db, user_id)
+            .await
+            .map_err(|error| {
+                error!(%error, %user_id, "Could not queue the close of the user's sessions");
+                error
+            })
     }
 
-    /// Whether a close of all of this user's sessions is still queued, in
-    /// memory or in the database.
+    /// Whether a close of all of this user's sessions may still be queued, in
+    /// memory or in the database. A queue that cannot be read counts as
+    /// pending, so an unreadable queue never lets a close be skipped.
     pub async fn user_close_pending(&self, user_id: Uuid) -> bool {
         if self.pending_revocations.has_user_close(user_id) {
             return true;
@@ -123,8 +131,8 @@ impl Services {
         PendingUserClose::is_pending(&self.db, user_id)
             .await
             .unwrap_or_else(|error| {
-                warn!(%error, %user_id, "Could not read the queue of users whose sessions are waiting to be closed");
-                false
+                warn!(%error, %user_id, "Could not read the queue of users whose sessions are waiting to be closed; treating this user's close as pending");
+                true
             })
     }
 
