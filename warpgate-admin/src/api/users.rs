@@ -14,6 +14,7 @@ use warpgate_common::{
     UserRequireCredentialsPolicy, WarpgateError,
 };
 use warpgate_common_http::errors::{bad_request, invalid_field};
+use warpgate_common_http::logging::get_client_ip_addr;
 use warpgate_core::logging::{AuditEvent, format_related_ids};
 use warpgate_core::resources::AdmittedSessions;
 use warpgate_core::{AccessChange, SessionsFilter};
@@ -393,7 +394,7 @@ impl DetailApi {
         if user.id == admin.auth.user_id()
             && edit_locks_out_caller(
                 parsed_ranges.as_deref(),
-                admin.trusted_client_ip(req).and_then(|ip| ip.parse().ok()),
+                get_client_ip_addr(req, admin.services()).await,
             )
         {
             return Ok(UpdateUserResponse::BadRequest(invalid_field(
