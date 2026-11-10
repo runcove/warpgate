@@ -924,6 +924,11 @@
       "description": "Per-protocol step-up SSO re-auth intervals.\n\nWhen set for a given protocol, the protocol handler consults a freshness\nstamp (e.g. `credentials_public_key.last_sso_at` for SSH pubkey) and, if\nthe last step-up is older than the interval (or never happened), forces\na `WebUserApproval` / SSO handshake before granting the session.\n\nLeaving a field as `None` disables the step-up gate for that protocol -\nexisting auth behaviour is unchanged. The Kubernetes, MySQL and Postgres\nfields are accepted so an existing config keeps parsing, but they no-op\nand warn at load time.",
       "type": "object",
       "properties": {
+        "exempt_max_session": {
+          "description": "Longest an SSH connection admitted through `exempt_users` stays open\n(default 4h). The connection is ended when this passes, and sooner if\na config reload no longer lists its user, key or target. Must not be\nzero.",
+          "type": "string",
+          "default": "4h"
+        },
         "exempt_users": {
           "description": "Service users whose SSH public-key sign-in skips the `ssh` step-up\ncheck. Empty by default.\n\nAn entry applies only while the user has no SSO and no password\ncredential, and only for a sign-in made with one of the entry's listed\nkey fingerprints (and, when `targets` is given, for one of those\ntargets). Anything else is checked as usual. Tickets, other protocols\nand users not listed here are not affected.",
           "type": "array",

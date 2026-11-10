@@ -1060,7 +1060,7 @@ impl Default for LogConfig {
 /// existing auth behaviour is unchanged. The Kubernetes, MySQL and Postgres
 /// fields are accepted so an existing config keeps parsing, but they no-op
 /// and warn at load time.
-#[derive(Debug, Deserialize, Serialize, Clone, Default, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, Clone, JsonSchema)]
 pub struct StepUpIntervalConfig {
     /// Per-pubkey step-up interval for SSH (`credentials_public_key.last_sso_at`).
     ///
@@ -1112,6 +1112,34 @@ pub struct StepUpIntervalConfig {
     /// and users not listed here are not affected.
     #[serde(default, deserialize_with = "deserialize_exempt_users")]
     pub exempt_users: Vec<StepUpExemptUser>,
+
+    /// Longest an SSH connection admitted through `exempt_users` stays open
+    /// (default 4h). The connection is ended when this passes, and sooner if
+    /// a config reload no longer lists its user, key or target. Must not be
+    /// zero.
+    #[serde(default = "default_exempt_max_session", with = "humantime_serde")]
+    #[schemars(with = "String")]
+    pub exempt_max_session: Duration,
+}
+
+pub const DEFAULT_EXEMPT_MAX_SESSION: Duration = Duration::from_secs(4 * 60 * 60);
+
+const fn default_exempt_max_session() -> Duration {
+    DEFAULT_EXEMPT_MAX_SESSION
+}
+
+impl Default for StepUpIntervalConfig {
+    fn default() -> Self {
+        Self {
+            ssh: None,
+            http: None,
+            kubernetes: None,
+            mysql: None,
+            postgres: None,
+            exempt_users: Vec::new(),
+            exempt_max_session: DEFAULT_EXEMPT_MAX_SESSION,
+        }
+    }
 }
 
 /// One entry of `step_up_interval.exempt_users`.
@@ -1353,6 +1381,9 @@ impl WarpgateConfig {
             if step_up.postgres.is_some() {
                 emit_config_warning("`step_up_interval.postgres` is accepted but currently no-ops (Postgres is password-only upstream, no SSO path).".to_owned());
             }
+            if step_up.exempt_max_session.is_zero() {
+                emit_config_warning("`step_up_interval.exempt_max_session` is zero: every connection admitted through `exempt_users` is ended straight away.".to_owned());
+            }
             let mut seen_users = std::collections::HashSet::new();
             for entry in &step_up.exempt_users {
                 if !seen_users.insert(entry.user.as_str()) {
@@ -1555,6 +1586,26 @@ step_up_interval: {}
         let explicit: WarpgateConfigStore =
             serde_yaml::from_str("step_up_interval:\n  exempt_users: []\n").unwrap();
         assert!(explicit.step_up_interval.unwrap().exempt_users.is_empty());
+    }
+
+    #[test]
+    fn unit_step_up_exempt_max_session_defaults_to_four_hours_and_parses() {
+        assert_eq!(
+            StepUpIntervalConfig::default().exempt_max_session,
+            Duration::from_secs(4 * 3600)
+        );
+        let parsed: WarpgateConfigStore =
+            serde_yaml::from_str("step_up_interval:\n  ssh: 12h\n").unwrap();
+        assert_eq!(
+            parsed.step_up_interval.unwrap().exempt_max_session,
+            Duration::from_secs(4 * 3600)
+        );
+        let parsed: WarpgateConfigStore =
+            serde_yaml::from_str("step_up_interval:\n  exempt_max_session: 30m\n").unwrap();
+        assert_eq!(
+            parsed.step_up_interval.unwrap().exempt_max_session,
+            Duration::from_secs(1800)
+        );
     }
 
     #[test]
