@@ -1115,14 +1115,17 @@ pub struct StepUpIntervalConfig {
 
     /// Longest an SSH connection admitted through `exempt_users` stays open
     /// (default 4h). The connection is ended when this passes, and sooner if
-    /// a config reload no longer lists its user, key or target. Must not be
-    /// zero.
+    /// a config reload no longer lists its user, key or target. Must be
+    /// greater than zero and at most 24h; any other value is refused when the
+    /// config is loaded (a reload with such a value leaves the running config
+    /// in place).
     #[serde(default = "default_exempt_max_session", with = "humantime_serde")]
     #[schemars(with = "String")]
     pub exempt_max_session: Duration,
 }
 
 pub const DEFAULT_EXEMPT_MAX_SESSION: Duration = Duration::from_secs(4 * 60 * 60);
+pub const MAX_EXEMPT_MAX_SESSION: Duration = Duration::from_secs(24 * 60 * 60);
 
 const fn default_exempt_max_session() -> Duration {
     DEFAULT_EXEMPT_MAX_SESSION
@@ -1238,6 +1241,23 @@ where
 }
 
 impl StepUpIntervalConfig {
+    /// Refuse an `exempt_max_session` of zero or above 24h. An error here
+    /// stops start-up, and a reload keeps the running config.
+    pub fn check_exempt_max_session(&self) -> anyhow::Result<()> {
+        if self.exempt_max_session.is_zero() {
+            anyhow::bail!(
+                "`step_up_interval.exempt_max_session` must be greater than zero (default 4h, at most 24h)"
+            );
+        }
+        if self.exempt_max_session > MAX_EXEMPT_MAX_SESSION {
+            anyhow::bail!(
+                "`step_up_interval.exempt_max_session` ({:?}) is above the 24h maximum",
+                self.exempt_max_session
+            );
+        }
+        Ok(())
+    }
+
     /// The `exempt_users` entries naming exactly this user.
     pub fn exempt_entries_for<'a>(
         &'a self,
@@ -1380,9 +1400,6 @@ impl WarpgateConfig {
             }
             if step_up.postgres.is_some() {
                 emit_config_warning("`step_up_interval.postgres` is accepted but currently no-ops (Postgres is password-only upstream, no SSO path).".to_owned());
-            }
-            if step_up.exempt_max_session.is_zero() {
-                emit_config_warning("`step_up_interval.exempt_max_session` is zero: every connection admitted through `exempt_users` is ended straight away.".to_owned());
             }
             let mut seen_users = std::collections::HashSet::new();
             for entry in &step_up.exempt_users {
@@ -1605,6 +1622,35 @@ step_up_interval: {}
         assert_eq!(
             parsed.step_up_interval.unwrap().exempt_max_session,
             Duration::from_secs(1800)
+        );
+    }
+
+    #[test]
+    fn unit_step_up_exempt_max_session_bounds() {
+        let with = |max: Duration| StepUpIntervalConfig {
+            exempt_max_session: max,
+            ..Default::default()
+        };
+        assert!(with(Duration::ZERO).check_exempt_max_session().is_err());
+        assert!(
+            with(Duration::from_secs(1))
+                .check_exempt_max_session()
+                .is_ok()
+        );
+        assert!(
+            with(Duration::from_secs(86_400))
+                .check_exempt_max_session()
+                .is_ok()
+        );
+        assert!(
+            with(Duration::from_secs(86_401))
+                .check_exempt_max_session()
+                .is_err()
+        );
+        assert!(
+            StepUpIntervalConfig::default()
+                .check_exempt_max_session()
+                .is_ok()
         );
     }
 

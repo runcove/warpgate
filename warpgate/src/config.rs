@@ -57,6 +57,9 @@ pub fn load_config(params: &GlobalParams, secure: bool) -> Result<WarpgateConfig
     // An error, not a warning: refused at start-up, and a reload that sets it
     // keeps the running config.
     config.store.http.check_plain_http_on_loopback()?;
+    if let Some(step_up) = &config.store.step_up_interval {
+        step_up.check_exempt_max_session()?;
+    }
     Ok(config)
 }
 
@@ -209,6 +212,52 @@ mod tests {
     fn parse(yaml: &str) -> (WarpgateConfigStore, Vec<String>) {
         let value: yaml_serde::Value = yaml_serde::from_str(yaml).unwrap();
         deserialize_store_collecting_ignored(value).unwrap()
+    }
+
+    fn write_config(dir: &tempfile::TempDir, step_up: &str) -> GlobalParams {
+        let path = dir.path().join("warpgate.yaml");
+        std::fs::write(&path, format!("step_up_interval:\n  ssh: 12h\n{step_up}")).unwrap();
+        GlobalParams::new(path, false).unwrap()
+    }
+
+    #[test]
+    fn exempt_max_session_is_checked_when_the_config_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        for (value, ok) in [
+            ("0s", false),
+            ("24h", true),
+            ("24h 1s", false),
+            ("4h", true),
+        ] {
+            let params = write_config(&dir, &format!("  exempt_max_session: {value}\n"));
+            assert_eq!(load_config(&params, false).is_ok(), ok, "{value}");
+        }
+    }
+
+    /// The reload watcher keeps the running config when `load_config` fails,
+    /// so a refused value never replaces a good config.
+    #[test]
+    fn a_refused_reload_leaves_the_previous_config_in_force() {
+        let dir = tempfile::tempdir().unwrap();
+        let params = write_config(&dir, "  exempt_max_session: 2h\n");
+        let mut running = load_config(&params, false).unwrap();
+        let before = running
+            .store
+            .step_up_interval
+            .clone()
+            .unwrap()
+            .exempt_max_session;
+
+        write_config(&dir, "  exempt_max_session: 25h\n");
+        // Same step the watcher takes: replace only on Ok.
+        if let Ok(new_config) = load_config(&params, false) {
+            running = new_config;
+        }
+        assert_eq!(
+            running.store.step_up_interval.unwrap().exempt_max_session,
+            before
+        );
+        assert_eq!(before, Duration::from_secs(7200));
     }
 
     #[test]

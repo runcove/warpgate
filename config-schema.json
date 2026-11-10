@@ -925,7 +925,7 @@
       "type": "object",
       "properties": {
         "exempt_max_session": {
-          "description": "Longest an SSH connection admitted through `exempt_users` stays open\n(default 4h). The connection is ended when this passes, and sooner if\na config reload no longer lists its user, key or target. Must not be\nzero.",
+          "description": "Longest an SSH connection admitted through `exempt_users` stays open\n(default 4h). The connection is ended when this passes, and sooner if\na config reload no longer lists its user, key or target. Must be\ngreater than zero and at most 24h; any other value is refused when the\nconfig is loaded (a reload with such a value leaves the running config\nin place).",
           "type": "string",
           "default": "4h"
         },
