@@ -1,9 +1,11 @@
 import base64
 import hashlib
+import re
 import subprocess
 import time
+from ipaddress import ip_address
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -13,6 +15,8 @@ from .util import target_host, wait_port
 
 ALLOWED_LOG = "allowed by step-up exemption"
 STEP_UP_REQUIRED_LOG = "SSH step-up required"
+SESSION_FIELD = re.compile(r"\bsession=(\S+)")
+REMOTE_IP_FIELD = re.compile(r"\bremote_ip=(\S+)")
 
 
 def _fingerprint(pubkey_path: str) -> str:
@@ -111,6 +115,17 @@ def _lines_for(log_path: Path, username: str, message: str):
     ]
 
 
+def _field(line: str, pattern: "re.Pattern[str]", name: str) -> str:
+    match = pattern.search(line)
+    assert match, f"the exemption line has no {name} field: {line}"
+    return match.group(1)
+
+
+def _is_loopback(address: str) -> bool:
+    ip = ip_address(address)
+    return (getattr(ip, "ipv4_mapped", None) or ip).is_loopback
+
+
 class TestStepUpExemptUsers:
     @pytest.mark.asyncio
     async def test_listed_key_skips_web_approval_and_an_unlisted_key_does_not(
@@ -157,7 +172,13 @@ class TestStepUpExemptUsers:
         out, _ = listed.communicate(timeout=60)
         assert listed.returncode == 0
         assert b"listed-ok" in out
-        assert _lines_for(log_path, username, ALLOWED_LOG), "no exemption log line"
+        allowed = _lines_for(log_path, username, ALLOWED_LOG)
+        assert len(allowed) == 1, "no exemption log line, or more than one"
+        # The line says which session it admitted and from where.
+        UUID(_field(allowed[0], SESSION_FIELD, "session"))
+        assert _is_loopback(
+            _field(allowed[0], REMOTE_IP_FIELD, "remote_ip")
+        ), "the exemption line does not show the client's address"
         assert not _lines_for(
             log_path, username, STEP_UP_REQUIRED_LOG
         ), "the listed key was asked for step-up"
