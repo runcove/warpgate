@@ -371,17 +371,24 @@ async fn username_taken(
 /// A ticket request is removed both by its own `user_id` and by the ticket it
 /// produced, since `ticket_requests.ticket_id` also references `tickets`.
 ///
-/// The user's tickets are locked before the first read, as a target delete
-/// does, and the open sessions they admitted are returned (and recorded for
-/// the close sweep) for the caller to close once this has committed. The
-/// user's own pending-close row is written in the same transaction, last
-/// before the commit; its time is returned with them, for the caller to remove the row once the close
-/// succeeded ([`warpgate_core::Services::settle_user_session_close`]).
+/// The user's own row is locked first and their tickets next, both before the
+/// first read (a target delete locks its tickets the same way), and the open
+/// sessions the tickets admitted are returned (and recorded for the close
+/// sweep) for the caller to close once this has committed. The user's own
+/// pending-close row is written in the same transaction, last before the
+/// commit; its time is returned with them, for the caller to remove the row
+/// once the close succeeded
+/// ([`warpgate_core::Services::settle_user_session_close`]).
 async fn delete_user_records(
     db: &DatabaseConnection,
     user: User::Model,
 ) -> Result<(AdmittedSessions, OffsetDateTime), WarpgateError> {
     let txn = db.begin().await?;
+    // The first statement: the user's own row is written, as the edit's first
+    // statement does, so a delete and an edit of one user serialise here,
+    // before this transaction reads anything. Then the tickets, whose order
+    // after the user's row every path that takes both keeps.
+    User::lock_for_update(&txn, user.id).await?;
     Ticket::lock_all_for_user(&txn, user.id).await?;
 
     UserRoleAssignment::Entity::delete_many()
@@ -2309,6 +2316,61 @@ mod tests {
             .settle_user_session_close(alice, second, Ok(()))
             .await;
         assert!(PendingUserClose::pending(&db).await.unwrap().is_empty());
+    }
+
+    /// The statements `db` executes from now on, in order.
+    fn log_statements(db: &mut DatabaseConnection) -> Arc<std::sync::Mutex<Vec<String>>> {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = log.clone();
+        db.set_metric_callback(move |info| sink.lock().unwrap().push(info.statement.sql.clone()));
+        log
+    }
+
+    /// MySQL fixes a transaction's snapshot at its first read, so a change of
+    /// the user that waits on another change's lock after a read would not see
+    /// that change's records. The delete's first statement is therefore the
+    /// write of the user's own row, as the edit's is, and its tickets are next.
+    #[tokio::test]
+    async fn a_delete_writes_the_user_row_before_it_reads_anything() {
+        let db = setup_db().await;
+        let alice = insert_user(&db, "alice").await;
+        let mut logged = db.clone();
+        let log = log_statements(&mut logged);
+
+        let _admitted = delete_user_records(&logged, alice).await.unwrap();
+
+        let statements = log.lock().unwrap().clone();
+        assert!(
+            statements[0].starts_with(r#"UPDATE "users""#),
+            "{statements:#?}"
+        );
+        assert!(
+            statements[1].starts_with(r#"UPDATE "tickets""#),
+            "{statements:#?}"
+        );
+    }
+
+    /// The same for an edit: nothing is read or written in its transaction
+    /// before the update of the user's row.
+    #[tokio::test]
+    async fn an_update_writes_the_user_row_before_it_reads_anything() {
+        let db = setup_db().await;
+        let mut services = services(&db).await;
+        let alice = insert_user(&db, "alice").await;
+        let log = log_statements(&mut services.db);
+        let body = edit("alice-renamed", Some(&["10.0.0.0/8"]));
+        let ranges =
+            Some(User::parse_allowed_ip_ranges(body.allowed_ip_ranges.clone().unwrap()).unwrap());
+
+        save_user_update(&services, alice, &body, ranges, |_| async { Ok(()) })
+            .await
+            .unwrap();
+
+        let statements = log.lock().unwrap().clone();
+        assert!(
+            statements[0].starts_with(r#"UPDATE "users""#),
+            "{statements:#?}"
+        );
     }
 
     /// A close that succeeded removes the row its own change wrote, but not

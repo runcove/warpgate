@@ -55,9 +55,20 @@ pub async fn mark<C: ConnectionTrait>(
 /// earlier mark's time therefore never removes a later mark's row.
 ///
 /// The row is read and written on `db`, which is the transaction of the change
-/// that needs the close: that change has already written the user's own row,
-/// which serialises concurrent changes of one user, so two marks of a user
-/// never read the same earlier row.
+/// that needs the close. That change has already written the user's own row as
+/// its first statement, before any read (an edit by its update, a delete by
+/// [`crate::User::lock_for_update`]), so concurrent changes of one user
+/// serialise there, and the read below, whose snapshot MySQL fixes at the first
+/// read, sees the row of the change that committed first.
+///
+/// Stamps only move forward. A node whose clock runs ahead leaves a `queued`
+/// in the future, which later marks never lower: they take the later of the
+/// two. The close of the change that wrote it still clears it, since that
+/// clears at the time `mark` returned. The sweep does not: it clears only rows
+/// older than its read less one sweep interval, so it skips such a row until
+/// wall time catches up, and meanwhile closes that user's sessions on every
+/// sweep. That happens only after a failed close or a node that stopped before
+/// its own close.
 ///
 /// The returned time is read back from the row: a backend that stores less
 /// precision than the clock (or rounds) would otherwise leave a row that a

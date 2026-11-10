@@ -2,9 +2,9 @@ use std::str::FromStr;
 
 use ipnet::IpNet;
 use poem_openapi::Object;
-use sea_orm::Set;
 use sea_orm::entity::prelude::*;
 use sea_orm::sea_query::{Func, IntoCondition};
+use sea_orm::{DatabaseTransaction, Set};
 use serde::Serialize;
 use uuid::Uuid;
 use warpgate_common::{User, UserDetails, WarpgateError};
@@ -149,6 +149,28 @@ impl Entity {
     pub fn username_eq_ci(username: &str) -> impl IntoCondition {
         Expr::expr(Func::lower(Expr::col(Column::Username))).eq(username.to_lowercase())
     }
+}
+
+/// Locks a user row until `transaction` completes, as the user's own edit does
+/// by writing it. A change that records a follow-up for the user (an edit or a
+/// delete) takes this first, before any statement that reads: a plain read
+/// fixes the transaction's snapshot on MySQL (REPEATABLE READ), and a snapshot
+/// taken before the wait for another change's lock on the row would not see
+/// that change's records once the wait ends.
+///
+/// The no-op update is deliberate, as in [`super::Ticket::lock_for_update`]:
+/// PostgreSQL/MySQL take a row lock, while SQLite takes the transaction's
+/// write lock. A row that is gone is not an error here.
+pub async fn lock_for_update(
+    transaction: &DatabaseTransaction,
+    id: Uuid,
+) -> Result<(), WarpgateError> {
+    Entity::update_many()
+        .col_expr(Column::Username, Expr::col(Column::Username).into())
+        .filter(Column::Id.eq(id))
+        .exec(transaction)
+        .await?;
+    Ok(())
 }
 
 /// Parse a user's allowed source ranges.

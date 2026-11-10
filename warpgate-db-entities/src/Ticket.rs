@@ -88,7 +88,9 @@ pub async fn lock_all_for_target(
 }
 
 /// [`lock_for_update`] for every ticket of a user, for deleting the user.
-/// Take it before anything else in the transaction, as for a target delete.
+/// Take it right after the user's own row is locked
+/// ([`super::User::lock_for_update`]) and before anything else in the
+/// transaction, as for a target delete.
 pub async fn lock_all_for_user(
     transaction: &DatabaseTransaction,
     user_id: Uuid,
