@@ -288,12 +288,13 @@ where
     model.allowed_ip_ranges = Set(allowed_ip_ranges);
 
     let txn = services.db.begin().await?;
+    let user = model.update(&txn).await?;
+    // Last before the commit, so the row's time is not aged by the work above.
     let queued = if close_needed {
         Some(PendingUserClose::mark(&txn, user_id).await?)
     } else {
         None
     };
-    let user = model.update(&txn).await?;
     txn.commit().await?;
 
     if let Some(queued) = queued {
@@ -373,15 +374,14 @@ async fn username_taken(
 /// The user's tickets are locked before the first read, as a target delete
 /// does, and the open sessions they admitted are returned (and recorded for
 /// the close sweep) for the caller to close once this has committed. The
-/// user's own pending-close row is written in the same transaction; its time is
-/// returned with them, for the caller to remove the row once the close
+/// user's own pending-close row is written in the same transaction, last
+/// before the commit; its time is returned with them, for the caller to remove the row once the close
 /// succeeded ([`warpgate_core::Services::settle_user_session_close`]).
 async fn delete_user_records(
     db: &DatabaseConnection,
     user: User::Model,
 ) -> Result<(AdmittedSessions, OffsetDateTime), WarpgateError> {
     let txn = db.begin().await?;
-    let queued = PendingUserClose::mark(&txn, user.id).await?;
     Ticket::lock_all_for_user(&txn, user.id).await?;
 
     UserRoleAssignment::Entity::delete_many()
@@ -422,7 +422,12 @@ async fn delete_user_records(
         .exec(&txn)
         .await?;
 
+    let user_id = user.id;
     user.delete(&txn).await?;
+    // Last before the commit, so the time of the row is not aged by a wait for
+    // the ticket lock or by the deletes above: the sweep leaves a row for a
+    // few seconds, and the delete's own close must settle it within them.
+    let queued = PendingUserClose::mark(&txn, user_id).await?;
     txn.commit().await?;
     Ok((AdmittedSessions(admitted), queued))
 }
@@ -1964,6 +1969,14 @@ mod tests {
         let db = setup_db().await;
         let services = services(&db).await;
         let alice = insert_user(&db, "alice").await;
+        // A delete that succeeds is recorded, so the zero below means that the
+        // failed one was not audited, not that nothing is being recorded.
+        let bob = insert_user(&db, "bob").await;
+        let bob_id = bob.id;
+        delete_user_and_close(&services, bob, Uuid::new_v4(), |_| async { Ok(()) })
+            .await
+            .unwrap();
+        assert_eq!(user_deleted_events(bob_id), 1);
         db.execute_unprepared("DROP TABLE pending_user_closes")
             .await
             .unwrap();
@@ -2249,6 +2262,55 @@ mod tests {
         assert!(PendingUserClose::pending(&db).await.unwrap().is_empty());
     }
 
+    /// Two changes of one user marked within the same second (MySQL stores whole
+    /// seconds) or on a node whose clock is behind must not share a time: the
+    /// earlier change's clear would remove the row of the later one, whose
+    /// close is still owed. Every mark is later than the one before, whatever
+    /// the clock says.
+    #[tokio::test]
+    async fn marks_of_one_user_are_ordered_whatever_the_clock_says() {
+        let db = setup_db().await;
+        let alice = Uuid::new_v4();
+        let now = OffsetDateTime::now_utc();
+
+        let first = PendingUserClose::mark_at(&db, alice, now).await.unwrap();
+        let second = PendingUserClose::mark_at(&db, alice, now).await.unwrap();
+        let third = PendingUserClose::mark_at(&db, alice, now - time::Duration::hours(1))
+            .await
+            .unwrap();
+        assert!(second >= first + time::Duration::seconds(1));
+        assert!(third >= second + time::Duration::seconds(1));
+
+        PendingUserClose::clear(&db, alice, first).await.unwrap();
+        assert_eq!(PendingUserClose::pending(&db).await.unwrap(), vec![alice]);
+        PendingUserClose::clear(&db, alice, second).await.unwrap();
+        assert_eq!(PendingUserClose::pending(&db).await.unwrap(), vec![alice]);
+        PendingUserClose::clear(&db, alice, third).await.unwrap();
+        assert!(PendingUserClose::pending(&db).await.unwrap().is_empty());
+    }
+
+    /// The same through the close of the change: with the clock held still, the
+    /// first change's successful close leaves the second change's row.
+    #[tokio::test]
+    async fn a_close_keeps_the_row_of_a_change_marked_at_the_same_instant() {
+        let db = setup_db().await;
+        let services = services(&db).await;
+        let alice = Uuid::new_v4();
+        let now = OffsetDateTime::now_utc();
+        let first = PendingUserClose::mark_at(&db, alice, now).await.unwrap();
+        let second = PendingUserClose::mark_at(&db, alice, now).await.unwrap();
+
+        services
+            .settle_user_session_close(alice, first, Ok(()))
+            .await;
+        assert_eq!(PendingUserClose::pending(&db).await.unwrap(), vec![alice]);
+
+        services
+            .settle_user_session_close(alice, second, Ok(()))
+            .await;
+        assert!(PendingUserClose::pending(&db).await.unwrap().is_empty());
+    }
+
     /// A close that succeeded removes the row its own change wrote, but not
     /// one a later change wrote again: that change's close is still owed.
     #[tokio::test]
@@ -2310,7 +2372,10 @@ mod tests {
     fn capture_audit_events() {
         static INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
         INSTALLED.get_or_init(|| {
-            let _ = tracing::subscriber::set_global_default(AuditCapture);
+            // A refused install would leave every "no event" assertion true
+            // for want of a recorder, so it fails the test instead.
+            tracing::subscriber::set_global_default(AuditCapture)
+                .expect("another global tracing subscriber took the audit capture's place");
         });
     }
 

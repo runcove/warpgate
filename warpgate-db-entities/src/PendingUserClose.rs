@@ -27,21 +27,53 @@ pub enum Relation {}
 
 impl ActiveModelBehavior for ActiveModel {}
 
+/// How much later than the row it replaces a record is stamped at least. One
+/// second, so the order survives a backend that stores whole seconds (MySQL
+/// `timestamp` does).
+const MIN_STEP: time::Duration = time::Duration::seconds(1);
+
 /// Records that this user's sessions must be closed, and returns the time the
 /// row now carries, to pass to [`clear`] once the close succeeded. A user
-/// already recorded has the time refreshed, so a clear or sweep that read an
-/// older time leaves the row.
+/// already recorded has the time refreshed to a later one than the row had,
+/// so a clear or sweep that read an older time leaves the row.
 ///
-/// The returned time is read back from the row: a backend that stores less
-/// precision than the clock (or rounds) would otherwise leave a row that a
-/// clear at the unrounded time cannot match.
+/// See [`mark_at`] for how the time is chosen.
 pub async fn mark<C: ConnectionTrait>(
     db: &C,
     user_id: Uuid,
 ) -> Result<OffsetDateTime, WarpgateError> {
+    mark_at(db, user_id, OffsetDateTime::now_utc()).await
+}
+
+/// [`mark`] with the clock's reading passed in, so a test can hold it still or
+/// set it back.
+///
+/// The row is stamped `max(the row it replaces + 1 second, now)`: strictly
+/// later than any time an earlier mark of this user returned, however close
+/// together the marks are, however coarse the backend's timestamps are, and
+/// whatever the clock of the node that wrote them said. A clear that carries an
+/// earlier mark's time therefore never removes a later mark's row.
+///
+/// The row is read and written on `db`, which is the transaction of the change
+/// that needs the close: that change has already written the user's own row,
+/// which serialises concurrent changes of one user, so two marks of a user
+/// never read the same earlier row.
+///
+/// The returned time is read back from the row: a backend that stores less
+/// precision than the clock (or rounds) would otherwise leave a row that a
+/// clear at the unrounded time cannot match.
+pub async fn mark_at<C: ConnectionTrait>(
+    db: &C,
+    user_id: Uuid,
+    now: OffsetDateTime,
+) -> Result<OffsetDateTime, WarpgateError> {
+    let queued = match Entity::find_by_id(user_id).one(db).await? {
+        Some(existing) => now.max(existing.queued + MIN_STEP),
+        None => now,
+    };
     Entity::insert(ActiveModel {
         user_id: Set(user_id),
-        queued: Set(OffsetDateTime::now_utc()),
+        queued: Set(queued),
     })
     .on_conflict(
         sea_orm::sea_query::OnConflict::column(Column::UserId)
