@@ -571,6 +571,22 @@ const fn web_approval_proves_step_up(approval_present: bool, approval_was_bypass
     approval_present && !approval_was_bypassed
 }
 
+/// Whether the sign-in recorded the key the client presented for every key
+/// row it matched. `exempt_users` is decided on those recorded fingerprints,
+/// so a key sign-in without one for a matched row is never exempt: step-up
+/// applies to it as to a user who is not listed.
+fn presented_keys_recorded(
+    matched_pubkey_ids: &[Uuid],
+    authenticated: &[AuthenticatedKey],
+) -> bool {
+    !matched_pubkey_ids.is_empty()
+        && matched_pubkey_ids.iter().all(|row_id| {
+            authenticated
+                .iter()
+                .any(|key| key.row_id == *row_id && !key.fingerprint.is_empty())
+        })
+}
+
 /// How long one auto-continue round waits before handing a packet back to the
 /// client.
 ///
@@ -651,15 +667,16 @@ mod tests {
     use uuid::Uuid;
     use warpgate_common::auth::{AuthResult, AuthStateUserInfo, CredentialKind};
     use warpgate_common::eventhub::EventHub;
+    use warpgate_core::auth::step_up::AuthenticatedKey;
 
     use super::{
         ChannelOperation, EventIntake, ExemptGrant, ExemptTick, ExemptVerdict, MAX_WEB_AUTH_WAITS,
         PendingCommand, PendingKeyboardInteractiveAuth, RCCommand, STEP_UP_MAX_READ_FAILURES,
         STEP_UP_RECHECK_MAX, SshClientError, TARGET_FORWARD_OPEN_TIMEOUT, TARGET_REPLY_TIMEOUT,
         WebApprovalWait, WebAuthStep, bump_waits, carry_forward, exempt_recheck, exempt_tick,
-        exempt_verdict, is_reserved_env_name, next_web_auth_step, read_failure_closes,
-        reject_with_allowed_auth_methods, reply_limit, round_creates_wait, wait_for_reply,
-        wait_for_state,
+        exempt_verdict, is_reserved_env_name, next_web_auth_step, presented_keys_recorded,
+        read_failure_closes, reject_with_allowed_auth_methods, reply_limit, round_creates_wait,
+        wait_for_reply, wait_for_state,
     };
 
     /// A client cannot set the variables Warpgate injects about the user;
@@ -1238,6 +1255,38 @@ mod tests {
                 }
             );
         }
+    }
+
+    fn key(row_id: Uuid, fingerprint: &str) -> AuthenticatedKey {
+        AuthenticatedKey {
+            row_id,
+            fingerprint: fingerprint.to_owned(),
+        }
+    }
+
+    /// A key sign-in that recorded no presented key for a matched row never
+    /// reaches the exemption, so step-up applies to it.
+    #[test]
+    fn a_key_sign_in_without_a_recorded_fingerprint_is_not_considered_for_the_exemption() {
+        let (a, b) = (Uuid::from_u128(1), Uuid::from_u128(2));
+
+        assert!(presented_keys_recorded(&[a], &[key(a, "SHA256:a")]));
+        assert!(presented_keys_recorded(
+            &[a, b],
+            &[key(b, "SHA256:b"), key(a, "SHA256:a")]
+        ));
+
+        // Nothing recorded at all.
+        assert!(!presented_keys_recorded(&[a], &[]));
+        // Recorded for another row only.
+        assert!(!presented_keys_recorded(&[a], &[key(b, "SHA256:b")]));
+        // One of two matched rows has none.
+        assert!(!presented_keys_recorded(&[a, b], &[key(a, "SHA256:a")]));
+        // A blank fingerprint is no fingerprint.
+        assert!(!presented_keys_recorded(&[a], &[key(a, "")]));
+        // No matched row to record a key for.
+        assert!(!presented_keys_recorded(&[], &[key(a, "SHA256:a")]));
+        assert!(!presented_keys_recorded(&[], &[]));
     }
 
     #[test]
@@ -4628,7 +4677,16 @@ impl ServerSession {
                             // it returns are kept to end the connection if a
                             // reload stops listing it or a key changes.
                             if pubkey_used && !has_stepup {
-                                if let StepUpExemption::Applies(fingerprints) =
+                                if !presented_keys_recorded(
+                                    &matched_pubkey_ids,
+                                    &self.authenticated_pubkeys,
+                                ) {
+                                    debug!(
+                                        username = %user_info.username,
+                                        "step-up exemption not considered: no presented key \
+                                         fingerprint recorded for a matched key"
+                                    );
+                                } else if let StepUpExemption::Applies(fingerprints) =
                                     ssh_step_up_exemption(
                                         &self.services.db,
                                         step_up_config,
