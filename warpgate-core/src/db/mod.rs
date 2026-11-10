@@ -122,7 +122,12 @@ async fn connect_to_sqlite(url: &str) -> Result<DatabaseConnection> {
         .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
         .synchronous(SqliteSynchronous::Normal)
-        .busy_timeout(Duration::from_secs(30));
+        .busy_timeout(Duration::from_secs(30))
+        // Deleting a user relies on `ON DELETE CASCADE` to remove its key,
+        // password, SSO and other credential rows, and SQLite enforces that
+        // only while this pragma is on for the connection. sqlx's default is
+        // on; it is set here so the cascade does not depend on that default.
+        .foreign_keys(true);
 
     // Sized for SQLite, which has one writer at a time: past a point more
     // connections only queue on its lock. Enough are kept that writers waiting
@@ -752,5 +757,129 @@ mod sqlite_pool_tests {
 
     fn row_count(row: &sea_orm::QueryResult) -> i64 {
         row.try_get::<i64>("", "c").unwrap()
+    }
+
+    /// The pool enforces foreign keys, so deleting a user removes the key,
+    /// password, SSO and OTP rows that belong to it (the schema's
+    /// `ON DELETE CASCADE`) and leaves another user's rows alone. A revoked
+    /// key must not outlive its user.
+    #[tokio::test]
+    async fn deleting_a_user_removes_its_credential_rows() {
+        use sea_orm::ActiveModelTrait;
+        use sea_orm::ActiveValue::Set;
+        use warpgate_db_entities as entities;
+
+        warpgate_db_entities::Parameters::set_config_migration_values(
+            ConfigMigrationValues::default(),
+        );
+        let dir = std::env::temp_dir().join(format!("wg-fk-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let url = format!("sqlite:{}?mode=rwc", dir.join("db.sqlite3").display());
+        let db = connect_to_sqlite(&url).await.unwrap();
+        migrate_database(&db).await.unwrap();
+
+        let pragma = db
+            .query_one(Statement::from_string(
+                sea_orm::DbBackend::Sqlite,
+                "PRAGMA foreign_keys",
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pragma.try_get::<i64>("", "foreign_keys").unwrap(), 1);
+
+        let mut ids = Vec::new();
+        for name in ["gone", "kept"] {
+            let user_id = uuid::Uuid::new_v4();
+            entities::User::ActiveModel {
+                id: Set(user_id),
+                username: Set(name.into()),
+                description: Set(String::new()),
+                credential_policy: Set(serde_json::json!({})),
+                rate_limit_bytes_per_second: Set(None),
+                ldap_server_id: Set(None),
+                ldap_object_uuid: Set(None),
+                allowed_ip_ranges: Set(serde_json::Value::Null),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+            entities::PublicKeyCredential::ActiveModel {
+                id: Set(uuid::Uuid::new_v4()),
+                user_id: Set(user_id),
+                label: Set("key".into()),
+                date_added: Set(None),
+                last_used: Set(None),
+                last_sso_at: Set(None),
+                openssh_public_key: Set("ssh-ed25519 AAAA".into()),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+            entities::PasswordCredential::ActiveModel {
+                id: Set(uuid::Uuid::new_v4()),
+                user_id: Set(user_id),
+                argon_hash: Set("hash".into()),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+            entities::SsoCredential::ActiveModel {
+                id: Set(uuid::Uuid::new_v4()),
+                user_id: Set(user_id),
+                provider: Set(None),
+                email: Set(format!("{name}@example.com")),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+            entities::OtpCredential::ActiveModel {
+                id: Set(uuid::Uuid::new_v4()),
+                user_id: Set(user_id),
+                secret_key: Set(vec![1, 2, 3]),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+            ids.push(user_id);
+        }
+
+        async fn rows_of(db: &DatabaseConnection, user_id: uuid::Uuid) -> [u64; 4] {
+            use sea_orm::PaginatorTrait;
+            use warpgate_db_entities as entities;
+            [
+                entities::PublicKeyCredential::Entity::find()
+                    .filter(entities::PublicKeyCredential::Column::UserId.eq(user_id))
+                    .count(db)
+                    .await
+                    .unwrap(),
+                entities::PasswordCredential::Entity::find()
+                    .filter(entities::PasswordCredential::Column::UserId.eq(user_id))
+                    .count(db)
+                    .await
+                    .unwrap(),
+                entities::SsoCredential::Entity::find()
+                    .filter(entities::SsoCredential::Column::UserId.eq(user_id))
+                    .count(db)
+                    .await
+                    .unwrap(),
+                entities::OtpCredential::Entity::find()
+                    .filter(entities::OtpCredential::Column::UserId.eq(user_id))
+                    .count(db)
+                    .await
+                    .unwrap(),
+            ]
+        }
+        assert_eq!(rows_of(&db, ids[0]).await, [1, 1, 1, 1]);
+
+        entities::User::Entity::delete_by_id(ids[0])
+            .exec(&db)
+            .await
+            .unwrap();
+
+        assert_eq!(rows_of(&db, ids[0]).await, [0, 0, 0, 0]);
+        assert_eq!(rows_of(&db, ids[1]).await, [1, 1, 1, 1]);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
