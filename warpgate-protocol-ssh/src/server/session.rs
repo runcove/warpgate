@@ -36,8 +36,8 @@ use warpgate_common::{
 use warpgate_common_http::ext::{construct_control_plane_url, construct_external_url};
 use warpgate_core::approvals::{GateOutcome, GatedConnection};
 use warpgate_core::auth::step_up::{
-    AuthenticatedKey, ExemptCredentialChange, StepUpExemption, StepUpWindow,
-    exempt_credential_change, exemption_still_listed, get_pubkey_last_sso_at, is_fresh,
+    AuthenticatedKey, ExemptCredentialChange, ExemptRevocation, StepUpExemption, StepUpWindow,
+    exempt_grant_revocation, exemption_still_listed, get_pubkey_last_sso_at, is_fresh,
     public_key_fingerprint, ssh_step_up_exemption, step_up_window, update_pubkey_last_sso_at,
 };
 use warpgate_core::auth::submit_credential;
@@ -489,10 +489,22 @@ async fn exempt_recheck(
         return Ok(verdict);
     }
     Ok(
-        match exempt_credential_change(db, grant.user_id, &grant.pubkey_ids, &grant.fingerprints)
-            .await?
+        match exempt_grant_revocation(
+            db,
+            step_up,
+            grant.user_id,
+            &grant.pubkey_ids,
+            &grant.fingerprints,
+            &grant.target,
+        )
+        .await?
         {
-            Some(change) => ExemptVerdict::CredentialsChanged(change),
+            Some(ExemptRevocation::NoLongerListed | ExemptRevocation::UserDeleted) => {
+                ExemptVerdict::NoLongerListed
+            }
+            Some(ExemptRevocation::Credentials(change)) => {
+                ExemptVerdict::CredentialsChanged(change)
+            }
             None => verdict,
         },
     )

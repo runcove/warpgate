@@ -397,6 +397,44 @@ pub async fn exempt_credential_change(
     }
 }
 
+/// Why the periodic database recheck of an exempt connection ends it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExemptRevocation {
+    /// The user, as named in the database now, is no longer covered by an
+    /// `exempt_users` entry (for instance after a rename).
+    NoLongerListed,
+    /// The user row is gone: a revocation, not a read failure.
+    UserDeleted,
+    Credentials(ExemptCredentialChange),
+}
+
+/// The one database read per tick for an exempt connection: the user's
+/// CURRENT username (so a rename is seen) is checked against the live config,
+/// then the credentials as in [`exempt_credential_change`]. A missing user row
+/// is a revocation; a database error is returned as an error, never read as
+/// "still holds". `step_up` must be the config as read on this same tick.
+pub async fn exempt_grant_revocation(
+    db: &DatabaseConnection,
+    step_up: Option<&StepUpIntervalConfig>,
+    user_id: Uuid,
+    pubkey_ids: &[Uuid],
+    granted_fingerprints: &[String],
+    target_name: &str,
+) -> Result<Option<ExemptRevocation>, WarpgateError> {
+    let Some(user) = entities::User::Entity::find_by_id(user_id).one(db).await? else {
+        return Ok(Some(ExemptRevocation::UserDeleted));
+    };
+    let username = user.username;
+    if !exemption_still_listed(step_up, &username, granted_fingerprints, target_name) {
+        return Ok(Some(ExemptRevocation::NoLongerListed));
+    }
+    Ok(
+        exempt_credential_change(db, user_id, pubkey_ids, granted_fingerprints)
+            .await?
+            .map(ExemptRevocation::Credentials),
+    )
+}
+
 /// Whether the key rows, as read now (`current`), still show exactly the
 /// fingerprints the grant recorded. A grant that recorded no fingerprint holds
 /// nothing, so it never holds, even against an empty read.
@@ -1493,6 +1531,51 @@ mod tests {
                 .unwrap(),
             Some(ExemptCredentialChange::SsoCredentialAdded)
         );
+    }
+
+    #[tokio::test]
+    async fn unit_exempt_revocation_follows_the_users_current_name() {
+        let db = setup_db().await;
+        let (user_id, username) = service_user(&db).await;
+        let key = add_key(&db, user_id, KEY_A).await;
+        let fps = vec![FP_A.to_owned()];
+        let cfg = exempt_config(vec![exempt_entry(&username, &[FP_A], None)]);
+        let keys = [key];
+        let check = || exempt_grant_revocation(&db, Some(&cfg), user_id, &keys, &fps, "t");
+        assert_eq!(check().await.unwrap(), None);
+
+        // An admin renames the user: no entry names it any more.
+        entities::User::Entity::update_many()
+            .col_expr(
+                entities::User::Column::Username,
+                sea_orm::sea_query::Expr::value(format!("{username}-renamed")),
+            )
+            .filter(entities::User::Column::Id.eq(user_id))
+            .exec(&db)
+            .await
+            .unwrap();
+        assert_eq!(
+            check().await.unwrap(),
+            Some(ExemptRevocation::NoLongerListed)
+        );
+    }
+
+    #[tokio::test]
+    async fn unit_exempt_revocation_a_deleted_user_closes_at_once() {
+        let db = setup_db().await;
+        let (user_id, username) = service_user(&db).await;
+        let key = add_key(&db, user_id, KEY_A).await;
+        let fps = vec![FP_A.to_owned()];
+        let cfg = exempt_config(vec![exempt_entry(&username, &[FP_A], None)]);
+        db.execute_unprepared("PRAGMA foreign_keys = OFF")
+            .await
+            .unwrap();
+        entities::User::Entity::delete_by_id(user_id)
+            .exec(&db)
+            .await
+            .unwrap();
+        let got = exempt_grant_revocation(&db, Some(&cfg), user_id, &[key], &fps, "t").await;
+        assert_eq!(got.unwrap(), Some(ExemptRevocation::UserDeleted));
     }
 
     #[tokio::test]
