@@ -1179,9 +1179,8 @@ impl ServerSession {
                 };
                 // The idle deadline is last real activity + timeout and moves
                 // only on a real event, so a step-up recheck never restarts it.
-                let idle_wait = inactivity_timeout.map(|timeout| {
-                    (idle_since + timeout).saturating_duration_since(Instant::now())
-                });
+                let idle_wait = inactivity_timeout
+                    .map(|timeout| (idle_since + timeout).saturating_duration_since(Instant::now()));
                 let step_up_wait = this
                     .step_up_recheck
                     .map(|at| at.saturating_duration_since(Instant::now()));
@@ -1289,8 +1288,9 @@ impl ServerSession {
                     .ok()
                     .and_then(|left| now.checked_add(left));
                 // Capped so a config change or a fresh SSO is seen promptly.
-                self.step_up_recheck =
-                    Some(Instant::now() + left.clamp(STEP_UP_RECHECK_MIN, STEP_UP_RECHECK_MAX));
+                self.step_up_recheck = Some(
+                    Instant::now() + left.clamp(STEP_UP_RECHECK_MIN, STEP_UP_RECHECK_MAX),
+                );
                 false
             }
         }
