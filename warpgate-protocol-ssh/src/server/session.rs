@@ -36,8 +36,8 @@ use warpgate_common::{
 use warpgate_common_http::ext::{construct_control_plane_url, construct_external_url};
 use warpgate_core::approvals::{GateOutcome, GatedConnection};
 use warpgate_core::auth::step_up::{
-    ExemptCredentialChange, StepUpWindow, exempt_credential_change, exemption_still_listed,
-    get_pubkey_last_sso_at, is_fresh, matched_key_fingerprints, ssh_step_up_exemption,
+    ExemptCredentialChange, StepUpExemption, StepUpWindow, exempt_credential_change,
+    exemption_still_listed, get_pubkey_last_sso_at, is_fresh, ssh_step_up_exemption,
     step_up_window, update_pubkey_last_sso_at,
 };
 use warpgate_core::auth::submit_credential;
@@ -4280,10 +4280,10 @@ impl ServerSession {
                             cfg.store.step_up_interval.clone()
                         };
                         let step_up_ssh = step_up_config.as_ref().and_then(|s| s.ssh);
-                        // Set when `step_up_interval.exempt_users` lets this
-                        // key sign-in skip the check below.
-                        let mut step_up_exempt = false;
-                        let mut exempt_fingerprints: Vec<String> = Vec::new();
+                        // Set, with the fingerprints of the keys it was
+                        // decided on, when `step_up_interval.exempt_users`
+                        // lets this key sign-in skip the check below.
+                        let mut exempt_fingerprints: Option<Vec<String>> = None;
                         if let (Some(interval), Some(step_up_config)) =
                             (step_up_ssh, step_up_config.as_ref())
                         {
@@ -4295,35 +4295,25 @@ impl ServerSession {
                             // The exemption is looked at only for a key
                             // sign-in that would otherwise face the check; it
                             // reads the user's credentials from the database
-                            // and logs its outcome.
-                            step_up_exempt = pubkey_used
-                                && !has_stepup
-                                && ssh_step_up_exemption(
-                                    &self.services.db,
-                                    step_up_config,
-                                    user_info.id,
-                                    &user_info.username,
-                                    &matched_pubkey_ids,
-                                    &resolved_target_name,
-                                )
-                                .await?
-                                .applies();
-                            if step_up_exempt {
-                                // Kept to end the connection if a reload stops
-                                // listing it. Unreadable keys fail closed:
-                                // the sign-in then faces the check.
-                                match matched_key_fingerprints(
-                                    &self.services.db,
-                                    user_info.id,
-                                    &matched_pubkey_ids,
-                                )
-                                .await?
+                            // and logs why it did not apply. The fingerprints
+                            // it returns are kept to end the connection if a
+                            // reload stops listing it or a key changes.
+                            if pubkey_used && !has_stepup {
+                                if let StepUpExemption::Applies(fingerprints) =
+                                    ssh_step_up_exemption(
+                                        &self.services.db,
+                                        step_up_config,
+                                        user_info.id,
+                                        &user_info.username,
+                                        &matched_pubkey_ids,
+                                        &resolved_target_name,
+                                    )
+                                    .await?
                                 {
-                                    Some(fingerprints) => exempt_fingerprints = fingerprints,
-                                    None => step_up_exempt = false,
+                                    exempt_fingerprints = Some(fingerprints);
                                 }
                             }
-                            if pubkey_used && !has_stepup && !step_up_exempt {
+                            if pubkey_used && !has_stepup && exempt_fingerprints.is_none() {
                                 // Every matched key must be fresh; no matched
                                 // key at all is stale.
                                 let mut all_fresh = !matched_pubkey_ids.is_empty();
@@ -4389,12 +4379,12 @@ impl ServerSession {
                         //
                         // An exempt sign-in has no SSO stamp to expire against;
                         // it is tracked by its grant instead.
-                        if step_up_exempt {
+                        if let Some(fingerprints) = exempt_fingerprints {
                             self.step_up_exempt = Some(ExemptGrant {
                                 username: user_info.username.clone(),
                                 user_id: user_info.id,
                                 pubkey_ids: matched_pubkey_ids.clone(),
-                                fingerprints: exempt_fingerprints,
+                                fingerprints,
                                 target: resolved_target_name.clone(),
                                 granted_at: Instant::now(),
                             });

@@ -161,20 +161,21 @@ impl StepUpExemptionIgnored {
 }
 
 /// How `step_up_interval.exempt_users` applies to one SSH public-key sign-in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StepUpExemption {
     /// The user is not listed.
     NotListed,
-    /// The sign-in skips the step-up check.
-    Applies,
+    /// The sign-in skips the step-up check. Holds the OpenSSH SHA256
+    /// fingerprints of the key rows it matched, as read for this decision.
+    Applies(Vec<String>),
     /// The user is listed but the entry does not cover this sign-in.
     Ignored(StepUpExemptionIgnored),
 }
 
 impl StepUpExemption {
     #[must_use]
-    pub const fn applies(self) -> bool {
-        matches!(self, Self::Applies)
+    pub const fn applies(&self) -> bool {
+        matches!(self, Self::Applies(_))
     }
 }
 
@@ -219,7 +220,7 @@ pub async fn ssh_step_up_exemption(
                 target = %target,
                 "SSH sign-in allowed by step-up exemption"
             );
-            Ok(StepUpExemption::Applies)
+            Ok(StepUpExemption::Applies(fingerprints))
         }
         Err(ignored) => {
             warn!(
@@ -408,7 +409,7 @@ pub async fn warn_exempt_users_with_credentials(
 ///
 /// `None` when there is no row to show a key for: no ids, a row that is gone
 /// or belongs to someone else, or a stored key that does not parse.
-pub async fn matched_key_fingerprints(
+async fn matched_key_fingerprints(
     db: &DatabaseConnection,
     user_id: Uuid,
     pubkey_ids: &[Uuid],
@@ -743,6 +744,10 @@ mod tests {
         .unwrap();
     }
 
+    fn applies(fingerprints: &[&str]) -> StepUpExemption {
+        StepUpExemption::Applies(fingerprints.iter().map(|f| (*f).to_owned()).collect())
+    }
+
     fn exempt_entry(user: &str, keys: &[&str], targets: Option<&[&str]>) -> StepUpExemptUser {
         StepUpExemptUser {
             user: user.into(),
@@ -786,7 +791,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(got, StepUpExemption::Applies);
+        assert_eq!(got, applies(&[FP_A]));
+        assert!(got.applies());
         let logged = logged_for(&username);
         assert_eq!(logged.len(), 1, "exactly one line: {logged:?}");
         assert!(
@@ -929,7 +935,7 @@ mod tests {
         let got = ssh_step_up_exemption(&db, &config, user_id, &username, &[listed], "prod")
             .await
             .unwrap();
-        assert_eq!(got, StepUpExemption::Applies);
+        assert_eq!(got, applies(&[FP_A]));
     }
 
     #[tokio::test]
@@ -1010,8 +1016,8 @@ mod tests {
             }
         };
 
-        assert_eq!(check("staging").await, StepUpExemption::Applies);
-        assert_eq!(check("build-1").await, StepUpExemption::Applies);
+        assert_eq!(check("staging").await, applies(&[FP_A]));
+        assert_eq!(check("build-1").await, applies(&[FP_A]));
         let refused = StepUpExemption::Ignored(StepUpExemptionIgnored::TargetNotListed);
         assert_eq!(check("prod").await, refused);
         assert_eq!(check("Staging").await, refused, "names are exact");
@@ -1029,8 +1035,22 @@ mod tests {
             let got = ssh_step_up_exemption(&db, &config, user_id, &username, &[key], target)
                 .await
                 .unwrap();
-            assert_eq!(got, StepUpExemption::Applies, "target {target:?}");
+            assert_eq!(got, applies(&[FP_A]), "target {target:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn unit_applies_returns_the_fingerprints_of_every_matched_key_in_order() {
+        let db = setup_db().await;
+        let (user_id, username) = service_user(&db).await;
+        let key_a = add_key(&db, user_id, KEY_A).await;
+        let key_b = add_key(&db, user_id, KEY_B).await;
+        let config = exempt_config(vec![exempt_entry(&username, &[FP_A, FP_B], None)]);
+
+        let got = ssh_step_up_exemption(&db, &config, user_id, &username, &[key_b, key_a], "prod")
+            .await
+            .unwrap();
+        assert_eq!(got, applies(&[FP_B, FP_A]));
     }
 
     #[tokio::test]
@@ -1052,8 +1072,8 @@ mod tests {
             }
         };
 
-        assert_eq!(run(key_a, "staging").await, StepUpExemption::Applies);
-        assert_eq!(run(key_b, "prod").await, StepUpExemption::Applies);
+        assert_eq!(run(key_a, "staging").await, applies(&[FP_A]));
+        assert_eq!(run(key_b, "prod").await, applies(&[FP_B]));
         assert_eq!(
             run(key_a, "prod").await,
             StepUpExemption::Ignored(StepUpExemptionIgnored::TargetNotListed)
