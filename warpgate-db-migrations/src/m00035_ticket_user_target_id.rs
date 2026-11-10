@@ -108,18 +108,25 @@ impl MigrationTrait for Migration {
                 )
                 .await?;
 
-                db.execute_unprepared("PRAGMA foreign_keys=OFF").await.ok();
-                manager
-                    .drop_table(Table::drop().table(Alias::new("tickets")).to_owned())
-                    .await?;
-                manager
-                    .rename_table(
-                        Table::rename()
-                            .table(Alias::new("tickets_new"), Alias::new("tickets"))
-                            .to_owned(),
-                    )
-                    .await?;
-                db.execute_unprepared("PRAGMA foreign_keys=ON").await.ok();
+                db.execute_unprepared("PRAGMA foreign_keys=OFF").await?;
+                let swapped = async {
+                    manager
+                        .drop_table(Table::drop().table(Alias::new("tickets")).to_owned())
+                        .await?;
+                    manager
+                        .rename_table(
+                            Table::rename()
+                                .table(Alias::new("tickets_new"), Alias::new("tickets"))
+                                .to_owned(),
+                        )
+                        .await
+                }
+                .await;
+                // Always restore the pragma before returning, even when the
+                // swap failed: the connection goes back to the pool.
+                let restored = db.execute_unprepared("PRAGMA foreign_keys=ON").await;
+                swapped?;
+                restored?;
             }
             DbBackend::MySql | DbBackend::Postgres => {
                 // Add the new FK columns as nullable first so we can populate them

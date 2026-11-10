@@ -141,6 +141,9 @@ async fn connect_to_sqlite(url: &str) -> Result<DatabaseConnection> {
     // `sqlite_pool_options`.
     let pool = sqlite_pool_options(Some(SQLITE_MAX_LIFETIME))
         .after_release(|conn, _meta| Box::pin(connection_is_clean(conn)))
+        // Also checked on hand-out, so a connection that is somehow already
+        // pooled with foreign keys off is discarded before anyone uses it.
+        .before_acquire(|conn, _meta| Box::pin(foreign_keys_are_on(conn)))
         .connect_with(connect_options)
         .await?;
 
@@ -158,6 +161,7 @@ async fn connect_to_sqlite(url: &str) -> Result<DatabaseConnection> {
 /// lock for good and every other writer gets "database is locked" until the
 /// process restarts. Nothing may be inside a transaction when a connection is
 /// released, so either signal means the connection is dropped and replaced.
+/// A connection whose `foreign_keys` pragma is not 1 is dropped too.
 #[cfg(feature = "sqlite")]
 async fn connection_is_clean(
     conn: &mut sea_orm::sqlx::SqliteConnection,
@@ -187,6 +191,25 @@ async fn connection_is_clean(
             in_transaction,
             "Dropping a SQLite connection released inside a transaction (it would hold the write lock)"
         );
+        return Ok(false);
+    }
+
+    foreign_keys_are_on(conn).await
+}
+
+/// Foreign keys must be on for every pooled connection (deleting a user relies
+/// on ON DELETE CASCADE). A connection with them off, such as one left so by a
+/// migration that toggled the pragma, is dropped. Used by `after_release` (via
+/// `connection_is_clean`) and by `before_acquire`.
+#[cfg(feature = "sqlite")]
+async fn foreign_keys_are_on(
+    conn: &mut sea_orm::sqlx::SqliteConnection,
+) -> Result<bool, sea_orm::sqlx::Error> {
+    let foreign_keys: i64 = sea_orm::sqlx::query_scalar("PRAGMA foreign_keys")
+        .fetch_one(&mut *conn)
+        .await?;
+    if foreign_keys != 1 {
+        tracing::warn!("Dropping a SQLite connection with foreign_keys off");
         return Ok(false);
     }
     Ok(true)
@@ -757,6 +780,75 @@ mod sqlite_pool_tests {
 
     fn row_count(row: &sea_orm::QueryResult) -> i64 {
         row.try_get::<i64>("", "c").unwrap()
+    }
+
+    /// A connection released with `foreign_keys` off (as a migration that
+    /// toggles the pragma could leave it) is dropped, not reused: every
+    /// connection the real pool hands out afterwards reads 1.
+    #[tokio::test]
+    async fn a_connection_released_with_foreign_keys_off_is_not_reused() {
+        let dir = std::env::temp_dir().join(format!("wg-fkoff-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let url = format!("sqlite:{}?mode=rwc", dir.join("db.sqlite3").display());
+        let db = connect_to_sqlite(&url).await.unwrap();
+        let pool = db.get_sqlite_connection_pool();
+
+        let mut conn = pool.acquire().await.unwrap();
+        sea_orm::sqlx::query("PRAGMA foreign_keys=OFF")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        let off: i64 = sea_orm::sqlx::query_scalar("PRAGMA foreign_keys")
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(off, 0);
+        assert!(!connection_is_clean(&mut conn).await.unwrap());
+        drop(conn);
+
+        // Hold every slot at once so the pool has to hand out all of its
+        // connections, including any it kept from the one released above.
+        let mut held = Vec::new();
+        for _ in 0..SQLITE_MAX_CONNECTIONS {
+            let mut c = pool.acquire().await.unwrap();
+            let fk: i64 = sea_orm::sqlx::query_scalar("PRAGMA foreign_keys")
+                .fetch_one(&mut *c)
+                .await
+                .unwrap();
+            assert_eq!(fk, 1, "the pool handed out a connection with foreign keys off");
+            held.push(c);
+        }
+        drop(held);
+        drop(db);
+
+        // The acquire path alone: a pool with only the `before_acquire` hook
+        // keeps the connection released with foreign keys off, and must still
+        // discard it on the next hand-out.
+        use sea_orm::sqlx::sqlite::SqliteConnectOptions;
+        let options = SqliteConnectOptions::new()
+            .filename(dir.join("db.sqlite3"))
+            .foreign_keys(true);
+        let pool = sqlite_pool_options(None)
+            .max_connections(1)
+            .before_acquire(|conn, _meta| Box::pin(foreign_keys_are_on(conn)))
+            .connect_with(options)
+            .await
+            .unwrap();
+        let mut conn = pool.acquire().await.unwrap();
+        sea_orm::sqlx::query("PRAGMA foreign_keys=OFF")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        drop(conn);
+        let mut conn = pool.acquire().await.unwrap();
+        let fk: i64 = sea_orm::sqlx::query_scalar("PRAGMA foreign_keys")
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(fk, 1, "before_acquire must discard a connection with foreign keys off");
+        drop(conn);
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The pool enforces foreign keys, so deleting a user removes the key,
