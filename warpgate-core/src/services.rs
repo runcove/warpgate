@@ -9,7 +9,7 @@ use sea_orm::{
 };
 use time::OffsetDateTime;
 use tokio::sync::{Mutex, broadcast};
-use tracing::warn;
+use tracing::{error, warn};
 use uuid::Uuid;
 use warpgate_common::auth::{AuthState, CredentialKind};
 use warpgate_common::{
@@ -17,8 +17,8 @@ use warpgate_common::{
 };
 use warpgate_db_entities::Parameters::MfaEnforcement;
 use warpgate_db_entities::{
-    OtpCredential, Parameters, PendingSessionClose, SsoCredential, TargetSession, Ticket,
-    TicketRequest, UserSession,
+    OtpCredential, Parameters, PendingSessionClose, PendingUserClose, SsoCredential, TargetSession,
+    Ticket, TicketRequest, UserSession,
 };
 
 use crate::auth_state_store::ApprovalRequestSink;
@@ -66,7 +66,7 @@ const APPROVAL_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 /// close); everything within this window becomes one cluster notification.
 const SESSION_CHANGE_COALESCE_WINDOW: Duration = Duration::from_millis(100);
 
-const TICKET_EXPIRY_SWEEP_INTERVAL: Duration = Duration::from_secs(5);
+pub(crate) const TICKET_EXPIRY_SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 
 impl Services {
     pub async fn close_sessions(&self, scope: SessionsFilter) -> Result<(), WarpgateError> {
@@ -100,6 +100,32 @@ impl Services {
             }
         }
         Ok(())
+    }
+
+    /// Queues a close of all of a user's open sessions for the expiry sweep,
+    /// for when the close that follows a saved change failed. The record names
+    /// the user, so no lookup of the sessions is needed and one opened later is
+    /// closed too. It is also kept in memory, so the sweep in this process still
+    /// acts if the database write fails.
+    pub async fn queue_user_session_closes(&self, user_id: Uuid) {
+        if let Err(error) = PendingUserClose::mark(&self.db, user_id).await {
+            error!(%error, %user_id, "Could not record the user whose sessions are waiting to be closed; queued in memory only, so repeat the change to retry it");
+        }
+        self.pending_revocations.push_user_close(user_id);
+    }
+
+    /// Whether a close of all of this user's sessions is still queued, in
+    /// memory or in the database.
+    pub async fn user_close_pending(&self, user_id: Uuid) -> bool {
+        if self.pending_revocations.has_user_close(user_id) {
+            return true;
+        }
+        PendingUserClose::is_pending(&self.db, user_id)
+            .await
+            .unwrap_or_else(|error| {
+                warn!(%error, %user_id, "Could not read the queue of users whose sessions are waiting to be closed");
+                false
+            })
     }
 
     pub async fn delete_ticket_closing_sessions(

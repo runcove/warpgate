@@ -199,6 +199,134 @@ fn edit_locks_out_caller(
     !warpgate_core::ip_allowed(ranges.as_ref(), client_ip)
 }
 
+/// Whether saving `new_ranges` would change the user's allowed ranges from
+/// the `stored` column value. An unset list and an empty one both mean no
+/// restriction, so they are the same; order, repeats and host bits are not
+/// significant. A stored value that cannot be read counts as changed.
+fn allowed_ranges_changed(stored: &serde_json::Value, new_ranges: Option<&[ipnet::IpNet]>) -> bool {
+    fn canonical(ranges: impl IntoIterator<Item = ipnet::IpNet>) -> Vec<ipnet::IpNet> {
+        let mut ranges: Vec<_> = ranges.into_iter().map(|range| range.trunc()).collect();
+        ranges.sort();
+        ranges.dedup();
+        ranges
+    }
+
+    let stored = if stored.is_null() {
+        Ok(vec![])
+    } else {
+        serde_json::from_value::<Vec<String>>(stored.clone())
+            .map_err(WarpgateError::from)
+            .and_then(User::parse_allowed_ip_ranges)
+            .map(canonical)
+    };
+    match stored {
+        Ok(stored) => stored != canonical(new_ranges.unwrap_or_default().iter().copied()),
+        Err(_) => true,
+    }
+}
+
+/// Which of the two session closes around the write of a user edit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseStage {
+    BeforeWrite,
+    AfterWrite,
+}
+
+/// Writes an admin's edit of `user`. When the edit changes the allowed IP
+/// ranges, the user's open sessions are closed, as deleting the user does:
+/// once before the write, so a failure to close leaves the edit unsaved and
+/// retryable, and again once it is committed, so a login admitted under the
+/// old ranges in between is closed too. A failure of the second close cannot
+/// be retried by the admin (the edit is saved), so it is queued for the
+/// expiry sweep and the update succeeds.
+///
+/// `close` runs the close for a stage; it is a parameter so tests can make a
+/// chosen stage fail.
+async fn save_user_update<F, Fut>(
+    services: &warpgate_core::Services,
+    user: User::Model,
+    body: &UserDataRequest,
+    parsed_ranges: Option<Vec<ipnet::IpNet>>,
+    close: F,
+) -> Result<User::Model, WarpgateError>
+where
+    F: Fn(CloseStage) -> Fut,
+    Fut: std::future::Future<Output = Result<(), WarpgateError>>,
+{
+    let user_id = user.id;
+    // A repeat of an edit whose follow-up close could not even be queued
+    // closes now, whether or not the stored ranges already match.
+    let close_needed = allowed_ranges_changed(&user.allowed_ip_ranges, parsed_ranges.as_deref())
+        || services.user_close_pending(user_id).await;
+
+    let allowed_ip_ranges = match parsed_ranges {
+        Some(ranges) => {
+            serde_json::to_value(ranges.iter().map(ToString::to_string).collect::<Vec<_>>())
+                .map_err(WarpgateError::from)?
+        }
+        None => serde_json::Value::Null,
+    };
+
+    if close_needed {
+        close(CloseStage::BeforeWrite).await?;
+    }
+
+    let mut model: User::ActiveModel = user.into();
+
+    model.username = Set(body.username.clone());
+    model.description = Set(body.description.clone().unwrap_or_default());
+    model.credential_policy =
+        Set(serde_json::to_value(body.credential_policy.clone()).map_err(WarpgateError::from)?);
+    model.rate_limit_bytes_per_second = Set(body.rate_limit_bytes_per_second.map(i64::from));
+    model.allowed_ip_ranges = Set(allowed_ip_ranges);
+    let user = model.update(&services.db).await?;
+
+    if close_needed {
+        queue_if_close_failed(services, user_id, close(CloseStage::AfterWrite).await).await;
+    }
+
+    Ok(user)
+}
+
+/// A close that follows a committed change cannot be retried by the admin, so
+/// its failure is queued for the expiry sweep instead of being reported.
+async fn queue_if_close_failed(
+    services: &warpgate_core::Services,
+    user_id: Uuid,
+    result: Result<(), WarpgateError>,
+) {
+    if let Err(error) = result {
+        tracing::warn!(%error, %user_id, "Could not close the user's sessions after saving a change; retrying on the next sweep");
+        services.queue_user_session_closes(user_id).await;
+    }
+}
+
+/// Deletes the user's records, then closes the sessions. `close` closes the
+/// user's own sessions and runs before and after the commit; it is a parameter
+/// so tests can make the second run fail.
+async fn delete_user_and_close<F, Fut>(
+    services: &warpgate_core::Services,
+    user: User::Model,
+    close: F,
+) -> Result<(), WarpgateError>
+where
+    F: Fn(CloseStage) -> Fut,
+    Fut: std::future::Future<Output = Result<(), WarpgateError>>,
+{
+    close(CloseStage::BeforeWrite).await?;
+
+    let user_id = user.id;
+    let admitted = delete_user_records(&services.db, user).await?;
+    // A login can land between the close above and the commit; the user's
+    // own sessions are closed again now that the delete is final. Both
+    // closes are attempted even if one fails. The user's own close cannot be
+    // retried by the admin (the user is gone), so its failure is queued for
+    // the expiry sweep; a failure to close the admitted sessions is returned.
+    let admitted_result = services.close_admitted_sessions(admitted).await;
+    queue_if_close_failed(services, user_id, close(CloseStage::AfterWrite).await).await;
+    admitted_result
+}
+
 /// Whether another account already uses this username, compared case-insensitively.
 /// `excluding` skips one account so a rename can keep — or re-case — its own name.
 async fn username_taken(
@@ -405,24 +533,12 @@ impl DetailApi {
             )));
         }
 
-        let allowed_ip_ranges = match parsed_ranges {
-            Some(ranges) => {
-                serde_json::to_value(ranges.iter().map(ToString::to_string).collect::<Vec<_>>())
-                    .map_err(WarpgateError::from)?
-            }
-            None => serde_json::Value::Null,
-        };
-
-        let mut model: User::ActiveModel = user.into();
-
-        model.username = Set(body.username.clone());
-        model.description = Set(body.description.clone().unwrap_or_default());
-        model.credential_policy =
-            Set(serde_json::to_value(body.credential_policy.clone())
-                .map_err(WarpgateError::from)?);
-        model.rate_limit_bytes_per_second = Set(body.rate_limit_bytes_per_second.map(i64::from));
-        model.allowed_ip_ranges = Set(allowed_ip_ranges);
-        let user = model.update(db).await?;
+        let services = admin.services();
+        let user_id = user.id;
+        let user = save_user_update(services, user, &body, parsed_ranges, |_| {
+            services.close_sessions(SessionsFilter::User { user_id })
+        })
+        .await?;
 
         warpgate_core::rate_limiting::apply_new_rate_limits(
             &admin.services().rate_limiter_registry,
@@ -452,24 +568,12 @@ impl DetailApi {
             return Ok(DeleteUserResponse::NotFound);
         };
 
-        admin
-            .services()
-            .close_sessions(SessionsFilter::User { user_id: user.id })
-            .await?;
-
+        let services = admin.services();
         let (user_id, username) = (user.id, user.username.clone());
-        let admitted = delete_user_records(db, user).await?;
-        // A login can land between the close above and the commit; the user's
-        // own sessions are closed again now that the delete is final. Both
-        // closes are attempted even if one fails, then the first error is
-        // returned, so a failure of one never leaves the other sessions open.
-        let admitted_result = admin.services().close_admitted_sessions(admitted).await;
-        let user_result = admin
-            .services()
-            .close_sessions(SessionsFilter::User { user_id })
-            .await;
-        admitted_result?;
-        user_result?;
+        delete_user_and_close(services, user, |_| {
+            services.close_sessions(SessionsFilter::User { user_id })
+        })
+        .await?;
 
         AuditEvent::UserDeleted {
             user_id,
@@ -1071,8 +1175,23 @@ fn is_reserved_username(username: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use sea_orm::ConnectionTrait as _;
     use sea_orm::Database;
+    use tokio::sync::Mutex;
+    use warpgate_common::{GlobalParams, UserSessionId, WarpgateConfig, WarpgateConfigStore};
+    use warpgate_core::cluster::Cluster;
+    use warpgate_core::login_protection::LoginProtectionService;
+    use warpgate_core::rate_limiting::RateLimiterRegistry;
+    use warpgate_core::recordings::SessionRecordings;
+    use warpgate_core::{
+        ApprovalRequestSink, AuthStateStore, DatabaseConfigProvider, SecretBackendRegistry,
+        Services, State,
+    };
     use warpgate_db_entities::Parameters::{ConfigMigrationValues, set_config_migration_values};
+    use warpgate_db_entities::PendingUserClose;
     use warpgate_db_entities::Target::{self, TargetKind};
     use warpgate_db_entities::TicketRequest::TicketRequestStatus;
     use warpgate_db_migrations::migrate_database;
@@ -1418,5 +1537,514 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(session.ended.is_some());
+    }
+
+    /// The services a node runs with, over `db`.
+    async fn services(db: &DatabaseConnection) -> Services {
+        let params = GlobalParams::new(PathBuf::from("/warpgate.yaml"), false).unwrap();
+        let rate_limiter_registry = Arc::new(Mutex::new(RateLimiterRegistry::new(db.clone())));
+        let cluster = Arc::new(Cluster::new(db.clone(), 0).await.unwrap());
+        Services {
+            db: db.clone(),
+            recordings: Arc::new(SessionRecordings::new(db.clone(), &params)),
+            config: Arc::new(Mutex::new(WarpgateConfig {
+                store: WarpgateConfigStore::default(),
+            })),
+            state: State::new(db, &rate_limiter_registry, cluster.node_id),
+            cluster: cluster.clone(),
+            rate_limiter_registry,
+            config_provider: Arc::new(DatabaseConfigProvider::new(db).into()),
+            auth_state_store: Arc::new(Mutex::new(AuthStateStore::new(ApprovalRequestSink {
+                db: db.clone(),
+                cluster: cluster.clone(),
+            }))),
+            admin_token: Arc::new(None),
+            login_protection: Arc::new(LoginProtectionService::new(db.clone()).await.unwrap()),
+            global_params: Arc::new(params),
+            listener_status: Default::default(),
+            secret_backends: Arc::new(SecretBackendRegistry::new(db.clone())),
+            live_streams: Default::default(),
+            pending_revocations: Default::default(),
+        }
+    }
+
+    async fn open_session_of(db: &DatabaseConnection, user: &User::Model) -> UserSessionId {
+        let session_id = UserSessionId(Uuid::new_v4());
+        warpgate_db_entities::UserSession::ActiveModel {
+            id: Set(session_id),
+            username: Set(Some(user.username.clone())),
+            user_id: Set(Some(user.id)),
+            remote_address: Set("127.0.0.1:22".into()),
+            started: Set(OffsetDateTime::now_utc()),
+            ended: Set(None),
+            protocol: Set("HTTP".into()),
+            node_id: Set(None),
+            auth_state_node_id: Set(None),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        session_id
+    }
+
+    async fn session_ended(db: &DatabaseConnection, id: UserSessionId) -> bool {
+        warpgate_db_entities::UserSession::Entity::find_by_id(id)
+            .one(db)
+            .await
+            .unwrap()
+            .unwrap()
+            .ended
+            .is_some()
+    }
+
+    fn edit(username: &str, ranges: Option<&[&str]>) -> UserDataRequest {
+        UserDataRequest {
+            username: username.into(),
+            credential_policy: None,
+            description: None,
+            rate_limit_bytes_per_second: None,
+            allowed_ip_ranges: ranges.map(|r| r.iter().map(ToString::to_string).collect()),
+        }
+    }
+
+    async fn save(
+        services: &Services,
+        user: User::Model,
+        body: &UserDataRequest,
+    ) -> Result<User::Model, WarpgateError> {
+        let ranges = match body.allowed_ip_ranges.clone() {
+            Some(ranges) => Some(User::parse_allowed_ip_ranges(ranges)?),
+            None => None,
+        };
+        let user_id = user.id;
+        save_user_update(services, user, body, ranges, |_| {
+            services.close_sessions(SessionsFilter::User { user_id })
+        })
+        .await
+    }
+
+    /// Like `save`, but the close at `failing` fails; the stages reached are
+    /// recorded in order. A failing after-write close first opens a session
+    /// for the user, as a login landing between the two closes would, and
+    /// returns its id.
+    async fn save_failing_close(
+        services: &Services,
+        user: User::Model,
+        body: &UserDataRequest,
+        failing: CloseStage,
+    ) -> (
+        Result<User::Model, WarpgateError>,
+        Vec<CloseStage>,
+        Option<UserSessionId>,
+    ) {
+        let ranges =
+            Some(User::parse_allowed_ip_ranges(body.allowed_ip_ranges.clone().unwrap()).unwrap());
+        let user_id = user.id;
+        let stages = std::sync::Mutex::new(vec![]);
+        let late = std::sync::Mutex::new(None);
+        let (db, late_user) = (services.db.clone(), user.clone());
+        let result = save_user_update(services, user, body, ranges, |stage| {
+            stages.lock().unwrap().push(stage);
+            let fail = stage == failing;
+            let (db, late_user, late) = (&db, &late_user, &late);
+            async move {
+                if fail {
+                    if stage == CloseStage::AfterWrite {
+                        *late.lock().unwrap() = Some(open_session_of(db, late_user).await);
+                    }
+                    return Err(WarpgateError::InvalidNetworkAddress("injected".into()));
+                }
+                services
+                    .close_sessions(SessionsFilter::User { user_id })
+                    .await
+            }
+        })
+        .await;
+        (
+            result,
+            stages.into_inner().unwrap(),
+            late.into_inner().unwrap(),
+        )
+    }
+
+    #[test]
+    fn only_a_real_change_of_the_ranges_counts_as_a_change() {
+        let nets =
+            |v: &[&str]| -> Vec<ipnet::IpNet> { v.iter().map(|x| x.parse().unwrap()).collect() };
+        let stored = |v: &[&str]| serde_json::json!(v);
+        let null = serde_json::Value::Null;
+
+        // Same list, in any order, with repeats, or with host bits set.
+        assert!(!allowed_ranges_changed(
+            &stored(&["10.0.0.0/8", "192.0.2.0/24"]),
+            Some(&nets(&["10.0.0.0/8", "192.0.2.0/24"])),
+        ));
+        assert!(!allowed_ranges_changed(
+            &stored(&["10.0.0.0/8", "192.0.2.0/24"]),
+            Some(&nets(&["192.0.2.0/24", "10.0.0.0/8", "10.0.0.0/8"])),
+        ));
+        assert!(!allowed_ranges_changed(
+            &stored(&["192.0.2.0/24"]),
+            Some(&nets(&["192.0.2.7/24"])),
+        ));
+        // Unset and empty both mean no restriction.
+        assert!(!allowed_ranges_changed(&null, None));
+        assert!(!allowed_ranges_changed(&null, Some(&[])));
+        assert!(!allowed_ranges_changed(&stored(&[]), None));
+
+        // Anything that changes who is admitted.
+        assert!(allowed_ranges_changed(&null, Some(&nets(&["10.0.0.0/8"]))));
+        assert!(allowed_ranges_changed(&stored(&["10.0.0.0/8"]), None));
+        assert!(allowed_ranges_changed(&stored(&["10.0.0.0/8"]), Some(&[])));
+        assert!(allowed_ranges_changed(
+            &stored(&["10.0.0.0/8"]),
+            Some(&nets(&["10.0.0.0/16"])),
+        ));
+        assert!(allowed_ranges_changed(
+            &stored(&["10.0.0.0/8"]),
+            Some(&nets(&["10.0.0.0/8", "192.0.2.0/24"])),
+        ));
+        assert!(allowed_ranges_changed(
+            &stored(&["10.0.0.0/8", "192.0.2.0/24"]),
+            Some(&nets(&["10.0.0.0/8"])),
+        ));
+        // A stored value that cannot be read is replaced, so it counts.
+        assert!(allowed_ranges_changed(
+            &serde_json::json!("garbage"),
+            Some(&nets(&["10.0.0.0/8"])),
+        ));
+        assert!(allowed_ranges_changed(&stored(&["not a network"]), None));
+    }
+
+    /// An edit that changes the allowed ranges ends the user's open sessions,
+    /// whichever way the ranges change, and no one else's.
+    #[tokio::test]
+    async fn changing_a_users_allowed_ranges_closes_their_sessions() {
+        let db = setup_db().await;
+        let services = services(&db).await;
+        let alice = insert_user(&db, "alice").await;
+        let bob = insert_user(&db, "bob").await;
+
+        let mut alice = alice;
+        for (stored_before, ranges) in [
+            // Restricting a user who had no restriction.
+            (None, Some(&["10.0.0.0/8"][..])),
+            // Narrowing, widening and replacing.
+            (Some(&["10.0.0.0/8"][..]), Some(&["10.1.0.0/16"][..])),
+            (
+                Some(&["10.1.0.0/16"][..]),
+                Some(&["10.0.0.0/8", "192.0.2.0/24"][..]),
+            ),
+            (
+                Some(&["10.0.0.0/8", "192.0.2.0/24"][..]),
+                Some(&["198.51.100.0/24"][..]),
+            ),
+            // Lifting the restriction.
+            (Some(&["198.51.100.0/24"][..]), None),
+        ] {
+            let alice_session = open_session_of(&db, &alice).await;
+            let bob_session = open_session_of(&db, &bob).await;
+
+            let saved = save(&services, alice.clone(), &edit("alice", ranges))
+                .await
+                .unwrap();
+
+            assert!(
+                session_ended(&db, alice_session).await,
+                "{stored_before:?} -> {ranges:?} left the user's session open"
+            );
+            assert!(
+                !session_ended(&db, bob_session).await,
+                "{stored_before:?} -> {ranges:?} closed another user's session"
+            );
+            match ranges {
+                Some(ranges) => assert_eq!(saved.allowed_ip_ranges, serde_json::json!(ranges)),
+                None => assert!(saved.allowed_ip_ranges.is_null()),
+            }
+            alice = saved;
+        }
+    }
+
+    /// An edit that leaves the allowed ranges as they are keeps the user's
+    /// sessions, whatever else it changes.
+    #[tokio::test]
+    async fn an_update_that_keeps_the_allowed_ranges_leaves_sessions_open() {
+        let db = setup_db().await;
+        let services = services(&db).await;
+        let alice = insert_user(&db, "alice").await;
+        let alice = save(
+            &services,
+            alice,
+            &edit("alice", Some(&["10.0.0.0/8", "192.0.2.0/24"])),
+        )
+        .await
+        .unwrap();
+        let session = open_session_of(&db, &alice).await;
+
+        // The same ranges, with other fields changed.
+        let mut body = edit("alice-renamed", Some(&["10.0.0.0/8", "192.0.2.0/24"]));
+        body.description = Some("renamed".into());
+        body.rate_limit_bytes_per_second = Some(1000);
+        let alice = save(&services, alice, &body).await.unwrap();
+        assert_eq!(alice.username, "alice-renamed");
+        assert!(!session_ended(&db, session).await);
+
+        // The same ranges listed in another order.
+        let alice = save(
+            &services,
+            alice,
+            &edit("alice-renamed", Some(&["192.0.2.0/24", "10.0.0.0/8"])),
+        )
+        .await
+        .unwrap();
+        assert!(!session_ended(&db, session).await);
+
+        // A user with no restriction who stays unrestricted.
+        let bob = insert_user(&db, "bob").await;
+        let bob_session = open_session_of(&db, &bob).await;
+        save(&services, bob, &edit("bob", None)).await.unwrap();
+        assert!(!session_ended(&db, bob_session).await);
+
+        // And the first change after all that still closes it.
+        save(&services, alice, &edit("alice-renamed", None))
+            .await
+            .unwrap();
+        assert!(session_ended(&db, session).await);
+    }
+
+    /// A failing close before the write aborts the edit: nothing is written,
+    /// the second close is never attempted, and the sessions stay for a retry.
+    #[tokio::test]
+    async fn a_failing_close_before_the_write_aborts_the_update() {
+        let db = setup_db().await;
+        let services = services(&db).await;
+        let alice = insert_user(&db, "alice").await;
+        let session = open_session_of(&db, &alice).await;
+
+        let (result, stages, _) = save_failing_close(
+            &services,
+            alice.clone(),
+            &edit("alice", Some(&["10.0.0.0/8"])),
+            CloseStage::BeforeWrite,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(stages, vec![CloseStage::BeforeWrite]);
+        let stored = User::Entity::find_by_id(alice.id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stored.allowed_ip_ranges.is_null());
+        assert!(!session_ended(&db, session).await);
+        assert_eq!(services.pending_revocations.user_closes_len(), 0);
+    }
+
+    /// A failing close after the write does not fail the edit: it is saved,
+    /// the user is queued for the sweep, and the sweep closes every open session
+    /// of the user.
+    #[tokio::test]
+    async fn a_failing_close_after_the_write_is_queued_and_the_update_succeeds() {
+        let db = setup_db().await;
+        let services = services(&db).await;
+        let alice = insert_user(&db, "alice").await;
+        let bob = insert_user(&db, "bob").await;
+        let bob_session = open_session_of(&db, &bob).await;
+
+        let (result, stages, late) = save_failing_close(
+            &services,
+            alice.clone(),
+            &edit("alice", Some(&["10.0.0.0/8"])),
+            CloseStage::AfterWrite,
+        )
+        .await;
+
+        let saved = result.unwrap();
+        assert_eq!(
+            stages,
+            vec![CloseStage::BeforeWrite, CloseStage::AfterWrite]
+        );
+        assert_eq!(saved.allowed_ip_ranges, serde_json::json!(["10.0.0.0/8"]));
+        // The session that landed between the two closes is covered too.
+        let session = late.unwrap();
+        assert_eq!(services.pending_revocations.user_closes_len(), 1);
+        assert_eq!(
+            PendingUserClose::pending(&db).await.unwrap(),
+            vec![alice.id]
+        );
+        assert!(!session_ended(&db, session).await);
+
+        // The first sweep closes the session but keeps the row for one more
+        // sweep, in case a session still opening was missed.
+        services.retry_pending_revocations().await;
+        assert!(session_ended(&db, session).await);
+        assert!(!session_ended(&db, bob_session).await);
+        assert_eq!(services.pending_revocations.user_closes_len(), 0);
+        assert_eq!(
+            PendingUserClose::pending(&db).await.unwrap(),
+            vec![alice.id]
+        );
+        age_pending_rows(&db).await;
+        services.retry_pending_revocations().await;
+        assert!(PendingUserClose::pending(&db).await.unwrap().is_empty());
+    }
+
+    /// Pushes the queue rows back in time, as if written long ago.
+    async fn age_pending_rows(db: &DatabaseConnection) {
+        PendingUserClose::Entity::update_many()
+            .col_expr(
+                PendingUserClose::Column::Queued,
+                sea_orm::sea_query::Expr::value(
+                    OffsetDateTime::now_utc() - time::Duration::hours(1),
+                ),
+            )
+            .exec(db)
+            .await
+            .unwrap();
+    }
+
+    /// The after-write close fails and the database cannot take the record of
+    /// it: the update still succeeds and the in-memory entry lets the sweep end
+    /// the user's session.
+    #[tokio::test]
+    async fn a_failed_queue_write_falls_back_to_the_in_memory_entry() {
+        let db = setup_db().await;
+        let services = services(&db).await;
+        let alice = insert_user(&db, "alice").await;
+        let bob = insert_user(&db, "bob").await;
+        let bob_session = open_session_of(&db, &bob).await;
+        db.execute_unprepared("DROP TABLE pending_user_closes")
+            .await
+            .unwrap();
+
+        let (result, _, late) = save_failing_close(
+            &services,
+            alice.clone(),
+            &edit("alice", Some(&["10.0.0.0/8"])),
+            CloseStage::AfterWrite,
+        )
+        .await;
+
+        result.unwrap();
+        let session = late.unwrap();
+        assert!(!session_ended(&db, session).await);
+        assert_eq!(services.pending_revocations.user_closes_len(), 1);
+
+        services.retry_pending_revocations().await;
+        assert!(session_ended(&db, session).await);
+        assert!(!session_ended(&db, bob_session).await);
+        assert_eq!(services.pending_revocations.user_closes_len(), 0);
+    }
+
+    /// A restart loses the in-memory queue; the recorded row still lets the
+    /// next process's sweep end the user's session.
+    #[tokio::test]
+    async fn a_recorded_queue_entry_survives_a_restart() {
+        let db = setup_db().await;
+        let before = services(&db).await;
+        let alice = insert_user(&db, "alice").await;
+        let session = open_session_of(&db, &alice).await;
+        before.queue_user_session_closes(alice.id).await;
+        drop(before);
+
+        let after = services(&db).await;
+        assert_eq!(after.pending_revocations.user_closes_len(), 0);
+        after.retry_pending_revocations().await;
+        assert!(session_ended(&db, session).await);
+    }
+
+    /// A failing close after the delete's commit does not fail the delete; a
+    /// session that opened in between is ended by the sweep.
+    #[tokio::test]
+    async fn a_failing_close_after_a_delete_is_queued_and_the_delete_succeeds() {
+        let db = setup_db().await;
+        let services = services(&db).await;
+        let alice = insert_user(&db, "alice").await;
+        let early = open_session_of(&db, &alice).await;
+        let late = std::sync::Mutex::new(None);
+
+        let (db2, alice2) = (db.clone(), alice.clone());
+        let user_id = alice.id;
+        delete_user_and_close(&services, alice.clone(), |stage| {
+            let (db2, alice2, late, services) = (&db2, &alice2, &late, &services);
+            async move {
+                if stage == CloseStage::BeforeWrite {
+                    return services
+                        .close_sessions(SessionsFilter::User { user_id })
+                        .await;
+                }
+                *late.lock().unwrap() = Some(open_session_of(db2, alice2).await);
+                Err(WarpgateError::InvalidNetworkAddress("injected".into()))
+            }
+        })
+        .await
+        .unwrap();
+
+        let late = late.into_inner().unwrap().unwrap();
+        assert!(
+            User::Entity::find_by_id(user_id)
+                .one(&db)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(session_ended(&db, early).await);
+        assert!(!session_ended(&db, late).await);
+        assert_eq!(PendingUserClose::pending(&db).await.unwrap(), vec![user_id]);
+
+        services.retry_pending_revocations().await;
+        assert!(session_ended(&db, late).await);
+    }
+
+    /// A record written after the sweep read the table survives the sweep's
+    /// clear, and so does one written within the last sweep interval.
+    #[tokio::test]
+    async fn a_newer_record_survives_the_clear_of_an_older_read() {
+        let db = setup_db().await;
+        let alice = Uuid::new_v4();
+        PendingUserClose::mark(&db, alice).await.unwrap();
+        age_pending_rows(&db).await;
+        let read_at = OffsetDateTime::now_utc();
+
+        // Marked again after the read: the time is refreshed, not kept.
+        PendingUserClose::mark(&db, alice).await.unwrap();
+        PendingUserClose::clear(&db, alice, read_at).await.unwrap();
+        assert_eq!(PendingUserClose::pending(&db).await.unwrap(), vec![alice]);
+
+        // A clear no earlier than the write removes it.
+        PendingUserClose::clear(&db, alice, OffsetDateTime::now_utc())
+            .await
+            .unwrap();
+        assert!(PendingUserClose::pending(&db).await.unwrap().is_empty());
+    }
+
+    /// Repeating an edit whose close could not be queued closes the user's
+    /// sessions even though the stored ranges already match.
+    #[tokio::test]
+    async fn a_repeated_update_forces_the_close_that_was_never_queued() {
+        let db = setup_db().await;
+        let services = services(&db).await;
+        let alice = insert_user(&db, "alice").await;
+        db.execute_unprepared("DROP TABLE pending_user_closes")
+            .await
+            .unwrap();
+
+        let (result, _, late) = save_failing_close(
+            &services,
+            alice.clone(),
+            &edit("alice", Some(&["10.0.0.0/8"])),
+            CloseStage::AfterWrite,
+        )
+        .await;
+        let saved = result.unwrap();
+        let session = late.unwrap();
+        assert!(services.user_close_pending(alice.id).await);
+
+        // The ranges now match the stored ones.
+        save(&services, saved, &edit("alice", Some(&["10.0.0.0/8"])))
+            .await
+            .unwrap();
+        assert!(session_ended(&db, session).await);
     }
 }

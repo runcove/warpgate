@@ -123,6 +123,8 @@ mod m00089_cove_open_session_indexes;
 // Sessions still to be closed after their ticket was deleted, kept so the close
 // survives a node restart.
 mod m00090_cove_pending_session_closes;
+// Users whose sessions are all still to be closed after a saved edit.
+mod m00095_cove_pending_user_closes;
 
 pub(crate) mod helpers;
 
@@ -234,6 +236,7 @@ impl MigratorTrait for Migrator {
             Box::new(m00080_cove_lp_ip_exempt_cidrs::Migration),
             Box::new(m00089_cove_open_session_indexes::Migration),
             Box::new(m00090_cove_pending_session_closes::Migration),
+            Box::new(m00095_cove_pending_user_closes::Migration),
         ]
     }
 }

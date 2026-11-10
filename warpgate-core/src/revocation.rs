@@ -11,12 +11,13 @@ use tracing::{info, warn};
 use uuid::Uuid;
 use warpgate_common::{Protocol, TargetOptions, UserSessionId, WarpgateError};
 use warpgate_db_entities::{
-    PendingSessionClose, TargetSession, User, UserRoleAssignment, UserSession,
+    PendingSessionClose, PendingUserClose, TargetSession, User, UserRoleAssignment, UserSession,
 };
 use warpgate_sso::{SsoLoginResponse, SsoProviderConfig};
 
 use crate::cluster::ClusterNotification;
 use crate::live_streams::{LiveStreamKind, host_binding};
+use crate::services::TICKET_EXPIRY_SWEEP_INTERVAL;
 use crate::{ConfigProvider, Services, SessionsFilter, apply_sso_mappings, resolve_sso_username};
 
 /// Waits up to [`LIVE_STREAM_LOOKUP_TIMEOUT`] for one access lookup of the
@@ -145,6 +146,7 @@ impl CloseRetryOutcome {
 pub struct PendingRevocations {
     changes: std::sync::Arc<std::sync::Mutex<Vec<AccessChange>>>,
     closes: std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<UserSessionId>>>,
+    user_closes: std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<Uuid>>>,
 }
 
 impl PendingRevocations {
@@ -160,6 +162,32 @@ impl PendingRevocations {
         self.closes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn lock_user_closes(&self) -> std::sync::MutexGuard<'_, std::collections::BTreeSet<Uuid>> {
+        self.user_closes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Queues a user whose open sessions must all be closed.
+    pub(crate) fn push_user_close(&self, user_id: Uuid) {
+        self.lock_user_closes().insert(user_id);
+    }
+
+    pub(crate) fn has_user_close(&self, user_id: Uuid) -> bool {
+        self.lock_user_closes().contains(&user_id)
+    }
+
+    fn take_user_closes(&self) -> Vec<Uuid> {
+        std::mem::take(&mut *self.lock_user_closes())
+            .into_iter()
+            .collect()
+    }
+
+    /// Users waiting for all their sessions to be closed.
+    pub fn user_closes_len(&self) -> usize {
+        self.lock_user_closes().len()
     }
 
     fn push(&self, change: AccessChange) {
@@ -280,6 +308,45 @@ impl Services {
             let _ = self.close_sessions_no_longer_authorised(change).await;
         }
         self.retry_pending_closes().await;
+        self.retry_pending_user_closes().await;
+    }
+
+    /// Closes every open session of each queued user, in memory or recorded in
+    /// the database. A user whose close fails is queued again.
+    ///
+    /// A recorded row is removed only if it was written no later than one
+    /// sweep interval before this sweep read the table: a newer record of the
+    /// same user is kept, and so is one a session still opening (its user not
+    /// yet set) could have escaped, which the next sweep closes again.
+    async fn retry_pending_user_closes(&self) {
+        let mut users: std::collections::BTreeSet<Uuid> = self
+            .pending_revocations
+            .take_user_closes()
+            .into_iter()
+            .collect();
+        let read_at = OffsetDateTime::now_utc();
+        match PendingUserClose::pending(&self.db).await {
+            Ok(persisted) => users.extend(persisted),
+            Err(error) => {
+                warn!(%error, "Could not read the users waiting to have their sessions closed; retrying the queued ones only");
+            }
+        }
+        let clear_up_to = read_at - TICKET_EXPIRY_SWEEP_INTERVAL;
+        for user_id in users {
+            match self.close_sessions(SessionsFilter::User { user_id }).await {
+                Ok(()) => {
+                    if let Err(error) =
+                        PendingUserClose::clear(&self.db, user_id, clear_up_to).await
+                    {
+                        warn!(%error, %user_id, "Could not clear the record of a closed user's sessions");
+                    }
+                }
+                Err(error) => {
+                    warn!(%error, %user_id, "Could not close a user's sessions; retrying on the next sweep");
+                    self.pending_revocations.push_user_close(user_id);
+                }
+            }
+        }
     }
 
     /// Retries queued session closes in chunks. A chunk that fails is retried
