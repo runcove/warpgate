@@ -13,7 +13,7 @@ use warpgate_common::helpers::username::username_eq_ci;
 use warpgate_common::{Protocol, User, UserSessionId, WarpgateError};
 
 use crate::cluster::{Cluster, ClusterNotification};
-use crate::login_protection::{FailedAttemptInfo, LoginProtectionConfig, LoginProtectionService};
+use crate::login_protection::{FailedAttemptInfo, LoginProtectionService};
 use crate::{ConfigProvider, ConfigProviderEnum};
 
 #[allow(clippy::unwrap_used)]
@@ -85,20 +85,8 @@ pub async fn vet_credential_bearer(
     user: &User,
     remote_ip: Option<IpAddr>,
 ) -> Result<bool, WarpgateError> {
-    let config = login_protection.read_settings().await?;
-    vet_credential_bearer_with(login_protection, &config, user, remote_ip).await
-}
-
-/// As [`vet_credential_bearer`], with login-protection settings the caller has
-/// already read.
-pub async fn vet_credential_bearer_with(
-    login_protection: &LoginProtectionService,
-    config: &LoginProtectionConfig,
-    user: &User,
-    remote_ip: Option<IpAddr>,
-) -> Result<bool, WarpgateError> {
     if login_protection
-        .check_user_locked_with(config, &user.username)
+        .check_user_locked(&user.username)
         .await?
         .is_some()
     {

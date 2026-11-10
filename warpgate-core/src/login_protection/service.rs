@@ -43,11 +43,8 @@ struct UserLockoutConfig {
 }
 
 /// Snapshot of login-protection settings, read fresh from the DB per call.
-/// A caller that makes several checks in one request reads it once with
-/// [`LoginProtectionService::read_settings`] and passes it to the `_with`
-/// variants of the checks.
 #[derive(Clone, Debug)]
-pub struct LoginProtectionConfig {
+struct LoginProtectionConfig {
     enabled: bool,
     retention_seconds: u32,
     ip_rate_limit: IpRateLimitConfig,
@@ -177,12 +174,6 @@ impl LoginProtectionService {
         ))
     }
 
-    /// Read the current settings from the DB, for the `_with` variants of the
-    /// checks.
-    pub async fn read_settings(&self) -> Result<LoginProtectionConfig, WarpgateError> {
-        Self::read_config(&self.db).await
-    }
-
     /// Create the service and warm the cache from DB state.
     pub async fn new(db: DatabaseConnection) -> Result<Self, WarpgateError> {
         let cache = LoginProtectionCache::new();
@@ -200,18 +191,9 @@ impl LoginProtectionService {
         &self,
         ip: &IpAddr,
     ) -> Result<Option<IpBlockInfo>, WarpgateError> {
-        let config = Self::read_config(&self.db).await?;
-        self.check_ip_blocked_with(&config, ip).await
-    }
-
-    /// As [`Self::check_ip_blocked`], with settings the caller has already read.
-    pub async fn check_ip_blocked_with(
-        &self,
-        config: &LoginProtectionConfig,
-        ip: &IpAddr,
-    ) -> Result<Option<IpBlockInfo>, WarpgateError> {
         let ip = &ip.to_canonical();
         let db = &self.db;
+        let config = Self::read_config(db).await?;
         // An exempt address is never reported blocked, even by a block row
         // written before it was added to the list.
         if !config.enabled || config.is_ip_exempt(ip) {
@@ -251,17 +233,8 @@ impl LoginProtectionService {
         &self,
         username: &str,
     ) -> Result<Option<UserLockInfo>, WarpgateError> {
-        let config = Self::read_config(&self.db).await?;
-        self.check_user_locked_with(&config, username).await
-    }
-
-    /// As [`Self::check_user_locked`], with settings the caller has already read.
-    pub async fn check_user_locked_with(
-        &self,
-        config: &LoginProtectionConfig,
-        username: &str,
-    ) -> Result<Option<UserLockInfo>, WarpgateError> {
         let db = &self.db;
+        let config = Self::read_config(db).await?;
         if !config.enabled {
             return Ok(None);
         }
@@ -377,7 +350,8 @@ impl LoginProtectionService {
                 .count(&txn)
                 .await?;
             if ip_count >= u64::from(config.ip_rate_limit.max_attempts) {
-                new_block = Self::create_or_update_ip_block(&txn, &remote_ip, now, &config).await?;
+                new_block =
+                    Self::create_or_update_ip_block(&txn, &remote_ip, now, &config).await?;
             }
         }
 

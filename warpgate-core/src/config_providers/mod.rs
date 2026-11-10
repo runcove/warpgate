@@ -365,30 +365,17 @@ impl ValidatedTicket {
     }
 }
 
-/// Whether the user a ticket session was started for is still admitted to
-/// sign in from `remote_ip`: the address is not blocked, the user exists and
-/// is not locked, and the user's allowed IP ranges admit the address. These are
-/// the checks [`validate_ticket`] makes when the session starts, for a
-/// session that is re-checked on later requests. A user that cannot be loaded
-/// is not admitted.
+/// Whether the user a ticket session was started for is still admitted: the
+/// user exists and their allowed IP ranges admit `remote_ip`. Only these
+/// administrator-controlled rules are judged on later requests of a signed-in
+/// session; an automatic lockout or address block stops new sign-ins and
+/// ticket use (see [`validate_ticket`]) but does not end a live session. A
+/// user that cannot be loaded is not admitted.
 pub async fn ticket_user_still_admitted(
     db: &DatabaseConnection,
-    login_protection: &LoginProtectionService,
     user_id: Uuid,
     remote_ip: Option<IpAddr>,
 ) -> Result<bool, WarpgateError> {
-    // The settings are read once and shared by the address and lockout checks.
-    let settings = login_protection.read_settings().await?;
-    if let Some(ip) = remote_ip
-        && login_protection
-            .check_ip_blocked_with(&settings, &ip)
-            .await?
-            .is_some()
-    {
-        warn!("Ticket session continued from a blocked IP: {ip}");
-        return Ok(false);
-    }
-
     let Some(user) = e::User::Entity::find_by_id(user_id).one(db).await? else {
         warn!(%user_id, "User of a ticket session not found");
         return Ok(false);
@@ -397,13 +384,12 @@ pub async fn ticket_user_still_admitted(
         warn!(%user_id, "User of a ticket session could not be loaded");
         return Ok(false);
     };
-    crate::auth_state_store::vet_credential_bearer_with(
-        login_protection,
-        &settings,
-        &user,
+    Ok(crate::auth_state_store::check_ip_allowed(
+        user.allowed_ip_ranges.as_ref(),
         remote_ip,
+        &user.username,
     )
-    .await
+    .is_ok())
 }
 
 pub async fn validate_ticket(
@@ -638,7 +624,7 @@ mod tests {
         let user_id = ticket.user_id;
         let inside: Option<IpAddr> = Some("10.1.2.3".parse().unwrap());
         let outside: Option<IpAddr> = Some("192.0.2.1".parse().unwrap());
-        let admitted = |ip| ticket_user_still_admitted(&db, &login_protection, user_id, ip);
+        let admitted = |ip| ticket_user_still_admitted(&db, user_id, ip);
 
         // No ranges set: admitted from anywhere.
         assert!(admitted(inside).await.unwrap());
@@ -659,7 +645,7 @@ mod tests {
 
         // A user that is gone (or never was) is not admitted.
         assert!(
-            !ticket_user_still_admitted(&db, &login_protection, Uuid::new_v4(), inside)
+            !ticket_user_still_admitted(&db, Uuid::new_v4(), inside)
                 .await
                 .unwrap()
         );

@@ -313,9 +313,24 @@ def test_ticket_session_is_anonymous_after_its_user_is_restricted_to_other_addre
     _anonymous_after(url, session)
 
 
-def test_ticket_session_is_anonymous_after_its_user_is_locked(
+def _still_signed_in(url, session, username):
+    assert _info_username(url, session) == username
+    assert session.get(f"{url}/some/path", allow_redirects=False).status_code != 401
+
+
+def _refused_ticket_link(url, secret):
+    resp, fresh = _open_ticket_link(url, secret)
+    assert resp.status_code // 100 != 2, "the ticket link opened"
+    info = fresh.get(f"{url}/@warpgate/api/info")
+    info.raise_for_status()
+    assert info.json().get("username") in (None, ""), info.json()
+
+
+def test_ticket_session_survives_its_user_being_locked(
     processes: ProcessManager, echo_server_port
 ):
+    """An automatic lockout refuses new sign-ins and ticket use but does not
+    end a session that is already signed in."""
     wg = _lp_wg(processes, ip_max=100, user_max=3)
     url = f"https://localhost:{wg.http_port}"
     with admin_client(url) as api:
@@ -324,23 +339,26 @@ def test_ticket_session_is_anonymous_after_its_user_is_locked(
 
     resp, session = _open_ticket_link(url, secret)
     assert resp.status_code // 100 in (2, 3)
-    assert _info_username(url, session) == alice.username
-
-    # Not locked yet: the session stays signed in across several requests.
-    for _ in range(3):
-        assert _info_username(url, session) == alice.username
-        assert session.get(f"{url}/some/path", allow_redirects=False).status_code != 401
+    _still_signed_in(url, session, alice.username)
 
     for _ in range(3):
         _post_login(url, alice.username, "wrong")
     time.sleep(0.2)
 
-    _anonymous_after(url, session)
+    # The live session carries on ...
+    for _ in range(3):
+        _still_signed_in(url, session, alice.username)
+    # ... while a new sign-in and a new use of the ticket are refused.
+    resp, fresh = _post_login(url, alice.username, "correct_password")
+    assert resp.status_code // 100 != 2
+    _refused_ticket_link(url, secret)
 
 
-def test_ticket_session_is_anonymous_after_its_address_is_blocked(
+def test_ticket_session_survives_its_address_being_blocked(
     processes: ProcessManager, echo_server_port
 ):
+    """An address block refuses new sign-ins and ticket use from that address
+    but does not end a session that is already signed in."""
     wg = _lp_wg(processes, ip_max=3, user_max=100)
     url = f"https://localhost:{wg.http_port}"
     with admin_client(url) as api:
@@ -349,9 +367,7 @@ def test_ticket_session_is_anonymous_after_its_address_is_blocked(
 
     resp, session = _open_ticket_link(url, secret)
     assert resp.status_code // 100 in (2, 3)
-    # Not blocked yet: the session stays signed in across several requests.
-    for _ in range(3):
-        assert _info_username(url, session) == alice.username
+    _still_signed_in(url, session, alice.username)
 
     # Loopback is not exempt by default, so three failed logins from here
     # block this address.
@@ -359,4 +375,8 @@ def test_ticket_session_is_anonymous_after_its_address_is_blocked(
         _post_login(url, alice.username, "wrong")
     time.sleep(0.2)
 
-    _anonymous_after(url, session)
+    for _ in range(3):
+        _still_signed_in(url, session, alice.username)
+    resp, _ = _post_login(url, alice.username, "correct_password")
+    assert resp.json().get("state") == "IpBlocked", resp.text
+    _refused_ticket_link(url, secret)

@@ -286,13 +286,7 @@ impl<E: Endpoint> Endpoint for TicketMiddlewareEndpoint<E> {
                         let client_ip = get_client_ip(&req, ctx.services())
                             .await
                             .and_then(|s| s.parse().ok());
-                        !ticket_user_still_admitted(
-                            &ctx.services().db,
-                            &ctx.services().login_protection,
-                            user_id,
-                            client_ip,
-                        )
-                        .await?
+                        !ticket_user_still_admitted(&ctx.services().db, user_id, client_ip).await?
                     } else {
                         true
                     }
