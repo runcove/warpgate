@@ -269,11 +269,12 @@ impl<E: Endpoint> Endpoint for TicketMiddlewareEndpoint<E> {
         let mut rotation = None;
 
         // A browser session that a ticket started lasts as long as the ticket
-        // and as long as its user may sign in from where the request comes
-        // from: once the ticket is deleted or expired, or the user is locked,
-        // outside their allowed IP ranges or on a blocked address, the session
-        // ends as at logout and the request carries on anonymous on a fresh
-        // session, with any ticket presented with it judged on its own.
+        // and as long as its user exists and may sign in from where the request
+        // comes from: once the ticket is deleted or expired, or the user is
+        // gone or outside their allowed IP ranges, the session ends as at
+        // logout and the request carries on anonymous on a fresh session, with
+        // any ticket presented with it judged on its own. Automatic lockouts
+        // and address blocks do not end a live session.
         if !session_is_temporary && let Some(auth) = session.get_auth() {
             let ended = match ticket_to_recheck(&auth) {
                 TicketRecheck::Skip => false,

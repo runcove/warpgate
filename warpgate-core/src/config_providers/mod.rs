@@ -615,7 +615,8 @@ mod tests {
         use sea_orm::ActiveValue::Set;
         use sea_orm::{ActiveModelTrait, IntoActiveModel};
 
-        let (db, login_protection, _target, ticket_id, _secret) = ticket_fixture(false, None).await;
+        let (db, _login_protection, _target, ticket_id, _secret) =
+            ticket_fixture(false, None).await;
         let ticket = e::Ticket::Entity::find_by_id(ticket_id)
             .one(&db)
             .await

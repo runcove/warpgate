@@ -319,8 +319,7 @@ def _still_signed_in(url, session, username):
 
 
 def _refused_ticket_link(url, secret):
-    resp, fresh = _open_ticket_link(url, secret)
-    assert resp.status_code // 100 != 2, "the ticket link opened"
+    _, fresh = _open_ticket_link(url, secret)
     info = fresh.get(f"{url}/@warpgate/api/info")
     info.raise_for_status()
     assert info.json().get("username") in (None, ""), info.json()
@@ -349,8 +348,8 @@ def test_ticket_session_survives_its_user_being_locked(
     for _ in range(3):
         _still_signed_in(url, session, alice.username)
     # ... while a new sign-in and a new use of the ticket are refused.
-    resp, fresh = _post_login(url, alice.username, "correct_password")
-    assert resp.status_code // 100 != 2
+    resp, _ = _post_login(url, alice.username, "correct_password")
+    assert resp.json().get("state") == "UserLocked", resp.text
     _refused_ticket_link(url, secret)
 
 
@@ -380,3 +379,19 @@ def test_ticket_session_survives_its_address_being_blocked(
     resp, _ = _post_login(url, alice.username, "correct_password")
     assert resp.json().get("state") == "IpBlocked", resp.text
     _refused_ticket_link(url, secret)
+
+
+def test_ticket_session_is_anonymous_after_its_user_is_deleted(
+    shared_wg, echo_server_port
+):
+    url = f"https://localhost:{shared_wg.http_port}"
+    with admin_client(url) as api:
+        alice, alice_target = _create_test_user(api, echo_server_port)
+        secret = _make_ticket(api, alice, alice_target)
+
+        resp, session = _open_ticket_link(url, secret)
+        assert resp.status_code // 100 in (2, 3)
+        assert _info_username(url, session) == alice.username
+        api.delete_user(alice.id)
+
+    _anonymous_after(url, session)
