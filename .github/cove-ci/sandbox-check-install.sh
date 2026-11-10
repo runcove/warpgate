@@ -50,8 +50,11 @@ FP=$(bash "$HERE/sandbox-fingerprint.sh") || exit 93
 STAGE=$(mktemp -d) || { echo "sandbox-check-install: REFUSE -- could not make a staging directory (exit 93)" >&2; exit 93; }
 trap 'rm -rf "$STAGE"' EXIT
 mkdir "$STAGE/out" "$STAGE/back" || exit 93
-for f in "${FILES[@]}"; do cp "$HERE/$f" "$STAGE/out/$f" || exit 93; done
-( umask 022; printf '%s\n' "$FP" > "$STAGE/out/fp" ) || exit 93
+# Explicit modes, not the runner's umask: docker cp keeps them, and the
+# self-check may run as another user (SANDBOX_CHECK_AS) that must read these.
+chmod 755 "$STAGE/out" || exit 93
+for f in "${FILES[@]}"; do cp "$HERE/$f" "$STAGE/out/$f" && chmod 755 "$STAGE/out/$f" || exit 93; done
+( umask 022; printf '%s\n' "$FP" > "$STAGE/out/fp" ) && chmod 644 "$STAGE/out/fp" || exit 93
 unset FP
 FILES+=(fp)
 
