@@ -390,11 +390,18 @@ pub async fn exempt_credential_change(
         return Ok(Some(ExemptCredentialChange::PasswordCredentialAdded));
     }
     let current = matched_key_fingerprints(db, user_id, pubkey_ids).await?;
-    if current.as_deref() == Some(granted_fingerprints) && !granted_fingerprints.is_empty() {
+    if grant_still_holds(current.as_deref(), granted_fingerprints) {
         Ok(None)
     } else {
         Ok(Some(ExemptCredentialChange::KeyChanged))
     }
+}
+
+/// Whether the key rows, as read now (`current`), still show exactly the
+/// fingerprints the grant recorded. A grant that recorded no fingerprint holds
+/// nothing, so it never holds, even against an empty read.
+fn grant_still_holds(current: Option<&[String]>, granted: &[String]) -> bool {
+    !granted.is_empty() && current == Some(granted)
 }
 
 fn entry_covers_keys(entry: &StepUpExemptUser, fingerprints: &[String]) -> bool {
@@ -1352,6 +1359,22 @@ mod tests {
 
         let got = exemption_for_rows(&db, &config, user_id, &username, &[key], "prod").await;
         assert!(got.is_err(), "{got:?}");
+    }
+
+    #[test]
+    fn unit_grant_still_holds_only_for_identical_non_empty_fingerprints() {
+        let a = vec![FP_A.to_owned()];
+        let ab = vec![FP_A.to_owned(), FP_B.to_owned()];
+        assert!(grant_still_holds(Some(&a), &a));
+        assert!(grant_still_holds(Some(&ab), &ab));
+        // Another key, a different set, or no readable key.
+        assert!(!grant_still_holds(Some(&ab), &a));
+        assert!(!grant_still_holds(Some(&[FP_B.to_owned()]), &a));
+        assert!(!grant_still_holds(None, &a));
+        // A grant with no fingerprint never holds, whatever was read.
+        assert!(!grant_still_holds(Some(&[]), &[]));
+        assert!(!grant_still_holds(None, &[]));
+        assert!(!grant_still_holds(Some(&a), &[]));
     }
 
     #[tokio::test]
