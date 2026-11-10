@@ -16,7 +16,7 @@ use warpgate_common_http::auth::UnauthenticatedRequestContext;
 use warpgate_common_http::logging::get_client_ip;
 use warpgate_common_http::ticket_query::without_ticket_query_param;
 use warpgate_common_http::{SessionAuthorization, authorization_token};
-use warpgate_core::{authorize_and_spend_ticket, ticket_user_still_admitted};
+use warpgate_core::{authorize_and_spend_ticket, session_user_still_admitted};
 use warpgate_db_entities::Ticket;
 
 use crate::api::common::end_login;
@@ -158,32 +158,34 @@ fn ticket_belongs_to_another_user(
 
 /// What a stored session's authorization asks of the per-request re-check.
 #[derive(Debug, PartialEq, Eq)]
-enum TicketRecheck {
-    /// Not backed by a ticket, or the synthetic `<public>` authorization (nil
-    /// user id), which has no ticket behind it.
-    Skip,
-    /// A ticket session that records no ticket id (stored by an older
-    /// version): nothing can vouch for it, so it counts as ended.
+enum SessionRecheck {
+    /// A signed-in user session: only the user is re-checked.
+    User { user_id: Uuid },
+    /// A ticket session that records no ticket id, or names no user (nil user
+    /// id). Only an older version stored these: nothing can vouch for them, so
+    /// they count as ended.
     NoTicketId,
     /// A ticket session to check against this ticket and its user.
     Check { ticket_id: Uuid, user_id: Uuid },
 }
 
-fn ticket_to_recheck(auth: &SessionAuthorization) -> TicketRecheck {
+fn session_to_recheck(auth: &SessionAuthorization) -> SessionRecheck {
     match auth {
-        SessionAuthorization::Ticket { user_id, .. } if user_id.is_nil() => TicketRecheck::Skip,
+        SessionAuthorization::Ticket { user_id, .. } if user_id.is_nil() => {
+            SessionRecheck::NoTicketId
+        }
         SessionAuthorization::Ticket {
             user_id,
             ticket_id: Some(ticket_id),
             ..
-        } => TicketRecheck::Check {
+        } => SessionRecheck::Check {
             ticket_id: *ticket_id,
             user_id: *user_id,
         },
         SessionAuthorization::Ticket {
             ticket_id: None, ..
-        } => TicketRecheck::NoTicketId,
-        _ => TicketRecheck::Skip,
+        } => SessionRecheck::NoTicketId,
+        SessionAuthorization::User { user_id, .. } => SessionRecheck::User { user_id: *user_id },
     }
 }
 
@@ -268,18 +270,23 @@ impl<E: Endpoint> Endpoint for TicketMiddlewareEndpoint<E> {
         let session = <&Session>::from_request_without_body(&req).await?.clone();
         let mut rotation = None;
 
-        // A browser session that a ticket started lasts as long as the ticket
-        // and as long as its user exists and may sign in from where the request
-        // comes from: once the ticket is deleted or expired, or the user is
+        // A browser session lasts as long as its user may sign in from where
+        // the request comes from, and a ticket-started one also as long as
+        // the ticket: once the ticket is deleted or expired, or the user is
         // gone or outside their allowed IP ranges, the session ends as at
-        // logout and the request carries on anonymous on a fresh session, with
-        // any ticket presented with it judged on its own. Automatic lockouts
-        // and address blocks do not end a live session.
+        // logout and the request carries on anonymous on a fresh session,
+        // with any ticket presented with it judged on its own. Automatic
+        // lockouts and address blocks do not end a live session.
         if !session_is_temporary && let Some(auth) = session.get_auth() {
-            let ended = match ticket_to_recheck(&auth) {
-                TicketRecheck::Skip => false,
-                TicketRecheck::NoTicketId => true,
-                TicketRecheck::Check { ticket_id, user_id } => {
+            let ended = match session_to_recheck(&auth) {
+                SessionRecheck::User { user_id } => {
+                    let client_ip = get_client_ip(&req, ctx.services())
+                        .await
+                        .and_then(|s| s.parse().ok());
+                    !session_user_still_admitted(&ctx.services().db, user_id, client_ip).await?
+                }
+                SessionRecheck::NoTicketId => true,
+                SessionRecheck::Check { ticket_id, user_id } => {
                     let expiry = Ticket::expiry_by_id(&ctx.services().db, ticket_id).await?;
                     if ticket_session_is_current(expiry, OffsetDateTime::now_utc()) {
                         // Only for a ticket that is still current: the user
@@ -287,7 +294,7 @@ impl<E: Endpoint> Endpoint for TicketMiddlewareEndpoint<E> {
                         let client_ip = get_client_ip(&req, ctx.services())
                             .await
                             .and_then(|s| s.parse().ok());
-                        !ticket_user_still_admitted(&ctx.services().db, user_id, client_ip).await?
+                        !session_user_still_admitted(&ctx.services().db, user_id, client_ip).await?
                     } else {
                         true
                     }
@@ -492,9 +499,9 @@ mod tests {
         assert!(!ticket_session_is_current(None, now));
     }
 
-    /// Only a ticket session that names a user is re-checked against its
-    /// ticket: a nil user id or the reserved public name has no ticket behind
-    /// it, and a user login has none either.
+    /// A ticket session that names a user is re-checked against its ticket
+    /// and user, a user login against its user only; a nil user id on a
+    /// ticket session (the reserved public name) has no one to check.
     #[test]
     fn only_a_ticket_session_naming_a_user_is_rechecked() {
         let ticket_id = Uuid::new_v4();
@@ -507,34 +514,37 @@ mod tests {
             };
         let user = Uuid::new_v4();
         assert_eq!(
-            ticket_to_recheck(&ticket(user, "alice", Some(ticket_id))),
-            TicketRecheck::Check {
+            session_to_recheck(&ticket(user, "alice", Some(ticket_id))),
+            SessionRecheck::Check {
                 ticket_id,
                 user_id: user
             }
         );
         assert_eq!(
-            ticket_to_recheck(&ticket(Uuid::nil(), "alice", Some(ticket_id))),
-            TicketRecheck::Skip
+            session_to_recheck(&ticket(Uuid::nil(), "alice", Some(ticket_id))),
+            SessionRecheck::NoTicketId
         );
         assert_eq!(
-            ticket_to_recheck(&ticket(Uuid::nil(), "alice", None)),
-            TicketRecheck::Skip
+            session_to_recheck(&ticket(Uuid::nil(), "alice", None)),
+            SessionRecheck::NoTicketId
         );
         // A real user may be named like the synthetic public user.
         assert_eq!(
-            ticket_to_recheck(&ticket(user, "<public>", Some(ticket_id))),
-            TicketRecheck::Check {
+            session_to_recheck(&ticket(user, "<public>", Some(ticket_id))),
+            SessionRecheck::Check {
                 ticket_id,
                 user_id: user
             }
         );
         // Stored without a ticket id: counts as ended.
         assert_eq!(
-            ticket_to_recheck(&ticket(user, "alice", None)),
-            TicketRecheck::NoTicketId
+            session_to_recheck(&ticket(user, "alice", None)),
+            SessionRecheck::NoTicketId
         );
-        assert_eq!(ticket_to_recheck(&user_auth(user)), TicketRecheck::Skip);
+        assert_eq!(
+            session_to_recheck(&user_auth(user)),
+            SessionRecheck::User { user_id: user }
+        );
     }
 
     /// A sign-in under way for someone else keeps the session from being

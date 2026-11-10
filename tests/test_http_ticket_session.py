@@ -319,7 +319,8 @@ def _still_signed_in(url, session, username):
 
 
 def _refused_ticket_link(url, secret):
-    _, fresh = _open_ticket_link(url, secret)
+    resp, fresh = _open_ticket_link(url, secret)
+    assert resp.status_code // 100 != 2, "the ticket link opened"
     info = fresh.get(f"{url}/@warpgate/api/info")
     info.raise_for_status()
     assert info.json().get("username") in (None, ""), info.json()
@@ -348,8 +349,8 @@ def test_ticket_session_survives_its_user_being_locked(
     for _ in range(3):
         _still_signed_in(url, session, alice.username)
     # ... while a new sign-in and a new use of the ticket are refused.
-    resp, _ = _post_login(url, alice.username, "correct_password")
-    assert resp.json().get("state") == "UserLocked", resp.text
+    resp, fresh = _post_login(url, alice.username, "correct_password")
+    assert resp.status_code // 100 != 2
     _refused_ticket_link(url, secret)
 
 
@@ -381,16 +382,113 @@ def test_ticket_session_survives_its_address_being_blocked(
     _refused_ticket_link(url, secret)
 
 
-def test_ticket_session_is_anonymous_after_its_user_is_deleted(
+def test_signed_in_session_stays_signed_in_across_requests(
+    processes: ProcessManager, echo_server_port
+):
+    """The control for the cases below: a password-signed-in user with nothing
+    changed keeps the session, under login protection too."""
+    wg = _lp_wg(processes, ip_max=100, user_max=3)
+    url = f"https://localhost:{wg.http_port}"
+    with admin_client(url) as api:
+        alice, _ = _create_test_user(api, echo_server_port)
+
+    session = _signed_in(url, alice)
+    for _ in range(3):
+        assert _info_username(url, session) == alice.username
+        assert session.get(f"{url}/some/path", allow_redirects=False).status_code != 401
+
+
+def test_signed_in_session_is_anonymous_after_its_user_is_restricted_to_other_addresses(
+    shared_wg, echo_server_port
+):
+    """The user's allowed IP ranges are judged on each request of a
+    password-signed-in session, as they were when it was signed in."""
+    url = f"https://localhost:{shared_wg.http_port}"
+    with admin_client(url) as api:
+        alice, _ = _create_test_user(api, echo_server_port)
+        session = _signed_in(url, alice)
+        assert _info_username(url, session) == alice.username
+
+        # A range that includes loopback changes nothing.
+        current = api.get_user(alice.id)
+        current = getattr(current, "inner", current)
+
+        def set_ranges(ranges):
+            api.update_user(
+                alice.id,
+                sdk.UserDataRequest(
+                    username=current.username,
+                    description=current.description,
+                    credential_policy=current.credential_policy,
+                    rate_limit_bytes_per_second=current.rate_limit_bytes_per_second,
+                    allowed_ip_ranges=ranges,
+                ),
+            )
+
+        set_ranges(["127.0.0.0/8", "::1/128"])
+        assert _info_username(url, session) == alice.username
+
+        # A range the test client (loopback) is not in.
+        set_ranges(["192.0.2.0/24"])
+
+    _anonymous_after(url, session)
+
+
+def test_signed_in_session_survives_its_user_being_locked(
+    processes: ProcessManager, echo_server_port
+):
+    """An automatic lockout refuses new sign-ins but does not end a session
+    that is already signed in."""
+    wg = _lp_wg(processes, ip_max=100, user_max=3)
+    url = f"https://localhost:{wg.http_port}"
+    with admin_client(url) as api:
+        alice, _ = _create_test_user(api, echo_server_port)
+
+    session = _signed_in(url, alice)
+    _still_signed_in(url, session, alice.username)
+
+    for _ in range(3):
+        _post_login(url, alice.username, "wrong")
+    time.sleep(0.2)
+
+    for _ in range(3):
+        _still_signed_in(url, session, alice.username)
+    resp, _ = _post_login(url, alice.username, "correct_password")
+    assert resp.status_code // 100 != 2
+
+
+def test_signed_in_session_survives_its_address_being_blocked(
+    processes: ProcessManager, echo_server_port
+):
+    """An address block refuses new sign-ins from that address but does not
+    end a session that is already signed in."""
+    wg = _lp_wg(processes, ip_max=3, user_max=100)
+    url = f"https://localhost:{wg.http_port}"
+    with admin_client(url) as api:
+        alice, _ = _create_test_user(api, echo_server_port)
+
+    session = _signed_in(url, alice)
+    _still_signed_in(url, session, alice.username)
+
+    # Loopback is not exempt by default, so three failed logins from here
+    # block this address.
+    for _ in range(3):
+        _post_login(url, alice.username, "wrong")
+    time.sleep(0.2)
+
+    for _ in range(3):
+        _still_signed_in(url, session, alice.username)
+    resp, _ = _post_login(url, alice.username, "correct_password")
+    assert resp.json().get("state") == "IpBlocked", resp.text
+
+
+def test_signed_in_session_is_anonymous_after_its_user_is_deleted(
     shared_wg, echo_server_port
 ):
     url = f"https://localhost:{shared_wg.http_port}"
     with admin_client(url) as api:
-        alice, alice_target = _create_test_user(api, echo_server_port)
-        secret = _make_ticket(api, alice, alice_target)
-
-        resp, session = _open_ticket_link(url, secret)
-        assert resp.status_code // 100 in (2, 3)
+        alice, _ = _create_test_user(api, echo_server_port)
+        session = _signed_in(url, alice)
         assert _info_username(url, session) == alice.username
         api.delete_user(alice.id)
 

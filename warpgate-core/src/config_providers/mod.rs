@@ -365,23 +365,24 @@ impl ValidatedTicket {
     }
 }
 
-/// Whether the user a ticket session was started for is still admitted: the
-/// user exists and their allowed IP ranges admit `remote_ip`. Only these
-/// administrator-controlled rules are judged on later requests of a signed-in
-/// session; an automatic lockout or address block stops new sign-ins and
-/// ticket use (see [`validate_ticket`]) but does not end a live session. A
-/// user that cannot be loaded is not admitted.
-pub async fn ticket_user_still_admitted(
+/// Whether the user a web session belongs to is still admitted: the user
+/// exists and their allowed IP ranges admit `remote_ip`, whether a ticket or
+/// a sign-in started the session. Only these administrator-controlled rules
+/// are judged on later requests of a signed-in session; an automatic lockout
+/// or address block stops new sign-ins and ticket use (see
+/// [`validate_ticket`]) but does not end a live session. A user that cannot
+/// be loaded is not admitted.
+pub async fn session_user_still_admitted(
     db: &DatabaseConnection,
     user_id: Uuid,
     remote_ip: Option<IpAddr>,
 ) -> Result<bool, WarpgateError> {
     let Some(user) = e::User::Entity::find_by_id(user_id).one(db).await? else {
-        warn!(%user_id, "User of a ticket session not found");
+        warn!(%user_id, "User of a web session not found");
         return Ok(false);
     };
     let Ok(user) = User::try_from(user) else {
-        warn!(%user_id, "User of a ticket session could not be loaded");
+        warn!(%user_id, "User of a web session could not be loaded");
         return Ok(false);
     };
     Ok(crate::auth_state_store::check_ip_allowed(
@@ -607,11 +608,11 @@ mod tests {
         )
     }
 
-    /// The user of a ticket session is judged by the rules the session started
+    /// The user of a web session is judged by the rules the session started
     /// under: gone, or outside their allowed IP ranges, ends it.
     #[cfg(feature = "sqlite")]
     #[tokio::test]
-    async fn a_ticket_sessions_user_is_vetted_again() {
+    async fn a_web_sessions_user_is_vetted_again() {
         use sea_orm::ActiveValue::Set;
         use sea_orm::{ActiveModelTrait, IntoActiveModel};
 
@@ -625,7 +626,7 @@ mod tests {
         let user_id = ticket.user_id;
         let inside: Option<IpAddr> = Some("10.1.2.3".parse().unwrap());
         let outside: Option<IpAddr> = Some("192.0.2.1".parse().unwrap());
-        let admitted = |ip| ticket_user_still_admitted(&db, user_id, ip);
+        let admitted = |ip| session_user_still_admitted(&db, user_id, ip);
 
         // No ranges set: admitted from anywhere.
         assert!(admitted(inside).await.unwrap());
@@ -644,9 +645,14 @@ mod tests {
         assert!(admitted(inside).await.unwrap());
         assert!(!admitted(outside).await.unwrap());
 
-        // A user that is gone (or never was) is not admitted.
+        // A user that is gone (or never was), or a nil id, is not admitted.
         assert!(
-            !ticket_user_still_admitted(&db, Uuid::new_v4(), inside)
+            !session_user_still_admitted(&db, Uuid::nil(), inside)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !session_user_still_admitted(&db, Uuid::new_v4(), inside)
                 .await
                 .unwrap()
         );
