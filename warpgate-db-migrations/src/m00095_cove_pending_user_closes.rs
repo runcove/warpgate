@@ -1,8 +1,8 @@
 use sea_orm_migration::prelude::*;
 
-/// Users whose open sessions must all be closed after an edit that was already
-/// saved. The row is written when the follow-up close fails, so a close that
-/// did not finish before a restart is picked up by the next sweep.
+/// Users whose open sessions must all be closed after an edit or delete. The
+/// row is written in the transaction of the change, so a close that did not
+/// finish before a restart is picked up by the next sweep.
 #[derive(DeriveMigrationName)]
 pub struct Migration;
 

@@ -3,11 +3,14 @@ use sea_orm::{QuerySelect, Set};
 use time::OffsetDateTime;
 use warpgate_common::WarpgateError;
 
-/// A user whose open sessions must all be closed. Recorded when the close that
-/// follows an edit of the user fails after the edit was saved; a sweep closes
-/// every open session of the user and then removes the row ([`clear`]). The
-/// record names the user, not sessions, so it needs no lookup of the sessions
-/// and covers one opened after it was written.
+/// A user whose open sessions must all be closed. Written in the same
+/// transaction as the edit or delete of the user that makes the close
+/// necessary, so the row exists exactly when that change committed and
+/// survives a restart of the node that never finished the close. The request
+/// removes it once its own close succeeded ([`clear`]); otherwise a sweep
+/// closes every open session of the user and then removes it. The record
+/// names the user, not sessions, so it needs no lookup of the sessions and
+/// covers one opened after it was written.
 ///
 /// Not part of the copied database: copying the database drops the per-user
 /// queue, and a stale row only closes sessions.
@@ -24,9 +27,18 @@ pub enum Relation {}
 
 impl ActiveModelBehavior for ActiveModel {}
 
-/// Records that this user's sessions must be closed. A user already recorded
-/// has the time refreshed, so a sweep that read the older time leaves the row.
-pub async fn mark<C: ConnectionTrait>(db: &C, user_id: Uuid) -> Result<(), WarpgateError> {
+/// Records that this user's sessions must be closed, and returns the time the
+/// row now carries, to pass to [`clear`] once the close succeeded. A user
+/// already recorded has the time refreshed, so a clear or sweep that read an
+/// older time leaves the row.
+///
+/// The returned time is read back from the row: a backend that stores less
+/// precision than the clock (or rounds) would otherwise leave a row that a
+/// clear at the unrounded time cannot match.
+pub async fn mark<C: ConnectionTrait>(
+    db: &C,
+    user_id: Uuid,
+) -> Result<OffsetDateTime, WarpgateError> {
     Entity::insert(ActiveModel {
         user_id: Set(user_id),
         queued: Set(OffsetDateTime::now_utc()),
@@ -38,7 +50,11 @@ pub async fn mark<C: ConnectionTrait>(db: &C, user_id: Uuid) -> Result<(), Warpg
     )
     .exec_without_returning(db)
     .await?;
-    Ok(())
+    let row = Entity::find_by_id(user_id)
+        .one(db)
+        .await?
+        .ok_or_else(|| DbErr::RecordNotFound(format!("pending_user_closes row for {user_id}")))?;
+    Ok(row.queued)
 }
 
 /// Every user still waiting to have their sessions closed.

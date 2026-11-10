@@ -146,7 +146,6 @@ impl CloseRetryOutcome {
 pub struct PendingRevocations {
     changes: std::sync::Arc<std::sync::Mutex<Vec<AccessChange>>>,
     closes: std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<UserSessionId>>>,
-    user_closes: std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<Uuid>>>,
 }
 
 impl PendingRevocations {
@@ -162,32 +161,6 @@ impl PendingRevocations {
         self.closes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    fn lock_user_closes(&self) -> std::sync::MutexGuard<'_, std::collections::BTreeSet<Uuid>> {
-        self.user_closes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    /// Queues a user whose open sessions must all be closed.
-    pub(crate) fn push_user_close(&self, user_id: Uuid) {
-        self.lock_user_closes().insert(user_id);
-    }
-
-    pub(crate) fn has_user_close(&self, user_id: Uuid) -> bool {
-        self.lock_user_closes().contains(&user_id)
-    }
-
-    fn take_user_closes(&self) -> Vec<Uuid> {
-        std::mem::take(&mut *self.lock_user_closes())
-            .into_iter()
-            .collect()
-    }
-
-    /// Users waiting for all their sessions to be closed.
-    pub fn user_closes_len(&self) -> usize {
-        self.lock_user_closes().len()
     }
 
     fn push(&self, change: AccessChange) {
@@ -311,26 +284,22 @@ impl Services {
         self.retry_pending_user_closes().await;
     }
 
-    /// Closes every open session of each queued user, in memory or recorded in
-    /// the database. A user whose close fails is queued again.
+    /// Closes every open session of each user recorded in the database. A user
+    /// whose close fails keeps the row, so the next sweep retries it.
     ///
     /// A recorded row is removed only if it was written no later than one
     /// sweep interval before this sweep read the table: a newer record of the
     /// same user is kept, and so is one a session still opening (its user not
     /// yet set) could have escaped, which the next sweep closes again.
     async fn retry_pending_user_closes(&self) {
-        let mut users: std::collections::BTreeSet<Uuid> = self
-            .pending_revocations
-            .take_user_closes()
-            .into_iter()
-            .collect();
         let read_at = OffsetDateTime::now_utc();
-        match PendingUserClose::pending(&self.db).await {
-            Ok(persisted) => users.extend(persisted),
+        let users = match PendingUserClose::pending(&self.db).await {
+            Ok(users) => users,
             Err(error) => {
-                warn!(%error, "Could not read the users waiting to have their sessions closed; retrying the queued ones only");
+                warn!(%error, "Could not read the users waiting to have their sessions closed; retrying on the next sweep");
+                return;
             }
-        }
+        };
         let clear_up_to = read_at - TICKET_EXPIRY_SWEEP_INTERVAL;
         for user_id in users {
             match self.close_sessions(SessionsFilter::User { user_id }).await {
@@ -343,7 +312,6 @@ impl Services {
                 }
                 Err(error) => {
                     warn!(%error, %user_id, "Could not close a user's sessions; retrying on the next sweep");
-                    self.pending_revocations.push_user_close(user_id);
                 }
             }
         }

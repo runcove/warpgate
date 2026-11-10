@@ -9,7 +9,7 @@ use sea_orm::{
 };
 use time::OffsetDateTime;
 use tokio::sync::{Mutex, broadcast};
-use tracing::{error, warn};
+use tracing::warn;
 use uuid::Uuid;
 use warpgate_common::auth::{AuthState, CredentialKind};
 use warpgate_common::{
@@ -102,32 +102,40 @@ impl Services {
         Ok(())
     }
 
-    /// Queues a close of all of a user's open sessions for the expiry sweep,
-    /// for when the close that follows a saved change failed. The record names
-    /// the user, so no lookup of the sessions is needed and one opened later is
-    /// closed too.
+    /// Settles the close of all of a user's open sessions that follows a
+    /// committed edit or delete. The change's own transaction wrote the user's
+    /// pending-close row ([`PendingUserClose::mark`], which returned `queued`),
+    /// so the row exists exactly when the change committed and a restart cannot
+    /// lose the close.
     ///
-    /// The user is always kept in memory too, so the sweep in this process acts
-    /// even if the database write fails. That write's error is returned all the
-    /// same: without the record a restart forgets the close, so the caller must
-    /// not report success for it.
-    pub async fn queue_user_session_closes(&self, user_id: Uuid) -> Result<(), WarpgateError> {
-        self.pending_revocations.push_user_close(user_id);
-        PendingUserClose::mark(&self.db, user_id)
-            .await
-            .map_err(|error| {
-                error!(%error, %user_id, "Could not queue the close of the user's sessions");
-                error
-            })
+    /// A close that succeeded removes the row, unless a later change wrote it
+    /// again (`queued` is then older than the row, so the row stays for that
+    /// change's own close). A close that failed leaves the row for the expiry
+    /// sweep. Nothing is queued in memory: the row is the one record, so a
+    /// later close that succeeds also ends the retry, where a memory copy
+    /// would go on closing sessions that opened after it.
+    pub async fn settle_user_session_close(
+        &self,
+        user_id: Uuid,
+        queued: OffsetDateTime,
+        closed: Result<(), WarpgateError>,
+    ) {
+        match closed {
+            Ok(()) => {
+                if let Err(error) = PendingUserClose::clear(&self.db, user_id, queued).await {
+                    warn!(%error, %user_id, "Could not clear the record of a closed user's sessions; the next sweep closes them again");
+                }
+            }
+            Err(error) => {
+                warn!(%error, %user_id, "Could not close the user's sessions after saving a change; retrying on the next sweep");
+            }
+        }
     }
 
-    /// Whether a close of all of this user's sessions may still be queued, in
-    /// memory or in the database. A queue that cannot be read counts as
-    /// pending, so an unreadable queue never lets a close be skipped.
+    /// Whether a close of all of this user's sessions is still recorded in the
+    /// database. A queue that cannot be read counts as pending, so an
+    /// unreadable queue never lets a close be skipped.
     pub async fn user_close_pending(&self, user_id: Uuid) -> bool {
-        if self.pending_revocations.has_user_close(user_id) {
-            return true;
-        }
         PendingUserClose::is_pending(&self.db, user_id)
             .await
             .unwrap_or_else(|error| {
