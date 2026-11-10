@@ -36,9 +36,9 @@ use warpgate_common::{
 use warpgate_common_http::ext::{construct_control_plane_url, construct_external_url};
 use warpgate_core::approvals::{GateOutcome, GatedConnection};
 use warpgate_core::auth::step_up::{
-    ExemptCredentialChange, StepUpExemption, StepUpWindow, exempt_credential_change,
-    exemption_still_listed, get_pubkey_last_sso_at, is_fresh, ssh_step_up_exemption,
-    step_up_window, update_pubkey_last_sso_at,
+    AuthenticatedKey, ExemptCredentialChange, StepUpExemption, StepUpWindow,
+    exempt_credential_change, exemption_still_listed, get_pubkey_last_sso_at, is_fresh,
+    public_key_fingerprint, ssh_step_up_exemption, step_up_window, update_pubkey_last_sso_at,
 };
 use warpgate_core::auth::submit_credential;
 use warpgate_core::login_protection::FailedAttemptInfo;
@@ -333,6 +333,12 @@ pub struct ServerSession {
     /// when any of them passes, and a key login with no matched row counts as
     /// expired once step-up applies.
     step_up_pubkeys: Option<Vec<Uuid>>,
+    /// For each public key row a submission matched on the current auth state,
+    /// the fingerprint of the key the client signed with. It is what
+    /// `step_up_interval.exempt_users` is decided on, so a key row rewritten
+    /// while the login is in progress cannot change which key was used.
+    /// Dropped with the auth state.
+    authenticated_pubkeys: Vec<AuthenticatedKey>,
     /// Set when this connection was admitted through
     /// `step_up_interval.exempt_users`: who and what it was admitted for, so a
     /// config reload that no longer lists them, or the maximum lifetime, ends it.
@@ -1463,6 +1469,7 @@ impl ServerSession {
             auth_state: None,
             disconnect_token: CancellationToken::new(),
             step_up_pubkeys: None,
+            authenticated_pubkeys: Vec::new(),
             step_up_exempt: None,
             step_up_recheck: None,
             step_up_known_deadline: None,
@@ -1837,6 +1844,7 @@ impl ServerSession {
             )
             .await?;
         self.auth_state = Some((state.clone(), target_name.to_string()));
+        self.authenticated_pubkeys.clear();
         Ok(state)
     }
 
@@ -4210,6 +4218,14 @@ impl ServerSession {
 
                 if let Some(credential) = credential {
                     let credential_type = Self::rate_limited_credential_type(&credential);
+                    // The fingerprint of the key the client signed with, taken
+                    // before the credential is consumed.
+                    let presented_fingerprint = match &credential {
+                        AuthCredential::PublicKey {
+                            public_key_bytes, ..
+                        } => public_key_fingerprint(public_key_bytes),
+                        _ => None,
+                    };
                     let outcome = submit_credential(
                         &mut state,
                         credential,
@@ -4220,6 +4236,17 @@ impl ServerSession {
 
                     if outcome.is_valid() {
                         self.probe = ProbeState::Settled;
+                        // The state is locked since the submission, so the
+                        // last matched key row is the one it just matched.
+                        if let (Some(fingerprint), Some(row_id)) = (
+                            presented_fingerprint,
+                            state.matched_public_key_ids().last().copied(),
+                        ) {
+                            self.authenticated_pubkeys.push(AuthenticatedKey {
+                                row_id,
+                                fingerprint,
+                            });
+                        }
                     } else if let Some(credential_type) = credential_type {
                         self.record_failed_login_attempt(username, credential_type)
                             .await;
@@ -4306,6 +4333,7 @@ impl ServerSession {
                                         user_info.id,
                                         &user_info.username,
                                         &matched_pubkey_ids,
+                                        &self.authenticated_pubkeys,
                                         &resolved_target_name,
                                     )
                                     .await?

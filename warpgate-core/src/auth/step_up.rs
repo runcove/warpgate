@@ -146,6 +146,9 @@ pub enum StepUpExemptionIgnored {
     HasPasswordCredential,
     KeyNotListed,
     TargetNotListed,
+    /// A key row no longer holds the key the client signed in with, or the
+    /// sign-in has no key recorded for a row it matched.
+    KeyChangedSinceSignIn,
 }
 
 impl StepUpExemptionIgnored {
@@ -156,6 +159,9 @@ impl StepUpExemptionIgnored {
             Self::HasPasswordCredential => "the user has a password credential",
             Self::KeyNotListed => "the sign-in key is not one of the listed keys",
             Self::TargetNotListed => "the target is not one of the listed targets",
+            Self::KeyChangedSinceSignIn => {
+                "a stored key no longer matches the key the client signed in with"
+            }
         }
     }
 }
@@ -179,6 +185,26 @@ impl StepUpExemption {
     }
 }
 
+/// A public key row a sign-in matched, with the OpenSSH SHA256 fingerprint of
+/// the key the client presented for it. The fingerprint comes from the key the
+/// client signed with, never from the database row, so a row rewritten while
+/// the sign-in is in progress cannot change which key the exemption is
+/// decided on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthenticatedKey {
+    pub row_id: Uuid,
+    pub fingerprint: String,
+}
+
+/// The OpenSSH SHA256 fingerprint (`SHA256:...`) of a public key in SSH wire
+/// format, as `ssh-keygen -lf` prints it. `None` when the bytes are not a key.
+#[must_use]
+pub fn public_key_fingerprint(public_key_bytes: &[u8]) -> Option<String> {
+    PublicKey::from_bytes(public_key_bytes)
+        .ok()
+        .map(|key| key.fingerprint(HashAlg::Sha256).to_string())
+}
+
 /// Decide whether an SSH public-key sign-in skips the step-up check because
 /// of `step_up_interval.exempt_users`. It logs one warning when a listed
 /// user's entry does not apply; the caller logs the sign-in that went through,
@@ -188,9 +214,12 @@ impl StepUpExemption {
 /// - the username equals the entry's `user` exactly;
 /// - the user has no SSO credential and no password credential (read from the
 ///   same tables the MFA checks in `Services` use);
-/// - every public key row the sign-in matched has an OpenSSH SHA256
-///   fingerprint listed in the entry's `keys`, so a key added to the user
-///   later is not covered;
+/// - every key the client signed in with has an OpenSSH SHA256 fingerprint
+///   listed in the entry's `keys`, so a key added to the user later is not
+///   covered. That fingerprint is the one in `authenticated_keys`, taken from
+///   the key the client presented; each matched row, read now, must still
+///   hold exactly that key (a row rewritten mid-login does not carry its
+///   successor's listing back to the key that signed in);
 /// - the entry has no `targets`, or `target_name` is one of them. An empty
 ///   `target_name` (no target chosen yet) is not one of them.
 ///
@@ -201,6 +230,7 @@ pub async fn ssh_step_up_exemption(
     user_id: Uuid,
     username: &str,
     matched_pubkey_ids: &[Uuid],
+    authenticated_keys: &[AuthenticatedKey],
     target_name: &str,
 ) -> Result<StepUpExemption, WarpgateError> {
     let entries: Vec<&StepUpExemptUser> = step_up.exempt_entries_for(username).collect();
@@ -208,7 +238,16 @@ pub async fn ssh_step_up_exemption(
         return Ok(StepUpExemption::NotListed);
     }
 
-    match listed_user_outcome(db, &entries, user_id, matched_pubkey_ids, target_name).await? {
+    match listed_user_outcome(
+        db,
+        &entries,
+        user_id,
+        matched_pubkey_ids,
+        authenticated_keys,
+        target_name,
+    )
+    .await?
+    {
         Ok(fingerprints) => Ok(StepUpExemption::Applies(fingerprints)),
         Err(ignored) => {
             warn!(
@@ -227,6 +266,7 @@ async fn listed_user_outcome(
     entries: &[&StepUpExemptUser],
     user_id: Uuid,
     matched_pubkey_ids: &[Uuid],
+    authenticated_keys: &[AuthenticatedKey],
     target_name: &str,
 ) -> Result<Result<Vec<String>, StepUpExemptionIgnored>, WarpgateError> {
     let (has_sso, has_password) = sso_and_password_credentials(db, user_id).await?;
@@ -241,6 +281,11 @@ async fn listed_user_outcome(
     else {
         return Ok(Err(StepUpExemptionIgnored::KeyNotListed));
     };
+    // From here `fingerprints` (read from the rows) are the fingerprints of
+    // the keys the client presented, so the listing below is decided on those.
+    if !presented_keys_match_rows(matched_pubkey_ids, authenticated_keys, &fingerprints) {
+        return Ok(Err(StepUpExemptionIgnored::KeyChangedSinceSignIn));
+    }
     if !entries
         .iter()
         .any(|entry| entry_covers_keys(entry, &fingerprints))
@@ -254,6 +299,31 @@ async fn listed_user_outcome(
     } else {
         Ok(Err(StepUpExemptionIgnored::TargetNotListed))
     }
+}
+
+/// Whether each matched row, as read now, holds the key the client presented
+/// for it: the row has at least one recorded presented key, and every one of
+/// them has the fingerprint the row shows. `pubkey_ids` and `row_fingerprints`
+/// are in the same order.
+fn presented_keys_match_rows(
+    pubkey_ids: &[Uuid],
+    authenticated_keys: &[AuthenticatedKey],
+    row_fingerprints: &[String],
+) -> bool {
+    pubkey_ids.len() == row_fingerprints.len()
+        && pubkey_ids
+            .iter()
+            .zip(row_fingerprints)
+            .all(|(row_id, row_fingerprint)| {
+                let presented: Vec<&AuthenticatedKey> = authenticated_keys
+                    .iter()
+                    .filter(|key| key.row_id == *row_id)
+                    .collect();
+                !presented.is_empty()
+                    && presented
+                        .iter()
+                        .all(|key| key.fingerprint == *row_fingerprint)
+            })
 }
 
 /// Whether the user has an SSO credential and whether it has a password
@@ -732,6 +802,72 @@ mod tests {
         .unwrap();
     }
 
+    /// What a client that signed in with exactly the keys these rows hold now
+    /// presented: no row was rewritten while the sign-in was in progress. A
+    /// missing row or a stored key that does not parse presents nothing.
+    async fn presented_by_rows(
+        db: &DatabaseConnection,
+        pubkey_ids: &[Uuid],
+    ) -> Vec<AuthenticatedKey> {
+        let mut presented = Vec::new();
+        for row_id in pubkey_ids {
+            let Ok(Some(row)) = entities::PublicKeyCredential::Entity::find_by_id(*row_id)
+                .one(db)
+                .await
+            else {
+                continue;
+            };
+            if let Ok(key) = PublicKey::from_openssh(&row.openssh_public_key) {
+                presented.push(AuthenticatedKey {
+                    row_id: *row_id,
+                    fingerprint: key.fingerprint(HashAlg::Sha256).to_string(),
+                });
+            }
+        }
+        presented
+    }
+
+    /// `ssh_step_up_exemption` for a client that presented what the rows hold.
+    async fn exemption_for_rows(
+        db: &DatabaseConnection,
+        step_up: &StepUpIntervalConfig,
+        user_id: Uuid,
+        username: &str,
+        pubkey_ids: &[Uuid],
+        target_name: &str,
+    ) -> Result<StepUpExemption, WarpgateError> {
+        let presented = presented_by_rows(db, pubkey_ids).await;
+        ssh_step_up_exemption(
+            db,
+            step_up,
+            user_id,
+            username,
+            pubkey_ids,
+            &presented,
+            target_name,
+        )
+        .await
+    }
+
+    fn presented(row_id: Uuid, fingerprint: &str) -> AuthenticatedKey {
+        AuthenticatedKey {
+            row_id,
+            fingerprint: fingerprint.to_owned(),
+        }
+    }
+
+    async fn rewrite_key(db: &DatabaseConnection, row_id: Uuid, openssh: &str) {
+        entities::PublicKeyCredential::Entity::update_many()
+            .set(entities::PublicKeyCredential::ActiveModel {
+                openssh_public_key: Set(openssh.into()),
+                ..Default::default()
+            })
+            .filter(entities::PublicKeyCredential::Column::Id.eq(row_id))
+            .exec(db)
+            .await
+            .unwrap();
+    }
+
     fn applies(fingerprints: &[&str]) -> StepUpExemption {
         StepUpExemption::Applies(fingerprints.iter().map(|f| (*f).to_owned()).collect())
     }
@@ -775,7 +911,7 @@ mod tests {
         let config = exempt_config(vec![exempt_entry(&username, &[FP_A], None)]);
         crate::approvals::tests::audit_events();
 
-        let got = ssh_step_up_exemption(&db, &config, user_id, &username, &[key], "prod")
+        let got = exemption_for_rows(&db, &config, user_id, &username, &[key], "prod")
             .await
             .unwrap();
 
@@ -794,7 +930,7 @@ mod tests {
         let config = exempt_config(vec![exempt_entry(&username, &[FP_A], None)]);
         crate::approvals::tests::audit_events();
 
-        let got = ssh_step_up_exemption(&db, &config, user_id, &username, &[key], "prod")
+        let got = exemption_for_rows(&db, &config, user_id, &username, &[key], "prod")
             .await
             .unwrap();
 
@@ -820,7 +956,7 @@ mod tests {
         let config = exempt_config(vec![exempt_entry(&username, &[FP_A], None)]);
         crate::approvals::tests::audit_events();
 
-        let got = ssh_step_up_exemption(&db, &config, user_id, &username, &[key], "prod")
+        let got = exemption_for_rows(&db, &config, user_id, &username, &[key], "prod")
             .await
             .unwrap();
 
@@ -845,14 +981,14 @@ mod tests {
         let config = exempt_config(vec![exempt_entry("someone-else", &[FP_A], None)]);
         crate::approvals::tests::audit_events();
 
-        let got = ssh_step_up_exemption(&db, &config, user_id, &username, &[key], "prod")
+        let got = exemption_for_rows(&db, &config, user_id, &username, &[key], "prod")
             .await
             .unwrap();
         assert_eq!(got, StepUpExemption::NotListed);
         assert!(logged_for(&username).is_empty());
 
         // Off by default: an empty list exempts nobody.
-        let got = ssh_step_up_exemption(
+        let got = exemption_for_rows(
             &db,
             &exempt_config(vec![]),
             user_id,
@@ -876,7 +1012,7 @@ mod tests {
             format!("{username}2"),
         ] {
             let config = exempt_config(vec![exempt_entry(&listed, &[FP_A], None)]);
-            let got = ssh_step_up_exemption(&db, &config, user_id, &username, &[key], "prod")
+            let got = exemption_for_rows(&db, &config, user_id, &username, &[key], "prod")
                 .await
                 .unwrap();
             assert_eq!(got, StepUpExemption::NotListed, "listed as {listed:?}");
@@ -892,7 +1028,7 @@ mod tests {
 
         // Signing in with a key the entry does not list.
         let other = add_key(&db, user_id, KEY_B).await;
-        let got = ssh_step_up_exemption(&db, &config, user_id, &username, &[other], "prod")
+        let got = exemption_for_rows(&db, &config, user_id, &username, &[other], "prod")
             .await
             .unwrap();
         assert_eq!(
@@ -902,7 +1038,7 @@ mod tests {
 
         // A key added after the entry was written is covered by nothing, even
         // when it signs in next to the listed one.
-        let got = ssh_step_up_exemption(&db, &config, user_id, &username, &[listed, other], "prod")
+        let got = exemption_for_rows(&db, &config, user_id, &username, &[listed, other], "prod")
             .await
             .unwrap();
         assert_eq!(
@@ -911,7 +1047,7 @@ mod tests {
         );
 
         // The listed one alone still passes.
-        let got = ssh_step_up_exemption(&db, &config, user_id, &username, &[listed], "prod")
+        let got = exemption_for_rows(&db, &config, user_id, &username, &[listed], "prod")
             .await
             .unwrap();
         assert_eq!(got, applies(&[FP_A]));
@@ -934,7 +1070,7 @@ mod tests {
             .await
             .unwrap();
 
-        let got = ssh_step_up_exemption(&db, &config, user_id, &username, &[key], "prod")
+        let got = exemption_for_rows(&db, &config, user_id, &username, &[key], "prod")
             .await
             .unwrap();
         assert_eq!(
@@ -944,25 +1080,170 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unit_a_row_rewritten_to_a_listed_key_during_sign_in_is_not_exempt() {
+        // The client signed in with KEY_B, which the entry does not list. The
+        // admin endpoints rewrite a key row in place, so before the exemption
+        // is decided the row holds KEY_A, which it does list.
+        let db = setup_db().await;
+        let (user_id, username) = service_user(&db).await;
+        let row = add_key(&db, user_id, KEY_B).await;
+        let config = exempt_config(vec![exempt_entry(&username, &[FP_A], None)]);
+        let signed_in_with = [presented(row, FP_B)];
+        rewrite_key(&db, row, KEY_A).await;
+
+        let got = ssh_step_up_exemption(
+            &db,
+            &config,
+            user_id,
+            &username,
+            &[row],
+            &signed_in_with,
+            "prod",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            got,
+            StepUpExemption::Ignored(StepUpExemptionIgnored::KeyChangedSinceSignIn)
+        );
+        assert!(!got.applies());
+
+        // The same sign-in with the row not rewritten is covered by nothing.
+        rewrite_key(&db, row, KEY_B).await;
+        let got = ssh_step_up_exemption(
+            &db,
+            &config,
+            user_id,
+            &username,
+            &[row],
+            &signed_in_with,
+            "prod",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            got,
+            StepUpExemption::Ignored(StepUpExemptionIgnored::KeyNotListed)
+        );
+    }
+
+    #[tokio::test]
+    async fn unit_the_listing_is_decided_on_the_key_the_client_presented() {
+        let db = setup_db().await;
+        let (user_id, username) = service_user(&db).await;
+        let row = add_key(&db, user_id, KEY_A).await;
+        let config = exempt_config(vec![exempt_entry(&username, &[FP_A], None)]);
+
+        let check = |presented: Vec<AuthenticatedKey>| {
+            let (db, config, username) = (&db, &config, &username);
+            async move {
+                ssh_step_up_exemption(db, config, user_id, username, &[row], &presented, "prod")
+                    .await
+                    .unwrap()
+            }
+        };
+        let changed = StepUpExemption::Ignored(StepUpExemptionIgnored::KeyChangedSinceSignIn);
+
+        // The row holds a listed key and the client presented that key.
+        assert_eq!(check(vec![presented(row, FP_A)]).await, applies(&[FP_A]));
+        // Nothing was recorded for the matched row.
+        assert_eq!(check(vec![]).await, changed, "no key recorded");
+        assert_eq!(
+            check(vec![presented(Uuid::new_v4(), FP_A)]).await,
+            changed,
+            "a key recorded for a different row"
+        );
+        // The row holds the listed key but the client presented another one.
+        assert_eq!(
+            check(vec![presented(row, FP_B)]).await,
+            changed,
+            "an unlisted key presented for a listed row"
+        );
+        // Two different keys presented for one row: both cannot be the row's.
+        assert_eq!(
+            check(vec![presented(row, FP_A), presented(row, FP_B)]).await,
+            changed,
+            "an unlisted key presented next to a listed one"
+        );
+        // The same key presented twice is still that key.
+        assert_eq!(
+            check(vec![presented(row, FP_A), presented(row, FP_A)]).await,
+            applies(&[FP_A])
+        );
+    }
+
+    #[tokio::test]
+    async fn unit_every_matched_row_needs_a_presented_key() {
+        let db = setup_db().await;
+        let (user_id, username) = service_user(&db).await;
+        let a = add_key(&db, user_id, KEY_A).await;
+        let b = add_key(&db, user_id, KEY_B).await;
+        let config = exempt_config(vec![exempt_entry(&username, &[FP_A, FP_B], None)]);
+
+        // Row `b` matched but the sign-in recorded a key only for `a`.
+        let got = ssh_step_up_exemption(
+            &db,
+            &config,
+            user_id,
+            &username,
+            &[a, b],
+            &[presented(a, FP_A)],
+            "prod",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            got,
+            StepUpExemption::Ignored(StepUpExemptionIgnored::KeyChangedSinceSignIn)
+        );
+
+        let got = ssh_step_up_exemption(
+            &db,
+            &config,
+            user_id,
+            &username,
+            &[a, b],
+            &[presented(a, FP_A), presented(b, FP_B)],
+            "prod",
+        )
+        .await
+        .unwrap();
+        assert!(got.applies(), "{got:?}");
+    }
+
+    #[test]
+    fn unit_public_key_fingerprint_is_the_openssh_sha256_of_the_wire_key() {
+        use data_encoding::BASE64;
+
+        for (openssh, fingerprint) in [(KEY_A, FP_A), (KEY_B, FP_B)] {
+            let blob = BASE64
+                .decode(openssh.split(' ').nth(1).unwrap().as_bytes())
+                .unwrap();
+            assert_eq!(public_key_fingerprint(&blob).as_deref(), Some(fingerprint));
+        }
+        assert_eq!(public_key_fingerprint(b"not a key"), None);
+        assert_eq!(public_key_fingerprint(&[]), None);
+    }
+
+    #[tokio::test]
     async fn unit_no_matched_key_or_an_unreadable_one_is_not_exempt() {
         let db = setup_db().await;
         let (user_id, username) = service_user(&db).await;
         let config = exempt_config(vec![exempt_entry(&username, &[FP_A], None)]);
         let ignored = StepUpExemption::Ignored(StepUpExemptionIgnored::KeyNotListed);
 
-        let got = ssh_step_up_exemption(&db, &config, user_id, &username, &[], "prod")
+        let got = exemption_for_rows(&db, &config, user_id, &username, &[], "prod")
             .await
             .unwrap();
         assert_eq!(got, ignored, "no matched key row");
 
-        let got =
-            ssh_step_up_exemption(&db, &config, user_id, &username, &[Uuid::new_v4()], "prod")
-                .await
-                .unwrap();
+        let got = exemption_for_rows(&db, &config, user_id, &username, &[Uuid::new_v4()], "prod")
+            .await
+            .unwrap();
         assert_eq!(got, ignored, "key row that is gone");
 
         let garbled = add_key(&db, user_id, "ssh-ed25519 AAAA").await;
-        let got = ssh_step_up_exemption(&db, &config, user_id, &username, &[garbled], "prod")
+        let got = exemption_for_rows(&db, &config, user_id, &username, &[garbled], "prod")
             .await
             .unwrap();
         assert_eq!(got, ignored, "stored key that does not parse");
@@ -970,7 +1251,7 @@ mod tests {
         // Someone else's key row is not this user's key.
         let (other_user, _) = service_user(&db).await;
         let theirs = add_key(&db, other_user, KEY_A).await;
-        let got = ssh_step_up_exemption(&db, &config, user_id, &username, &[theirs], "prod")
+        let got = exemption_for_rows(&db, &config, user_id, &username, &[theirs], "prod")
             .await
             .unwrap();
         assert_eq!(got, ignored, "key row of another user");
@@ -989,7 +1270,7 @@ mod tests {
         let check = |target: &'static str| {
             let (db, config, username) = (&db, &config, &username);
             async move {
-                ssh_step_up_exemption(db, config, user_id, username, &[key], target)
+                exemption_for_rows(db, config, user_id, username, &[key], target)
                     .await
                     .unwrap()
             }
@@ -1011,7 +1292,7 @@ mod tests {
         let key = add_key(&db, user_id, KEY_A).await;
         let config = exempt_config(vec![exempt_entry(&username, &[FP_A], None)]);
         for target in ["prod", "staging", ""] {
-            let got = ssh_step_up_exemption(&db, &config, user_id, &username, &[key], target)
+            let got = exemption_for_rows(&db, &config, user_id, &username, &[key], target)
                 .await
                 .unwrap();
             assert_eq!(got, applies(&[FP_A]), "target {target:?}");
@@ -1026,7 +1307,7 @@ mod tests {
         let key_b = add_key(&db, user_id, KEY_B).await;
         let config = exempt_config(vec![exempt_entry(&username, &[FP_A, FP_B], None)]);
 
-        let got = ssh_step_up_exemption(&db, &config, user_id, &username, &[key_b, key_a], "prod")
+        let got = exemption_for_rows(&db, &config, user_id, &username, &[key_b, key_a], "prod")
             .await
             .unwrap();
         assert_eq!(got, applies(&[FP_B, FP_A]));
@@ -1045,7 +1326,7 @@ mod tests {
         let run = |key: Uuid, target: &'static str| {
             let (db, config, username) = (&db, &config, &username);
             async move {
-                ssh_step_up_exemption(db, config, user_id, username, &[key], target)
+                exemption_for_rows(db, config, user_id, username, &[key], target)
                     .await
                     .unwrap()
             }
@@ -1069,7 +1350,7 @@ mod tests {
             .await
             .unwrap();
 
-        let got = ssh_step_up_exemption(&db, &config, user_id, &username, &[key], "prod").await;
+        let got = exemption_for_rows(&db, &config, user_id, &username, &[key], "prod").await;
         assert!(got.is_err(), "{got:?}");
     }
 
