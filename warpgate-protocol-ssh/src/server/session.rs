@@ -498,6 +498,65 @@ async fn exempt_recheck(
     )
 }
 
+/// What one tick of the exempt recheck does to the connection.
+#[derive(Debug, PartialEq, Eq)]
+enum ExemptTick {
+    /// Keep it and look again after `next`. `failures` is the count of
+    /// consecutive unreadable checks to carry into the next tick.
+    Keep { next: Duration, failures: u32 },
+    /// End it, for this reason.
+    Close { why: &'static str, failures: u32 },
+}
+
+impl ExemptTick {
+    const fn failures(&self) -> u32 {
+        match self {
+            Self::Keep { failures, .. } | Self::Close { failures, .. } => *failures,
+        }
+    }
+}
+
+/// The decision `enforce_step_up_window` takes on each tick for a connection
+/// admitted through `exempt_users`, given what the recheck returned and the
+/// count of consecutive unreadable checks so far.
+///
+/// A revocation closes at once. A check that could not read the database
+/// never keeps the connection on its own account and never clears the count:
+/// it adds one, and the connection closes with the last failure it is
+/// allowed. Only a complete read that still covers the connection resets the
+/// count to zero.
+fn exempt_tick(
+    result: &Result<ExemptVerdict, WarpgateError>,
+    failures: u32,
+    known_deadline: Option<OffsetDateTime>,
+    now: OffsetDateTime,
+) -> ExemptTick {
+    let close = |why| ExemptTick::Close { why, failures };
+    match result {
+        Ok(ExemptVerdict::Keep(next)) => ExemptTick::Keep {
+            next: *next,
+            failures: 0,
+        },
+        Ok(ExemptVerdict::NoLongerListed) => close("no longer listed in the config"),
+        Ok(ExemptVerdict::MaxLifetime) => close("maximum lifetime reached"),
+        Ok(ExemptVerdict::CredentialsChanged(change)) => close(change.reason()),
+        Err(_) => {
+            let failures = failures.saturating_add(1);
+            if read_failure_closes(failures, known_deadline, now) {
+                ExemptTick::Close {
+                    why: "the exemption could not be verified",
+                    failures,
+                }
+            } else {
+                ExemptTick::Keep {
+                    next: STEP_UP_RECHECK_MAX,
+                    failures,
+                }
+            }
+        }
+    }
+}
+
 /// Whether one more unreadable check ends a connection: it has no known
 /// deadline left, or this was the last failure it is allowed.
 fn read_failure_closes(
@@ -594,11 +653,11 @@ mod tests {
     use warpgate_common::eventhub::EventHub;
 
     use super::{
-        ChannelOperation, EventIntake, ExemptGrant, ExemptVerdict, MAX_WEB_AUTH_WAITS,
+        ChannelOperation, EventIntake, ExemptGrant, ExemptTick, ExemptVerdict, MAX_WEB_AUTH_WAITS,
         PendingCommand, PendingKeyboardInteractiveAuth, RCCommand, STEP_UP_MAX_READ_FAILURES,
-        SshClientError, TARGET_FORWARD_OPEN_TIMEOUT, TARGET_REPLY_TIMEOUT, WebApprovalWait,
-        WebAuthStep, bump_waits, carry_forward, exempt_recheck, exempt_verdict,
-        is_reserved_env_name, next_web_auth_step, read_failure_closes,
+        STEP_UP_RECHECK_MAX, SshClientError, TARGET_FORWARD_OPEN_TIMEOUT, TARGET_REPLY_TIMEOUT,
+        WebApprovalWait, WebAuthStep, bump_waits, carry_forward, exempt_recheck, exempt_tick,
+        exempt_verdict, is_reserved_env_name, next_web_auth_step, read_failure_closes,
         reject_with_allowed_auth_methods, reply_limit, round_creates_wait, wait_for_reply,
         wait_for_state,
     };
@@ -703,6 +762,185 @@ mod tests {
         assert_eq!(
             exempt_verdict(&g, Some(&shorter), Duration::from_secs(30)),
             ExemptVerdict::MaxLifetime
+        );
+    }
+
+    fn unreadable() -> Result<ExemptVerdict, warpgate_common::WarpgateError> {
+        Err(warpgate_common::WarpgateError::DatabaseError(
+            sea_orm::DbErr::Custom("database unavailable".into()),
+        ))
+    }
+
+    fn tick_at(
+        result: &Result<ExemptVerdict, warpgate_common::WarpgateError>,
+        failures: u32,
+    ) -> ExemptTick {
+        exempt_tick(result, failures, None, time::OffsetDateTime::now_utc())
+    }
+
+    /// Run `enforce_step_up_window`'s per-tick step over a list of results,
+    /// threading the failure count the way the session does, and return what
+    /// each tick decided.
+    fn run_ticks(
+        results: &[Result<ExemptVerdict, warpgate_common::WarpgateError>],
+    ) -> Vec<ExemptTick> {
+        let mut failures = 0;
+        let mut decided = Vec::new();
+        for result in results {
+            let tick = tick_at(result, failures);
+            failures = tick.failures();
+            let closed = matches!(tick, ExemptTick::Close { .. });
+            decided.push(tick);
+            if closed {
+                break;
+            }
+        }
+        decided
+    }
+
+    fn keep_after_error(failures: u32) -> ExemptTick {
+        ExemptTick::Keep {
+            next: STEP_UP_RECHECK_MAX,
+            failures,
+        }
+    }
+
+    const COULD_NOT_VERIFY: &str = "the exemption could not be verified";
+
+    /// Unreadable checks 1 to 5 keep the connection and the 6th closes it. If
+    /// the error branch kept it for good, or cleared the count, a database
+    /// that stays down would leave a revoked connection open.
+    #[test]
+    fn unreadable_checks_one_to_five_keep_the_connection_and_the_sixth_closes() {
+        let results: Vec<_> = (0..10).map(|_| unreadable()).collect();
+        assert_eq!(
+            run_ticks(&results),
+            vec![
+                keep_after_error(1),
+                keep_after_error(2),
+                keep_after_error(3),
+                keep_after_error(4),
+                keep_after_error(5),
+                ExemptTick::Close {
+                    why: COULD_NOT_VERIFY,
+                    failures: 6
+                },
+            ]
+        );
+    }
+
+    /// An unreadable check always adds to the count, from any count, and the
+    /// connection it keeps is looked at again within the recheck cap.
+    #[test]
+    fn an_unreadable_check_never_resets_the_count() {
+        for failures in 0..STEP_UP_MAX_READ_FAILURES - 1 {
+            match tick_at(&unreadable(), failures) {
+                ExemptTick::Keep { next, failures: f } => {
+                    assert_eq!(f, failures + 1);
+                    assert!(next <= STEP_UP_RECHECK_MAX);
+                }
+                closed @ ExemptTick::Close { .. } => panic!("closed at {failures}: {closed:?}"),
+            }
+        }
+        assert_eq!(
+            tick_at(&unreadable(), STEP_UP_MAX_READ_FAILURES - 1),
+            ExemptTick::Close {
+                why: COULD_NOT_VERIFY,
+                failures: STEP_UP_MAX_READ_FAILURES
+            }
+        );
+        // An error between complete reads is counted from where it stands.
+        assert_eq!(tick_at(&unreadable(), 3), keep_after_error(4));
+    }
+
+    /// Only a complete read that still covers the connection clears the
+    /// count: after five unreadable checks and one such read, five more
+    /// unreadable checks are again survived.
+    #[test]
+    fn a_complete_read_resets_the_count() {
+        let covered = Duration::from_secs(7);
+        let mut results: Vec<_> = (0..5).map(|_| unreadable()).collect();
+        results.push(Ok(ExemptVerdict::Keep(covered)));
+        results.extend((0..6).map(|_| unreadable()));
+        assert_eq!(
+            run_ticks(&results),
+            vec![
+                keep_after_error(1),
+                keep_after_error(2),
+                keep_after_error(3),
+                keep_after_error(4),
+                keep_after_error(5),
+                ExemptTick::Keep {
+                    next: covered,
+                    failures: 0
+                },
+                keep_after_error(1),
+                keep_after_error(2),
+                keep_after_error(3),
+                keep_after_error(4),
+                keep_after_error(5),
+                ExemptTick::Close {
+                    why: COULD_NOT_VERIFY,
+                    failures: 6
+                },
+            ]
+        );
+    }
+
+    fn revocations() -> [(ExemptVerdict, &'static str); 5] {
+        use super::ExemptCredentialChange as Change;
+        [
+            (
+                ExemptVerdict::NoLongerListed,
+                "no longer listed in the config",
+            ),
+            (ExemptVerdict::MaxLifetime, "maximum lifetime reached"),
+            (
+                ExemptVerdict::CredentialsChanged(Change::KeyChanged),
+                Change::KeyChanged.reason(),
+            ),
+            (
+                ExemptVerdict::CredentialsChanged(Change::SsoCredentialAdded),
+                Change::SsoCredentialAdded.reason(),
+            ),
+            (
+                ExemptVerdict::CredentialsChanged(Change::PasswordCredentialAdded),
+                Change::PasswordCredentialAdded.reason(),
+            ),
+        ]
+    }
+
+    /// A revocation closes on the tick it is seen, at any count.
+    #[test]
+    fn a_revocation_closes_at_once() {
+        for failures in [0, 3, STEP_UP_MAX_READ_FAILURES - 1] {
+            for (verdict, why) in revocations() {
+                assert_eq!(
+                    tick_at(&Ok(verdict), failures),
+                    ExemptTick::Close { why, failures },
+                    "count {failures}, {why}"
+                );
+            }
+        }
+    }
+
+    /// A deadline already passed ends the connection at its first unreadable
+    /// check, as for a normal connection.
+    #[test]
+    fn an_unreadable_check_after_the_known_deadline_closes_at_once() {
+        let now = time::OffsetDateTime::now_utc();
+        let past = Some(now - time::Duration::seconds(1));
+        let ahead = Some(now + time::Duration::seconds(60));
+        assert_eq!(
+            exempt_tick(&unreadable(), 0, past, now),
+            ExemptTick::Close {
+                why: COULD_NOT_VERIFY,
+                failures: 1
+            }
+        );
+        assert_eq!(
+            exempt_tick(&unreadable(), 0, ahead, now),
+            keep_after_error(1)
         );
     }
 
@@ -925,6 +1163,80 @@ mod tests {
                 Some(now + time::Duration::seconds(60)),
                 now
             ));
+        }
+
+        /// The recheck result feeds `exempt_tick` the way
+        /// `enforce_step_up_window` does, threading the count through ticks.
+        fn tick(
+            result: &Result<ExemptVerdict, warpgate_common::WarpgateError>,
+            failures: u32,
+        ) -> ExemptTick {
+            exempt_tick(result, failures, None, time::OffsetDateTime::now_utc())
+        }
+
+        #[tokio::test]
+        async fn a_failing_database_ends_the_connection_on_the_sixth_tick() {
+            let a = admitted().await;
+            a.db.execute_unprepared("DROP TABLE credentials_sso")
+                .await
+                .unwrap();
+
+            let mut failures = 0;
+            for n in 1..=STEP_UP_MAX_READ_FAILURES {
+                let result = recheck(&a).await;
+                assert!(result.is_err(), "tick {n} must not read as covered");
+                match tick(&result, failures) {
+                    ExemptTick::Keep { failures: f, .. } => {
+                        assert!(n < STEP_UP_MAX_READ_FAILURES, "tick {n} must close");
+                        failures = f;
+                    }
+                    ExemptTick::Close { why, failures: f } => {
+                        assert_eq!(n, STEP_UP_MAX_READ_FAILURES, "closed early at tick {n}");
+                        assert_eq!(why, "the exemption could not be verified");
+                        failures = f;
+                    }
+                }
+                assert_eq!(failures, n);
+            }
+        }
+
+        #[tokio::test]
+        async fn a_complete_read_resets_the_count_and_a_database_revocation_closes_at_once() {
+            let a = admitted().await;
+
+            // Five unreadable ticks' worth of count, then a complete read that
+            // still covers the connection.
+            let result = recheck(&a).await;
+            let Ok(ExemptVerdict::Keep(next)) = &result else {
+                panic!("expected a covered connection, got {result:?}");
+            };
+            assert_eq!(
+                tick(&result, STEP_UP_MAX_READ_FAILURES - 1),
+                ExemptTick::Keep {
+                    next: *next,
+                    failures: 0
+                }
+            );
+
+            // The key replaced in the database closes the connection on that
+            // tick, with no failures needed.
+            entities::PublicKeyCredential::Entity::update_many()
+                .set(entities::PublicKeyCredential::ActiveModel {
+                    openssh_public_key: Set(KEY_B.into()),
+                    ..Default::default()
+                })
+                .filter(entities::PublicKeyCredential::Column::Id.eq(a.key_id))
+                .exec(&a.db)
+                .await
+                .unwrap();
+            let result = recheck(&a).await;
+            assert_eq!(
+                tick(&result, 0),
+                ExemptTick::Close {
+                    why: ExemptCredentialChange::KeyChanged.reason(),
+                    failures: 0
+                }
+            );
         }
     }
 
@@ -1633,39 +1945,34 @@ impl ServerSession {
                 let cfg = self.services.config.lock().await;
                 cfg.store.step_up_interval.clone()
             };
-            let verdict = match exempt_recheck(
+            let result = exempt_recheck(
                 &grant,
                 step_up.as_ref(),
                 &self.services.db,
                 grant.granted_at.elapsed(),
             )
-            .await
-            {
-                Ok(verdict) => verdict,
-                Err(error) => {
-                    return self
-                        .step_up_read_failed(&error, OffsetDateTime::now_utc())
-                        .await;
-                }
-            };
-            return match verdict {
-                ExemptVerdict::Keep(next) => {
-                    self.step_up_read_failures = 0;
+            .await;
+            let tick = exempt_tick(
+                &result,
+                self.step_up_read_failures,
+                self.step_up_known_deadline,
+                OffsetDateTime::now_utc(),
+            );
+            if let Err(error) = &result {
+                warn!(
+                    %error,
+                    failures = tick.failures(),
+                    "Could not read the step-up state"
+                );
+            }
+            self.step_up_read_failures = tick.failures();
+            return match tick {
+                ExemptTick::Keep { next, .. } => {
                     self.step_up_recheck = Some(Instant::now() + next);
                     false
                 }
-                ExemptVerdict::NoLongerListed => {
-                    self.close_for_exemption(&grant, "no longer listed in the config")
-                        .await;
-                    true
-                }
-                ExemptVerdict::MaxLifetime => {
-                    self.close_for_exemption(&grant, "maximum lifetime reached")
-                        .await;
-                    true
-                }
-                ExemptVerdict::CredentialsChanged(change) => {
-                    self.close_for_exemption(&grant, change.reason()).await;
+                ExemptTick::Close { why, .. } => {
+                    self.close_for_exemption(&grant, why).await;
                     true
                 }
             };
@@ -1731,11 +2038,11 @@ impl ServerSession {
         }
     }
 
-    /// A failed read of the step-up state (the `last_sso_at` stamp, or for an
-    /// exempt connection its key and credential rows) never extends a
+    /// A failed read of a key's `last_sso_at` stamp never extends a
     /// connection: it closes once the last known deadline passes, or after
     /// repeated failures, like the login gate that refuses when it cannot read
-    /// the stamp.
+    /// the stamp. (A connection admitted through `exempt_users` is decided by
+    /// `exempt_tick` instead.)
     async fn step_up_read_failed(&mut self, error: &WarpgateError, now: OffsetDateTime) -> bool {
         self.step_up_read_failures += 1;
         warn!(
@@ -1744,12 +2051,7 @@ impl ServerSession {
             "Could not read the step-up state"
         );
         if read_failure_closes(self.step_up_read_failures, self.step_up_known_deadline, now) {
-            if let Some(grant) = self.step_up_exempt.clone() {
-                self.close_for_exemption(&grant, "the exemption could not be verified")
-                    .await;
-            } else {
-                self.close_for_step_up("step-up window unverifiable").await;
-            }
+            self.close_for_step_up("step-up window unverifiable").await;
             return true;
         }
         self.step_up_recheck = Some(Instant::now() + STEP_UP_RECHECK_MAX);
