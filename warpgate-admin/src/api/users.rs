@@ -1,3 +1,4 @@
+use poem::Request;
 use poem_openapi::param::Path;
 use poem_openapi::payload::Json;
 use poem_openapi::{ApiResponse, Object, OpenApi};
@@ -185,6 +186,18 @@ enum UpdateUserResponse {
     NotFound,
 }
 
+/// True when saving `new_ranges` as the calling admin's own allowed ranges
+/// would no longer admit `client_ip`. `None` or an empty list means no
+/// restriction, and an unknown client address cannot be judged.
+fn edit_locks_out_caller(
+    new_ranges: Option<&[ipnet::IpNet]>,
+    client_ip: Option<std::net::IpAddr>,
+) -> bool {
+    let ranges: Option<Vec<warpgate_common::helpers::ipnet::WarpgateIpNet>> =
+        new_ranges.map(|r| r.iter().copied().map(Into::into).collect());
+    !warpgate_core::ip_allowed(ranges.as_ref(), client_ip)
+}
+
 /// Whether another account already uses this username, compared case-insensitively.
 /// `excluding` skips one account so a rename can keep — or re-case — its own name.
 async fn username_taken(
@@ -325,6 +338,7 @@ impl DetailApi {
     async fn api_update_user(
         &self,
         admin: AdminContext,
+        req: &Request,
         body: Json<UserDataRequest>,
         id: Path<Uuid>,
     ) -> Result<UpdateUserResponse, WarpgateError> {
@@ -359,12 +373,9 @@ impl DetailApi {
             )));
         }
 
-        let allowed_ip_ranges = match body.allowed_ip_ranges.clone() {
+        let parsed_ranges = match body.allowed_ip_ranges.clone() {
             Some(ranges) => match User::parse_allowed_ip_ranges(ranges) {
-                Ok(ranges) => {
-                    serde_json::to_value(ranges.iter().map(ToString::to_string).collect::<Vec<_>>())
-                        .map_err(WarpgateError::from)?
-                }
+                Ok(ranges) => Some(ranges),
                 Err(WarpgateError::InvalidNetworkAddress(range)) => {
                     return Ok(UpdateUserResponse::BadRequest(invalid_field(
                         "allowed_ip_ranges",
@@ -373,6 +384,31 @@ impl DetailApi {
                 }
                 Err(error) => return Err(error),
             },
+            None => None,
+        };
+
+        // An admin's own session and tokens are re-checked against their
+        // ranges on every request, so a change that excludes the address
+        // they are using would end their access with this very edit.
+        if user.id == admin.auth.user_id()
+            && edit_locks_out_caller(
+                parsed_ranges.as_deref(),
+                admin.trusted_client_ip(req).and_then(|ip| ip.parse().ok()),
+            )
+        {
+            return Ok(UpdateUserResponse::BadRequest(invalid_field(
+                "allowed_ip_ranges",
+                "these ranges do not include the address this request comes from, \
+                 so you would be signed out of your own account; \
+                 add your current address or edit the ranges from another account",
+            )));
+        }
+
+        let allowed_ip_ranges = match parsed_ranges {
+            Some(ranges) => {
+                serde_json::to_value(ranges.iter().map(ToString::to_string).collect::<Vec<_>>())
+                    .map_err(WarpgateError::from)?
+            }
             None => serde_json::Value::Null,
         };
 
@@ -1049,6 +1085,42 @@ mod tests {
         assert!(!is_reserved_username("public"));
         assert!(!is_reserved_username("alice"));
         assert!(!is_reserved_username(""));
+    }
+
+    #[test]
+    fn own_range_edit_must_keep_the_callers_address() {
+        let ip = |s: &str| Some(s.parse::<std::net::IpAddr>().unwrap());
+        let nets =
+            |v: &[&str]| -> Vec<ipnet::IpNet> { v.iter().map(|x| x.parse().unwrap()).collect() };
+
+        // No restriction, or an empty list.
+        assert!(!edit_locks_out_caller(None, ip("192.0.2.5")));
+        assert!(!edit_locks_out_caller(Some(&[]), ip("192.0.2.5")));
+        // Range that includes the caller.
+        assert!(!edit_locks_out_caller(
+            Some(&nets(&["192.0.2.0/24"])),
+            ip("192.0.2.5")
+        ));
+        assert!(!edit_locks_out_caller(
+            Some(&nets(&["10.0.0.0/8", "192.0.2.5/32"])),
+            ip("192.0.2.5")
+        ));
+        // Range that excludes the caller.
+        assert!(edit_locks_out_caller(
+            Some(&nets(&["10.0.0.0/8"])),
+            ip("192.0.2.5")
+        ));
+        assert!(edit_locks_out_caller(
+            Some(&nets(&["2001:db8::/32"])),
+            ip("192.0.2.5")
+        ));
+        // IPv4-mapped IPv6 address is matched as IPv4.
+        assert!(!edit_locks_out_caller(
+            Some(&nets(&["192.0.2.0/24"])),
+            ip("::ffff:192.0.2.5")
+        ));
+        // Unknown caller address cannot be judged.
+        assert!(!edit_locks_out_caller(Some(&nets(&["10.0.0.0/8"])), None));
     }
 
     async fn setup_db() -> DatabaseConnection {
