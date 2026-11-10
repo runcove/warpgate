@@ -36,8 +36,8 @@ use warpgate_common::{
 use warpgate_common_http::ext::{construct_control_plane_url, construct_external_url};
 use warpgate_core::approvals::{GateOutcome, GatedConnection};
 use warpgate_core::auth::step_up::{
-    StepUpWindow, get_pubkey_last_sso_at, is_fresh, ssh_step_up_exemption, step_up_window,
-    update_pubkey_last_sso_at,
+    StepUpWindow, exemption_still_listed, get_pubkey_last_sso_at, is_fresh,
+    matched_key_fingerprints, ssh_step_up_exemption, step_up_window, update_pubkey_last_sso_at,
 };
 use warpgate_core::auth::submit_credential;
 use warpgate_core::login_protection::FailedAttemptInfo;
@@ -332,6 +332,10 @@ pub struct ServerSession {
     /// when any of them passes, and a key login with no matched row counts as
     /// expired once step-up applies.
     step_up_pubkeys: Option<Vec<Uuid>>,
+    /// Set when this connection was admitted through
+    /// `step_up_interval.exempt_users`: who and what it was admitted for, so a
+    /// config reload that no longer lists them, or the maximum lifetime, ends it.
+    step_up_exempt: Option<ExemptGrant>,
     /// When to next evaluate the step-up window; `None` when untracked.
     step_up_recheck: Option<Instant>,
     /// The earliest deadline seen at the last successful read, kept so a
@@ -423,6 +427,39 @@ fn is_reserved_env_name(name: &str) -> bool {
 /// window would slide the step-up window forward forever. A user whose
 /// `credential_policy.ssh` legitimately lists `WebUserApproval` reaches exactly
 /// that combination, because a policy-raised `Need` is bypassable by design.
+/// What a connection admitted through `step_up_interval.exempt_users` was
+/// admitted for.
+#[derive(Debug, Clone)]
+struct ExemptGrant {
+    username: String,
+    fingerprints: Vec<String>,
+    target: String,
+    granted_at: Instant,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ExemptVerdict {
+    /// Still covered; look again after this long.
+    Keep(Duration),
+    NoLongerListed,
+    MaxLifetime,
+}
+
+fn exempt_verdict(
+    grant: &ExemptGrant,
+    step_up: Option<&warpgate_common::StepUpIntervalConfig>,
+    elapsed: Duration,
+) -> ExemptVerdict {
+    if !exemption_still_listed(step_up, &grant.username, &grant.fingerprints, &grant.target) {
+        return ExemptVerdict::NoLongerListed;
+    }
+    let max = step_up.map_or(Duration::ZERO, |s| s.exempt_max_session);
+    if elapsed >= max {
+        return ExemptVerdict::MaxLifetime;
+    }
+    ExemptVerdict::Keep((max - elapsed).clamp(STEP_UP_RECHECK_MIN, STEP_UP_RECHECK_MAX))
+}
+
 const fn web_approval_proves_step_up(approval_present: bool, approval_was_bypassed: bool) -> bool {
     approval_present && !approval_was_bypassed
 }
@@ -509,7 +546,7 @@ mod tests {
     use warpgate_common::eventhub::EventHub;
 
     use super::{
-        ChannelOperation, EventIntake, MAX_WEB_AUTH_WAITS, PendingCommand,
+        ChannelOperation, EventIntake, ExemptGrant, ExemptVerdict, exempt_verdict, MAX_WEB_AUTH_WAITS, PendingCommand,
         PendingKeyboardInteractiveAuth, RCCommand, SshClientError, TARGET_FORWARD_OPEN_TIMEOUT,
         TARGET_REPLY_TIMEOUT, WebApprovalWait, WebAuthStep, bump_waits, carry_forward,
         is_reserved_env_name, next_web_auth_step, reject_with_allowed_auth_methods, reply_limit,
@@ -537,6 +574,86 @@ mod tests {
     /// credential policy lists `WebUserApproval` re-stamps `last_sso_at` on
     /// every reconnect inside `web_approval_grace_period_seconds`, and the
     /// step-up interval never fires again.
+    fn grant(user: &str, fps: &[&str], target: &str) -> ExemptGrant {
+        ExemptGrant {
+            username: user.into(),
+            fingerprints: fps.iter().map(|f| (*f).to_owned()).collect(),
+            target: target.into(),
+            granted_at: Instant::now(),
+        }
+    }
+
+    fn exempt_cfg(
+        user: &str,
+        keys: &[&str],
+        targets: Option<&[&str]>,
+        max: Duration,
+    ) -> warpgate_common::StepUpIntervalConfig {
+        warpgate_common::StepUpIntervalConfig {
+            exempt_users: vec![warpgate_common::StepUpExemptUser {
+                user: user.into(),
+                keys: keys.iter().map(|k| (*k).to_owned()).collect(),
+                targets: targets.map(|t| t.iter().map(|t| (*t).to_owned()).collect()),
+            }],
+            exempt_max_session: max,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn an_exempt_connection_survives_a_reload_that_still_lists_it() {
+        let g = grant("qa", &["SHA256:a"], "staging");
+        let cfg = exempt_cfg(
+            "qa",
+            &["SHA256:a", "SHA256:b"],
+            Some(&["staging", "x"]),
+            Duration::from_secs(3600),
+        );
+        assert!(matches!(
+            exempt_verdict(&g, Some(&cfg), Duration::from_secs(5)),
+            ExemptVerdict::Keep(_)
+        ));
+    }
+
+    #[test]
+    fn a_reload_that_drops_the_user_key_or_target_ends_an_exempt_connection() {
+        let g = grant("qa", &["SHA256:a"], "staging");
+        let max = Duration::from_secs(3600);
+        let gone = ExemptVerdict::NoLongerListed;
+        let none = warpgate_common::StepUpIntervalConfig::default();
+        assert_eq!(exempt_verdict(&g, Some(&none), Duration::ZERO), gone);
+        assert_eq!(exempt_verdict(&g, None, Duration::ZERO), gone);
+        let other_user = exempt_cfg("qa2", &["SHA256:a"], None, max);
+        assert_eq!(exempt_verdict(&g, Some(&other_user), Duration::ZERO), gone);
+        let other_key = exempt_cfg("qa", &["SHA256:b"], None, max);
+        assert_eq!(exempt_verdict(&g, Some(&other_key), Duration::ZERO), gone);
+        let other_target = exempt_cfg("qa", &["SHA256:a"], Some(&["prod"]), max);
+        assert_eq!(
+            exempt_verdict(&g, Some(&other_target), Duration::ZERO),
+            gone
+        );
+    }
+
+    #[test]
+    fn an_exempt_connection_ends_at_the_maximum_lifetime() {
+        let g = grant("qa", &["SHA256:a"], "staging");
+        let cfg = exempt_cfg("qa", &["SHA256:a"], None, Duration::from_secs(60));
+        assert!(matches!(
+            exempt_verdict(&g, Some(&cfg), Duration::from_secs(59)),
+            ExemptVerdict::Keep(_)
+        ));
+        assert_eq!(
+            exempt_verdict(&g, Some(&cfg), Duration::from_secs(60)),
+            ExemptVerdict::MaxLifetime
+        );
+        // A shortened limit applies to a connection that is already open.
+        let shorter = exempt_cfg("qa", &["SHA256:a"], None, Duration::from_secs(10));
+        assert_eq!(
+            exempt_verdict(&g, Some(&shorter), Duration::from_secs(30)),
+            ExemptVerdict::MaxLifetime
+        );
+    }
+
     #[test]
     fn a_bypassed_web_approval_neither_satisfies_step_up_nor_stamps_last_sso_at() {
         // A real approval collected by this attempt: gate satisfied, stamp taken.
@@ -1078,6 +1195,7 @@ impl ServerSession {
             auth_state: None,
             disconnect_token: CancellationToken::new(),
             step_up_pubkeys: None,
+            step_up_exempt: None,
             step_up_recheck: None,
             step_up_known_deadline: None,
             step_up_read_failures: 0,
@@ -1235,6 +1353,32 @@ impl ServerSession {
     /// the key's current `last_sso_at`, and schedule the next look. Returns
     /// `true` when the window has passed and the connection was closed.
     async fn enforce_step_up_window(&mut self) -> bool {
+        if let Some(grant) = self.step_up_exempt.clone() {
+            let verdict = {
+                let cfg = self.services.config.lock().await;
+                exempt_verdict(
+                    &grant,
+                    cfg.store.step_up_interval.as_ref(),
+                    grant.granted_at.elapsed(),
+                )
+            };
+            return match verdict {
+                ExemptVerdict::Keep(next) => {
+                    self.step_up_recheck = Some(Instant::now() + next);
+                    false
+                }
+                ExemptVerdict::NoLongerListed => {
+                    self.close_for_exemption(&grant, "no longer listed in the config")
+                        .await;
+                    true
+                }
+                ExemptVerdict::MaxLifetime => {
+                    self.close_for_exemption(&grant, "maximum lifetime reached")
+                        .await;
+                    true
+                }
+            };
+        }
         let Some(pubkeys) = self.step_up_pubkeys.clone() else {
             self.step_up_recheck = None;
             return false;
@@ -1313,6 +1457,24 @@ impl ServerSession {
         }
         self.step_up_recheck = Some(Instant::now() + STEP_UP_RECHECK_MAX);
         false
+    }
+
+    async fn close_for_exemption(&mut self, grant: &ExemptGrant, why: &str) {
+        let reason = "Session ended; reconnect to sign in again";
+        info!(
+            session = %self.id,
+            username = %grant.username,
+            key_fingerprint = %grant.fingerprints.join(","),
+            target = %grant.target,
+            reason = why,
+            "Closing the connection admitted through step_up_interval.exempt_users"
+        );
+        let _ = self.emit_service_message(reason);
+        self.disconnect_description = reason.to_owned();
+        self.step_up_recheck = None;
+        self.step_up_exempt = None;
+        self.request_disconnect();
+        self.disconnect_server().await;
     }
 
     async fn close_for_step_up(&mut self, why: &str) {
@@ -3831,6 +3993,7 @@ impl ServerSession {
                         // Set when `step_up_interval.exempt_users` lets this
                         // key sign-in skip the check below.
                         let mut step_up_exempt = false;
+                        let mut exempt_fingerprints: Vec<String> = Vec::new();
                         if let (Some(interval), Some(step_up_config)) =
                             (step_up_ssh, step_up_config.as_ref())
                         {
@@ -3855,6 +4018,21 @@ impl ServerSession {
                                 )
                                 .await?
                                 .applies();
+                            if step_up_exempt {
+                                // Kept to end the connection if a reload stops
+                                // listing it. Unreadable keys fail closed:
+                                // the sign-in then faces the check.
+                                match matched_key_fingerprints(
+                                    &self.services.db,
+                                    user_info.id,
+                                    &matched_pubkey_ids,
+                                )
+                                .await?
+                                {
+                                    Some(fingerprints) => exempt_fingerprints = fingerprints,
+                                    None => step_up_exempt = false,
+                                }
+                            }
                             if pubkey_used && !has_stepup && !step_up_exempt {
                                 // Every matched key must be fresh; no matched
                                 // key at all is stale.
@@ -3919,9 +4097,17 @@ impl ServerSession {
                         // later still applies; the check does nothing while
                         // step-up is off.
                         //
-                        // An exempt sign-in is not tracked: the connection has
-                        // no SSO stamp to expire against.
-                        if valid_kinds.contains(&CredentialKind::PublicKey) && !step_up_exempt {
+                        // An exempt sign-in has no SSO stamp to expire against;
+                        // it is tracked by its grant instead.
+                        if step_up_exempt {
+                            self.step_up_exempt = Some(ExemptGrant {
+                                username: user_info.username.clone(),
+                                fingerprints: exempt_fingerprints,
+                                target: resolved_target_name.clone(),
+                                granted_at: Instant::now(),
+                            });
+                            self.step_up_recheck = Some(Instant::now() + STEP_UP_RECHECK_MIN);
+                        } else if valid_kinds.contains(&CredentialKind::PublicKey) {
                             self.step_up_pubkeys = Some(matched_pubkey_ids.clone());
                             self.step_up_recheck = Some(Instant::now());
                         }

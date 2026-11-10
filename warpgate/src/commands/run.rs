@@ -82,6 +82,22 @@ pub async fn command(params: &GlobalParams, enable_admin_token: bool) -> Result<
 
     validate_encryption_config(&config);
 
+    // Entries naming a user with an SSO or password credential never apply;
+    // say so once, now that the database is available.
+    let step_up_config = config.store.step_up_interval.clone();
+    if let Some(step_up_config) = step_up_config
+        && let Err(error) = warpgate_core::auth::step_up::warn_exempt_users_with_credentials(
+            &services.db,
+            &step_up_config,
+        )
+        .await
+    {
+        warn!(
+            ?error,
+            "Could not check step_up_interval.exempt_users against user credentials"
+        );
+    }
+
     // Join the cluster before the credential backfill below
     services.cluster.start().await?;
 
