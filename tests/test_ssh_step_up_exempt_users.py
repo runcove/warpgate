@@ -116,7 +116,12 @@ def _lines_for(log_path: Path, username: str, message: str):
 
 
 def _field(line: str, pattern: "re.Pattern[str]", name: str) -> str:
-    match = pattern.search(line)
+    # The tracing span prefix on every line (`SSH{session=<uuid>}:`) prints a
+    # session field too, so look only at what follows the event's message:
+    # tracing prints the event's own fields after it.
+    _, found, event_fields = line.rpartition(ALLOWED_LOG)
+    assert found, f"not the exemption line: {line}"
+    match = pattern.search(event_fields)
     assert match, f"the exemption line has no {name} field: {line}"
     return match.group(1)
 
@@ -126,38 +131,45 @@ def _is_loopback(address: str) -> bool:
     return (getattr(ip, "ipv4_mapped", None) or ip).is_loopback
 
 
+def _setup_two_key_user(processes: ProcessManager, wg_c_ed25519_pubkey: Path):
+    """One service user with two keys, only the ed25519 one listed in
+    `exempt_users`. Returns (wg, username, ssh_target, log_path)."""
+    username = f"svc-{uuid4()}"
+    log_path = processes.ctx.tmpdir / f"wg-log-{uuid4()}.log"
+    wg = _start(
+        processes, username, [_fingerprint("ssh-keys/id_ed25519.pub")], log_path
+    )
+
+    ssh_port = processes.start_ssh_server(
+        trusted_keys=[wg_c_ed25519_pubkey.read_text()]
+    )
+    wait_port(ssh_port)
+
+    url = f"https://localhost:{wg.http_port}"
+    with admin_client(url) as api:
+        ssh_target = _setup_service_user(
+            api,
+            ssh_port,
+            username,
+            [
+                ("listed", open("ssh-keys/id_ed25519.pub").read().strip()),
+                ("not listed", open("ssh-keys/id_rsa.pub").read().strip()),
+            ],
+        )
+    return wg, username, ssh_target, log_path
+
+
 class TestStepUpExemptUsers:
     @pytest.mark.asyncio
-    async def test_listed_key_skips_web_approval_and_an_unlisted_key_does_not(
+    async def test_listed_key_skips_web_approval(
         self,
         processes: ProcessManager,
         wg_c_ed25519_pubkey: Path,
     ):
-        """One service user with two keys, only the ed25519 one listed in
-        `exempt_users`. The listed key reaches the target with no
-        `WebUserApproval`; the other key still gets the step-up check."""
-        username = f"svc-{uuid4()}"
-        log_path = processes.ctx.tmpdir / f"wg-log-{uuid4()}.log"
-        wg = _start(
-            processes, username, [_fingerprint("ssh-keys/id_ed25519.pub")], log_path
+        """The listed key reaches the target with no `WebUserApproval`."""
+        wg, username, ssh_target, log_path = _setup_two_key_user(
+            processes, wg_c_ed25519_pubkey
         )
-
-        ssh_port = processes.start_ssh_server(
-            trusted_keys=[wg_c_ed25519_pubkey.read_text()]
-        )
-        wait_port(ssh_port)
-
-        url = f"https://localhost:{wg.http_port}"
-        with admin_client(url) as api:
-            ssh_target = _setup_service_user(
-                api,
-                ssh_port,
-                username,
-                [
-                    ("listed", open("ssh-keys/id_ed25519.pub").read().strip()),
-                    ("not listed", open("ssh-keys/id_rsa.pub").read().strip()),
-                ],
-            )
 
         # The listed key: straight through, nothing to approve.
         listed = _client(
@@ -183,6 +195,17 @@ class TestStepUpExemptUsers:
             log_path, username, STEP_UP_REQUIRED_LOG
         ), "the listed key was asked for step-up"
 
+    @pytest.mark.asyncio
+    async def test_unlisted_key_still_needs_web_approval(
+        self,
+        processes: ProcessManager,
+        wg_c_ed25519_pubkey: Path,
+    ):
+        """The other key of the same user still gets the step-up check."""
+        wg, username, ssh_target, log_path = _setup_two_key_user(
+            processes, wg_c_ed25519_pubkey
+        )
+
         # The other key of the same user: the login stops at the step-up check
         # and waits for a browser approval that never comes.
         unlisted = _client(
@@ -207,4 +230,4 @@ class TestStepUpExemptUsers:
             unlisted.kill()
         out, _ = unlisted.communicate(timeout=10)
         assert b"unlisted-ok" not in out
-        assert len(_lines_for(log_path, username, ALLOWED_LOG)) == 1
+        assert len(_lines_for(log_path, username, ALLOWED_LOG)) == 0
