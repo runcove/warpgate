@@ -15,8 +15,8 @@ from .util import target_host, wait_port
 
 ALLOWED_LOG = "allowed by step-up exemption"
 STEP_UP_REQUIRED_LOG = "SSH step-up required"
-SESSION_FIELD = re.compile(r"\bsession=(\S+)")
-REMOTE_IP_FIELD = re.compile(r"\bremote_ip=(\S+)")
+SESSION_FIELD = re.compile(r"\bsession=([0-9A-Fa-f-]{32,36})\b")
+REMOTE_IP_FIELD = re.compile(r"\bremote_ip=([^\s,}]+)")
 
 
 def _fingerprint(pubkey_path: str) -> str:
