@@ -4380,6 +4380,18 @@ impl ServerSession {
                         // An exempt sign-in has no SSO stamp to expire against;
                         // it is tracked by its grant instead.
                         if let Some(fingerprints) = exempt_fingerprints {
+                            info!(
+                                session = %self.id,
+                                remote_ip = %self.remote_address.ip(),
+                                username = %user_info.username,
+                                key_fingerprint = %fingerprints.join(","),
+                                target = %if resolved_target_name.is_empty() {
+                                    "unknown"
+                                } else {
+                                    resolved_target_name.as_str()
+                                },
+                                "SSH sign-in allowed by step-up exemption"
+                            );
                             self.step_up_exempt = Some(ExemptGrant {
                                 username: user_info.username.clone(),
                                 user_id: user_info.id,

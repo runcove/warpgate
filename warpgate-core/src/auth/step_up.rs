@@ -15,7 +15,7 @@ use std::time::Duration;
 use russh::keys::{HashAlg, PublicKey};
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
 use time::OffsetDateTime;
-use tracing::{info, warn};
+use tracing::warn;
 use uuid::Uuid;
 use warpgate_common::{StepUpExemptUser, StepUpIntervalConfig, WarpgateError};
 use warpgate_db_entities as entities;
@@ -180,8 +180,9 @@ impl StepUpExemption {
 }
 
 /// Decide whether an SSH public-key sign-in skips the step-up check because
-/// of `step_up_interval.exempt_users`, and log the outcome (one info line when
-/// it applies, one warning when a listed user's entry does not).
+/// of `step_up_interval.exempt_users`. It logs one warning when a listed
+/// user's entry does not apply; the caller logs the sign-in that went through,
+/// once it has been accepted.
 ///
 /// An entry applies only if all of these hold:
 /// - the username equals the entry's `user` exactly;
@@ -208,20 +209,7 @@ pub async fn ssh_step_up_exemption(
     }
 
     match listed_user_outcome(db, &entries, user_id, matched_pubkey_ids, target_name).await? {
-        Ok(fingerprints) => {
-            let target = if target_name.is_empty() {
-                "unknown"
-            } else {
-                target_name
-            };
-            info!(
-                username = %username,
-                key_fingerprint = %fingerprints.join(","),
-                target = %target,
-                "SSH sign-in allowed by step-up exemption"
-            );
-            Ok(StepUpExemption::Applies(fingerprints))
-        }
+        Ok(fingerprints) => Ok(StepUpExemption::Applies(fingerprints)),
         Err(ignored) => {
             warn!(
                 username = %username,
@@ -780,7 +768,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unit_exempt_user_with_only_a_listed_key_passes_and_is_logged() {
+    async fn unit_exempt_user_with_only_a_listed_key_passes_and_logs_nothing_yet() {
         let db = setup_db().await;
         let (user_id, username) = service_user(&db).await;
         let key = add_key(&db, user_id, KEY_A).await;
@@ -793,17 +781,8 @@ mod tests {
 
         assert_eq!(got, applies(&[FP_A]));
         assert!(got.applies());
-        let logged = logged_for(&username);
-        assert_eq!(logged.len(), 1, "exactly one line: {logged:?}");
-        assert!(
-            message_of(&logged[0]).contains("step-up exemption"),
-            "{logged:?}"
-        );
-        assert_eq!(
-            logged[0].get("key_fingerprint").map(String::as_str),
-            Some(FP_A)
-        );
-        assert_eq!(logged[0].get("target").map(String::as_str), Some("prod"));
+        // The sign-in is logged by the caller once it has been accepted.
+        assert!(logged_for(&username).is_empty());
     }
 
     #[tokio::test]
