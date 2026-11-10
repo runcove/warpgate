@@ -261,18 +261,14 @@ async fn listed_user_outcome(
     else {
         return Ok(Err(StepUpExemptionIgnored::KeyNotListed));
     };
-    let covering_keys: Vec<&&StepUpExemptUser> = entries
+    if !entries
         .iter()
-        .filter(|entry| fingerprints.iter().all(|fp| entry.keys.contains(fp)))
-        .collect();
-    if covering_keys.is_empty() {
+        .any(|entry| entry_covers_keys(entry, &fingerprints))
+    {
         return Ok(Err(StepUpExemptionIgnored::KeyNotListed));
     }
-    if covering_keys.iter().any(|entry| {
-        entry
-            .targets
-            .as_ref()
-            .is_none_or(|targets| targets.iter().any(|t| t == target_name))
+    if entries.iter().any(|entry| {
+        entry_covers_keys(entry, &fingerprints) && entry_covers_target(entry, target_name)
     }) {
         Ok(Ok(fingerprints))
     } else {
@@ -280,11 +276,86 @@ async fn listed_user_outcome(
     }
 }
 
+fn entry_covers_keys(entry: &StepUpExemptUser, fingerprints: &[String]) -> bool {
+    fingerprints.iter().all(|fp| entry.keys.contains(fp))
+}
+
+fn entry_covers_target(entry: &StepUpExemptUser, target_name: &str) -> bool {
+    entry
+        .targets
+        .as_ref()
+        .is_none_or(|targets| targets.iter().any(|t| t == target_name))
+}
+
+/// Whether a connection admitted through `exempt_users` is still covered by
+/// the live config: step-up is still configured for SSH, and an entry names
+/// exactly this user, lists every key it signed in with and (when it has
+/// `targets`) the target. Used to end such connections after a config reload.
+#[must_use]
+pub fn exemption_still_listed(
+    step_up: Option<&StepUpIntervalConfig>,
+    username: &str,
+    fingerprints: &[String],
+    target_name: &str,
+) -> bool {
+    let Some(step_up) = step_up else {
+        return false;
+    };
+    !fingerprints.is_empty()
+        && step_up.exempt_entries_for(username).any(|entry| {
+            entry_covers_keys(entry, fingerprints) && entry_covers_target(entry, target_name)
+        })
+}
+
+/// Log one warning for each `exempt_users` entry whose user has an SSO or
+/// password credential (such an entry never applies). Meant to run once at
+/// startup, when the database is available. A user that does not exist yet is
+/// not reported.
+pub async fn warn_exempt_users_with_credentials(
+    db: &DatabaseConnection,
+    step_up: &StepUpIntervalConfig,
+) -> Result<usize, WarpgateError> {
+    let mut warned = 0;
+    let mut seen = std::collections::HashSet::new();
+    for entry in &step_up.exempt_users {
+        if !seen.insert(entry.user.as_str()) {
+            continue;
+        }
+        let Some(user) = entities::User::Entity::find()
+            .filter(entities::User::Column::Username.eq(entry.user.as_str()))
+            .one(db)
+            .await?
+        else {
+            continue;
+        };
+        let has_sso = entities::SsoCredential::Entity::find()
+            .filter(entities::SsoCredential::Column::UserId.eq(user.id))
+            .one(db)
+            .await?
+            .is_some();
+        let has_password = entities::PasswordCredential::Entity::find()
+            .filter(entities::PasswordCredential::Column::UserId.eq(user.id))
+            .one(db)
+            .await?
+            .is_some();
+        if has_sso || has_password {
+            warn!(
+                username = %entry.user,
+                has_sso,
+                has_password,
+                "step_up_interval.exempt_users lists a user with an SSO or password credential; the entry will not be applied"
+            );
+            warned += 1;
+        }
+    }
+    Ok(warned)
+}
+
 /// The OpenSSH SHA256 fingerprint of each given public key row of the user.
 ///
 /// `None` when there is no row to show a key for: no ids, a row that is gone
 /// or belongs to someone else, or a stored key that does not parse.
-async fn matched_key_fingerprints(
+pub async fn matched_key_fingerprints(
     db: &DatabaseConnection,
     user_id: Uuid,
     pubkey_ids: &[Uuid],
@@ -422,7 +493,10 @@ mod tests {
             StepUpWindow::Remaining(hours(10))
         );
         // Shorter interval: the same connection is now past its window.
-        assert_eq!(step_up_window(last, Some(hours(1)), now), StepUpWindow::Expired);
+        assert_eq!(
+            step_up_window(last, Some(hours(1)), now),
+            StepUpWindow::Expired
+        );
         // Longer interval extends it; removing it cancels the limit.
         assert_eq!(
             step_up_window(last, Some(hours(24)), now),
@@ -945,5 +1019,60 @@ mod tests {
 
         let got = ssh_step_up_exemption(&db, &config, user_id, &username, &[key], "prod").await;
         assert!(got.is_err(), "{got:?}");
+    }
+
+    #[test]
+    fn unit_exemption_still_listed_follows_the_live_config() {
+        let fps = vec![FP_A.to_owned()];
+        let cfg = exempt_config(vec![exempt_entry("qa", &[FP_A], Some(&["staging"]))]);
+        assert!(exemption_still_listed(Some(&cfg), "qa", &fps, "staging"));
+        // user removed or renamed
+        assert!(!exemption_still_listed(Some(&cfg), "qa2", &fps, "staging"));
+        assert!(!exemption_still_listed(
+            Some(&exempt_config(vec![])),
+            "qa",
+            &fps,
+            "staging"
+        ));
+        // key no longer listed, or one more key in use than is listed
+        let other = exempt_config(vec![exempt_entry("qa", &[FP_B], Some(&["staging"]))]);
+        assert!(!exemption_still_listed(Some(&other), "qa", &fps, "staging"));
+        let both = vec![FP_A.to_owned(), FP_B.to_owned()];
+        assert!(!exemption_still_listed(Some(&cfg), "qa", &both, "staging"));
+        // target no longer listed
+        assert!(!exemption_still_listed(Some(&cfg), "qa", &fps, "prod"));
+        // step-up config gone, or no key recorded
+        assert!(!exemption_still_listed(None, "qa", &fps, "staging"));
+        assert!(!exemption_still_listed(Some(&cfg), "qa", &[], "staging"));
+    }
+
+    #[tokio::test]
+    async fn unit_startup_check_reports_listed_users_with_sso_or_password() {
+        let db = setup_db().await;
+        let (clean, clean_name) = service_user(&db).await;
+        add_key(&db, clean, KEY_A).await;
+        let (pw, pw_name) = service_user(&db).await;
+        add_password(&db, pw).await;
+        let (sso, sso_name) = service_user(&db).await;
+        add_sso(&db, sso).await;
+        let (_unlisted, _) = service_user(&db).await;
+        let config = exempt_config(vec![
+            exempt_entry(&clean_name, &[FP_A], None),
+            exempt_entry(&pw_name, &[FP_A], None),
+            exempt_entry(&sso_name, &[FP_A], None),
+            exempt_entry("no-such-user", &[FP_A], None),
+        ]);
+        assert_eq!(
+            warn_exempt_users_with_credentials(&db, &config)
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            warn_exempt_users_with_credentials(&db, &exempt_config(vec![]))
+                .await
+                .unwrap(),
+            0
+        );
     }
 }
