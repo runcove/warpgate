@@ -44,3 +44,4 @@ zeroize = { version = "^1.5", default-features = false }
 
 [dev-dependencies]
 warpgate-db-migrations = { path = "../warpgate-db-migrations", features = ["sqlite"] }
+tokio = { workspace = true, features = ["test-util"] }

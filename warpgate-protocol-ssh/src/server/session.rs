@@ -83,6 +83,29 @@ const STEP_UP_RECHECK_MAX: Duration = Duration::from_secs(10);
 const STEP_UP_RECHECK_MIN: Duration = Duration::from_millis(250);
 /// Consecutive unreadable checks after which a connection is closed.
 const STEP_UP_MAX_READ_FAILURES: u32 = 6;
+/// Longest one step-up database read may take before it counts as an
+/// unreadable check. Half of `STEP_UP_RECHECK_MAX`: far above a healthy
+/// read, and short enough that the failures allowed before a close
+/// (`STEP_UP_MAX_READ_FAILURES`) add up within about a minute.
+const STEP_UP_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Run one step-up database read with `STEP_UP_READ_TIMEOUT` as its bound. A
+/// read that does not finish in time is returned as an error, so it is counted
+/// like any other unreadable check.
+async fn bound_step_up_read<T>(
+    username: &str,
+    limit: Duration,
+    read: impl std::future::Future<Output = Result<T, WarpgateError>>,
+) -> Result<T, WarpgateError> {
+    if let Ok(result) = tokio::time::timeout(limit, read).await {
+        result
+    } else {
+        warn!(%username, timeout = ?limit, "The step-up database read timed out");
+        Err(WarpgateError::DatabaseError(sea_orm::DbErr::Custom(
+            "step-up database read timed out".into(),
+        )))
+    }
+}
 
 /// What the session loop woke for.
 #[allow(clippy::large_enum_variant)]
@@ -484,18 +507,33 @@ async fn exempt_recheck(
     db: &sea_orm::DatabaseConnection,
     elapsed: Duration,
 ) -> Result<ExemptVerdict, WarpgateError> {
+    exempt_recheck_bounded(grant, step_up, db, elapsed, STEP_UP_READ_TIMEOUT).await
+}
+
+/// `exempt_recheck` with the bound on its database read given.
+async fn exempt_recheck_bounded(
+    grant: &ExemptGrant,
+    step_up: Option<&warpgate_common::StepUpIntervalConfig>,
+    db: &sea_orm::DatabaseConnection,
+    elapsed: Duration,
+    limit: Duration,
+) -> Result<ExemptVerdict, WarpgateError> {
     let verdict = exempt_verdict(grant, step_up, elapsed);
     if !matches!(verdict, ExemptVerdict::Keep(_)) {
         return Ok(verdict);
     }
     Ok(
-        match exempt_grant_revocation(
-            db,
-            step_up,
-            grant.user_id,
-            &grant.pubkey_ids,
-            &grant.fingerprints,
-            &grant.target,
+        match bound_step_up_read(
+            &grant.username,
+            limit,
+            exempt_grant_revocation(
+                db,
+                step_up,
+                grant.user_id,
+                &grant.pubkey_ids,
+                &grant.fingerprints,
+                &grant.target,
+            ),
         )
         .await?
         {
@@ -684,11 +722,12 @@ mod tests {
     use super::{
         ChannelOperation, EventIntake, ExemptGrant, ExemptTick, ExemptVerdict, MAX_WEB_AUTH_WAITS,
         PendingCommand, PendingKeyboardInteractiveAuth, RCCommand, STEP_UP_MAX_READ_FAILURES,
-        STEP_UP_RECHECK_MAX, SshClientError, TARGET_FORWARD_OPEN_TIMEOUT, TARGET_REPLY_TIMEOUT,
-        WebApprovalWait, WebAuthStep, bump_waits, carry_forward, exempt_recheck, exempt_tick,
-        exempt_verdict, is_reserved_env_name, next_web_auth_step, presented_keys_recorded,
-        read_failure_closes, reject_with_allowed_auth_methods, reply_limit, round_creates_wait,
-        wait_for_reply, wait_for_state,
+        STEP_UP_READ_TIMEOUT, STEP_UP_RECHECK_MAX, SshClientError, TARGET_FORWARD_OPEN_TIMEOUT,
+        TARGET_REPLY_TIMEOUT, WebApprovalWait, WebAuthStep, bound_step_up_read, bump_waits,
+        carry_forward, exempt_recheck, exempt_tick, exempt_verdict, is_reserved_env_name,
+        next_web_auth_step, presented_keys_recorded, read_failure_closes,
+        reject_with_allowed_auth_methods, reply_limit, round_creates_wait, wait_for_reply,
+        wait_for_state,
     };
 
     /// A client cannot set the variables Warpgate injects about the user;
@@ -1227,6 +1266,63 @@ mod tests {
                 }
                 assert_eq!(failures, n);
             }
+        }
+
+        /// A read that never returns (the only pooled connection is held
+        /// elsewhere) counts as an unreadable check within the bound, so the
+        /// connection closes after the allowed number of them.
+        #[tokio::test]
+        async fn a_hung_database_read_counts_as_a_failure_within_the_bound() {
+            use sea_orm::TransactionTrait;
+
+            let a = admitted().await;
+            let _held = a.db.begin().await.unwrap();
+            // Pause only now: setting the database up needs real time.
+            tokio::time::pause();
+
+            let mut failures = 0;
+            for n in 1..=STEP_UP_MAX_READ_FAILURES {
+                let started = tokio::time::Instant::now();
+                let result =
+                    exempt_recheck(&a.grant, Some(&a.cfg), &a.db, Duration::from_secs(5)).await;
+                assert!(
+                    result.is_err(),
+                    "tick {n}: a hung read must not read as covered"
+                );
+                assert!(
+                    started.elapsed() <= STEP_UP_READ_TIMEOUT + Duration::from_millis(100),
+                    "tick {n} took {:?}",
+                    started.elapsed()
+                );
+                match tick(&result, failures) {
+                    ExemptTick::Keep { failures: f, .. } => {
+                        assert!(n < STEP_UP_MAX_READ_FAILURES, "tick {n} must close");
+                        failures = f;
+                    }
+                    ExemptTick::Close { why, failures: f } => {
+                        assert_eq!(n, STEP_UP_MAX_READ_FAILURES);
+                        assert_eq!(why, "the exemption could not be verified");
+                        failures = f;
+                    }
+                }
+                assert_eq!(failures, n);
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn bound_step_up_read_gives_up_on_a_read_that_never_finishes() {
+            let started = tokio::time::Instant::now();
+            let result: Result<(), _> = bound_step_up_read(
+                "someone",
+                STEP_UP_READ_TIMEOUT,
+                std::future::pending::<Result<(), warpgate_common::WarpgateError>>(),
+            )
+            .await;
+            assert!(result.is_err());
+            assert_eq!(started.elapsed(), STEP_UP_READ_TIMEOUT);
+
+            let ok = bound_step_up_read("someone", STEP_UP_READ_TIMEOUT, async { Ok(7) }).await;
+            assert_eq!(ok.unwrap(), 7);
         }
 
         #[tokio::test]
@@ -2048,6 +2144,10 @@ impl ServerSession {
             cfg.store.step_up_interval.as_ref().and_then(|s| s.ssh)
         };
         let now = OffsetDateTime::now_utc();
+        let username = self
+            .user_info
+            .as_ref()
+            .map_or_else(|| "unknown".to_owned(), |u| u.username.clone());
         let mut window = StepUpWindow::NotApplicable;
         if interval.is_some() {
             // A key login with no matched row cannot show a fresh SSO.
@@ -2057,7 +2157,13 @@ impl ServerSession {
                 StepUpWindow::Remaining(Duration::MAX)
             };
             for pubkey_id in &pubkeys {
-                let last = match get_pubkey_last_sso_at(&self.services.db, *pubkey_id).await {
+                let last = match bound_step_up_read(
+                    &username,
+                    STEP_UP_READ_TIMEOUT,
+                    get_pubkey_last_sso_at(&self.services.db, *pubkey_id),
+                )
+                .await
+                {
                     Ok(last) => last,
                     Err(error) => {
                         return self.step_up_read_failed(&error, now).await;
