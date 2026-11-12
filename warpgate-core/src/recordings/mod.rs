@@ -12,8 +12,8 @@ use tokio_util::task::TaskTracker;
 use tracing::{info, warn};
 use uuid::Uuid;
 use warpgate_common::helpers::fs::{
-    KEEP_FOR_DIRECTORY, secure_directory, secure_directory_by_masking,
-    secure_recordings_root_by_masking,
+    KEEP_FOR_DIRECTORY, create_recording_directory_all, secure_directory,
+    secure_directory_by_masking, secure_recordings_root_by_masking,
 };
 use warpgate_common::{GlobalParams, TargetSessionId};
 use warpgate_db_entities::Recording::{self, RecordingKind};
@@ -228,14 +228,18 @@ impl SessionRecordings {
         // On S3 this folder is a scratch copy, live-readable while the session runs and
         // dropped once each file finishes uploading.
         let folder = storage.recording_folder(id, &name);
-        tokio::fs::create_dir_all(&folder)
-            .await
-            .map_err(|source| Error::CreateDirectory {
-                path: folder.clone(),
-                source,
-            })?;
+        let masking = self.params.should_secure_files() && self.params.recordings_keep_group_read();
+        if masking {
+            create_recording_directory_all(&folder).await
+        } else {
+            tokio::fs::create_dir_all(&folder).await
+        }
+        .map_err(|source| Error::CreateDirectory {
+            path: folder.clone(),
+            source,
+        })?;
         if self.params.should_secure_files() {
-            if self.params.recordings_keep_group_read() {
+            if masking {
                 // Every directory from the root down to this recording, so a reader
                 // granted read by a default POSIX ACL on the root can traverse to it.
                 // Only these three, never recursive, and never adding a bit. The root

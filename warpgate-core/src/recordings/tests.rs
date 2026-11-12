@@ -975,6 +975,131 @@ async fn a_symlinked_session_or_recording_directory_fails_the_start() {
     }
 }
 
+/// A symlink in place of a recording file fails the start under the flag: the file is
+/// opened with `O_NOFOLLOW`, so nothing behind the link is written or chmodded.
+#[tokio::test]
+async fn a_symlinked_recording_file_fails_the_start() {
+    for s3 in [false, true] {
+        let h = Harness::with_securing(s3.then(FakeS3::default), true, true).await;
+        let base = if s3 { scratch_root(&h) } else { disk_root(&h) };
+        let leaf = base.join(h.session_id.to_string()).join(NAME);
+        std::fs::create_dir_all(&leaf).unwrap();
+        let elsewhere = h.root.join("elsewhere");
+        std::fs::write(&elsewhere, b"kept").unwrap();
+        set_mode(&elsewhere, 0o666);
+        std::os::unix::fs::symlink(&elsewhere, leaf.join(RecordingFile::NDJsonData.filename()))
+            .unwrap();
+
+        let started = start_named(&h).await;
+        assert!(started.is_err(), "s3: {s3}");
+        assert_eq!(mode_of(&elsewhere), 0o666, "s3: {s3}");
+        assert_eq!(std::fs::read(&elsewhere).unwrap(), b"kept", "s3: {s3}");
+    }
+}
+
+/// The ACL entries of `path`, numeric, without comments or effective rights.
+fn acl_entries(path: &Path) -> Vec<String> {
+    let output = std::process::Command::new("getfacl")
+        .args(["-n", "-c", "-E", "-p"])
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "getfacl {}", path.display());
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Puts the uploader's ACL on `root`: execute on the root, and a default ACL giving
+/// `reader` read on files and read + execute on directories, nothing to the owning
+/// group or others. `false` when ACLs are not available here.
+fn grant_reader_by_default_acl(root: &Path, reader: u32) -> bool {
+    let setfacl = |args: &[&str]| {
+        std::process::Command::new("setfacl")
+            .args(args)
+            .arg(root)
+            .output()
+            .is_ok_and(|o| o.status.success())
+    };
+    setfacl(&["-m", &format!("u:{reader}:x")])
+        && setfacl(&["-d", "-m", &format!("u::rwx,g::---,o::---,u:{reader}:rX")])
+}
+
+/// End to end on a real default ACL (this process's own uid stands in for the
+/// uploader): with the flag, a new directory's ACL mask is r-x and a new file's r--,
+/// so the named reader can read, while the owning group and others get nothing.
+/// Without the flag, the exact chmod empties the mask. Skipped where ACLs are not
+/// supported. Under a default ACL the kernel ignores the umask, so this holds under
+/// umask 0077 as under any other.
+#[tokio::test]
+async fn a_default_acl_reader_keeps_read_and_nobody_else_gains_it() {
+    use std::os::unix::fs::MetadataExt;
+
+    let probe = tempfile_in_temp_dir();
+    let reader = std::fs::metadata(&probe).unwrap().uid();
+    std::fs::remove_file(&probe).unwrap();
+
+    for keep_group_read in [true, false] {
+        let h = Harness::with_securing(None, true, keep_group_read).await;
+        let base = disk_root(&h);
+        std::fs::create_dir_all(&base).unwrap();
+        set_mode(&base, 0o700);
+        if !grant_reader_by_default_acl(&base, reader) {
+            eprintln!("skipped: setfacl failed (no ACL support here)");
+            return;
+        }
+
+        let recording = start_named(&h).await.unwrap().unwrap();
+        h.wait_for_writers(2).await;
+        let session = base.join(h.session_id.to_string());
+        let leaf = session.join(NAME);
+        let file = leaf.join(RecordingFile::NDJsonData.filename());
+        let named = format!("user:{reader}:r-x");
+
+        // Without the flag only the recording directory is chmodded.
+        let dirs = if keep_group_read {
+            vec![&session, &leaf]
+        } else {
+            vec![&leaf]
+        };
+        for dir in dirs {
+            let acl = acl_entries(dir);
+            let expected_mask = if keep_group_read {
+                "mask::r-x"
+            } else {
+                "mask::---"
+            };
+            for entry in [named.as_str(), "group::---", "other::---", expected_mask] {
+                assert!(
+                    acl.iter().any(|e| e == entry),
+                    "flag {keep_group_read}: {} lacks {entry}: {acl:?}",
+                    dir.display()
+                );
+            }
+        }
+        let acl = acl_entries(&file);
+        let expected_mask = if keep_group_read {
+            "mask::r--"
+        } else {
+            "mask::---"
+        };
+        for entry in [named.as_str(), "group::---", "other::---", expected_mask] {
+            assert!(
+                acl.iter().any(|e| e == entry),
+                "flag {keep_group_read}: file lacks {entry}: {acl:?}"
+            );
+        }
+        let expected_mode = if keep_group_read { 0o640 } else { 0o600 };
+        assert_eq!(mode_of(&file), expected_mode, "flag {keep_group_read}");
+
+        drop(recording);
+        h.wait_for_writers(0).await;
+    }
+}
+
 fn tempfile_in_temp_dir() -> PathBuf {
     let probe = std::env::temp_dir().join(format!("wg-uid-probe-{}", Uuid::new_v4()));
     std::fs::write(&probe, b"").unwrap();

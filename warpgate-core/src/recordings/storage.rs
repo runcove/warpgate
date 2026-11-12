@@ -8,7 +8,7 @@ use tokio::io::{AsyncRead, AsyncWriteExt};
 use tracing::error;
 use warpgate_aws::{S3MultipartUpload, S3Storage};
 use warpgate_common::helpers::fs::{
-    KEEP_FOR_RECORDING_FILE, secure_file, secure_open_file_by_masking,
+    KEEP_FOR_RECORDING_FILE, restrict_recording_file_open, secure_file, secure_open_file_by_masking,
 };
 use warpgate_common::{GlobalParams, TargetSessionId};
 use warpgate_db_entities::Parameters::RecordingsStorageConfig;
@@ -173,14 +173,16 @@ impl Storage {
     ) -> Result<RecordingSink> {
         let local_path = local_path_in(&self.local_root, recording, file);
 
-        let local_file = File::options()
-            .append(true)
-            .create(true)
-            .open(&local_path)
-            .await?;
+        let masking = params.should_secure_files() && params.recordings_keep_group_read();
+        let mut options = File::options();
+        options.append(true).create(true);
+        if masking {
+            restrict_recording_file_open(&mut options);
+        }
+        let local_file = options.open(&local_path).await?;
 
         if params.should_secure_files() {
-            if params.recordings_keep_group_read() {
+            if masking {
                 secure_open_file_by_masking(&local_file, KEEP_FOR_RECORDING_FILE, &local_path)?;
             } else {
                 secure_file(&local_path)?;

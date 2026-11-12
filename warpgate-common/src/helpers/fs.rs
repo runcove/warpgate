@@ -48,15 +48,77 @@ pub fn secure_file<P: AsRef<Path>>(path: P) -> std::io::Result<()> {
         .inspect_err(warn_failure)
 }
 
-/// What a recordings directory keeps when a separate reader is granted read access:
+/// What a recordings directory keeps under `--recordings-keep-group-read`: at most
 /// owner rwx and group r-x. Everything else (setuid/setgid/sticky, group write, all
-/// "other" bits) is stripped.
+/// "other" bits) is stripped. Under a POSIX ACL the group bits are the ACL mask, so
+/// what they keep is the most the ACL's named entries and owning-group entry may
+/// grant; every access beyond the owner comes from the ACL. Recordings directories
+/// are also created with this mode.
 pub const KEEP_FOR_DIRECTORY: u32 = 0o750;
 
-/// What a recording file keeps when a separate reader is granted read access: owner
-/// rw and group r. Everything else (exec bits, setuid/setgid/sticky, group write, all
-/// "other" bits) is stripped.
+/// What a recording file keeps under `--recordings-keep-group-read`: at most owner rw
+/// and group r. Everything else (exec bits, setuid/setgid/sticky, group write, all
+/// "other" bits) is stripped. Under a POSIX ACL the group bits are the ACL mask, as
+/// for [`KEEP_FOR_DIRECTORY`]. Recording files are also created with this mode.
 pub const KEEP_FOR_RECORDING_FILE: u32 = 0o640;
+
+/// The bits the process umask must clear for `--recordings-keep-group-read`: every
+/// group and other bit, so a new recording gets no access beyond the owner except
+/// what a default ACL grants (where one applies, the kernel uses it in place of the
+/// umask).
+pub const UMASK_REQUIRED_TO_KEEP_GROUP_READ: u32 = 0o077;
+
+/// This process's umask, read from `/proc/self/status`. Reading it through `umask(2)`
+/// would set it too, for every thread of the process.
+pub fn process_umask() -> std::io::Result<u32> {
+    parse_umask_from_status(&std::fs::read_to_string("/proc/self/status")?).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "/proc/self/status has no Umask line",
+        )
+    })
+}
+
+fn parse_umask_from_status(status: &str) -> Option<u32> {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("Umask:"))
+        .and_then(|value| u32::from_str_radix(value.trim(), 8).ok())
+}
+
+/// An error unless `umask` clears every bit of `required`.
+pub fn check_umask_covers(umask: u32, required: u32) -> anyhow::Result<()> {
+    if umask & required != required {
+        anyhow::bail!(
+            "--recordings-keep-group-read needs a umask that covers {required:04o} (for example UMask=0077 in the service unit); this process runs with umask {umask:04o}. Refusing to start"
+        );
+    }
+    Ok(())
+}
+
+/// Opens a recording file the way `--recordings-keep-group-read` needs: created at
+/// most [`KEEP_FOR_RECORDING_FILE`], so it is never born wider, even under a default
+/// ACL, and never through a symlink in place of the file (`O_NOFOLLOW`: the open
+/// fails with `ELOOP`, and the recording start with it).
+pub fn restrict_recording_file_open(
+    options: &mut tokio::fs::OpenOptions,
+) -> &mut tokio::fs::OpenOptions {
+    options
+        .mode(KEEP_FOR_RECORDING_FILE)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+}
+
+/// Creates a recordings directory and any missing parent the way
+/// `--recordings-keep-group-read` needs: each one created at most
+/// [`KEEP_FOR_DIRECTORY`], so it is never born wider, even under a default ACL.
+/// Existing directories are left as they are.
+pub async fn create_recording_directory_all(path: &Path) -> std::io::Result<()> {
+    tokio::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(KEEP_FOR_DIRECTORY)
+        .create(path)
+        .await
+}
 
 enum Masked {
     Done,
@@ -95,36 +157,52 @@ fn open_directory_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
         .open(path)
 }
 
-fn log_not_owned(path: &Path, owner: u32, euid: u32) {
-    error!(
-        "Warning: cannot tighten permissions of {path:?}: it is owned by uid {owner}, not by this process (uid {euid})"
-    );
+fn not_owned(path: &Path, owner: u32, euid: u32) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!(
+            "cannot tighten permissions of {}: it is owned by uid {owner}, not by this process (uid {euid})",
+            path.display()
+        ),
+    )
 }
 
 /// Tightens a directory Warpgate created to `current & keep` instead of setting an
 /// exact mode. It never adds a bit, so a reader granted read by a default POSIX ACL
-/// keeps it (an exact `chmod 0700` would also zero the ACL mask). A symlink at `path`
-/// and any chmod failure are errors: the caller fails closed.
+/// keeps it (an exact `chmod 0700` would also zero the ACL mask). A symlink at `path`,
+/// a directory owned by another user (unless this process runs as root) and any chmod
+/// failure are errors: the caller fails closed.
 pub fn secure_directory_by_masking<P: AsRef<Path>>(path: P, keep: u32) -> std::io::Result<()> {
     let path = path.as_ref();
     let dir = open_directory_no_follow(path)?;
-    if let Masked::NotOwned { owner, euid } = mask_fd(dir.as_fd(), keep, true)? {
-        log_not_owned(path, owner, euid);
+    match mask_fd(dir.as_fd(), keep, true)? {
+        Masked::Done => Ok(()),
+        Masked::NotOwned { owner, euid } => Err(not_owned(path, owner, euid)),
     }
-    Ok(())
 }
 
 /// Tightens an already-open file Warpgate created to `current & keep`, through its
-/// descriptor. Same rules as [`secure_directory_by_masking`]; `path` is only for logs.
+/// descriptor. A file owned by another user (unless this process runs as root) and
+/// any chmod failure are errors: the caller fails closed. `path` is only for the
+/// error. Open the file with [`restrict_recording_file_open`] so a symlink in its
+/// place fails the open.
 pub fn secure_open_file_by_masking(file: impl AsFd, keep: u32, path: &Path) -> std::io::Result<()> {
-    if let Masked::NotOwned { owner, euid } = mask_fd(file.as_fd(), keep, true)? {
-        log_not_owned(path, owner, euid);
+    match mask_fd(file.as_fd(), keep, true)? {
+        Masked::Done => Ok(()),
+        Masked::NotOwned { owner, euid } => Err(not_owned(path, owner, euid)),
     }
-    Ok(())
 }
 
-static ROOT_NOT_OWNED_WARNED: AtomicBool = AtomicBool::new(false);
-static ROOT_FAILED_WARNED: AtomicBool = AtomicBool::new(false);
+/// Which warnings about the recordings root have been logged already.
+struct RootWarnings {
+    not_owned: AtomicBool,
+    failed: AtomicBool,
+}
+
+static ROOT_WARNINGS: RootWarnings = RootWarnings {
+    not_owned: AtomicBool::new(false),
+    failed: AtomicBool::new(false),
+};
 
 /// Tightens the recordings root to `current & keep`. The root may predate Warpgate
 /// and belong to someone else, so this never fails: a root this process does not own
@@ -132,19 +210,22 @@ static ROOT_FAILED_WARNED: AtomicBool = AtomicBool::new(false);
 /// example a symlink) or chmodded is left as it is. Each case is logged once per
 /// process, not once per recording.
 pub fn secure_recordings_root_by_masking<P: AsRef<Path>>(path: P, keep: u32) {
-    let path = path.as_ref();
+    secure_recordings_root_warning_once(path.as_ref(), keep, &ROOT_WARNINGS);
+}
+
+fn secure_recordings_root_warning_once(path: &Path, keep: u32, warnings: &RootWarnings) {
     let result = open_directory_no_follow(path).and_then(|dir| mask_fd(dir.as_fd(), keep, false));
     match result {
         Ok(Masked::Done) => {}
         Ok(Masked::NotOwned { owner, euid }) => {
-            if !ROOT_NOT_OWNED_WARNED.swap(true, Ordering::Relaxed) {
+            if !warnings.not_owned.swap(true, Ordering::Relaxed) {
                 warn!(
                     "Recordings root {path:?} is owned by uid {owner}, not by this process (uid {euid}): leaving its mode as it is. Its owner must keep it closed to others and give the reader access to it"
                 );
             }
         }
         Err(e) => {
-            if !ROOT_FAILED_WARNED.swap(true, Ordering::Relaxed) {
+            if !warnings.failed.swap(true, Ordering::Relaxed) {
                 warn!(
                     "Could not tighten the recordings root {path:?} ({e}): leaving its mode as it is"
                 );
@@ -331,5 +412,187 @@ mod tests {
         let before = mode(other);
         secure_recordings_root_by_masking(other, KEEP_FOR_DIRECTORY);
         assert_eq!(mode(other), before);
+    }
+
+    /// A directory and a file this process does not own, or `None` (for example when
+    /// running as root, who owns them all and may chmod them anyway).
+    fn not_owned_dir_and_file() -> Option<(&'static Path, &'static Path)> {
+        let euid = nix::unistd::geteuid();
+        if euid.is_root() {
+            return None;
+        }
+        let not_mine =
+            |p: &&'static Path| std::fs::metadata(p).is_ok_and(|m| m.uid() != euid.as_raw());
+        let dir = ["/usr", "/etc", "/"]
+            .into_iter()
+            .map(Path::new)
+            .find(not_mine)?;
+        let file = ["/etc/passwd", "/etc/hostname", "/etc/os-release"]
+            .into_iter()
+            .map(Path::new)
+            .find(|p| not_mine(p) && std::fs::File::open(p).is_ok())?;
+        Some((dir, file))
+    }
+
+    /// A session or recording directory, or a recording file, that is not this
+    /// process's own fails closed: an error, and no chmod is attempted.
+    #[test]
+    fn a_child_owned_by_someone_else_is_an_error() {
+        let Some((dir, file)) = not_owned_dir_and_file() else {
+            eprintln!("skipped: no directory and file owned by another user");
+            return;
+        };
+        let (dir_before, file_before) = (mode(dir), mode(file));
+
+        let err = secure_directory_by_masking(dir, KEEP_FOR_DIRECTORY).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+        assert!(err.to_string().contains("owned by uid"), "{err}");
+
+        let open = std::fs::File::open(file).unwrap();
+        let err = secure_open_file_by_masking(&open, KEEP_FOR_RECORDING_FILE, file).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+
+        assert_eq!(mode(dir), dir_before);
+        assert_eq!(mode(file), file_before);
+    }
+
+    async fn open_recording_file(path: &Path) -> std::io::Result<tokio::fs::File> {
+        let mut options = tokio::fs::File::options();
+        options.append(true).create(true);
+        restrict_recording_file_open(&mut options).open(path).await
+    }
+
+    /// A symlink in place of a recording file fails the open; its target is untouched.
+    #[tokio::test]
+    async fn a_symlinked_recording_file_is_refused() {
+        let (tmp, _dir, file) = dir_and_file(0o700, 0o666);
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+
+        let err = open_recording_file(&link).await.unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(nix::libc::ELOOP), "{err}");
+        assert_eq!(mode(&file), 0o666);
+        assert_eq!(std::fs::read(&file).unwrap(), b"x");
+    }
+
+    /// New directories and files are created at most 0o750 / 0o640: what the umask
+    /// leaves of those, whatever it is.
+    #[tokio::test]
+    async fn recordings_are_created_at_the_ceiling() {
+        let umask = process_umask().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("root");
+        let leaf = parent.join("session").join("recording");
+        create_recording_directory_all(&leaf).await.unwrap();
+        for dir in [&parent, &parent.join("session"), &leaf] {
+            assert_eq!(mode(dir), 0o750 & !umask, "{}", dir.display());
+        }
+
+        let file = leaf.join("data.ndjson");
+        drop(open_recording_file(&file).await.unwrap());
+        assert_eq!(mode(&file), 0o640 & !umask);
+
+        // An existing file is opened as it is, for appending.
+        set(&file, 0o600);
+        drop(open_recording_file(&file).await.unwrap());
+        assert_eq!(mode(&file), 0o600);
+    }
+
+    #[test]
+    fn the_umask_must_cover_group_and_other() {
+        for wide in [0o000, 0o002, 0o022, 0o027, 0o070, 0o007] {
+            let err = check_umask_covers(wide, UMASK_REQUIRED_TO_KEEP_GROUP_READ).unwrap_err();
+            let message = err.to_string();
+            assert!(message.contains("covers 0077"), "{message}");
+            assert!(message.contains(&format!("umask {wide:04o}")), "{message}");
+        }
+        for narrow in [0o077, 0o177, 0o277, 0o777] {
+            check_umask_covers(narrow, UMASK_REQUIRED_TO_KEEP_GROUP_READ).unwrap();
+        }
+    }
+
+    #[test]
+    fn the_umask_is_parsed_from_proc_status() {
+        assert_eq!(
+            parse_umask_from_status("Name:\twarpgate\nUmask:\t0077\nState:\tR\n"),
+            Some(0o077)
+        );
+        assert_eq!(parse_umask_from_status("Umask:\t0022\n"), Some(0o022));
+        assert_eq!(parse_umask_from_status("Name:\twarpgate\n"), None);
+    }
+
+    /// The umask read without changing it is the one a child process inherits.
+    #[test]
+    fn the_process_umask_is_read_without_changing_it() {
+        let Ok(output) = std::process::Command::new("sh")
+            .args(["-c", "umask"])
+            .output()
+        else {
+            eprintln!("skipped: no sh");
+            return;
+        };
+        let shell = u32::from_str_radix(String::from_utf8_lossy(&output.stdout).trim(), 8).unwrap();
+        assert_eq!(process_umask().unwrap(), shell);
+        assert_eq!(process_umask().unwrap(), shell);
+    }
+
+    /// Counts the warnings logged on this thread.
+    struct CountWarnings(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl tracing::Subscriber for CountWarnings {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            if *event.metadata().level() == tracing::Level::WARN {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    fn warnings_logged(f: impl FnOnce()) -> usize {
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        tracing::subscriber::with_default(CountWarnings(count.clone()), f);
+        count.load(Ordering::Relaxed)
+    }
+
+    fn fresh_warnings() -> RootWarnings {
+        RootWarnings {
+            not_owned: AtomicBool::new(false),
+            failed: AtomicBool::new(false),
+        }
+    }
+
+    /// A root that cannot be secured is warned about once, not once per recording.
+    #[test]
+    fn a_root_problem_is_warned_about_once() {
+        let (tmp, dir, _file) = dir_and_file(0o777, 0o666);
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        let warnings = fresh_warnings();
+        let logged = warnings_logged(|| {
+            for _ in 0..3 {
+                secure_recordings_root_warning_once(&link, KEEP_FOR_DIRECTORY, &warnings);
+            }
+        });
+        assert_eq!(logged, 1);
+
+        let Some((other, _)) = not_owned_dir_and_file() else {
+            eprintln!("skipped the not-owned half: no directory owned by another user");
+            return;
+        };
+        let logged = warnings_logged(|| {
+            for _ in 0..3 {
+                secure_recordings_root_warning_once(other, KEEP_FOR_DIRECTORY, &warnings);
+            }
+        });
+        assert_eq!(logged, 1);
     }
 }

@@ -36,12 +36,12 @@ pub struct Cli {
     skip_securing_files: bool,
 
     /// Secure the recordings tree by removing bits (directories to at most 750, files to
-    /// at most 640) instead of setting exactly 700 / 600, so a separate reader keeps the
-    /// read access a default POSIX ACL on the recordings root gives it (or a group
-    /// Warpgate's own user is in, with a umask that leaves group read). A group grant on
-    /// the root alone does not reach new files: setgid is stripped, so they get
-    /// Warpgate's primary group. Never opens up existing files. Has no effect with
-    /// --skip-securing-files
+    /// at most 640, and created at those modes) instead of setting exactly 700 / 600, so
+    /// a separate reader keeps the read access a default POSIX ACL on the recordings
+    /// root gives it. Every access beyond the owner comes from the ACL: `run` refuses to
+    /// start unless the umask covers 0077. A group grant on the root alone does not
+    /// reach new files: setgid is stripped, so they get Warpgate's primary group. Never
+    /// opens up existing files. Has no effect with --skip-securing-files
     #[clap(long)]
     recordings_keep_group_read: bool,
 }
@@ -223,6 +223,7 @@ async fn _main() -> Result<()> {
             Ok(())
         }
         Commands::Run { enable_admin_token } => {
+            params.check_umask_for_recordings()?;
             crate::commands::run::command(&params, *enable_admin_token).await
         }
         Commands::Check => crate::commands::check::command(&params).await,

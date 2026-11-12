@@ -60,19 +60,30 @@ so no other user can read a recording, whatever ACL the deployment set.
 With `--recordings-keep-group-read`, Warpgate secures the recordings tree by
 removing bits instead: the recordings root, the session directory and the
 recording directory become `current & 0750`, and each recording file it opens
-becomes `current & 0640`. It never adds a bit. The flag does nothing with
+becomes `current & 0640`. It never adds a bit. New directories are created with
+mode `0750` and new files with `0640`, so nothing is born wider, even under a
+default ACL, where the kernel ignores the umask. The flag does nothing with
 `--skip-securing-files`, and nothing outside the recordings tree changes: the
 config, database and TLS files are still set to exactly `0600`.
+
+The recordings tree is the disk backend's recordings directory or, with the S3
+backend, the local scratch directory that buffers recordings while they upload
+(`data/recordings-scratch` unless `scratch_path` is set). The flag covers either
+the same way.
+
+With the flag, `warpgate run` refuses to start unless the process umask covers
+`0077` (for example `UMask=0077` in the service unit). Every access beyond the
+owner then comes from the ACL.
 
 ### Granting the reader
 
 The grant that works is a **default POSIX ACL on the recordings root** that
 gives the reader read on files and read + execute on directories, plus an
 access ACL giving the reader execute on the root itself (and on every
-directory above it). Run Warpgate with `UMask=0077`; the default ACL is what
-gives the reader access to new directories and files, and the
-masking keeps the ACL mask from being zeroed. The alternative is a group that
-Warpgate's own user belongs to, running with a umask that leaves group read.
+directory above it). The default ACL is what gives the reader access to new
+directories and files, and the masking keeps the ACL mask from being zeroed.
+Set the default ACL's owning-group and other entries to nothing (`d:g::---`,
+`d:o::---`).
 
 A group grant on the root alone (a group-owned root with setgid) does **not**
 work: the masking strips setgid, so new directories and files get Warpgate's
@@ -90,18 +101,27 @@ primary group, not the root's.
   uid and Warpgate's uid is logged once per process, and recordings still
   start. The same applies when the root cannot be opened or chmodded (for
   example when it is a symlink, which is not followed): one warning per
-  process, and recordings still start. The session and recording directories
-  and the recording files are Warpgate's own: a failure to secure them (a
-  symlink in their place included) fails the recording start.
+  process, and recordings still start.
+- **The session and recording directories and the recording files are
+  Warpgate's own**, and fail closed: a symlink in their place, one owned by
+  another user (unless Warpgate runs as root), or a failure to chmod one fails
+  the recording start.
 - **setuid, setgid and sticky are stripped** from the root, as from every
   directory the flag touches.
-- **The owning group gains read on new files.** Under a default ACL a file's
-  group bits are the ACL mask, and `0640` keeps that at read, so the default
-  ACL's owning-group entry applies to new recordings. `setfacl` copies that
-  entry from the root's group bits unless it is given, so Warpgate's primary
-  group can read new recordings unless the default ACL sets `g::---`.
-- **The result relies on `UMask=0077` plus the ACL.** The flag only removes
-  bits, so every access beyond the owner comes from the ACL (where a default
-  ACL applies, the kernel uses it in place of the umask), and the umask keeps
-  everything else closed. With a wider umask, the group can read recordings
-  without any ACL.
+- **Group read comes only from the ACL's owning-group entry.** Under a default
+  ACL a new file's group bits are the ACL mask, and `0640` keeps that at read.
+  The mask bounds the named entries and the owning-group entry; it grants
+  nothing itself. With the uploader's default ACL (`d:g::---`) only the named
+  reader entry uses it, and nobody in Warpgate's group can read new
+  recordings. Members of the file's group can read only where the default
+  ACL's owning-group entry grants read. When a default ACL is set without a
+  `g::` entry, `setfacl` fills one in from the root's own owning-group ACL
+  entry (not from its mode's group bits, which are the mask once the root has
+  an ACL), so set `d:g::---` explicitly. On a host with no ACL, the required
+  umask leaves new recordings with no group bits; a directory or file that
+  already had group read keeps it, for its owning group (normally Warpgate's
+  primary group) only.
+- **The result relies on the umask plus the ACL.** The flag only removes bits,
+  so every access beyond the owner comes from the ACL (where a default ACL
+  applies, the kernel uses it in place of the umask), and the umask, which
+  `warpgate run` checks, keeps everything else closed.
