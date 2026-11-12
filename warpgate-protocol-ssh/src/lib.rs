@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 mod channel_audit;
 mod client;
 mod command_detector;

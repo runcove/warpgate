@@ -392,6 +392,29 @@ mod tests {
         fn close(&mut self) {}
     }
 
+    /// A user that exists, as a completing sign-in requires.
+    async fn existing_user(db: &DatabaseConnection) -> AuthStateUserInfo {
+        use sea_orm::ActiveValue::Set;
+        let id = Uuid::new_v4();
+        warpgate_db_entities::User::ActiveModel {
+            id: Set(id),
+            username: Set("alice".into()),
+            description: Set(String::new()),
+            credential_policy: Set(serde_json::Value::Null),
+            rate_limit_bytes_per_second: Set(None),
+            ldap_server_id: Set(None),
+            ldap_object_uuid: Set(None),
+            allowed_ip_ranges: Set(serde_json::Value::Null),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        AuthStateUserInfo {
+            id,
+            username: "alice".into(),
+        }
+    }
+
     fn target() -> Target {
         Target {
             id: Uuid::new_v4(),
@@ -436,10 +459,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let user_info = AuthStateUserInfo {
-            id: Uuid::new_v4(),
-            username: "alice".into(),
-        };
+        let user_info = existing_user(&db).await;
         parent
             .lock()
             .await
@@ -484,10 +504,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let user_info = AuthStateUserInfo {
-            id: Uuid::new_v4(),
-            username: "alice".into(),
-        };
+        let user_info = existing_user(&db).await;
         parent
             .lock()
             .await
@@ -542,10 +559,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let user_info = AuthStateUserInfo {
-            id: Uuid::new_v4(),
-            username: "alice".into(),
-        };
+        let user_info = existing_user(&db).await;
         parent
             .lock()
             .await
@@ -601,10 +615,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let user_info = AuthStateUserInfo {
-            id: Uuid::new_v4(),
-            username: "alice".into(),
-        };
+        let user_info = existing_user(&db).await;
         parent
             .lock()
             .await
@@ -693,10 +704,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let user_info = AuthStateUserInfo {
-            id: Uuid::new_v4(),
-            username: "alice".into(),
-        };
+        let user_info = existing_user(&db).await;
         let parent_id: UserSessionId = parent.lock().await.user_session_id();
         let target = target();
 
@@ -778,10 +786,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let user_info = AuthStateUserInfo {
-            id: Uuid::new_v4(),
-            username: "alice".into(),
-        };
+        let user_info = existing_user(&db).await;
         first_parent
             .lock()
             .await
@@ -894,10 +899,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let user_info = AuthStateUserInfo {
-            id: Uuid::new_v4(),
-            username: "alice".into(),
-        };
+        let user_info = existing_user(&db).await;
         parent
             .lock()
             .await

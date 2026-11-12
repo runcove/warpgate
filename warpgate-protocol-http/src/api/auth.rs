@@ -568,7 +568,17 @@ async fn submit_and_finalize(
     match outcome.into_accepted() {
         Ok(user_info) => {
             let username = user_info.username.clone();
-            authorize_session(req, ctx, user_info).await?;
+            match authorize_session(req, ctx, user_info).await {
+                Ok(()) => {}
+                // The user was removed, or their allowed ranges changed to
+                // leave this address out, while the sign-in was in progress.
+                Err(WarpgateError::UserNoLongerAdmitted) => {
+                    return Ok(LoginResponse::Failure(Json(LoginFailureResponse::state(
+                        ApiAuthState::Failed,
+                    ))));
+                }
+                Err(error) => return Err(error.into()),
+            }
             state.emit_authenticated_event_once();
             if let Some(ip) = client_ip {
                 let _ = services

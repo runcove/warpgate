@@ -719,7 +719,10 @@ mod stale_cookie_login_tests {
     const BOB: Uuid = Uuid::from_u128(2);
 
     async fn services() -> Services {
-        crate::test_db::services(crate::test_db::memory_db().await).await
+        let db = crate::test_db::memory_db().await;
+        crate::test_db::insert_user(&db, ALICE, "alice").await;
+        crate::test_db::insert_user(&db, BOB, "bob").await;
+        crate::test_db::services(db).await
     }
 
     type Store = Arc<Mutex<SessionStore>>;

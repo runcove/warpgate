@@ -30,7 +30,7 @@ use warpgate_common_http::{
     AuthenticatedRequestContext, RequestAuthorization, SessionAuthorization,
     X_WARPGATE_CLUSTER_IDENTITY, X_WARPGATE_TOKEN, is_cluster_peer_request,
 };
-use warpgate_core::{ConfigProvider, vet_credential_bearer};
+use warpgate_core::{ConfigProvider, WarpgateServerHandle, vet_credential_bearer};
 use warpgate_db_entities::User;
 use warpgate_sso::WarpgateIdToken;
 
@@ -896,34 +896,44 @@ pub async fn authorize_session(
         .await
         .context("resolving session handle")?;
 
+    // Judged from the address of the request that completes the sign-in,
+    // as every later request of the session is.
+    let client_ip = get_client_ip_addr(req, ctx.services()).await;
+
     // session user cannot be switched, so a second attempt should kill
     // thi session and init a new one
     let attributed = server_handle
         .lock()
         .await
-        .set_user_info(user_info.clone())
+        .set_user_info_from(user_info.clone(), client_ip)
         .await;
     match attributed {
         Ok(()) => {}
         Err(WarpgateError::UserSessionAlreadyAttributed) => {
-            let old_id = server_handle.lock().await.user_session_id();
-            {
-                let mut store = session_middleware.lock().await;
-                store.remove_session(session);
-            }
-            warpgate_core::State::remove_session(&ctx.services().state, old_id).await;
-            session.clear();
+            discard_login_session(session_middleware.0, session, ctx, &server_handle).await;
             server_handle = session_middleware
                 .lock()
                 .await
                 .handle_for_request(req, ctx)
                 .await
                 .context("registering replacement session")?;
-            server_handle
+            let attributed = server_handle
                 .lock()
                 .await
-                .set_user_info(user_info.clone())
-                .await?;
+                .set_user_info_from(user_info.clone(), client_ip)
+                .await;
+            if let Err(error) = attributed {
+                if matches!(error, WarpgateError::UserNoLongerAdmitted) {
+                    discard_login_session(session_middleware.0, session, ctx, &server_handle).await;
+                }
+                return Err(error);
+            }
+        }
+        // The sign-in is refused where it completes: the attempt's session
+        // ends, and the browser starts over on a fresh one.
+        Err(error @ WarpgateError::UserNoLongerAdmitted) => {
+            discard_login_session(session_middleware.0, session, ctx, &server_handle).await;
+            return Err(error);
         }
         Err(error) => return Err(error),
     }
@@ -939,6 +949,20 @@ pub async fn authorize_session(
     warpgate_common_http::auth::stamp_session_auth_time(session);
 
     Ok(())
+}
+
+/// Ends the user session behind this browser session and clears the browser
+/// session, so the next request starts on a fresh one.
+async fn discard_login_session(
+    store: &Arc<Mutex<SessionStore>>,
+    session: &Session,
+    ctx: &UnauthenticatedRequestContext,
+    server_handle: &Arc<Mutex<WarpgateServerHandle>>,
+) {
+    let id = server_handle.lock().await.user_session_id();
+    store.lock().await.remove_session(session);
+    warpgate_core::State::remove_session(&ctx.services().state, id).await;
+    session.clear();
 }
 
 /// Authorization for a request from an authenticated cluster peer. The proxying
@@ -2078,5 +2102,138 @@ mod public_session_tests {
         resp.assert_status_is_ok();
         resp.assert_text("-/- on the shared public session, visit 1")
             .await;
+    }
+}
+
+#[cfg(test)]
+mod sign_in_completion_tests {
+    //! A web sign-in completes on the request that submits its last factor.
+    //! It is judged there by the user's current record: removed, or with
+    //! allowed ranges that leave the request's address out, it is refused
+    //! and leaves no live session behind.
+    use poem::session::ServerSession;
+    use poem::test::TestClient;
+    use poem::web::Data;
+    use poem::{Route, get, handler};
+    use sea_orm::ActiveValue::Set;
+    use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, PaginatorTrait, QueryFilter};
+    use warpgate_db_entities::UserSession;
+
+    use super::*;
+    use crate::test_db::{memory_db, services};
+
+    const IP_HEADER: &str = "x-real-ip";
+
+    /// Completes the sign-in of the user in the app's data, as the password,
+    /// OTP and SSO steps do once their credentials are accepted.
+    #[handler]
+    async fn complete(
+        req: &Request,
+        session: &Session,
+        ctx: Data<&UnauthenticatedRequestContext>,
+        user: Data<&AuthStateUserInfo>,
+    ) -> poem::Result<String> {
+        authorize_session(req, ctx.0, user.0.clone()).await?;
+        Ok(session
+            .get_auth()
+            .map_or_else(|| "nobody".into(), |auth| auth.username().to_owned()))
+    }
+
+    async fn alice(db: &DatabaseConnection, ranges: serde_json::Value) -> AuthStateUserInfo {
+        let id = Uuid::new_v4();
+        User::ActiveModel {
+            id: Set(id),
+            username: Set("alice".into()),
+            description: Set(String::new()),
+            credential_policy: Set(serde_json::Value::Null),
+            rate_limit_bytes_per_second: Set(None),
+            ldap_server_id: Set(None),
+            ldap_object_uuid: Set(None),
+            allowed_ip_ranges: Set(ranges),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        AuthStateUserInfo {
+            id,
+            username: "alice".into(),
+        }
+    }
+
+    async fn app(db: &DatabaseConnection, user: AuthStateUserInfo) -> impl Endpoint {
+        let services = services(db.clone()).await;
+        services.config.lock().await.store.http.client_ip_header = Some(IP_HEADER.into());
+        let ctx = UnauthenticatedRequestContext::new(services).await;
+        let storage = SharedSessionStorage::new(db.clone());
+        Route::new()
+            .at("/complete", get(complete))
+            .data(SessionStore::new())
+            .data(ctx)
+            .data(user)
+            .data(storage.clone())
+            .with(ServerSession::new(session_cookie_config(), storage))
+    }
+
+    async fn open_sessions_of(db: &DatabaseConnection, user: &AuthStateUserInfo) -> u64 {
+        UserSession::Entity::find()
+            .filter(UserSession::Column::UserId.eq(user.id))
+            .filter(UserSession::Column::Ended.is_null())
+            .count(db)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_web_sign_in_completing_outside_the_users_ranges_is_refused() {
+        let db = memory_db().await;
+        // As the ranges stand once an administrator narrowed them during the
+        // sign-in: its start was admitted from anywhere.
+        let user = alice(&db, serde_json::json!(["10.0.0.0/8"])).await;
+        let cli = TestClient::new(app(&db, user.clone()).await);
+
+        let resp = cli
+            .get("/complete")
+            .header(IP_HEADER, "192.0.2.1")
+            .send()
+            .await;
+
+        resp.assert_status(StatusCode::UNAUTHORIZED);
+        assert_eq!(open_sessions_of(&db, &user).await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_web_sign_in_completing_inside_the_users_ranges_is_admitted() {
+        let db = memory_db().await;
+        let user = alice(&db, serde_json::json!(["10.0.0.0/8"])).await;
+        let cli = TestClient::new(app(&db, user.clone()).await);
+
+        let resp = cli
+            .get("/complete")
+            .header(IP_HEADER, "10.1.2.3")
+            .send()
+            .await;
+
+        let status = resp.0.status();
+        let body = resp.0.into_body().into_string().await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body, "alice");
+        assert_eq!(open_sessions_of(&db, &user).await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_web_sign_in_of_a_deleted_user_is_refused() {
+        let db = memory_db().await;
+        let user = alice(&db, serde_json::Value::Null).await;
+        User::Entity::delete_by_id(user.id).exec(&db).await.unwrap();
+        let cli = TestClient::new(app(&db, user.clone()).await);
+
+        let resp = cli
+            .get("/complete")
+            .header(IP_HEADER, "10.1.2.3")
+            .send()
+            .await;
+
+        resp.assert_status(StatusCode::UNAUTHORIZED);
+        assert_eq!(open_sessions_of(&db, &user).await, 0);
     }
 }

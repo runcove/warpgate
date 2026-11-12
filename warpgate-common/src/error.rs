@@ -53,6 +53,10 @@ pub enum WarpgateError {
     UserSessionAlreadyAttributed,
     #[error("user session is no longer open")]
     UserSessionEnded,
+    /// A sign-in completed after the user was removed, or from an address
+    /// outside the user's current allowed IP ranges.
+    #[error("sign-in refused: the user may not sign in from this address")]
+    UserNoLongerAdmitted,
     #[error(transparent)]
     Anyhow(#[from] anyhow::Error),
     #[error(transparent)]
@@ -126,6 +130,7 @@ impl UserFacingReason for WarpgateError {
             | Self::SessionNotApproved
             | Self::UserSessionAlreadyAttributed
             | Self::UserSessionEnded
+            | Self::UserNoLongerAdmitted
             | Self::NoAdminAccess
             | Self::NoAdminPermission(_)
             | Self::TargetUserOutranksAdmin
@@ -217,7 +222,8 @@ impl ResponseError for WarpgateError {
             | Self::TicketExpired(_)
             | Self::UserNotFound(_)
             | Self::RoleNotFound(_)
-            | Self::IpAddrNotAllowed(..) => poem::http::StatusCode::UNAUTHORIZED,
+            | Self::IpAddrNotAllowed(..)
+            | Self::UserNoLongerAdmitted => poem::http::StatusCode::UNAUTHORIZED,
             Self::UserAlreadyExists(_) => poem::http::StatusCode::CONFLICT,
             Self::InvalidRequest(_) => poem::http::StatusCode::BAD_REQUEST,
             Self::NoAdminAccess | Self::NoAdminPermission(_) | Self::TargetUserOutranksAdmin => {

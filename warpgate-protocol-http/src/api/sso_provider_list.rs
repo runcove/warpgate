@@ -20,7 +20,7 @@ use warpgate_common_http::logging::get_client_ip_addr;
 use warpgate_common_http::warpgate_csp_with_script_nonce;
 use warpgate_core::ConfigProvider;
 use warpgate_core::auth::submit_credential;
-use warpgate_sso::{SsoClient, SsoInternalProviderConfig};
+use warpgate_sso::{SsoClient, SsoInternalProviderConfig, SsoLoginResponse, SsoProviderConfig};
 
 use crate::SsoLoginState;
 use crate::api::auth_scheme::AuthedSession;
@@ -197,6 +197,33 @@ impl SsoFailure {
             _ => make_redirect_url(&self.reason),
         }
     }
+}
+
+/// Answers an SSO return once its sign-in is decided: the redirect for an
+/// admitted one, the failure for one `refused` where it completes.
+///
+/// The provider's role and group changes are applied either way, so a
+/// refusal does not hold them back, and the access they take away ends too.
+/// Applying them maps roles and closes sessions; it signs no one in.
+async fn finish_sso_return(
+    services: &warpgate_core::Services,
+    provider_config: &SsoProviderConfig,
+    response: &SsoLoginResponse,
+    refused: bool,
+    return_to: &Option<(String, String)>,
+    admitted_redirect: String,
+) -> Result<Result<String, SsoFailure>, WarpgateError> {
+    services
+        .resolve_and_map_sso_user(provider_config, response)
+        .await?;
+    if refused {
+        return Ok(Err(SsoFailure::at(
+            return_to,
+            SsoLoginError::AccessDenied,
+            "Login denied",
+        )));
+    }
+    Ok(Ok(admitted_redirect))
 }
 
 /// The failure for a credential login protection rejected. The block check
@@ -641,36 +668,47 @@ impl Api {
         };
         session.set_sso_login_state(login_state());
 
+        // Set when the sign-in is refused where it completes: the user was
+        // removed, or their allowed ranges changed to leave this address out,
+        // while it was in progress.
+        let mut refused = false;
         if let Ok(user_info) = outcome.into_accepted() {
-            authorize_session(req, &ctx, user_info).await?;
-            // Stamp the HTTP per-session step-up clock, after
-            // `authorize_session` (which can clear the session). Only the SSO
-            // return path stamps: password / OTP logins are not SSO handshakes
-            // and must not refresh the clock, else a user who only ever logs in
-            // via password would never re-SSO and the step-up gate would
-            // silently become a no-op.
-            session.set_last_sso_at(OffsetDateTime::now_utc());
-            state.emit_authenticated_event_once();
-            if let Some(ip) = client_ip {
-                let _ = services
-                    .login_protection
-                    .clear_failed_attempts(&ip, &username)
-                    .await;
+            match authorize_session(req, &ctx, user_info).await {
+                Ok(()) => {
+                    // Stamp the HTTP per-session step-up clock, after
+                    // `authorize_session` (which can clear the session). Only
+                    // the SSO return path stamps: password / OTP logins are not
+                    // SSO handshakes and must not refresh the clock, else a
+                    // user who only ever logs in via password would never
+                    // re-SSO and the step-up gate would silently become a
+                    // no-op.
+                    session.set_last_sso_at(OffsetDateTime::now_utc());
+                    state.emit_authenticated_event_once();
+                    if let Some(ip) = client_ip {
+                        let _ = services
+                            .login_protection
+                            .clear_failed_attempts(&ip, &username)
+                            .await;
+                    }
+                    // `authorize_session` can clear the session, so store it
+                    // again.
+                    session.set_sso_login_state(login_state());
+                }
+                Err(WarpgateError::UserNoLongerAdmitted) => refused = true,
+                Err(error) => return Err(error),
             }
-            // `authorize_session` can clear the session, so store it again.
-            session.set_sso_login_state(login_state());
         }
         drop(state);
 
-        // Also ends whatever access the role sync took away.
-        services
-            .resolve_and_map_sso_user(provider_config, &response)
-            .await?;
-
-        Ok(Ok(post_login_redirect(
-            context.next_url.as_deref(),
-            &context.return_origin,
-        )))
+        finish_sso_return(
+            services,
+            provider_config,
+            &response,
+            refused,
+            &return_to,
+            post_login_redirect(context.next_url.as_deref(), &context.return_origin),
+        )
+        .await
     }
 
     #[oai(
@@ -763,15 +801,17 @@ impl Api {
 
 #[cfg(test)]
 mod tests {
-    use sea_orm::{ActiveModelTrait, IntoActiveModel, Set};
+    use sea_orm::{ActiveModelTrait, ColumnTrait, IntoActiveModel, QueryFilter, Set};
     use uuid::Uuid;
-    use warpgate_db_entities::{Parameters, User};
+    use warpgate_db_entities::{Parameters, Role, SsoCredential, User, UserRoleAssignment};
+    use warpgate_sso::{SsoLoginResponse, SsoProviderConfig};
 
     use super::{
-        SsoFailure, SsoLoginError, blocked_address_failure, is_safe_redirect_target,
-        make_redirect_url, next_with_login_error, post_login_redirect, rejected_credential_failure,
+        SsoFailure, SsoLoginError, blocked_address_failure, finish_sso_return,
+        is_safe_redirect_target, make_redirect_url, next_with_login_error, post_login_redirect,
+        rejected_credential_failure,
     };
-    use crate::test_db::{memory_db, services};
+    use crate::test_db::{insert_user, memory_db, services};
 
     #[test]
     fn error_redirect_is_site_relative_and_escaped() {
@@ -1080,5 +1120,122 @@ mod tests {
                 "{next:?} must keep today's login page"
             );
         }
+    }
+
+    /// A structurally valid ID token; nothing here checks its signature.
+    const ID_TOKEN: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lkcC5leGFtcGxlLmNvbSIsInN1YiI6InN1YmplY3QtMSIsImF1ZCI6WyJjbGllbnQiXSwiZXhwIjo0MTAyNDQ0ODAwLCJpYXQiOjE3MDAwMDAwMDB9.c2lnbmF0dXJl";
+
+    fn provider_config() -> SsoProviderConfig {
+        serde_json::from_value(serde_json::json!({
+            "name": "idp",
+            "provider": {
+                "type": "custom",
+                "client_id": "client",
+                "client_secret": "unused",
+                "issuer_url": "https://idp.example.com",
+                "scopes": [],
+                "role_mappings": null,
+                "admin_role_mappings": null,
+                "roles_claim": null,
+                "admin_roles_claim": null,
+            },
+            "return_domain_whitelist": null,
+        }))
+        .unwrap()
+    }
+
+    /// The provider reports `alice@example.com` as a member of `groups`.
+    fn sso_response(groups: &[&str]) -> SsoLoginResponse {
+        SsoLoginResponse {
+            name: None,
+            email: Some("alice@example.com".into()),
+            email_verified: Some(true),
+            access_roles: Some(groups.iter().map(|group| (*group).to_string()).collect()),
+            admin_roles: None,
+            id_token: ID_TOKEN.parse().unwrap(),
+            subject: "subject-1".into(),
+            sid: None,
+            preferred_username: None,
+        }
+    }
+
+    /// `alice`, matched by her SSO e-mail, and a role `ops` she does not hold.
+    async fn alice_without_ops() -> (warpgate_core::Services, Uuid, Uuid) {
+        let db = memory_db().await;
+        let user_id = Uuid::new_v4();
+        insert_user(&db, user_id, "alice").await;
+        SsoCredential::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            user_id: Set(user_id),
+            provider: Set(Some("idp".into())),
+            email: Set("alice@example.com".into()),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        let role_id = Uuid::new_v4();
+        Role::ActiveModel {
+            id: Set(role_id),
+            name: Set("ops".into()),
+            description: Set(String::new()),
+            is_default: Set(false),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        (services(db).await, user_id, role_id)
+    }
+
+    async fn holds_role(services: &warpgate_core::Services, user_id: Uuid, role_id: Uuid) -> bool {
+        UserRoleAssignment::Entity::find_active()
+            .filter(UserRoleAssignment::Column::UserId.eq(user_id))
+            .filter(UserRoleAssignment::Column::RoleId.eq(role_id))
+            .one(&services.db)
+            .await
+            .unwrap()
+            .is_some()
+    }
+
+    async fn finish(
+        services: &warpgate_core::Services,
+        refused: bool,
+    ) -> Result<Result<String, SsoFailure>, warpgate_common::WarpgateError> {
+        finish_sso_return(
+            services,
+            &provider_config(),
+            &sso_response(&["ops"]),
+            refused,
+            &Some((ORIGIN.to_string(), "/cove/login".to_string())),
+            format!("{ORIGIN}/cove/home"),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn an_admitted_sign_in_applies_the_provider_s_groups_and_redirects() {
+        let (services, user_id, role_id) = alice_without_ops().await;
+
+        let outcome = finish(&services, false).await.unwrap();
+
+        assert_eq!(outcome.ok(), Some(format!("{ORIGIN}/cove/home")));
+        assert!(holds_role(&services, user_id, role_id).await);
+    }
+
+    /// The provider's group changes are not held back by a refusal at
+    /// completion; the refusal is then the generic denial.
+    #[tokio::test]
+    async fn a_refused_sign_in_still_applies_the_provider_s_groups() {
+        let (services, user_id, role_id) = alice_without_ops().await;
+
+        let outcome = finish(&services, true).await.unwrap();
+
+        let failure = outcome.expect_err("the sign-in is refused");
+        assert_eq!(failure.code, SsoLoginError::AccessDenied);
+        assert_eq!(failure.reason, "Login denied");
+        assert_eq!(
+            failure.into_redirect_url(),
+            format!("{ORIGIN}/cove/login?login_error=access_denied")
+        );
+        assert!(holds_role(&services, user_id, role_id).await);
     }
 }
