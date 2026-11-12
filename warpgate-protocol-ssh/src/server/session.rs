@@ -1849,6 +1849,328 @@ mod tests {
             TARGET_FORWARD_OPEN_TIMEOUT
         );
     }
+
+    /// A sign-in that the connection's handle refuses at completion must leave
+    /// the session with no user and no identity, whatever the refusal was.
+    mod sign_in_completion {
+        use std::net::SocketAddr;
+        use std::path::PathBuf;
+
+        use sea_orm::{
+            ActiveModelTrait, ConnectionTrait, Database, DatabaseConnection, EntityTrait, Set,
+        };
+        use warpgate_common::{GlobalParams, WarpgateConfig, WarpgateConfigStore};
+        use warpgate_core::cluster::Cluster;
+        use warpgate_core::login_protection::LoginProtectionService;
+        use warpgate_core::rate_limiting::RateLimiterRegistry;
+        use warpgate_core::recordings::SessionRecordings;
+        use warpgate_core::{
+            ApprovalRequestSink, AuthStateStore, DatabaseConfigProvider, SecretBackendRegistry,
+            Services, SessionHandle, State, UserSessionStateInit,
+        };
+        use warpgate_db_entities as entities;
+        use warpgate_db_entities::Parameters::{
+            ConfigMigrationValues, set_config_migration_values,
+        };
+        use warpgate_db_migrations::migrate_database;
+
+        use super::super::*;
+
+        const INSIDE: &str = "10.1.2.3";
+        const OUTSIDE: &str = "192.0.2.1";
+
+        struct NoopHandle;
+
+        impl SessionHandle for NoopHandle {
+            fn close(&mut self) {}
+        }
+
+        struct SignIn {
+            db: DatabaseConnection,
+            session: ServerSession,
+            user: AuthStateUserInfo,
+            // The client's end of the connection, kept open for the test.
+            _client: std::net::TcpStream,
+        }
+
+        async fn services(db: &DatabaseConnection) -> Services {
+            let params = GlobalParams::new(PathBuf::from("/warpgate.yaml"), false).unwrap();
+            let rate_limiter_registry = Arc::new(Mutex::new(RateLimiterRegistry::new(db.clone())));
+            let cluster = Arc::new(Cluster::new(db.clone(), 0).await.unwrap());
+            Services {
+                db: db.clone(),
+                recordings: Arc::new(SessionRecordings::new(db.clone(), &params)),
+                config: Arc::new(Mutex::new(WarpgateConfig {
+                    store: WarpgateConfigStore::default(),
+                })),
+                state: State::new(db, &rate_limiter_registry, cluster.node_id),
+                cluster: cluster.clone(),
+                rate_limiter_registry,
+                config_provider: Arc::new(DatabaseConfigProvider::new(db).into()),
+                auth_state_store: Arc::new(Mutex::new(AuthStateStore::new(ApprovalRequestSink {
+                    db: db.clone(),
+                    cluster,
+                }))),
+                admin_token: Arc::new(None),
+                login_protection: Arc::new(LoginProtectionService::new(db.clone()).await.unwrap()),
+                global_params: Arc::new(params),
+                listener_status: Default::default(),
+                secret_backends: Arc::new(SecretBackendRegistry::new(db.clone())),
+                live_streams: Default::default(),
+                pending_revocations: Default::default(),
+            }
+        }
+
+        /// A connection from `ip` whose sign-in is about to complete, as the
+        /// server registers it: before its credentials are checked.
+        async fn sign_in_from(ip: &str) -> SignIn {
+            set_config_migration_values(ConfigMigrationValues::default());
+            let db = Database::connect("sqlite::memory:").await.unwrap();
+            migrate_database(&db).await.unwrap();
+            let user_id = Uuid::new_v4();
+            entities::User::ActiveModel {
+                id: Set(user_id),
+                username: Set("alice".into()),
+                description: Set(String::new()),
+                credential_policy: Set(sea_orm::JsonValue::Object(Default::default())),
+                rate_limit_bytes_per_second: Set(None),
+                ldap_server_id: Set(None),
+                ldap_object_uuid: Set(None),
+                allowed_ip_ranges: Set(sea_orm::JsonValue::Null),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+            let services = services(&db).await;
+
+            let remote_address = SocketAddr::new(ip.parse().unwrap(), 22);
+            let server_handle = State::register_node_local_user_session(
+                &services.state,
+                crate::PROTOCOL_NAME,
+                UserSessionStateInit {
+                    remote_address: Some(remote_address),
+                    handle: Box::new(NoopHandle),
+                },
+            )
+            .await
+            .unwrap();
+            let id = server_handle.lock().await.user_session_id();
+
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (client_socket, _) = listener.accept().unwrap();
+
+            let rc_handles = RemoteClient::create(id, services.clone()).unwrap();
+            let (hub, event_sender) = EventHub::setup(EVENT_QUEUE_CAPACITY);
+            let control_events = hub
+                .subscribe(|e| !matches!(e, Event::ConsoleInput(_) | Event::Client(_)))
+                .await;
+            let target_events = hub.subscribe(|e| matches!(e, Event::Client(_))).await;
+            let channel_writer = ChannelWriter::new();
+            let intake =
+                EventIntake::new(control_events, target_events, channel_writer.data_slots());
+            let session = ServerSession {
+                id,
+                user_info: None,
+                authorized_identity: None,
+                authentication_type: None,
+                target_env: None,
+                session_handle: None,
+                channels: ChannelRegistry::new(),
+                channel_inputs: ChannelInputs::default(),
+                deferred_server_events: vec![],
+                pending_events: VecDeque::new(),
+                rc_tx: rc_handles.command_tx,
+                rc_abort_tx: rc_handles.abort_tx,
+                rc_state: RCState::NotInitialized,
+                remote_address,
+                services: services.clone(),
+                server_handle,
+                target: TargetSelection::None,
+                target_session_id: None,
+                pending_recordings: vec![],
+                traffic_recorders: HashMap::new(),
+                hub,
+                event_sender,
+                intake,
+                service_output: ServiceOutput::new(),
+                channel_writer,
+                auth_state: None,
+                disconnect_token: CancellationToken::new(),
+                step_up_pubkeys: None,
+                authenticated_pubkeys: Vec::new(),
+                step_up_exempt: None,
+                step_up_recheck: None,
+                step_up_known_deadline: None,
+                step_up_read_failures: 0,
+                disconnect_description: String::new(),
+                keyboard_interactive_state: None,
+                cached_successful_ticket_auth: None,
+                allowed_auth_methods: get_allowed_auth_methods(&services).await.unwrap(),
+                host_key_trust_prompt_active: Arc::new(AtomicBool::new(false)),
+                probe: ProbeState::NoAttempt,
+                web_auth_waits_used: 0,
+                client_socket: Some(client_socket),
+            };
+            SignIn {
+                db,
+                session,
+                user: AuthStateUserInfo {
+                    id: user_id,
+                    username: "alice".into(),
+                },
+                _client: client,
+            }
+        }
+
+        impl SignIn {
+            fn identity(&self) -> AuthorizedIdentity {
+                AuthorizedIdentity::for_authenticated_session(
+                    self.user.clone(),
+                    crate::PROTOCOL_NAME,
+                )
+            }
+
+            /// The administrator narrows the allowed ranges to leave the
+            /// connection's address out, while the sign-in is in progress.
+            async fn narrow_ranges(&self) {
+                let ranges = sea_orm::JsonValue::Array(vec![sea_orm::JsonValue::String(
+                    "10.0.0.0/8".into(),
+                )]);
+                entities::User::ActiveModel {
+                    id: Set(self.user.id),
+                    allowed_ip_ranges: Set(ranges),
+                    ..Default::default()
+                }
+                .update(&self.db)
+                .await
+                .unwrap();
+            }
+
+            async fn delete_user(&self) {
+                entities::User::Entity::delete_by_id(self.user.id)
+                    .exec(&self.db)
+                    .await
+                    .unwrap();
+            }
+
+            async fn handle_user(&self) -> Option<AuthStateUserInfo> {
+                self.session
+                    .server_handle
+                    .lock()
+                    .await
+                    .user_session_state()
+                    .lock()
+                    .await
+                    .user_info
+                    .clone()
+            }
+
+            /// Nothing of the sign-in is left on the session or its handle.
+            async fn assert_not_signed_in(&self) {
+                assert!(self.session.user_info.is_none(), "session user");
+                assert!(
+                    self.session.authorized_identity.is_none(),
+                    "session identity"
+                );
+                assert_eq!(self.handle_user().await, None, "handle user");
+            }
+        }
+
+        #[tokio::test]
+        async fn a_sign_in_of_a_deleted_user_leaves_no_user_or_identity() {
+            let mut s = sign_in_from(INSIDE).await;
+            s.delete_user().await;
+
+            let admitted = s
+                .session
+                .admit_user_sign_in(s.identity(), s.user.clone(), None)
+                .await;
+
+            assert!(
+                matches!(admitted, Err(WarpgateError::UserNoLongerAdmitted)),
+                "{admitted:?}"
+            );
+            s.assert_not_signed_in().await;
+        }
+
+        #[tokio::test]
+        async fn a_sign_in_outside_narrowed_ranges_leaves_no_user_or_identity() {
+            let mut s = sign_in_from(OUTSIDE).await;
+            s.narrow_ranges().await;
+
+            let admitted = s
+                .session
+                .admit_user_sign_in(s.identity(), s.user.clone(), None)
+                .await;
+
+            assert!(
+                matches!(admitted, Err(WarpgateError::UserNoLongerAdmitted)),
+                "{admitted:?}"
+            );
+            s.assert_not_signed_in().await;
+        }
+
+        /// A failure that is not a refusal (here, the database cannot be
+        /// written) leaves the session as unsigned-in as a refusal does.
+        #[tokio::test]
+        async fn a_sign_in_failing_at_the_handle_leaves_no_user_or_identity() {
+            let mut s = sign_in_from(INSIDE).await;
+            s.db.execute_unprepared("DROP TABLE user_sessions")
+                .await
+                .unwrap();
+
+            let admitted = s
+                .session
+                .admit_user_sign_in(s.identity(), s.user.clone(), None)
+                .await;
+
+            assert!(
+                matches!(&admitted, Err(error) if !matches!(error, WarpgateError::UserNoLongerAdmitted)),
+                "{admitted:?}"
+            );
+            s.assert_not_signed_in().await;
+        }
+
+        /// The ticket sign-in has no identity and calls the accept step
+        /// itself; a refusal there leaves no user either.
+        #[tokio::test]
+        async fn a_refused_accept_step_leaves_no_user() {
+            let mut s = sign_in_from(OUTSIDE).await;
+            s.narrow_ranges().await;
+
+            let accepted = s.session._auth_accept(s.user.clone(), None).await;
+
+            assert!(
+                matches!(accepted, Err(WarpgateError::UserNoLongerAdmitted)),
+                "{accepted:?}"
+            );
+            s.assert_not_signed_in().await;
+        }
+
+        /// The other side: an admitted sign-in records both, so the tests
+        /// above are not satisfied by a session that never records anything.
+        #[tokio::test]
+        async fn an_admitted_sign_in_records_the_user_and_the_identity() {
+            let mut s = sign_in_from(INSIDE).await;
+            s.narrow_ranges().await;
+
+            s.session
+                .admit_user_sign_in(s.identity(), s.user.clone(), None)
+                .await
+                .unwrap();
+
+            assert_eq!(s.session.user_info, Some(s.user.clone()));
+            assert_eq!(
+                s.session
+                    .authorized_identity
+                    .as_ref()
+                    .map(|identity| identity.user_info().clone()),
+                Some(s.user.clone())
+            );
+            assert_eq!(s.handle_user().await, Some(s.user.clone()));
+        }
+    }
 }
 
 impl std::fmt::Debug for ServerSession {
@@ -4882,15 +5204,14 @@ impl ServerSession {
                             };
                             Some(authorization)
                         };
-                        self.authorized_identity = Some(identity);
                         // Refused when the user was removed, or their
                         // allowed ranges changed to leave this address out,
                         // while the sign-in was in progress.
-                        if let Err(error) =
-                            self._auth_accept(user_info.clone(), authorization).await
+                        if let Err(error) = self
+                            .admit_user_sign_in(identity, user_info.clone(), authorization)
+                            .await
                         {
                             if matches!(error, WarpgateError::UserNoLongerAdmitted) {
-                                self.authorized_identity = None;
                                 return Ok(AuthResult::Rejected);
                             }
                             return Err(error.into());
@@ -4984,6 +5305,10 @@ impl ServerSession {
                             authorization.target().name
                         );
                         let user_info = authorization.user_info().clone();
+                        // The ticket's use was spent above, before this
+                        // check, so a sign-in refused here has used one up.
+                        // That is accepted: it only happens while a change to
+                        // the user is in progress.
                         if let Err(error) = self
                             ._auth_accept(user_info.clone(), Some(authorization))
                             .await
@@ -5001,6 +5326,21 @@ impl ServerSession {
                 }
             }
         }
+    }
+
+    /// Completes a key sign-in at the connection's handle, then records the
+    /// identity the target menu authorizes against. The identity is recorded
+    /// only once [`Self::_auth_accept`] has succeeded, so any error from it,
+    /// a refusal or not, leaves it unset.
+    async fn admit_user_sign_in(
+        &mut self,
+        identity: AuthorizedIdentity,
+        user_info: AuthStateUserInfo,
+        authorization: Option<TargetAuthorization>,
+    ) -> Result<(), WarpgateError> {
+        self._auth_accept(user_info, authorization).await?;
+        self.authorized_identity = Some(identity);
+        Ok(())
     }
 
     async fn _auth_accept(

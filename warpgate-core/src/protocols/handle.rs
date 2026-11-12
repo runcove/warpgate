@@ -659,8 +659,8 @@ mod sign_in_completion_tests {
         assert!(attributed < read, "{statements:#?}");
     }
 
-    /// The other side of the ordering: a change that commits just after a
-    /// sign-in passed its check still ends that session through its close.
+    /// A change committed after a sign-in completed still closes that
+    /// session: the close finds it by its row and its live handle.
     #[tokio::test]
     async fn a_change_committing_after_the_check_closes_the_signed_in_session() {
         let f = fixture().await;
