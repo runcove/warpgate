@@ -154,14 +154,18 @@ fn plain_names(relative: &Path) -> std::io::Result<Vec<&OsStr>> {
 /// it and never through a symlink, so the directory checked is the directory used
 /// and a symlink swapped in anywhere below the root is refused, not followed. With
 /// `create`, a missing directory is made at most [`KEEP_FOR_DIRECTORY`] first. Each
-/// directory is tightened like [`secure_directory_by_masking`] and fails closed the
-/// same way. The root itself is opened by path. Returns the last directory.
+/// directory is tightened to `current & KEEP_FOR_DIRECTORY` through its descriptor; a
+/// directory owned by another user (unless this process runs as root) and any chmod
+/// failure are errors, so the caller fails closed. The root itself is opened by path
+/// and only to walk from (`O_PATH` on Linux): it is never chmodded here, so a root
+/// this process can write and search but not read still works. Returns the last
+/// directory.
 fn walk_masking(root: &Path, names: &[&OsStr], create: bool) -> std::io::Result<OwnedFd> {
     let mut path = root.to_path_buf();
     let mut current = OwnedFd::from(
         std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(nix::libc::O_DIRECTORY)
+            .custom_flags(ROOT_WALK_FLAGS)
             .open(root)?,
     );
     for name in names {
@@ -178,13 +182,20 @@ fn walk_masking(root: &Path, names: &[&OsStr], create: bool) -> std::io::Result<
     Ok(current)
 }
 
+/// How [`walk_masking`] opens the root: as a directory to walk from, not to read
+/// (`O_PATH` ignores the access mode, so the read asked for is never checked).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const ROOT_WALK_FLAGS: i32 = nix::libc::O_PATH | nix::libc::O_DIRECTORY;
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+const ROOT_WALK_FLAGS: i32 = nix::libc::O_DIRECTORY;
+
 /// Creates the directories of `relative` beneath the recordings `root` the way
 /// `--recordings-keep-group-read` needs: the root, if missing, by path; below it
 /// each directory relative to the one above (`mkdirat`, then `openat` with
 /// `O_NOFOLLOW`), so nothing is created or chmodded through a symlink below the
 /// root. New directories are created at most [`KEEP_FOR_DIRECTORY`]; every directory
 /// below the root is then tightened to `current & KEEP_FOR_DIRECTORY` and fails
-/// closed like [`secure_directory_by_masking`]. The root is not tightened here.
+/// closed as [`walk_masking`] describes. The root is not tightened here.
 pub fn create_recording_directories(root: &Path, relative: &Path) -> std::io::Result<()> {
     std::fs::DirBuilder::new()
         .recursive(true)
@@ -260,20 +271,6 @@ fn not_owned(path: &Path, owner: u32, euid: u32) -> std::io::Error {
             path.display()
         ),
     )
-}
-
-/// Tightens a directory Warpgate created to `current & keep` instead of setting an
-/// exact mode. It never adds a bit, so a reader granted read by a default POSIX ACL
-/// keeps it (an exact `chmod 0700` would also zero the ACL mask). A symlink at `path`,
-/// a directory owned by another user (unless this process runs as root) and any chmod
-/// failure are errors: the caller fails closed.
-pub fn secure_directory_by_masking<P: AsRef<Path>>(path: P, keep: u32) -> std::io::Result<()> {
-    let path = path.as_ref();
-    let dir = open_directory_no_follow(path)?;
-    match mask_fd(dir.as_fd(), keep, true)? {
-        Masked::Done => Ok(()),
-        Masked::NotOwned { owner, euid } => Err(not_owned(path, owner, euid)),
-    }
 }
 
 /// Tightens an already-open file Warpgate created to `current & keep`, through its
@@ -368,8 +365,15 @@ mod tests {
         secure_open_file_by_masking(&open, KEEP_FOR_RECORDING_FILE, file).unwrap();
     }
 
+    /// Walks to `dir` from its parent the way a recording is opened: `dir` opened
+    /// with `openat` relative to its parent and tightened by [`walk_masking`].
+    fn walk_to(dir: &Path) -> std::io::Result<OwnedFd> {
+        let (parent, name) = (dir.parent().unwrap(), dir.file_name().unwrap());
+        walk_masking(parent, &[name], false)
+    }
+
     fn mask(dir: &Path, file: &Path) {
-        secure_directory_by_masking(dir, KEEP_FOR_DIRECTORY).unwrap();
+        walk_to(dir).unwrap();
         mask_file(file);
     }
 
@@ -445,7 +449,7 @@ mod tests {
         let link = tmp.path().join("link");
         std::os::unix::fs::symlink(&dir, &link).unwrap();
 
-        let err = secure_directory_by_masking(&link, KEEP_FOR_DIRECTORY).unwrap_err();
+        let err = walk_to(&link).unwrap_err();
         // Linux reports ENOTDIR (O_DIRECTORY sees the link itself); ELOOP is the
         // O_NOFOLLOW error elsewhere. Either way the open is refused.
         assert!(
@@ -461,7 +465,7 @@ mod tests {
     #[test]
     fn a_file_is_not_a_directory() {
         let (_tmp, _dir, file) = dir_and_file(0o700, 0o666);
-        let err = secure_directory_by_masking(&file, KEEP_FOR_DIRECTORY).unwrap_err();
+        let err = walk_to(&file).unwrap_err();
         assert_eq!(err.raw_os_error(), Some(nix::libc::ENOTDIR));
         assert_eq!(mode(&file), 0o666);
     }
@@ -527,7 +531,8 @@ mod tests {
         }
         let not_mine =
             |p: &&'static Path| std::fs::metadata(p).is_ok_and(|m| m.uid() != euid.as_raw());
-        let dir = ["/usr", "/etc", "/"]
+        // Not `/`: a walk reaches a directory as a child of another.
+        let dir = ["/usr", "/etc", "/var"]
             .into_iter()
             .map(Path::new)
             .find(|p| not_mine(p) && p.is_dir())
@@ -547,33 +552,65 @@ mod tests {
 
     /// A session or recording directory, or a recording file, that is not this
     /// process's own fails closed: an error, and no chmod is attempted. Root may
-    /// tighten them anyway, so as root they are masked instead.
+    /// tighten them anyway, so as root they are masked and the recording is opened.
     #[test]
     fn a_child_owned_by_someone_else_is_an_error() {
         let other = not_owned_dir_and_file();
         let (dir, file) = (other.dir.as_path(), other.file.as_path());
         let (dir_before, file_before) = (mode(dir), mode(file));
-        let open = std::fs::File::open(file).unwrap();
 
         if other.as_root {
-            secure_directory_by_masking(dir, KEEP_FOR_DIRECTORY).unwrap();
-            secure_open_file_by_masking(&open, KEEP_FOR_RECORDING_FILE, file).unwrap();
+            let (root, name) = (dir.parent().unwrap(), dir.file_name().unwrap());
+            let relative = Path::new(name).join("recording");
+            create_recording_directories(root, &relative).unwrap();
             assert_eq!(mode(dir), dir_before & KEEP_FOR_DIRECTORY);
-            assert_eq!(mode(file), file_before & KEEP_FOR_RECORDING_FILE);
             assert_ne!(mode(dir), dir_before);
+            let mut open = open_recording_file(root, &relative.join("data")).unwrap();
+            std::io::Write::write_all(&mut open, b"used").unwrap();
+            assert_eq!(std::fs::read(dir.join("recording/data")).unwrap(), b"used");
+
+            assert_eq!(file.parent(), Some(root));
+            drop(open_recording_file(root, Path::new(file.file_name().unwrap())).unwrap());
+            assert_eq!(mode(file), file_before & KEEP_FOR_RECORDING_FILE);
             assert_ne!(mode(file), file_before);
             return;
         }
 
-        let err = secure_directory_by_masking(dir, KEEP_FOR_DIRECTORY).unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
-        assert!(err.to_string().contains("owned by uid"), "{err}");
+        let names = |extra: &str| Path::new(dir.file_name().unwrap()).join(extra);
+        let errors = [
+            walk_to(dir).map(drop).unwrap_err(),
+            create_recording_directories(dir.parent().unwrap(), &names("recording")).unwrap_err(),
+            open_recording_file(dir.parent().unwrap(), &names("recording")).unwrap_err(),
+        ];
+        for err in errors {
+            assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+            assert!(err.to_string().contains("owned by uid"), "{err}");
+        }
+        assert!(!dir.join("recording").exists());
 
+        let open = std::fs::File::open(file).unwrap();
         let err = secure_open_file_by_masking(&open, KEEP_FOR_RECORDING_FILE, file).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
 
         assert_eq!(mode(dir), dir_before);
         assert_eq!(mode(file), file_before);
+    }
+
+    /// A root this process can write and search but not read still gets its
+    /// recording directories and files: the root is only walked from, never read.
+    #[test]
+    fn a_root_that_cannot_be_read_still_takes_recordings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        set(&root, 0o300);
+        let created = create_recording_directories(&root, Path::new("session/recording"));
+        let opened = open_recording_file(&root, Path::new("session/recording/data"));
+        let made = root.join("session/recording/data").is_file();
+        set(&root, 0o700);
+        created.unwrap();
+        opened.unwrap();
+        assert!(made);
     }
 
     /// A symlink in place of a recording file fails the open; its target is untouched.
@@ -660,12 +697,22 @@ mod tests {
             body();
             return true;
         }
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([test, "--exact", "--test-threads=1"])
             .env(UMASK_ZERO_CHILD, "1")
-            .status()
+            .output()
             .unwrap();
-        assert!(status.success(), "the umask 0 child failed: {status}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "the umask 0 child failed: {}\n{stdout}",
+            output.status
+        );
+        // A wrong test name would run nothing and still succeed.
+        assert!(
+            stdout.contains("test result: ok. 1 passed;"),
+            "the umask 0 child did not run exactly one test:\n{stdout}"
+        );
         false
     }
 

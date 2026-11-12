@@ -105,8 +105,12 @@ primary group, not the root's.
 - **The session and recording directories and the recording files are
   Warpgate's own**, and fail closed: a symlink in their place, one owned by
   another user (unless Warpgate runs as root), or a failure to chmod one fails
-  the recording start: the session proceeds without a recording and one error
-  line is logged. Below the root, each directory and file is created and
+  the recording start. When Warpgate runs as root, a directory or file below
+  the root that another user owns is tightened like its own and used. A failed
+  start leaves the session without that recording and logs one line per failed
+  recording start: per channel on SSH, per API request on Kubernetes. SSH and
+  web SSH log it at error level; Kubernetes, RDP, VNC and the web desktop at
+  warning level. Below the root, each directory and file is created and
   opened relative to the directory above it, never through a symlink, so
   nothing is created or chmodded through a symlink there, and the directory
   checked is the one written to.

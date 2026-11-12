@@ -19,7 +19,7 @@ bless *ARGS:
     for p in {{projects}}; do cargo bless --manifest-path $p/Cargo.toml {{ARGS}}; done
 
 test:
-    for p in {{projects}}; do cargo test --all-features -p $p; done
+    for p in {{projects}}; do WARPGATE_TEST_REQUIRE_ACL=$(command -v setfacl >/dev/null && echo 1) cargo test --all-features -p $p; done
 
 npm *ARGS:
     cd warpgate-web && npm {{ARGS}}

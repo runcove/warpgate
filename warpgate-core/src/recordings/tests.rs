@@ -911,8 +911,9 @@ async fn a_symlinked_root_is_left_alone_and_the_recording_starts() {
 }
 
 /// A recordings root owned by another user is left alone and the recording still
-/// starts. Needs a sticky world-writable directory this process does not own;
-/// skipped when there is none (for example when running as root).
+/// starts, even when running as root. As a user, the root is a sticky world-writable
+/// directory this process does not own (the test fails if there is none); as root,
+/// it is a fresh root (mode 0777) chowned to uid and gid 65534 (`nobody`).
 #[tokio::test]
 async fn a_root_owned_by_someone_else_is_left_alone_and_the_recording_starts() {
     use std::os::unix::fs::MetadataExt;
@@ -921,16 +922,28 @@ async fn a_root_owned_by_someone_else_is_left_alone_and_the_recording_starts() {
     let probe = tempfile_in_temp_dir();
     let euid = std::fs::metadata(&probe).unwrap().uid();
     std::fs::remove_file(&probe).unwrap();
-    let Some(other) = ["/tmp", "/var/tmp", "/dev/shm"].into_iter().find(|p| {
-        std::fs::metadata(p)
-            .is_ok_and(|m| m.is_dir() && m.uid() != euid && m.mode() & 0o1777 == 0o1777)
-    }) else {
-        eprintln!("skipped: no world-writable directory owned by another user");
-        return;
+    let h;
+    let other = if euid == 0 {
+        h = Harness::with_securing(None, true, true).await;
+        let root = disk_root(&h);
+        std::fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::chown(&root, Some(65534), Some(65534)).unwrap();
+        set_mode(&root, 0o777);
+        root
+    } else {
+        let other = ["/tmp", "/var/tmp", "/dev/shm"]
+            .into_iter()
+            .find(|p| {
+                std::fs::metadata(p)
+                    .is_ok_and(|m| m.is_dir() && m.uid() != euid && m.mode() & 0o1777 == 0o1777)
+            })
+            .expect("a world-writable directory owned by another user");
+        h = Harness::with_disk_path(None, true, true, other).await;
+        PathBuf::from(other)
     };
-    let before = mode_of(Path::new(other));
-    let h = Harness::with_disk_path(None, true, true, other).await;
-    let session = Path::new(other).join(h.session_id.to_string());
+    let other = other.as_path();
+    let before = (mode_of(other), std::fs::metadata(other).unwrap().uid());
+    let session = other.join(h.session_id.to_string());
 
     let started = start_named(&h).await;
     let session_mode = std::fs::metadata(&session).map(|m| {
@@ -943,7 +956,8 @@ async fn a_root_owned_by_someone_else_is_left_alone_and_the_recording_starts() {
     h.wait_for_writers(0).await;
     let _ = std::fs::remove_dir_all(&session);
 
-    assert_eq!(mode_of(Path::new(other)), before, "{other} is untouched");
+    let after = (mode_of(other), std::fs::metadata(other).unwrap().uid());
+    assert_eq!(after, before, "{} is untouched", other.display());
     assert_eq!(session_mode.unwrap() & !0o750, 0);
 }
 
@@ -985,9 +999,9 @@ async fn a_symlinked_session_or_recording_directory_fails_the_start() {
     }
 }
 
-/// A symlink in place of a recording file fails the start under the flag: the file is
-/// opened with `O_NOFOLLOW`, so nothing behind the link is written or chmodded.
-/// Linux's `ELOOP`, what `O_NOFOLLOW` fails with on a symlink.
+/// `ELOOP`, what `O_NOFOLLOW` fails with on a symlink: 40 on Linux on x86, x86_64,
+/// arm, aarch64 and riscv (not on alpha, mips, parisc or sparc). warpgate-core has no
+/// libc dependency to name it.
 const ELOOP: i32 = 40;
 
 /// The raw OS error of the first `std::io::Error` in `err`'s source chain.
@@ -1002,6 +1016,8 @@ fn raw_os_error(err: &(dyn std::error::Error + 'static)) -> Option<i32> {
     None
 }
 
+/// A symlink in place of a recording file fails the start under the flag: the file is
+/// opened with `O_NOFOLLOW`, so nothing behind the link is written or chmodded.
 #[tokio::test]
 async fn a_symlinked_recording_file_fails_the_start() {
     for s3 in [false, true] {
