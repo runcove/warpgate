@@ -587,9 +587,11 @@ mod tests {
 
     /// A root this process can write and search but not read still gets its
     /// recording directories and files: the root is only walked from, never read.
-    /// Linux only (`O_PATH`). It needs a process that a 0300 directory really keeps
-    /// out: run as root (or with `CAP_DAC_OVERRIDE`) it fails on that precondition
-    /// rather than passing without testing anything.
+    /// Linux only (`O_PATH`). The property needs a process that a 0300 directory
+    /// really keeps out, so only a run as an ordinary user proves it; such a run
+    /// that can still read the directory (`CAP_DAC_OVERRIDE`) fails rather than
+    /// passing without testing anything. Run as root, who reads through any mode,
+    /// it checks only that a 0300 root still takes recordings.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn a_root_that_cannot_be_read_still_takes_recordings() {
@@ -597,15 +599,23 @@ mod tests {
         let root = tmp.path().join("root");
         std::fs::create_dir(&root).unwrap();
         set(&root, 0o300);
-        let readable = std::fs::read_dir(&root).is_ok();
-        if readable {
-            set(&root, 0o700);
+        if nix::unistd::geteuid().is_root() {
+            eprintln!(
+                "a_root_that_cannot_be_read_still_takes_recordings: running as root, who can \
+                 read a 0300 directory, so only the recordings are checked here; the run as \
+                 an ordinary user checks that an unreadable root is never read"
+            );
+        } else {
+            let readable = std::fs::read_dir(&root).is_ok();
+            if readable {
+                set(&root, 0o700);
+            }
+            assert!(
+                !readable,
+                "this process can read a 0300 directory (CAP_DAC_OVERRIDE?), so this test \
+                 cannot tell an unreadable root apart: run it without that capability"
+            );
         }
-        assert!(
-            !readable,
-            "this process can read a 0300 directory (root or CAP_DAC_OVERRIDE), so this \
-             test cannot tell an unreadable root apart: run it as an ordinary user"
-        );
         let created = create_recording_directories(&root, Path::new("session/recording"));
         let opened = open_recording_file(&root, Path::new("session/recording/data"));
         let made = root.join("session/recording/data").is_file();
