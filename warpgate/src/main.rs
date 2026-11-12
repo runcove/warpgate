@@ -34,12 +34,25 @@ pub struct Cli {
     /// Do not tighten UNIX modes of config and data files
     #[clap(long)]
     skip_securing_files: bool,
+
+    /// Secure the recordings tree by removing bits (directories to at most 750, files to
+    /// at most 640) instead of setting exactly 700 / 600, so a separate reader keeps the
+    /// read access a default POSIX ACL on the recordings root gives it (or a group
+    /// Warpgate's own user is in, with a umask that leaves group read). A group grant on
+    /// the root alone does not reach new files: setgid is stripped, so they get
+    /// Warpgate's primary group. Never opens up existing files. Has no effect with
+    /// --skip-securing-files
+    #[clap(long)]
+    recordings_keep_group_read: bool,
 }
 
 impl Cli {
     #[allow(clippy::wrong_self_convention)]
     pub fn into_global_params(&self) -> anyhow::Result<GlobalParams> {
-        warpgate_common::GlobalParams::new(self.config.clone(), !self.skip_securing_files)
+        Ok(
+            warpgate_common::GlobalParams::new(self.config.clone(), !self.skip_securing_files)?
+                .with_recordings_keep_group_read(self.recordings_keep_group_read),
+        )
     }
 }
 

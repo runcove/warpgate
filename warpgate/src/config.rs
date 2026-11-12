@@ -220,6 +220,25 @@ mod tests {
         GlobalParams::new(path, false).unwrap()
     }
 
+    /// The recordings flag must not reach the config file: still exactly 0600.
+    #[test]
+    fn config_file_is_secured_exactly_even_with_the_recordings_flag() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("warpgate.yaml");
+        std::fs::write(&path, "step_up_interval:\n  ssh: 12h\n").unwrap();
+        for mode in [0o644, 0o666, 0o640] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            let params = GlobalParams::new(path.clone(), true)
+                .unwrap()
+                .with_recordings_keep_group_read(true);
+            load_config(&params, true).unwrap();
+            let got = std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
+            assert_eq!(got, 0o600, "from {mode:o}");
+        }
+    }
+
     #[test]
     fn exempt_max_session_is_checked_when_the_config_loads() {
         let dir = tempfile::tempdir().unwrap();

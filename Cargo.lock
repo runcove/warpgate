@@ -9134,6 +9134,7 @@ dependencies = [
  "sha2 0.11.1",
  "socket2",
  "strum 0.28.0",
+ "tempfile",
  "thiserror 2.0.21",
  "time",
  "tokio",

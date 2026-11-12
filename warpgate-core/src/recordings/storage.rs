@@ -7,7 +7,9 @@ use tokio::fs::File;
 use tokio::io::{AsyncRead, AsyncWriteExt};
 use tracing::error;
 use warpgate_aws::{S3MultipartUpload, S3Storage};
-use warpgate_common::helpers::fs::secure_file;
+use warpgate_common::helpers::fs::{
+    KEEP_FOR_RECORDING_FILE, secure_file, secure_open_file_by_masking,
+};
 use warpgate_common::{GlobalParams, TargetSessionId};
 use warpgate_db_entities::Parameters::RecordingsStorageConfig;
 use warpgate_db_entities::{Parameters, Recording};
@@ -146,9 +148,19 @@ impl Storage {
         self.enable
     }
 
+    /// Local root of all recordings (final location on disk, scratch on S3).
+    pub(crate) fn local_root(&self) -> &Path {
+        &self.local_root
+    }
+
+    /// Local folder holding all of one session's recordings.
+    pub(crate) fn session_folder(&self, session_id: &TargetSessionId) -> PathBuf {
+        self.local_root.join(session_id.to_string())
+    }
+
     /// Local folder holding a recording's files (final on disk, scratch on S3).
     pub(crate) fn recording_folder(&self, session_id: &TargetSessionId, name: &str) -> PathBuf {
-        self.local_root.join(session_id.to_string()).join(name)
+        self.session_folder(session_id).join(name)
     }
 
     /// Open the write destination for one recording file. On S3 this also starts
@@ -168,7 +180,11 @@ impl Storage {
             .await?;
 
         if params.should_secure_files() {
-            secure_file(&local_path)?;
+            if params.recordings_keep_group_read() {
+                secure_open_file_by_masking(&local_file, KEEP_FOR_RECORDING_FILE, &local_path)?;
+            } else {
+                secure_file(&local_path)?;
+            }
         }
 
         Ok(match &self.backend {

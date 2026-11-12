@@ -401,6 +401,29 @@ mod tests {
             .unwrap()
     }
 
+    /// The recordings flag must not reach the database file: still exactly 0600.
+    #[tokio::test]
+    async fn database_file_is_secured_exactly_even_with_the_recordings_flag() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("wg-db-secure-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let params = GlobalParams::new(dir.join("warpgate.yaml"), true)
+            .unwrap()
+            .with_recordings_keep_group_read(true);
+        let config = WarpgateConfig {
+            store: warpgate_common::WarpgateConfigStore::default(),
+        };
+
+        let db = connect_to_db(&config, &params).await.unwrap();
+        let db_file = dir.join("data/db/db.sqlite3");
+        let mode = std::fs::metadata(&db_file).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o600);
+
+        db.close().await.unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[tokio::test]
     async fn sqlite_pool_keeps_its_connections_open() {
         let dir = std::env::temp_dir().join(format!("wg-pool-keep-{}", Uuid::new_v4()));

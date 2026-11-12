@@ -566,3 +566,31 @@ pub async fn command(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    /// The recordings flag must not reach the TLS certificate or key: still exactly 0600.
+    #[test]
+    fn tls_files_are_secured_exactly_even_with_the_recordings_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let params = GlobalParams::new(dir.path().join("warpgate.yaml"), true)
+            .unwrap()
+            .with_recordings_keep_group_read(true);
+        let mut store = WarpgateConfigStore::default();
+        store.http.certificate = "tls.certificate.pem".into();
+        store.http.key = "tls.key.pem".into();
+        let config = WarpgateConfig { store };
+
+        install_tls(&params, &config, None).unwrap();
+
+        for file in [&config.store.http.certificate, &config.store.http.key] {
+            let path = dir.path().join(file);
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
+            assert_eq!(mode, 0o600, "{}", path.display());
+        }
+    }
+}

@@ -11,7 +11,8 @@ use sea_orm::{ConnectionTrait, Database, IntoActiveModel};
 use tokio::io::AsyncReadExt;
 use warpgate_aws::{S3Credentials, S3Storage, S3StorageConfig, StaticCredentials};
 use warpgate_db_entities::Parameters::{
-    self, ConfigMigrationValues, RecordingsStorageConfig, set_config_migration_values,
+    self, ConfigMigrationValues, RecordingsDiskConfig, RecordingsStorageConfig,
+    set_config_migration_values,
 };
 use warpgate_db_migrations::migrate_database;
 
@@ -123,6 +124,21 @@ struct Harness {
 
 impl Harness {
     async fn new(s3: Option<FakeS3>) -> Self {
+        Self::with_securing(s3, false, false).await
+    }
+
+    async fn with_securing(s3: Option<FakeS3>, secure: bool, keep_group_read: bool) -> Self {
+        Self::with_disk_path(s3, secure, keep_group_read, "data/recordings").await
+    }
+
+    /// `disk_path` is the disk backend's recordings root, relative to the harness root
+    /// unless absolute.
+    async fn with_disk_path(
+        s3: Option<FakeS3>,
+        secure: bool,
+        keep_group_read: bool,
+        disk_path: &str,
+    ) -> Self {
         set_config_migration_values(ConfigMigrationValues::default());
         let db = Database::connect("sqlite::memory:").await.unwrap();
         migrate_database(&db).await.unwrap();
@@ -153,13 +169,18 @@ impl Harness {
             .unwrap()
             .into_active_model();
         parameters.recordings_enable = Set(true);
-        if let Some(config) = &s3_config {
-            parameters.recordings_storage =
-                Set(serde_json::to_string(&RecordingsStorageConfig::S3(config.clone())).unwrap());
-        }
+        let storage = match &s3_config {
+            Some(config) => RecordingsStorageConfig::S3(config.clone()),
+            None => RecordingsStorageConfig::Disk(RecordingsDiskConfig {
+                path: disk_path.into(),
+            }),
+        };
+        parameters.recordings_storage = Set(serde_json::to_string(&storage).unwrap());
         parameters.update(&db).await.unwrap();
 
-        let params = GlobalParams::new(root.join("warpgate.yaml"), false).unwrap();
+        let params = GlobalParams::new(root.join("warpgate.yaml"), secure)
+            .unwrap()
+            .with_recordings_keep_group_read(keep_group_read);
         let recordings = SessionRecordings::new(db.clone(), &params);
 
         let session_id = TargetSessionId(Uuid::new_v4());
@@ -569,4 +590,393 @@ async fn a_recorder_cancelled_while_opening_its_files_does_not_end() {
     );
     assert_eq!(h.ended().await, None);
     assert!(exists(&h.scratch(RecordingFile::NDJsonData).await));
+}
+
+/// Modes (masked to 0o7777) of everything one recording touches.
+struct Modes {
+    root: u32,
+    session: u32,
+    leaf: u32,
+    file: u32,
+}
+
+/// Starts a two-file recording under `base` (the recordings root) and reads back the
+/// modes of the root, the session directory, the recording directory and one file.
+/// The root is created beforehand at `root_mode`, so a chmod of it is observable.
+async fn start_and_read_modes(h: &Harness, base: &Path, root_mode: u32) -> Modes {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::create_dir_all(base).unwrap();
+    std::fs::set_permissions(base, std::fs::Permissions::from_mode(root_mode)).unwrap();
+
+    let recording: TwoFiles = h
+        .recordings
+        .start(&h.session_id, None, ())
+        .await
+        .unwrap()
+        .unwrap();
+    h.wait_for_writers(2).await;
+
+    let model = h.recording().await;
+    let session = base.join(model.session_id.to_string());
+    let leaf = session.join(&model.name);
+    let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+    let modes = Modes {
+        root: mode(base),
+        session: mode(&session),
+        leaf: mode(&leaf),
+        file: mode(&leaf.join(RecordingFile::NDJsonData.filename())),
+    };
+    // A file the other writer made gets the same treatment.
+    assert_eq!(
+        mode(&leaf.join(RecordingFile::Index.filename())),
+        modes.file
+    );
+
+    drop(recording);
+    h.wait_for_writers(0).await;
+    modes
+}
+
+fn disk_root(h: &Harness) -> PathBuf {
+    h.root.join("data/recordings")
+}
+
+fn scratch_root(h: &Harness) -> PathBuf {
+    h.root.join("scratch")
+}
+
+/// What `create_dir_all` leaves a directory at under this process's umask.
+fn default_dir_mode(h: &Harness) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    let probe = h.root.join("umask-probe-dir");
+    std::fs::create_dir(&probe).unwrap();
+    std::fs::metadata(&probe).unwrap().permissions().mode() & 0o7777
+}
+
+/// What a newly created file is left at under this process's umask.
+fn default_file_mode(h: &Harness) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    let probe = h.root.join("umask-probe-file");
+    std::fs::File::create(&probe).unwrap();
+    std::fs::metadata(&probe).unwrap().permissions().mode() & 0o7777
+}
+
+/// With the flag on, nothing may end up wider than 0o750 (directories) or 0o640 (files):
+/// no group write, no other access, no exec bit on files, no setuid/setgid/sticky.
+fn assert_within_ceiling(modes: &Modes) {
+    for (what, mode) in [
+        ("root", modes.root),
+        ("session", modes.session),
+        ("leaf", modes.leaf),
+    ] {
+        assert_eq!(mode & !0o750, 0, "{what} is wider than 750: {mode:o}");
+    }
+    assert_eq!(
+        modes.file & !0o640,
+        0,
+        "file is wider than 640: {:o}",
+        modes.file
+    );
+}
+
+async fn keeps_group_read(h: Harness, base: PathBuf) {
+    let dir_default = default_dir_mode(&h);
+    let file_default = default_file_mode(&h);
+    let modes = start_and_read_modes(&h, &base, 0o777).await;
+
+    assert_eq!(modes.root, 0o750, "a 777 root becomes 750");
+    // Directories Warpgate creates start at the umask default and only lose bits.
+    assert_eq!(modes.session, dir_default & 0o750);
+    assert_eq!(modes.leaf, dir_default & 0o750);
+    assert_eq!(modes.file, file_default & 0o640);
+    assert_within_ceiling(&modes);
+}
+
+async fn never_adds_a_bit(h: Harness, base: PathBuf) {
+    let dir_default = default_dir_mode(&h);
+    let modes = start_and_read_modes(&h, &base, 0o700).await;
+
+    assert_eq!(modes.root, 0o700, "a 700 root stays 700");
+    assert_eq!(modes.session, dir_default & 0o750);
+    assert_eq!(modes.leaf, dir_default & 0o750);
+    assert_within_ceiling(&modes);
+}
+
+async fn special_bits_are_stripped(h: Harness, base: PathBuf) {
+    let modes = start_and_read_modes(&h, &base, 0o7777).await;
+
+    assert_eq!(modes.root, 0o750, "a 7777 root becomes 750");
+    assert_within_ceiling(&modes);
+}
+
+async fn old_modes(h: Harness, base: PathBuf) {
+    let dir_default = default_dir_mode(&h);
+    let modes = start_and_read_modes(&h, &base, 0o755).await;
+
+    assert_eq!(modes.root, 0o755, "root is left alone");
+    assert_eq!(
+        modes.session, dir_default,
+        "session directory is left alone"
+    );
+    assert_eq!(modes.leaf, 0o700);
+    assert_eq!(modes.file, 0o600);
+}
+
+#[tokio::test]
+async fn disk_recordings_keep_group_read_when_asked() {
+    let h = Harness::with_securing(None, true, true).await;
+    let base = disk_root(&h);
+    keeps_group_read(h, base).await;
+}
+
+#[tokio::test]
+async fn s3_scratch_keeps_group_read_when_asked() {
+    let h = Harness::with_securing(Some(FakeS3::default()), true, true).await;
+    let base = scratch_root(&h);
+    keeps_group_read(h, base).await;
+}
+
+#[tokio::test]
+async fn disk_recordings_never_gain_a_bit_when_asked() {
+    let h = Harness::with_securing(None, true, true).await;
+    let base = disk_root(&h);
+    never_adds_a_bit(h, base).await;
+}
+
+#[tokio::test]
+async fn s3_scratch_never_gains_a_bit_when_asked() {
+    let h = Harness::with_securing(Some(FakeS3::default()), true, true).await;
+    let base = scratch_root(&h);
+    never_adds_a_bit(h, base).await;
+}
+
+#[tokio::test]
+async fn disk_recordings_lose_special_bits_when_asked() {
+    let h = Harness::with_securing(None, true, true).await;
+    let base = disk_root(&h);
+    special_bits_are_stripped(h, base).await;
+}
+
+#[tokio::test]
+async fn s3_scratch_loses_special_bits_when_asked() {
+    let h = Harness::with_securing(Some(FakeS3::default()), true, true).await;
+    let base = scratch_root(&h);
+    special_bits_are_stripped(h, base).await;
+}
+
+#[tokio::test]
+async fn disk_recordings_keep_the_old_modes_when_not_asked() {
+    let h = Harness::with_securing(None, true, false).await;
+    let base = disk_root(&h);
+    old_modes(h, base).await;
+}
+
+#[tokio::test]
+async fn s3_scratch_keeps_the_old_modes_when_not_asked() {
+    let h = Harness::with_securing(Some(FakeS3::default()), true, false).await;
+    let base = scratch_root(&h);
+    old_modes(h, base).await;
+}
+
+/// `--skip-securing-files` wins over `--recordings-keep-group-read`: no chmod at all.
+#[tokio::test]
+async fn nothing_is_chmodded_when_securing_is_skipped() {
+    for keep_group_read in [false, true] {
+        let h = Harness::with_securing(None, false, keep_group_read).await;
+        let dir_default = default_dir_mode(&h);
+        let file_default = default_file_mode(&h);
+        let modes = start_and_read_modes(&h, &disk_root(&h), 0o755).await;
+
+        assert_eq!(modes.root, 0o755);
+        assert_eq!(modes.session, dir_default);
+        assert_eq!(modes.leaf, dir_default);
+        assert_eq!(modes.file, file_default);
+    }
+}
+
+/// The flag only touches the recordings tree: another session's directory and files
+/// are left alone, not recursed into.
+#[tokio::test]
+async fn keeping_group_read_does_not_touch_other_sessions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let h = Harness::with_securing(None, true, true).await;
+    let base = disk_root(&h);
+    let other = base.join(Uuid::new_v4().to_string());
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let other_file = other.join("data.ndjson");
+    std::fs::write(&other_file, b"x").unwrap();
+    std::fs::set_permissions(&other_file, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+    let modes = start_and_read_modes(&h, &base, 0o755).await;
+    assert_eq!(modes.root, 0o750);
+
+    let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(mode(&other), 0o777);
+    assert_eq!(mode(&other_file), 0o666);
+}
+
+fn mode_of(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::symlink_metadata(path)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o7777
+}
+
+fn set_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+const NAME: &str = "named";
+
+async fn start_named(h: &Harness) -> Result<Option<TwoFiles>> {
+    h.recordings
+        .start::<TwoFiles, _>(&h.session_id, Some(NAME.into()), ())
+        .await
+}
+
+/// Every directory and file of a named recording exists beforehand, wide open. After
+/// the start each is exactly at the ceiling, so a regression to an exact 0700 / 0600
+/// fails here whatever the umask is.
+async fn wide_existing_recording_is_masked(h: Harness, base: PathBuf) {
+    let session = base.join(h.session_id.to_string());
+    let leaf = session.join(NAME);
+    let files = [RecordingFile::NDJsonData, RecordingFile::Index].map(|f| leaf.join(f.filename()));
+    std::fs::create_dir_all(&leaf).unwrap();
+    for dir in [&base, &session, &leaf] {
+        set_mode(dir, 0o777);
+    }
+    for file in &files {
+        std::fs::write(file, b"").unwrap();
+        set_mode(file, 0o666);
+    }
+
+    let recording = start_named(&h).await.unwrap().unwrap();
+    h.wait_for_writers(2).await;
+
+    for dir in [&base, &session, &leaf] {
+        assert_eq!(mode_of(dir), 0o750, "{}", dir.display());
+    }
+    for file in &files {
+        assert_eq!(mode_of(file), 0o640, "{}", file.display());
+    }
+    drop(recording);
+    h.wait_for_writers(0).await;
+}
+
+#[tokio::test]
+async fn disk_wide_existing_recording_is_masked_to_the_ceiling() {
+    let h = Harness::with_securing(None, true, true).await;
+    let base = disk_root(&h);
+    wide_existing_recording_is_masked(h, base).await;
+}
+
+#[tokio::test]
+async fn s3_wide_existing_scratch_is_masked_to_the_ceiling() {
+    let h = Harness::with_securing(Some(FakeS3::default()), true, true).await;
+    let base = scratch_root(&h);
+    wide_existing_recording_is_masked(h, base).await;
+}
+
+/// A recordings root that is a symlink is not chmodded through, and the recording
+/// still starts: the root is only warned about.
+#[tokio::test]
+async fn a_symlinked_root_is_left_alone_and_the_recording_starts() {
+    let h = Harness::with_securing(None, true, true).await;
+    let real = h.root.join("real-recordings");
+    std::fs::create_dir_all(&real).unwrap();
+    set_mode(&real, 0o777);
+    std::fs::create_dir_all(h.root.join("data")).unwrap();
+    std::os::unix::fs::symlink(&real, disk_root(&h)).unwrap();
+
+    let recording = start_named(&h).await.unwrap().unwrap();
+    h.wait_for_writers(2).await;
+
+    assert_eq!(
+        mode_of(&real),
+        0o777,
+        "the root behind the symlink is untouched"
+    );
+    let session = real.join(h.session_id.to_string());
+    assert_eq!(mode_of(&session) & !0o750, 0);
+    assert_eq!(mode_of(&session.join(NAME)) & !0o750, 0);
+    drop(recording);
+    h.wait_for_writers(0).await;
+}
+
+/// A recordings root owned by another user is left alone and the recording still
+/// starts. Needs a sticky world-writable directory this process does not own;
+/// skipped when there is none (for example when running as root).
+#[tokio::test]
+async fn a_root_owned_by_someone_else_is_left_alone_and_the_recording_starts() {
+    use std::os::unix::fs::MetadataExt;
+
+    // This process's uid, as the owner of a file it just made (no nix dependency here).
+    let probe = tempfile_in_temp_dir();
+    let euid = std::fs::metadata(&probe).unwrap().uid();
+    std::fs::remove_file(&probe).unwrap();
+    let Some(other) = ["/tmp", "/var/tmp", "/dev/shm"].into_iter().find(|p| {
+        std::fs::metadata(p)
+            .is_ok_and(|m| m.is_dir() && m.uid() != euid && m.mode() & 0o1777 == 0o1777)
+    }) else {
+        eprintln!("skipped: no world-writable directory owned by another user");
+        return;
+    };
+    let before = mode_of(Path::new(other));
+    let h = Harness::with_disk_path(None, true, true, other).await;
+    let session = Path::new(other).join(h.session_id.to_string());
+
+    let started = start_named(&h).await;
+    let session_mode = std::fs::metadata(&session).map(|m| {
+        use std::os::unix::fs::PermissionsExt;
+        m.permissions().mode() & 0o7777
+    });
+    let recording = started.unwrap().unwrap();
+    h.wait_for_writers(2).await;
+    drop(recording);
+    h.wait_for_writers(0).await;
+    let _ = std::fs::remove_dir_all(&session);
+
+    assert_eq!(mode_of(Path::new(other)), before, "{other} is untouched");
+    assert_eq!(session_mode.unwrap() & !0o750, 0);
+}
+
+/// The directories Warpgate makes fail closed: a symlink where the session or the
+/// recording directory goes makes the start fail, and nothing behind it is chmodded.
+#[tokio::test]
+async fn a_symlinked_session_or_recording_directory_fails_the_start() {
+    for symlinked_leaf in [false, true] {
+        let h = Harness::with_securing(None, true, true).await;
+        let base = disk_root(&h);
+        let session = base.join(h.session_id.to_string());
+        let elsewhere = h.root.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        set_mode(&elsewhere, 0o777);
+        if symlinked_leaf {
+            std::fs::create_dir_all(&session).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, session.join(NAME)).unwrap();
+        } else {
+            std::fs::create_dir_all(&base).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, &session).unwrap();
+        }
+
+        let started = start_named(&h).await;
+        assert!(started.is_err(), "symlinked leaf: {symlinked_leaf}");
+        assert_eq!(
+            mode_of(&elsewhere),
+            0o777,
+            "symlinked leaf: {symlinked_leaf}"
+        );
+    }
+}
+
+fn tempfile_in_temp_dir() -> PathBuf {
+    let probe = std::env::temp_dir().join(format!("wg-uid-probe-{}", Uuid::new_v4()));
+    std::fs::write(&probe, b"").unwrap();
+    probe
 }
