@@ -12,7 +12,7 @@ use warpgate_common::{GlobalParams, TargetSessionId};
 use warpgate_db_entities::Parameters::RecordingsStorageConfig;
 use warpgate_db_entities::{Parameters, Recording};
 
-use super::{RecordingFile, Result};
+use super::{RecordingFile, Result, blocking_io};
 
 /// Local directory used to buffer in-progress recordings while the backend is S3.
 const S3_SCRATCH_SUBDIR: &str = "data/recordings-scratch";
@@ -172,10 +172,13 @@ impl Storage {
         let local_path = local_path_in(&self.local_root, recording, file);
 
         let local_file = if params.should_secure_files() && params.recordings_keep_group_read() {
-            // Opened relative to the checked directories, never through a symlink,
-            // and tightened.
+            // Created new, relative to the checked directories, never through a
+            // symlink, and tightened.
+            let root = self.local_root.clone();
             let relative = relative_path(recording, file);
-            File::from_std(open_recording_file(&self.local_root, Path::new(&relative))?)
+            File::from_std(
+                blocking_io(move || open_recording_file(&root, Path::new(&relative))).await?,
+            )
         } else {
             let local_file = File::options()
                 .append(true)

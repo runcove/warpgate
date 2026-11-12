@@ -102,6 +102,15 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Runs blocking filesystem calls on tokio's blocking pool, off the async workers.
+async fn blocking_io<T: Send + 'static>(
+    f: impl FnOnce() -> std::io::Result<T> + Send + 'static,
+) -> std::io::Result<T> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(std::io::Error::other)?
+}
+
 pub struct RecordingWriterOpener {
     storage: Storage,
     model: Recording::Model,
@@ -206,7 +215,9 @@ impl SessionRecordings {
 
     /// Starting a recording with the same name again will append to it. On S3
     /// storage this is not supported: each start completes its own upload of the
-    /// same keys, and `ended` is not reset on append.
+    /// same keys, and `ended` is not reset on append. With
+    /// `--recordings-keep-group-read` it is refused: each recording file must be new,
+    /// so the second start fails.
     /// `None` when recording is disabled.
     pub async fn start<T, M>(
         &self,
@@ -231,11 +242,22 @@ impl SessionRecordings {
         let folder = storage.recording_folder(id, &name);
         let masking = self.params.should_secure_files() && self.params.recordings_keep_group_read();
         if masking {
-            // Below the root, each directory is created and opened relative to the one
-            // above it, never through a symlink, and tightened as it is opened: the
-            // session and recording directories are Warpgate's own and fail closed.
+            let root = storage.local_root().to_path_buf();
             let relative = Path::new(&id.to_string()).join(&name);
-            create_recording_directories(storage.local_root(), &relative)
+            blocking_io(move || {
+                // Below the root, each directory is created and opened relative to the
+                // one above it, never through a symlink, and tightened as it is opened:
+                // the session and recording directories are Warpgate's own and fail
+                // closed.
+                create_recording_directories(&root, &relative)?;
+                // The root too, so a reader granted read by a default POSIX ACL on it
+                // can traverse to the recording: never recursive and never adding a
+                // bit. The root may predate Warpgate and belong to someone else, so it
+                // is only warned about.
+                secure_recordings_root_by_masking(&root, KEEP_FOR_DIRECTORY);
+                Ok(())
+            })
+            .await
         } else {
             tokio::fs::create_dir_all(&folder).await
         }
@@ -243,17 +265,8 @@ impl SessionRecordings {
             path: folder.clone(),
             source,
         })?;
-        if self.params.should_secure_files() {
-            if masking {
-                // The session and recording directories were tightened above. The root
-                // too, so a reader granted read by a default POSIX ACL on it can
-                // traverse to the recording: never recursive and never adding a bit.
-                // The root may predate Warpgate and belong to someone else, so it is
-                // only warned about.
-                secure_recordings_root_by_masking(storage.local_root(), KEEP_FOR_DIRECTORY);
-            } else {
-                secure_directory(&folder)?;
-            }
+        if self.params.should_secure_files() && !masking {
+            secure_directory(&folder)?;
         }
 
         let model = {

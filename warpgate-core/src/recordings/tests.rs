@@ -841,20 +841,15 @@ async fn start_named(h: &Harness) -> Result<Option<TwoFiles>> {
         .await
 }
 
-/// Every directory and file of a named recording exists beforehand, wide open. After
-/// the start each is exactly at the ceiling, so a regression to an exact 0700 / 0600
-/// fails here whatever the umask is.
+/// Every directory of a named recording exists beforehand, wide open. After the start
+/// each is exactly at the ceiling, so a regression to an exact 0700 fails here whatever
+/// the umask is. The files are new, so they are created within the ceiling.
 async fn wide_existing_recording_is_masked(h: Harness, base: PathBuf) {
     let session = base.join(h.session_id.to_string());
     let leaf = session.join(NAME);
-    let files = [RecordingFile::NDJsonData, RecordingFile::Index].map(|f| leaf.join(f.filename()));
     std::fs::create_dir_all(&leaf).unwrap();
     for dir in [&base, &session, &leaf] {
         set_mode(dir, 0o777);
-    }
-    for file in &files {
-        std::fs::write(file, b"").unwrap();
-        set_mode(file, 0o666);
     }
 
     let recording = start_named(&h).await.unwrap().unwrap();
@@ -863,8 +858,8 @@ async fn wide_existing_recording_is_masked(h: Harness, base: PathBuf) {
     for dir in [&base, &session, &leaf] {
         assert_eq!(mode_of(dir), 0o750, "{}", dir.display());
     }
-    for file in &files {
-        assert_eq!(mode_of(file), 0o640, "{}", file.display());
+    for file in [RecordingFile::NDJsonData, RecordingFile::Index].map(|f| leaf.join(f.filename())) {
+        assert_eq!(mode_of(&file) & !0o640, 0, "{}", file.display());
     }
     drop(recording);
     h.wait_for_writers(0).await;
@@ -882,6 +877,30 @@ async fn s3_wide_existing_scratch_is_masked_to_the_ceiling() {
     let h = Harness::with_securing(Some(FakeS3::default()), true, true).await;
     let base = scratch_root(&h);
     wide_existing_recording_is_masked(h, base).await;
+}
+
+/// `EEXIST`, what `O_CREAT | O_EXCL` fails with on an existing entry: 17 on every
+/// Linux architecture. warpgate-core has no libc dependency to name it.
+const EEXIST: i32 = 17;
+
+/// Under the flag each recording file must be new: an existing file where a recording
+/// file goes fails the start, and is neither written nor chmodded.
+#[tokio::test]
+async fn an_existing_recording_file_fails_the_start() {
+    for s3 in [false, true] {
+        let h = Harness::with_securing(s3.then(FakeS3::default), true, true).await;
+        let base = if s3 { scratch_root(&h) } else { disk_root(&h) };
+        let leaf = base.join(h.session_id.to_string()).join(NAME);
+        std::fs::create_dir_all(&leaf).unwrap();
+        let existing = leaf.join(RecordingFile::NDJsonData.filename());
+        std::fs::write(&existing, b"kept").unwrap();
+        set_mode(&existing, 0o666);
+
+        let err = start_named(&h).await.err().expect("the start fails");
+        assert_eq!(raw_os_error(&err), Some(EEXIST), "s3: {s3}: {err:?}");
+        assert_eq!(mode_of(&existing), 0o666, "s3: {s3}");
+        assert_eq!(std::fs::read(&existing).unwrap(), b"kept", "s3: {s3}");
+    }
 }
 
 /// A recordings root that is a symlink is not chmodded through, and the recording
@@ -999,10 +1018,33 @@ async fn a_symlinked_session_or_recording_directory_fails_the_start() {
     }
 }
 
-/// `ELOOP`, what `O_NOFOLLOW` fails with on a symlink: 40 on Linux on x86, x86_64,
-/// arm, aarch64 and riscv (not on alpha, mips, parisc or sparc). warpgate-core has no
-/// libc dependency to name it.
-const ELOOP: i32 = 40;
+/// Run as root, Warpgate refuses a session directory below the recordings root that
+/// another user owns, rather than tightening and using it: the start fails and the
+/// directory is neither chmodded nor written into. Needs root to chown the directory
+/// to uid 65534, so it is ignored by default; run it as root with `--ignored`. Run
+/// with `--ignored` as any other user it fails, it never passes without checking.
+#[tokio::test]
+#[ignore = "needs root: run as root with --ignored"]
+async fn as_root_a_session_directory_owned_by_someone_else_fails_the_start() {
+    use std::os::unix::fs::MetadataExt;
+
+    let probe = tempfile_in_temp_dir();
+    let euid = std::fs::metadata(&probe).unwrap().uid();
+    std::fs::remove_file(&probe).unwrap();
+    assert_eq!(euid, 0, "this test needs root, and runs as uid {euid}");
+
+    let h = Harness::with_securing(None, true, true).await;
+    let session = disk_root(&h).join(h.session_id.to_string());
+    std::fs::create_dir_all(&session).unwrap();
+    std::os::unix::fs::chown(&session, Some(65534), Some(65534)).unwrap();
+    set_mode(&session, 0o777);
+
+    let err = start_named(&h).await.err().expect("the start fails");
+    let message = format!("{err}");
+    assert!(message.contains("owned by uid 65534"), "{message}");
+    assert_eq!(mode_of(&session), 0o777);
+    assert_eq!(std::fs::read_dir(&session).unwrap().count(), 0);
+}
 
 /// The raw OS error of the first `std::io::Error` in `err`'s source chain.
 fn raw_os_error(err: &(dyn std::error::Error + 'static)) -> Option<i32> {
@@ -1016,8 +1058,9 @@ fn raw_os_error(err: &(dyn std::error::Error + 'static)) -> Option<i32> {
     None
 }
 
-/// A symlink in place of a recording file fails the start under the flag: the file is
-/// opened with `O_NOFOLLOW`, so nothing behind the link is written or chmodded.
+/// A symlink in place of a recording file fails the start under the flag: the file
+/// must be new (`O_CREAT | O_EXCL`, which never follows a symlink), so nothing behind
+/// the link is written or chmodded.
 #[tokio::test]
 async fn a_symlinked_recording_file_fails_the_start() {
     for s3 in [false, true] {
@@ -1032,7 +1075,7 @@ async fn a_symlinked_recording_file_fails_the_start() {
             .unwrap();
 
         let err = start_named(&h).await.err().expect("the start fails");
-        assert_eq!(raw_os_error(&err), Some(ELOOP), "s3: {s3}: {err:?}");
+        assert_eq!(raw_os_error(&err), Some(EEXIST), "s3: {s3}: {err:?}");
         assert_eq!(mode_of(&elsewhere), 0o666, "s3: {s3}");
         assert_eq!(std::fs::read(&elsewhere).unwrap(), b"kept", "s3: {s3}");
     }
@@ -1044,8 +1087,13 @@ fn acl_entries(path: &Path) -> Vec<String> {
         .args(["-n", "-c", "-E", "-p"])
         .arg(path)
         .output()
-        .unwrap();
-    assert!(output.status.success(), "getfacl {}", path.display());
+        .unwrap_or_else(|e| panic!("running getfacl (is the acl package installed?): {e}"));
+    assert!(
+        output.status.success(),
+        "getfacl {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
     String::from_utf8(output.stdout)
         .unwrap()
         .lines()
@@ -1054,26 +1102,39 @@ fn acl_entries(path: &Path) -> Vec<String> {
         .collect()
 }
 
-/// Puts the uploader's ACL on `root`: execute on the root, and a default ACL giving
-/// `reader` read on files and read + execute on directories, nothing to the owning
-/// group or others. `false` when ACLs are not available here.
-fn grant_reader_by_default_acl(root: &Path, reader: u32) -> bool {
+/// Puts the ACL that grants the reader on `root`: execute on the root, and a default
+/// ACL giving `reader` read on files and read + execute on directories, nothing to the
+/// owning group or others. An error saying why when ACLs are not available here.
+fn grant_reader_by_default_acl(root: &Path, reader: u32) -> std::result::Result<(), String> {
     let setfacl = |args: &[&str]| {
-        std::process::Command::new("setfacl")
+        let output = std::process::Command::new("setfacl")
             .args(args)
             .arg(root)
             .output()
-            .is_ok_and(|o| o.status.success())
+            .map_err(|e| format!("running setfacl (is the acl package installed?): {e}"))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "setfacl {args:?} {} failed (no ACL support on this filesystem?): {}",
+                root.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))
+        }
     };
-    setfacl(&["-m", &format!("u:{reader}:x")])
-        && setfacl(&["-d", "-m", &format!("u::rwx,g::---,o::---,u:{reader}:rX")])
+    setfacl(&["-m", &format!("u:{reader}:x")])?;
+    setfacl(&["-d", "-m", &format!("u::rwx,g::---,o::---,u:{reader}:rX")])
 }
 
+/// Set to `1` to let the real-ACL test skip where ACLs are not available. Without
+/// it, missing `setfacl` / `getfacl` or ACL support fails the test.
+const SKIP_ACL_TEST: &str = "WARPGATE_TEST_SKIP_ACL";
+
 /// End to end on a real default ACL (this process's own uid stands in for the
-/// uploader): with the flag, a new directory's ACL mask is r-x and a new file's r--,
+/// reader): with the flag, a new directory's ACL mask is r-x and a new file's r--,
 /// so the named reader can read, while the owning group and others get nothing.
-/// Without the flag, the exact chmod empties the mask. Skipped where ACLs are not
-/// supported, unless `WARPGATE_TEST_REQUIRE_ACL=1`, which makes that a failure.
+/// Without the flag, the exact chmod empties the mask. Fails where ACLs are not
+/// available, unless [`SKIP_ACL_TEST`] is `1`, which turns that into a skip.
 /// Under a default ACL the kernel ignores the umask, so this holds under umask 0077
 /// as under any other.
 #[tokio::test]
@@ -1089,15 +1150,15 @@ async fn a_default_acl_reader_keeps_read_and_nobody_else_gains_it() {
         let base = disk_root(&h);
         std::fs::create_dir_all(&base).unwrap();
         set_mode(&base, 0o700);
-        if !grant_reader_by_default_acl(&base, reader) {
+        if let Err(why) = grant_reader_by_default_acl(&base, reader) {
             assert!(
-                std::env::var_os("WARPGATE_TEST_REQUIRE_ACL").is_none_or(|v| v != "1"),
-                "setfacl is missing or failed, and WARPGATE_TEST_REQUIRE_ACL=1 requires ACLs"
+                std::env::var_os(SKIP_ACL_TEST).is_some_and(|v| v == "1"),
+                "{why}. This test needs POSIX ACLs; set {SKIP_ACL_TEST}=1 to skip it where \
+                 they are not available"
             );
             eprintln!(
-                "SKIPPED a_default_acl_reader_keeps_read_and_nobody_else_gains_it: setfacl is \
-                 missing or failed (no ACL support here); nothing was asserted. Set \
-                 WARPGATE_TEST_REQUIRE_ACL=1 to make this a failure"
+                "SKIPPED a_default_acl_reader_keeps_read_and_nobody_else_gains_it ({SKIP_ACL_TEST}=1): \
+                 {why}; nothing was asserted"
             );
             return;
         }

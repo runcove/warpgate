@@ -104,16 +104,17 @@ primary group, not the root's.
   process, and recordings still start.
 - **The session and recording directories and the recording files are
   Warpgate's own**, and fail closed: a symlink in their place, one owned by
-  another user (unless Warpgate runs as root), or a failure to chmod one fails
-  the recording start. When Warpgate runs as root, a directory or file below
-  the root that another user owns is tightened like its own and used. A failed
-  start leaves the session without that recording and logs one line per failed
-  recording start: per channel on SSH, per API request on Kubernetes. SSH and
-  web SSH log it at error level; Kubernetes, RDP, VNC and the web desktop at
-  warning level. Below the root, each directory and file is created and
-  opened relative to the directory above it, never through a symlink, so
-  nothing is created or chmodded through a symlink there, and the directory
-  checked is the one written to.
+  another user (even when Warpgate runs as root), or a failure to chmod one
+  fails the recording start. Each recording file must be new: an existing file
+  of that name fails the start too, so starting a recording with the same name
+  again is refused under the flag. A failed start leaves the session without
+  that recording and logs one line per failed recording start: per channel on
+  SSH, per API request or exec/attach stream on Kubernetes. SSH, web SSH and
+  Kubernetes exec/attach log it at error level; Kubernetes API requests, RDP,
+  VNC and the web desktop at warning level. Below the root, each directory and
+  file is created and opened relative to the directory above it, never through
+  a symlink, so nothing is created or chmodded through a symlink there, and the
+  directory checked is the one written to.
 - **The root and the directories above it are resolved by path.** The
   guarantee above holds for a root that only Warpgate's user (and root) can
   change, along with every directory above it; a root someone else can replace
@@ -123,9 +124,9 @@ primary group, not the root's.
 - **Group read comes only from the ACL's owning-group entry.** Under a default
   ACL a new file's group bits are the ACL mask, and `0640` keeps that at read.
   The mask bounds the named entries and the owning-group entry; it grants
-  nothing itself. With the uploader's default ACL (`d:g::---`) only the named
-  reader entry uses it, and nobody in Warpgate's group can read new
-  recordings. Members of the file's group can read only where the default
+  nothing itself. With the default ACL that grants the reader (`d:g::---`)
+  only the named reader entry uses it, and nobody in Warpgate's group can read
+  new recordings. Members of the file's group can read only where the default
   ACL's owning-group entry grants read. When a default ACL is set without a
   `g::` entry, `setfacl` fills one in from the root's own owning-group ACL
   entry (not from its mode's group bits, which are the mask once the root has
