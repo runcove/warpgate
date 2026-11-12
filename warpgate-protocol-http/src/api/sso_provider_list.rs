@@ -642,7 +642,19 @@ impl Api {
         session.set_sso_login_state(login_state());
 
         if let Ok(user_info) = outcome.into_accepted() {
-            authorize_session(req, &ctx, user_info).await?;
+            match authorize_session(req, &ctx, user_info).await {
+                Ok(()) => {}
+                // The user was removed, or their allowed ranges changed to
+                // leave this address out, while the sign-in was in progress.
+                Err(WarpgateError::UserNoLongerAdmitted) => {
+                    return Ok(Err(SsoFailure::at(
+                        &return_to,
+                        SsoLoginError::AccessDenied,
+                        "Login denied: this user may not sign in from your IP address",
+                    )));
+                }
+                Err(error) => return Err(error),
+            }
             // Stamp the HTTP per-session step-up clock, after
             // `authorize_session` (which can clear the session). Only the SSO
             // return path stamps: password / OTP logins are not SSO handshakes

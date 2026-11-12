@@ -4883,7 +4883,18 @@ impl ServerSession {
                             Some(authorization)
                         };
                         self.authorized_identity = Some(identity);
-                        self._auth_accept(user_info.clone(), authorization).await?;
+                        // Refused when the user was removed, or their
+                        // allowed ranges changed to leave this address out,
+                        // while the sign-in was in progress.
+                        if let Err(error) =
+                            self._auth_accept(user_info.clone(), authorization).await
+                        {
+                            if matches!(error, WarpgateError::UserNoLongerAdmitted) {
+                                self.authorized_identity = None;
+                                return Ok(AuthResult::Rejected);
+                            }
+                            return Err(error.into());
+                        }
                         self.authentication_type = Some("user".to_string());
 
                         // Every key login is tracked, so step-up switched on
@@ -4973,8 +4984,15 @@ impl ServerSession {
                             authorization.target().name
                         );
                         let user_info = authorization.user_info().clone();
-                        self._auth_accept(user_info.clone(), Some(authorization))
-                            .await?;
+                        if let Err(error) = self
+                            ._auth_accept(user_info.clone(), Some(authorization))
+                            .await
+                        {
+                            if matches!(error, WarpgateError::UserNoLongerAdmitted) {
+                                return Ok(AuthResult::Rejected);
+                            }
+                            return Err(error.into());
+                        }
                         self.authentication_type = Some("ticket".to_string());
 
                         Ok(AuthResult::Accepted { user_info })
@@ -4990,12 +5008,13 @@ impl ServerSession {
         user_info: AuthStateUserInfo,
         authorization: Option<TargetAuthorization>,
     ) -> Result<(), WarpgateError> {
-        self.user_info = Some(user_info.clone());
+        // Set only once the sign-in is admitted where it completes.
         self.server_handle
             .lock()
             .await
             .set_user_info(user_info.clone())
             .await?;
+        self.user_info = Some(user_info.clone());
 
         let Some(authorization) = authorization else {
             self.target = TargetSelection::Menu;

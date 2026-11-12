@@ -339,6 +339,7 @@ mod logout_tests {
     }
 
     async fn app_with(services: Services, storage: SharedSessionStorage) -> impl Endpoint {
+        crate::test_db::insert_user(&services.db, ALICE, "alice").await;
         let ctx = UnauthenticatedRequestContext::new(services).await;
         Route::new()
             .at("/login", get(log_in))

@@ -89,6 +89,35 @@ pub async fn hold_write_lock(
 
 pub const HOLD: Duration = Duration::from_millis(500);
 
+/// A user with no allowed-range restriction, as a completing sign-in needs
+/// its user to exist. Does nothing if the user is already there.
+pub async fn insert_user(db: &DatabaseConnection, id: Uuid, username: &str) {
+    use sea_orm::ActiveModelTrait;
+    use sea_orm::ActiveValue::Set;
+    use sea_orm::EntityTrait;
+    if warpgate_db_entities::User::Entity::find_by_id(id)
+        .one(db)
+        .await
+        .unwrap()
+        .is_some()
+    {
+        return;
+    }
+    warpgate_db_entities::User::ActiveModel {
+        id: Set(id),
+        username: Set(username.into()),
+        description: Set(String::new()),
+        credential_policy: Set(serde_json::Value::Null),
+        rate_limit_bytes_per_second: Set(None),
+        ldap_server_id: Set(None),
+        ldap_object_uuid: Set(None),
+        allowed_ip_ranges: Set(serde_json::Value::Null),
+    }
+    .insert(db)
+    .await
+    .unwrap();
+}
+
 /// The services a node runs with, over `db`.
 pub async fn services(db: DatabaseConnection) -> Services {
     let params = GlobalParams::new(PathBuf::from("/warpgate.yaml"), false).unwrap();
