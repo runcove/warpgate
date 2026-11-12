@@ -686,7 +686,8 @@ async fn keeps_group_read(h: Harness, base: PathBuf) {
     let modes = start_and_read_modes(&h, &base, 0o777).await;
 
     assert_eq!(modes.root, 0o750, "a 777 root becomes 750");
-    // Directories Warpgate creates start at the umask default and only lose bits.
+    // Directories Warpgate creates are born at most 0750 under the umask, and masking
+    // only removes bits.
     assert_eq!(modes.session, dir_default & 0o750);
     assert_eq!(modes.leaf, dir_default & 0o750);
     assert_eq!(modes.file, file_default & 0o640);
@@ -947,7 +948,8 @@ async fn a_root_owned_by_someone_else_is_left_alone_and_the_recording_starts() {
 }
 
 /// The directories Warpgate makes fail closed: a symlink where the session or the
-/// recording directory goes makes the start fail, and nothing behind it is chmodded.
+/// recording directory goes makes the start fail, and nothing behind it is created
+/// or chmodded.
 #[tokio::test]
 async fn a_symlinked_session_or_recording_directory_fails_the_start() {
     for symlinked_leaf in [false, true] {
@@ -972,11 +974,34 @@ async fn a_symlinked_session_or_recording_directory_fails_the_start() {
             0o777,
             "symlinked leaf: {symlinked_leaf}"
         );
+        let created: Vec<_> = std::fs::read_dir(&elsewhere)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(
+            created.is_empty(),
+            "symlinked leaf: {symlinked_leaf}: created through the link: {created:?}"
+        );
     }
 }
 
 /// A symlink in place of a recording file fails the start under the flag: the file is
 /// opened with `O_NOFOLLOW`, so nothing behind the link is written or chmodded.
+/// Linux's `ELOOP`, what `O_NOFOLLOW` fails with on a symlink.
+const ELOOP: i32 = 40;
+
+/// The raw OS error of the first `std::io::Error` in `err`'s source chain.
+fn raw_os_error(err: &(dyn std::error::Error + 'static)) -> Option<i32> {
+    let mut current = Some(err);
+    while let Some(e) = current {
+        if let Some(io) = e.downcast_ref::<std::io::Error>() {
+            return io.raw_os_error();
+        }
+        current = e.source();
+    }
+    None
+}
+
 #[tokio::test]
 async fn a_symlinked_recording_file_fails_the_start() {
     for s3 in [false, true] {
@@ -990,8 +1015,8 @@ async fn a_symlinked_recording_file_fails_the_start() {
         std::os::unix::fs::symlink(&elsewhere, leaf.join(RecordingFile::NDJsonData.filename()))
             .unwrap();
 
-        let started = start_named(&h).await;
-        assert!(started.is_err(), "s3: {s3}");
+        let err = start_named(&h).await.err().expect("the start fails");
+        assert_eq!(raw_os_error(&err), Some(ELOOP), "s3: {s3}: {err:?}");
         assert_eq!(mode_of(&elsewhere), 0o666, "s3: {s3}");
         assert_eq!(std::fs::read(&elsewhere).unwrap(), b"kept", "s3: {s3}");
     }
@@ -1032,8 +1057,9 @@ fn grant_reader_by_default_acl(root: &Path, reader: u32) -> bool {
 /// uploader): with the flag, a new directory's ACL mask is r-x and a new file's r--,
 /// so the named reader can read, while the owning group and others get nothing.
 /// Without the flag, the exact chmod empties the mask. Skipped where ACLs are not
-/// supported. Under a default ACL the kernel ignores the umask, so this holds under
-/// umask 0077 as under any other.
+/// supported, unless `WARPGATE_TEST_REQUIRE_ACL=1`, which makes that a failure.
+/// Under a default ACL the kernel ignores the umask, so this holds under umask 0077
+/// as under any other.
 #[tokio::test]
 async fn a_default_acl_reader_keeps_read_and_nobody_else_gains_it() {
     use std::os::unix::fs::MetadataExt;
@@ -1048,7 +1074,15 @@ async fn a_default_acl_reader_keeps_read_and_nobody_else_gains_it() {
         std::fs::create_dir_all(&base).unwrap();
         set_mode(&base, 0o700);
         if !grant_reader_by_default_acl(&base, reader) {
-            eprintln!("skipped: setfacl failed (no ACL support here)");
+            assert!(
+                std::env::var_os("WARPGATE_TEST_REQUIRE_ACL").is_none_or(|v| v != "1"),
+                "setfacl is missing or failed, and WARPGATE_TEST_REQUIRE_ACL=1 requires ACLs"
+            );
+            eprintln!(
+                "SKIPPED a_default_acl_reader_keeps_read_and_nobody_else_gains_it: setfacl is \
+                 missing or failed (no ACL support here); nothing was asserted. Set \
+                 WARPGATE_TEST_REQUIRE_ACL=1 to make this a failure"
+            );
             return;
         }
 

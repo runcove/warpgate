@@ -36,7 +36,7 @@ pub struct Cli {
     skip_securing_files: bool,
 
     /// Secure the recordings tree by removing bits (directories to at most 750, files to
-    /// at most 640, and created at those modes) instead of setting exactly 700 / 600, so
+    /// at most 640, and created at most at those modes) instead of setting exactly 700 / 600, so
     /// a separate reader keeps the read access a default POSIX ACL on the recordings
     /// root gives it. Every access beyond the owner comes from the ACL: `run` refuses to
     /// start unless the umask covers 0077. A group grant on the root alone does not

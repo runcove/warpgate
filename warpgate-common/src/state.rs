@@ -43,7 +43,7 @@ impl GlobalParams {
     }
 
     /// Whether the recordings directories and files are secured by removing bits
-    /// (directories `& 0o750`, files `& 0o640`, and created at those modes) instead
+    /// (directories `& 0o750`, files `& 0o640`, and created at most at those modes) instead
     /// of being set to exactly 0o700 / 0o600, so a reader keeps the read access a
     /// default POSIX ACL on the recordings root gives it. Every access beyond the
     /// owner comes from the ACL: `warpgate run` refuses to start unless the umask

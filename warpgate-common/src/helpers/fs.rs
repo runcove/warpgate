@@ -1,7 +1,8 @@
-use std::os::fd::{AsFd, BorrowedFd};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::ffi::OsStr;
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::prelude::PermissionsExt;
-use std::path::Path;
+use std::path::{Component, Path};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use tracing::{error, warn};
@@ -96,28 +97,122 @@ pub fn check_umask_covers(umask: u32, required: u32) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Opens a recording file the way `--recordings-keep-group-read` needs: created at
-/// most [`KEEP_FOR_RECORDING_FILE`], so it is never born wider, even under a default
-/// ACL, and never through a symlink in place of the file (`O_NOFOLLOW`: the open
-/// fails with `ELOOP`, and the recording start with it).
-pub fn restrict_recording_file_open(
-    options: &mut tokio::fs::OpenOptions,
-) -> &mut tokio::fs::OpenOptions {
-    options
-        .mode(KEEP_FOR_RECORDING_FILE)
-        .custom_flags(nix::libc::O_NOFOLLOW)
+/// The bits of `mode` as a [`nix::sys::stat::Mode`].
+const fn nix_mode(mode: u32) -> nix::sys::stat::Mode {
+    nix::sys::stat::Mode::from_bits_truncate(mode as nix::libc::mode_t)
 }
 
-/// Creates a recordings directory and any missing parent the way
-/// `--recordings-keep-group-read` needs: each one created at most
-/// [`KEEP_FOR_DIRECTORY`], so it is never born wider, even under a default ACL.
-/// Existing directories are left as they are.
-pub async fn create_recording_directory_all(path: &Path) -> std::io::Result<()> {
-    tokio::fs::DirBuilder::new()
+/// Makes directory `name` in `dir` at most [`KEEP_FOR_DIRECTORY`] (`mkdirat`). An
+/// existing entry of that name, whatever it is, is left alone: opening it decides.
+fn make_directory_at(dir: BorrowedFd<'_>, name: &OsStr) -> std::io::Result<()> {
+    match nix::sys::stat::mkdirat(dir, name, nix_mode(KEEP_FOR_DIRECTORY)) {
+        Ok(()) | Err(nix::errno::Errno::EEXIST) => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Opens directory `name` in `dir` (`openat`), never following a symlink there.
+fn open_directory_at(dir: BorrowedFd<'_>, name: &OsStr) -> std::io::Result<OwnedFd> {
+    use nix::fcntl::OFlag;
+    Ok(nix::fcntl::openat(
+        dir,
+        name,
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        nix::sys::stat::Mode::empty(),
+    )?)
+}
+
+/// Opens file `name` in `dir` for appending (`openat`), creating it at most
+/// [`KEEP_FOR_RECORDING_FILE`], never through a symlink there (`O_NOFOLLOW`: `ELOOP`).
+fn open_file_at(dir: BorrowedFd<'_>, name: &OsStr) -> std::io::Result<std::fs::File> {
+    use nix::fcntl::OFlag;
+    let fd = nix::fcntl::openat(
+        dir,
+        name,
+        OFlag::O_WRONLY | OFlag::O_APPEND | OFlag::O_CREAT | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        nix_mode(KEEP_FOR_RECORDING_FILE),
+    )?;
+    Ok(std::fs::File::from(fd))
+}
+
+/// The components of `relative`, each a plain name. An absolute path, `.` or `..`
+/// is refused, so a walk never leaves the directory it starts from.
+fn plain_names(relative: &Path) -> std::io::Result<Vec<&OsStr>> {
+    relative
+        .components()
+        .map(|c| match c {
+            Component::Normal(name) => Ok(name),
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{} is not a plain relative path", relative.display()),
+            )),
+        })
+        .collect()
+}
+
+/// Walks `names` down from `root`, each directory opened relative to the one above
+/// it and never through a symlink, so the directory checked is the directory used
+/// and a symlink swapped in anywhere below the root is refused, not followed. With
+/// `create`, a missing directory is made at most [`KEEP_FOR_DIRECTORY`] first. Each
+/// directory is tightened like [`secure_directory_by_masking`] and fails closed the
+/// same way. The root itself is opened by path. Returns the last directory.
+fn walk_masking(root: &Path, names: &[&OsStr], create: bool) -> std::io::Result<OwnedFd> {
+    let mut path = root.to_path_buf();
+    let mut current = OwnedFd::from(
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_DIRECTORY)
+            .open(root)?,
+    );
+    for name in names {
+        path.push(name);
+        if create {
+            make_directory_at(current.as_fd(), name)?;
+        }
+        let next = open_directory_at(current.as_fd(), name)?;
+        if let Masked::NotOwned { owner, euid } = mask_fd(next.as_fd(), KEEP_FOR_DIRECTORY, true)? {
+            return Err(not_owned(&path, owner, euid));
+        }
+        current = next;
+    }
+    Ok(current)
+}
+
+/// Creates the directories of `relative` beneath the recordings `root` the way
+/// `--recordings-keep-group-read` needs: the root, if missing, by path; below it
+/// each directory relative to the one above (`mkdirat`, then `openat` with
+/// `O_NOFOLLOW`), so nothing is created or chmodded through a symlink below the
+/// root. New directories are created at most [`KEEP_FOR_DIRECTORY`]; every directory
+/// below the root is then tightened to `current & KEEP_FOR_DIRECTORY` and fails
+/// closed like [`secure_directory_by_masking`]. The root is not tightened here.
+pub fn create_recording_directories(root: &Path, relative: &Path) -> std::io::Result<()> {
+    std::fs::DirBuilder::new()
         .recursive(true)
         .mode(KEEP_FOR_DIRECTORY)
-        .create(path)
-        .await
+        .create(root)?;
+    walk_masking(root, &plain_names(relative)?, true).map(drop)
+}
+
+/// Opens the recording file at `relative` beneath the recordings `root` for
+/// appending, the way `--recordings-keep-group-read` needs: every directory below
+/// the root opened relative to the one above and never through a symlink, each
+/// tightened as by [`create_recording_directories`] (none is created); the file
+/// opened the same way (`O_NOFOLLOW`: a symlink there fails with `ELOOP`), created
+/// at most [`KEEP_FOR_RECORDING_FILE`] and then tightened to
+/// `current & KEEP_FOR_RECORDING_FILE`, failing closed like
+/// [`secure_open_file_by_masking`].
+pub fn open_recording_file(root: &Path, relative: &Path) -> std::io::Result<std::fs::File> {
+    let names = plain_names(relative)?;
+    let Some((file_name, dirs)) = names.split_last() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "a recording file needs a name",
+        ));
+    };
+    let dir = walk_masking(root, dirs, false)?;
+    let file = open_file_at(dir.as_fd(), file_name)?;
+    secure_open_file_by_masking(&file, KEEP_FOR_RECORDING_FILE, &root.join(relative))?;
+    Ok(file)
 }
 
 enum Masked {
@@ -184,8 +279,7 @@ pub fn secure_directory_by_masking<P: AsRef<Path>>(path: P, keep: u32) -> std::i
 /// Tightens an already-open file Warpgate created to `current & keep`, through its
 /// descriptor. A file owned by another user (unless this process runs as root) and
 /// any chmod failure are errors: the caller fails closed. `path` is only for the
-/// error. Open the file with [`restrict_recording_file_open`] so a symlink in its
-/// place fails the open.
+/// error. [`open_recording_file`] opens a recording file this way.
 pub fn secure_open_file_by_masking(file: impl AsFd, keep: u32, path: &Path) -> std::io::Result<()> {
     match mask_fd(file.as_fd(), keep, true)? {
         Masked::Done => Ok(()),
@@ -389,66 +483,92 @@ mod tests {
         assert_eq!(mode(&dir), 0o777);
     }
 
-    /// A root owned by another user is left alone, and is not an error. Needs a
-    /// directory this process does not own; skipped when none is found (for example
-    /// when running as root, who owns them all).
+    /// A root owned by another user is left alone, and is not an error, even when
+    /// running as root.
     #[test]
     fn a_root_owned_by_someone_else_is_left_alone_without_failing() {
-        let euid = nix::unistd::geteuid().as_raw();
-        let Some(other) = ["/", "/usr", "/etc"]
-            .into_iter()
-            .map(Path::new)
-            .find(|p| std::fs::metadata(p).is_ok_and(|m| m.is_dir() && m.uid() != euid))
-        else {
-            eprintln!("skipped: no directory owned by another user");
-            return;
-        };
+        let other = not_owned_dir_and_file();
         // Skipped for ownership, not merely failed: the chmod is never attempted.
-        let dir = open_directory_no_follow(other).unwrap();
+        let dir = open_directory_no_follow(&other.dir).unwrap();
         assert!(matches!(
             mask_fd(dir.as_fd(), KEEP_FOR_DIRECTORY, false).unwrap(),
             Masked::NotOwned { .. }
         ));
-        let before = mode(other);
-        secure_recordings_root_by_masking(other, KEEP_FOR_DIRECTORY);
-        assert_eq!(mode(other), before);
+        let before = mode(&other.dir);
+        secure_recordings_root_by_masking(&other.dir, KEEP_FOR_DIRECTORY);
+        assert_eq!(mode(&other.dir), before);
     }
 
-    /// A directory and a file this process does not own, or `None` (for example when
-    /// running as root, who owns them all and may chmod them anyway).
-    fn not_owned_dir_and_file() -> Option<(&'static Path, &'static Path)> {
+    /// The uid and gid given to the test's objects when running as root (`nobody`).
+    const OTHER_ID: u32 = 65534;
+
+    /// A directory and a file this process does not own. As a user, system paths
+    /// owned by root. As root, who owns those, a fresh directory (mode 0777) and file
+    /// (mode 0666) chowned to uid and gid 65534; `_tmp` keeps them alive.
+    struct NotOwnedPaths {
+        _tmp: Option<tempfile::TempDir>,
+        dir: PathBuf,
+        file: PathBuf,
+        as_root: bool,
+    }
+
+    fn not_owned_dir_and_file() -> NotOwnedPaths {
         let euid = nix::unistd::geteuid();
         if euid.is_root() {
-            return None;
+            let (tmp, dir, file) = dir_and_file(0o777, 0o666);
+            std::os::unix::fs::chown(&dir, Some(OTHER_ID), Some(OTHER_ID)).unwrap();
+            std::os::unix::fs::chown(&file, Some(OTHER_ID), Some(OTHER_ID)).unwrap();
+            return NotOwnedPaths {
+                _tmp: Some(tmp),
+                dir,
+                file,
+                as_root: true,
+            };
         }
         let not_mine =
             |p: &&'static Path| std::fs::metadata(p).is_ok_and(|m| m.uid() != euid.as_raw());
         let dir = ["/usr", "/etc", "/"]
             .into_iter()
             .map(Path::new)
-            .find(not_mine)?;
+            .find(|p| not_mine(p) && p.is_dir())
+            .expect("a directory owned by another user");
         let file = ["/etc/passwd", "/etc/hostname", "/etc/os-release"]
             .into_iter()
             .map(Path::new)
-            .find(|p| not_mine(p) && std::fs::File::open(p).is_ok())?;
-        Some((dir, file))
+            .find(|p| not_mine(p) && std::fs::File::open(p).is_ok())
+            .expect("a readable file owned by another user");
+        NotOwnedPaths {
+            _tmp: None,
+            dir: dir.to_path_buf(),
+            file: file.to_path_buf(),
+            as_root: false,
+        }
     }
 
     /// A session or recording directory, or a recording file, that is not this
-    /// process's own fails closed: an error, and no chmod is attempted.
+    /// process's own fails closed: an error, and no chmod is attempted. Root may
+    /// tighten them anyway, so as root they are masked instead.
     #[test]
     fn a_child_owned_by_someone_else_is_an_error() {
-        let Some((dir, file)) = not_owned_dir_and_file() else {
-            eprintln!("skipped: no directory and file owned by another user");
-            return;
-        };
+        let other = not_owned_dir_and_file();
+        let (dir, file) = (other.dir.as_path(), other.file.as_path());
         let (dir_before, file_before) = (mode(dir), mode(file));
+        let open = std::fs::File::open(file).unwrap();
+
+        if other.as_root {
+            secure_directory_by_masking(dir, KEEP_FOR_DIRECTORY).unwrap();
+            secure_open_file_by_masking(&open, KEEP_FOR_RECORDING_FILE, file).unwrap();
+            assert_eq!(mode(dir), dir_before & KEEP_FOR_DIRECTORY);
+            assert_eq!(mode(file), file_before & KEEP_FOR_RECORDING_FILE);
+            assert_ne!(mode(dir), dir_before);
+            assert_ne!(mode(file), file_before);
+            return;
+        }
 
         let err = secure_directory_by_masking(dir, KEEP_FOR_DIRECTORY).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
         assert!(err.to_string().contains("owned by uid"), "{err}");
 
-        let open = std::fs::File::open(file).unwrap();
         let err = secure_open_file_by_masking(&open, KEEP_FOR_RECORDING_FILE, file).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
 
@@ -456,46 +576,115 @@ mod tests {
         assert_eq!(mode(file), file_before);
     }
 
-    async fn open_recording_file(path: &Path) -> std::io::Result<tokio::fs::File> {
-        let mut options = tokio::fs::File::options();
-        options.append(true).create(true);
-        restrict_recording_file_open(&mut options).open(path).await
-    }
-
     /// A symlink in place of a recording file fails the open; its target is untouched.
-    #[tokio::test]
-    async fn a_symlinked_recording_file_is_refused() {
-        let (tmp, _dir, file) = dir_and_file(0o700, 0o666);
-        let link = tmp.path().join("link");
-        std::os::unix::fs::symlink(&file, &link).unwrap();
+    #[test]
+    fn a_symlinked_recording_file_is_refused() {
+        let (tmp, dir, file) = dir_and_file(0o700, 0o666);
+        std::os::unix::fs::symlink(&file, dir.join("link")).unwrap();
 
-        let err = open_recording_file(&link).await.unwrap_err();
+        let err = open_recording_file(tmp.path(), Path::new("d/link")).unwrap_err();
         assert_eq!(err.raw_os_error(), Some(nix::libc::ELOOP), "{err}");
         assert_eq!(mode(&file), 0o666);
         assert_eq!(std::fs::read(&file).unwrap(), b"x");
     }
 
-    /// New directories and files are created at most 0o750 / 0o640: what the umask
-    /// leaves of those, whatever it is.
-    #[tokio::test]
-    async fn recordings_are_created_at_the_ceiling() {
+    /// A symlink in place of a directory below the root is refused, and nothing is
+    /// created or chmodded behind it, whether it is the first or a later directory.
+    #[test]
+    fn a_symlinked_directory_below_the_root_is_refused() {
+        for (relative, link) in [("link/recording", "link"), ("real/link", "real/link")] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join("root");
+            let elsewhere = tmp.path().join("elsewhere");
+            std::fs::create_dir_all(root.join("real")).unwrap();
+            std::fs::create_dir(&elsewhere).unwrap();
+            set(&elsewhere, 0o777);
+            std::os::unix::fs::symlink(&elsewhere, root.join(link)).unwrap();
+
+            create_recording_directories(&root, Path::new(relative)).unwrap_err();
+            open_recording_file(&root, &Path::new(relative).join("f")).unwrap_err();
+            assert_eq!(mode(&elsewhere), 0o777, "{relative}");
+            assert_eq!(
+                std::fs::read_dir(&elsewhere).unwrap().count(),
+                0,
+                "{relative}"
+            );
+        }
+    }
+
+    /// `..` and absolute paths are refused, so a walk never leaves the root.
+    #[test]
+    fn a_walk_never_leaves_the_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        for relative in ["../x", "/x", "a/../../x", "./x"] {
+            let err = create_recording_directories(tmp.path(), Path::new(relative)).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{relative}");
+        }
+    }
+
+    /// New directories and files are created at most 0o750 / 0o640 under whatever
+    /// umask; existing directories and files are tightened, never widened.
+    #[test]
+    fn recordings_are_created_at_most_the_ceiling() {
         let umask = process_umask().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        let parent = tmp.path().join("root");
-        let leaf = parent.join("session").join("recording");
-        create_recording_directory_all(&leaf).await.unwrap();
-        for dir in [&parent, &parent.join("session"), &leaf] {
+        let root = tmp.path().join("root");
+        let leaf = root.join("session").join("recording");
+        create_recording_directories(&root, Path::new("session/recording")).unwrap();
+        for dir in [&root, &root.join("session"), &leaf] {
             assert_eq!(mode(dir), 0o750 & !umask, "{}", dir.display());
         }
 
-        let file = leaf.join("data.ndjson");
-        drop(open_recording_file(&file).await.unwrap());
-        assert_eq!(mode(&file), 0o640 & !umask);
+        let relative = Path::new("session/recording/data.ndjson");
+        drop(open_recording_file(&root, relative).unwrap());
+        assert_eq!(mode(&leaf.join("data.ndjson")), 0o640 & !umask);
 
-        // An existing file is opened as it is, for appending.
-        set(&file, 0o600);
-        drop(open_recording_file(&file).await.unwrap());
-        assert_eq!(mode(&file), 0o600);
+        // An existing file is opened as it is, for appending, and only loses bits.
+        set(&leaf.join("data.ndjson"), 0o604);
+        set(&leaf, 0o777);
+        let mut open = open_recording_file(&root, relative).unwrap();
+        std::io::Write::write_all(&mut open, b"more").unwrap();
+        assert_eq!(mode(&leaf.join("data.ndjson")), 0o600);
+        assert_eq!(mode(&leaf), 0o750);
+    }
+
+    /// Set in the child process [`in_a_child_with_umask_zero`] starts.
+    const UMASK_ZERO_CHILD: &str = "WARPGATE_TEST_UMASK_ZERO_CHILD";
+
+    /// Runs `body` in a copy of this test binary running only `test`, with the umask
+    /// set to 0 there (a umask is per process, and the other tests share this one).
+    /// Returns whether this is the child, which then has run `body`.
+    fn in_a_child_with_umask_zero(test: &str, body: impl FnOnce()) -> bool {
+        if std::env::var_os(UMASK_ZERO_CHILD).is_some() {
+            nix::sys::stat::umask(nix::sys::stat::Mode::empty());
+            body();
+            return true;
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([test, "--exact", "--test-threads=1"])
+            .env(UMASK_ZERO_CHILD, "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "the umask 0 child failed: {status}");
+        false
+    }
+
+    /// Under umask 0 and with no default ACL, a new directory or file gets exactly the
+    /// mode it is created with, so this tells creating at 0o750 / 0o640 apart from
+    /// creating wider and tightening afterwards. Checked before any tightening.
+    #[test]
+    fn under_umask_zero_new_directories_and_files_are_born_at_the_ceiling() {
+        in_a_child_with_umask_zero(
+            "helpers::fs::tests::under_umask_zero_new_directories_and_files_are_born_at_the_ceiling",
+            || {
+                let tmp = tempfile::tempdir().unwrap();
+                let dir = std::fs::File::open(tmp.path()).unwrap();
+                make_directory_at(dir.as_fd(), OsStr::new("d")).unwrap();
+                assert_eq!(mode(&tmp.path().join("d")), 0o750);
+                drop(open_file_at(dir.as_fd(), OsStr::new("f")).unwrap());
+                assert_eq!(mode(&tmp.path().join("f")), 0o640);
+            },
+        );
     }
 
     #[test]
@@ -584,13 +773,10 @@ mod tests {
         });
         assert_eq!(logged, 1);
 
-        let Some((other, _)) = not_owned_dir_and_file() else {
-            eprintln!("skipped the not-owned half: no directory owned by another user");
-            return;
-        };
+        let other = not_owned_dir_and_file();
         let logged = warnings_logged(|| {
             for _ in 0..3 {
-                secure_recordings_root_warning_once(other, KEEP_FOR_DIRECTORY, &warnings);
+                secure_recordings_root_warning_once(&other.dir, KEEP_FOR_DIRECTORY, &warnings);
             }
         });
         assert_eq!(logged, 1);

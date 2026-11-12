@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fmt::Debug;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,8 +13,8 @@ use tokio_util::task::TaskTracker;
 use tracing::{info, warn};
 use uuid::Uuid;
 use warpgate_common::helpers::fs::{
-    KEEP_FOR_DIRECTORY, create_recording_directory_all, secure_directory,
-    secure_directory_by_masking, secure_recordings_root_by_masking,
+    KEEP_FOR_DIRECTORY, create_recording_directories, secure_directory,
+    secure_recordings_root_by_masking,
 };
 use warpgate_common::{GlobalParams, TargetSessionId};
 use warpgate_db_entities::Recording::{self, RecordingKind};
@@ -230,7 +231,11 @@ impl SessionRecordings {
         let folder = storage.recording_folder(id, &name);
         let masking = self.params.should_secure_files() && self.params.recordings_keep_group_read();
         if masking {
-            create_recording_directory_all(&folder).await
+            // Below the root, each directory is created and opened relative to the one
+            // above it, never through a symlink, and tightened as it is opened: the
+            // session and recording directories are Warpgate's own and fail closed.
+            let relative = Path::new(&id.to_string()).join(&name);
+            create_recording_directories(storage.local_root(), &relative)
         } else {
             tokio::fs::create_dir_all(&folder).await
         }
@@ -240,15 +245,12 @@ impl SessionRecordings {
         })?;
         if self.params.should_secure_files() {
             if masking {
-                // Every directory from the root down to this recording, so a reader
-                // granted read by a default POSIX ACL on the root can traverse to it.
-                // Only these three, never recursive, and never adding a bit. The root
-                // may predate Warpgate and belong to someone else, so it is only
-                // warned about; the two directories Warpgate made fail closed.
+                // The session and recording directories were tightened above. The root
+                // too, so a reader granted read by a default POSIX ACL on it can
+                // traverse to the recording: never recursive and never adding a bit.
+                // The root may predate Warpgate and belong to someone else, so it is
+                // only warned about.
                 secure_recordings_root_by_masking(storage.local_root(), KEEP_FOR_DIRECTORY);
-                for dir in [&storage.session_folder(id), &folder] {
-                    secure_directory_by_masking(dir, KEEP_FOR_DIRECTORY)?;
-                }
             } else {
                 secure_directory(&folder)?;
             }

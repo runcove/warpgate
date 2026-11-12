@@ -60,8 +60,8 @@ so no other user can read a recording, whatever ACL the deployment set.
 With `--recordings-keep-group-read`, Warpgate secures the recordings tree by
 removing bits instead: the recordings root, the session directory and the
 recording directory become `current & 0750`, and each recording file it opens
-becomes `current & 0640`. It never adds a bit. New directories are created with
-mode `0750` and new files with `0640`, so nothing is born wider, even under a
+becomes `current & 0640`. It never adds a bit. New directories are created at
+most `0750` and new files at most `0640`, so nothing is born wider, even under a
 default ACL, where the kernel ignores the umask. The flag does nothing with
 `--skip-securing-files`, and nothing outside the recordings tree changes: the
 config, database and TLS files are still set to exactly `0600`.
@@ -105,7 +105,15 @@ primary group, not the root's.
 - **The session and recording directories and the recording files are
   Warpgate's own**, and fail closed: a symlink in their place, one owned by
   another user (unless Warpgate runs as root), or a failure to chmod one fails
-  the recording start.
+  the recording start: the session proceeds without a recording and one error
+  line is logged. Below the root, each directory and file is created and
+  opened relative to the directory above it, never through a symlink, so
+  nothing is created or chmodded through a symlink there, and the directory
+  checked is the one written to.
+- **The root and the directories above it are resolved by path.** The
+  guarantee above holds for a root that only Warpgate's user (and root) can
+  change, along with every directory above it; a root someone else can replace
+  is outside it.
 - **setuid, setgid and sticky are stripped** from the root, as from every
   directory the flag touches.
 - **Group read comes only from the ACL's owning-group entry.** Under a default
