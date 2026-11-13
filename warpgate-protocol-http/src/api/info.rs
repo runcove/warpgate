@@ -17,7 +17,7 @@ use warpgate_db_entities::{LdapServer, Parameters};
 use warpgate_version::warpgate_version;
 
 use crate::api::common::local_logout_disabled;
-use crate::common::{SessionExt, is_user_admin};
+use crate::common::{SessionExt, is_user_admin, session_cookie_base_host};
 
 pub struct Api;
 
@@ -119,6 +119,9 @@ pub struct Info {
     external_host: Option<String>,
     external_hosts: Option<ExternalHostsInfo>,
     control_plane_host: Option<String>,
+    /// The domain the session cookie is shared across (this host and its
+    /// subdomains); unset when the cookie is host-only.
+    cookie_domain: Option<String>,
     ports: PortsInfo,
     password_login_mode: Parameters::PasswordLoginMode,
     sso_auto_redirect: bool,
@@ -315,6 +318,7 @@ impl Api {
                 .and_then(|auth_ctx| auth_ctx.auth.username().map(ToString::to_string)),
             selected_target: session.get_target_name(),
             external_host,
+            cookie_domain: session_cookie_base_host(&config).await,
             password_login_mode: parameters.password_login_mode,
             sso_auto_redirect: parameters.sso_auto_redirect,
             authorized_via_ticket: matches!(

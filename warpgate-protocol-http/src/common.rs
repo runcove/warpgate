@@ -200,6 +200,17 @@ fn is_cross_origin_api_request(
     is_cross_origin_request(req, request_host, accepted)
 }
 
+/// The host the session cookie is scoped to (as `Domain`, so its subdomains
+/// share it), and the one a session cookie is accepted under: the configured
+/// external host. `None` when no external host is set, so the cookie stays
+/// host-only.
+pub async fn session_cookie_base_host(config: &warpgate_common::WarpgateConfig) -> Option<String> {
+    construct_external_url(None, config, None)
+        .await
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+}
+
 /// The full origins (scheme, host and port) a page of Warpgate's own sends
 /// requests from: the request's own, as Warpgate is reached
 /// (`construct_external_url` for the request), and the configured external
@@ -1204,10 +1215,7 @@ pub async fn inject_request_authorization<E: Endpoint + 'static>(
         // origin. Without it the external URL is derived from Host header
         let (base_host, control_plane_host, accepted) = {
             let config = ctx.services().config.lock().await;
-            let base_host = construct_external_url(None, &config, None)
-                .await
-                .ok()
-                .and_then(|url| url.host_str().map(str::to_owned));
+            let base_host = session_cookie_base_host(&config).await;
             let accepted = accepted_origins(&req, &config).await;
             (base_host, config.control_plane_host(), accepted)
         };
@@ -1314,6 +1322,27 @@ mod tests {
     };
 
     const BROWSER_ACCEPT: &str = "text/html,application/xhtml+xml,*/*;q=0.8";
+
+    /// The host the info API reports as `cookie_domain`: the configured
+    /// external host, without a port, and nothing when none is set.
+    #[tokio::test]
+    async fn session_cookie_base_host_is_the_external_host() {
+        let config = |external_host: Option<&str>| warpgate_common::WarpgateConfig {
+            store: warpgate_common::WarpgateConfigStore {
+                external_host: external_host.map(str::to_owned),
+                ..Default::default()
+            },
+        };
+        assert_eq!(
+            super::session_cookie_base_host(&config(Some("Warp.Example.com:8888"))).await,
+            Some("warp.example.com".to_owned())
+        );
+        assert_eq!(
+            super::session_cookie_base_host(&config(Some("warp.example.com"))).await,
+            Some("warp.example.com".to_owned())
+        );
+        assert_eq!(super::session_cookie_base_host(&config(None)).await, None);
+    }
 
     #[test]
     fn gateway_redirect_navigation_redirects_to_login() {

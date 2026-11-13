@@ -2216,6 +2216,10 @@
           "control_plane_host": {
             "type": "string"
           },
+          "cookie_domain": {
+            "type": "string",
+            "description": "The domain the session cookie is shared across (this host and its\nsubdomains); unset when the cookie is host-only."
+          },
           "ports": {
             "$ref": "#/components/schemas/PortsInfo"
           },
