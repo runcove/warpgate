@@ -26,7 +26,8 @@ use crate::SsoLoginState;
 use crate::api::auth_scheme::AuthedSession;
 use crate::api::common::{emit_unknown_authentication_failed_event, logout};
 use crate::common::{
-    SessionExt, authorize_session, get_or_create_auth_state_for_request, session_id_for_login,
+    SessionExt, authorize_session, gateway_pages_origin, get_or_create_auth_state_for_request,
+    session_id_for_login,
 };
 use crate::session::SessionStore;
 use crate::step_up::StepUpSessionExt;
@@ -108,12 +109,16 @@ enum GetSsoKubernetesConfigsResponse {
     Forbidden,
 }
 
-fn make_redirect_url(err: &str) -> String {
+/// Warpgate's own page with `err` in `login_error`, under `gateway_origin`:
+/// empty (site-relative) where the return's host serves that page, the
+/// control-plane origin where it is bound to an HTTP target
+/// ([`gateway_pages_origin`]).
+fn make_redirect_url(gateway_origin: &str, err: &str) -> String {
     error!("SSO error: {err}");
     let query = form_urlencoded::Serializer::new(String::new())
         .append_pair("login_error", err)
         .finish();
-    format!("/@warpgate?{query}")
+    format!("{gateway_origin}/@warpgate?{query}")
 }
 
 /// The fixed `login_error` codes an SSO failure reports to a caller that
@@ -181,8 +186,9 @@ impl SsoFailure {
     }
 
     /// Back to the caller's own `next` with the code when that is a safe
-    /// site-relative target, otherwise today's `/@warpgate` page.
-    fn into_redirect_url(self) -> String {
+    /// site-relative target, otherwise today's `/@warpgate` page under
+    /// `gateway_origin` ([`make_redirect_url`]).
+    fn into_redirect_url_at(self, gateway_origin: &str) -> String {
         match self.return_to {
             Some((origin, next)) if is_safe_redirect_target(&next) => {
                 error!(code = self.code.code(), "SSO error: {}", self.reason);
@@ -194,8 +200,13 @@ impl SsoFailure {
                     next_with_login_error(&next, self.code, retry_after)
                 )
             }
-            _ => make_redirect_url(&self.reason),
+            _ => make_redirect_url(gateway_origin, &self.reason),
         }
+    }
+
+    #[cfg(test)]
+    fn into_redirect_url(self) -> String {
+        self.into_redirect_url_at("")
     }
 }
 
@@ -403,7 +414,7 @@ impl Api {
         code: Query<Option<String>>,
         state: Query<Option<String>>,
     ) -> Result<Response<ReturnToSsoResponse>, WarpgateError> {
-        let url = self
+        let url = match self
             .api_return_to_sso_get_common(
                 req,
                 session,
@@ -413,7 +424,10 @@ impl Api {
                 state.as_ref(),
             )
             .await?
-            .unwrap_or_else(SsoFailure::into_redirect_url);
+        {
+            Ok(url) => url,
+            Err(failure) => failure.into_redirect_url_at(&gateway_pages_origin(req).await),
+        };
 
         Ok(Response::new(ReturnToSsoResponse::Ok).header("Location", url))
     }
@@ -432,7 +446,7 @@ impl Api {
         data: Form<ReturnToSsoFormData>,
         state: Query<Option<String>>,
     ) -> Result<Response<ReturnToSsoPostResponse>, WarpgateError> {
-        let url = self
+        let url = match self
             .api_return_to_sso_get_common(
                 req,
                 session,
@@ -442,7 +456,10 @@ impl Api {
                 data.state.as_ref().or(state.as_ref()),
             )
             .await?
-            .unwrap_or_else(SsoFailure::into_redirect_url);
+        {
+            Ok(url) => url,
+            Err(failure) => failure.into_redirect_url_at(&gateway_pages_origin(req).await),
+        };
 
         let csp_nonce = Uuid::new_v4().simple().to_string();
         let serialized_url = html_escape::encode_script(&serde_json::to_string(&url)?).to_string();
@@ -816,8 +833,27 @@ mod tests {
     #[test]
     fn error_redirect_is_site_relative_and_escaped() {
         assert_eq!(
-            make_redirect_url("No user matching a&b@example.com"),
+            make_redirect_url("", "No user matching a&b@example.com"),
             "/@warpgate?login_error=No+user+matching+a%26b%40example.com"
+        );
+    }
+
+    /// A failed return on a host bound to an HTTP target, which serves no
+    /// `/@warpgate` page, goes to that page on the control plane; a caller's
+    /// safe `next` still wins.
+    #[test]
+    fn a_failure_without_next_goes_to_the_gateway_origin() {
+        const CONTROL_PLANE: &str = "https://admin.example.test:8443";
+        let failure = SsoFailure::new(SsoLoginError::SsoFailed, "reason");
+        assert_eq!(
+            failure.into_redirect_url_at(CONTROL_PLANE),
+            "https://admin.example.test:8443/@warpgate?login_error=reason"
+        );
+        let mut failure = SsoFailure::new(SsoLoginError::SsoFailed, "reason");
+        failure.return_to = Some((ORIGIN.to_string(), "/cove/login".to_string()));
+        assert_eq!(
+            failure.into_redirect_url_at(CONTROL_PLANE),
+            format!("{ORIGIN}/cove/login?login_error=sso_failed")
         );
     }
 

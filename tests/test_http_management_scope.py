@@ -1,11 +1,14 @@
 """Warpgate's management routes on hosts bound to an HTTP target.
 
-A host that is some target's `external_host` serves only the login flow under
-`/@warpgate` and `/_warpgate`: the gateway shell and assets, the login steps,
-SSO, `info` and logout. The user API and the admin API answer 404 there and
-are served on every other host as before.
+A host that is some target's `external_host` serves only the gateway's assets
+and the SSO return under `/@warpgate` and `/_warpgate`. The login page, the
+login steps, `info`, logout, the user API and the admin API answer 404 there
+and are served on every other host as before; a visitor without a session is
+sent to sign in on the control-plane host.
 """
 
+import re
+from urllib.parse import unquote, urlparse
 from uuid import uuid4
 
 import pytest
@@ -105,7 +108,7 @@ class TestHTTPManagementScope:
         assert response.status_code == 404, response.status_code
 
     def test_user_api_is_404_on_target_host(self, setup):
-        session = setup.login(setup.target_url)
+        session = setup.login(setup.main_url)
         for method, path in [
             ("GET", "/@warpgate/api/targets"),
             ("GET", "/@warpgate/api/profile/credentials"),
@@ -120,8 +123,8 @@ class TestHTTPManagementScope:
                 f"{method} {path}: {response.status_code}"
             )
 
-    def test_password_login_works_on_target_host(self, setup):
-        session = setup.login(setup.target_url)
+    def test_session_from_main_host_works_on_target_host(self, setup):
+        session = setup.login(setup.main_url)
 
         response = session.get(
             f"{setup.target_url}/some/path?a=b", allow_redirects=False
@@ -129,23 +132,62 @@ class TestHTTPManagementScope:
         assert response.status_code // 100 == 2, response.status_code
         assert response.json()["path"] == "/some/path"
 
-        for path in ["/@warpgate", "/@warpgate/api/sso/providers"]:
-            response = session.get(f"{setup.target_url}{path}")
-            assert response.status_code == 200, f"{path}: {response.status_code}"
+    def test_sign_in_routes_are_404_on_target_host(self, setup):
+        # A page on the target host shares its origin: it must not read who
+        # is signed in, sign the browser out, or sign it in as someone else.
+        session = setup.login(setup.main_url)
+        for method, path in [
+            ("GET", "/@warpgate"),
+            ("GET", "/@warpgate/api/info"),
+            ("GET", "/_warpgate/api/info"),
+            ("POST", "/@warpgate/api/auth/logout"),
+            ("POST", "/@warpgate/api/auth/login"),
+            ("GET", "/@warpgate/api/sso/providers"),
+            ("POST", "/@warpgate/api/sso/logout"),
+        ]:
+            response = session.request(
+                method,
+                f"{setup.target_url}{path}",
+                json={"username": setup.user.username, "password": "123"},
+                allow_redirects=False,
+            )
+            assert response.status_code == 404, (
+                f"{method} {path}: {response.status_code}"
+            )
 
-    def test_embed_info_and_logout_work_on_target_host(self, setup):
-        session = setup.login(setup.target_url)
-
-        response = session.get(f"{setup.target_url}/@warpgate/api/info")
-        assert response.status_code == 200
+        # None of them reached the session: still signed in.
+        response = session.get(f"{setup.main_url}/@warpgate/api/info")
         assert response.json()["username"] == setup.user.username
-
-        response = session.post(f"{setup.target_url}/@warpgate/api/auth/logout")
+        response = session.get(f"{setup.target_url}/x", allow_redirects=False)
         assert response.status_code // 100 == 2, response.status_code
 
-        response = session.get(f"{setup.target_url}/@warpgate/api/info")
-        assert response.status_code == 200
-        assert response.json()["username"] is None
+    def test_assets_load_on_target_host(self, setup):
+        shell = requests.get(f"{setup.main_url}/@warpgate", verify=False)
+        assert shell.status_code == 200
+        asset = re.search(r'(?:src|href)="(/@warpgate/assets/[^"]+)"', shell.text)
+        assert asset, shell.text
+        response = requests.get(f"{setup.target_url}{asset.group(1)}", verify=False)
+        assert response.status_code == 200, response.status_code
+
+    def test_signed_out_visitor_is_sent_to_the_main_host_to_sign_in(self, setup):
+        def sign_in_redirect(path):
+            response = requests.get(
+                f"{setup.target_url}{path}",
+                headers={"Accept": "text/html", "Sec-Fetch-Mode": "navigate"},
+                allow_redirects=False,
+                verify=False,
+            )
+            assert response.status_code == 307, response.status_code
+            login, _, next_url = response.headers["location"].partition("?next=")
+            assert login == f"{setup.main_url}/@warpgate#/login", login
+            return urlparse(unquote(next_url))
+
+        next_url = sign_in_redirect("/some/page?x=1")
+        assert next_url.geturl() == f"{setup.target_url}/some/page?x=1"
+
+        # An attacker-chosen path stays a page on the target host.
+        next_url = sign_in_redirect("//evil.example/x")
+        assert next_url.netloc == f"{setup.target_host}:{setup.port}", next_url
 
     def test_admin_api_by_token_works_on_non_target_host(self, setup):
         # Cove's daemon reaches the admin API by a token on a host no target

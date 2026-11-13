@@ -72,8 +72,8 @@ class Test:
         port = binding_wg.http_port
         # Target hosts sit under Warpgate's external host, as a deployment
         # binds them, and every host is reached by its own URL, as a browser
-        # reaches it: the user logs in on the bound target's host (the login
-        # flow is served there), the session cookie is scoped to
+        # reaches it: the user logs in on the main host (a bound host serves
+        # no login), the session cookie is scoped to
         # `.<external host>`, and the same session reaches the main host and
         # every target host. The full Host header, port included, is what a
         # binding matches.
@@ -112,7 +112,7 @@ class Test:
         session = requests.Session()
         session.verify = False
         response = session.post(
-            f"{bound_url}/@warpgate/api/auth/login",
+            f"{url}/@warpgate/api/auth/login",
             json={"username": user.username, "password": "123"},
         )
         assert response.status_code == 201

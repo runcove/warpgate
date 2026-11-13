@@ -135,8 +135,15 @@ def test_an_admin_session_works_on_the_control_plane_host_and_not_on_the_bound_s
         )
         assert response.status_code == 404, response.status_code
 
-        # The bound site serves the target to a logged-in user.
-        session = login(main_url, user.username)
+        # The bound site serves no login; a user signs in on the control
+        # plane host and the bound site serves them the target.
+        response = requests.post(
+            f"{main_url}/@warpgate/api/auth/login",
+            json={"username": user.username, "password": "123"},
+            verify=False,
+        )
+        assert response.status_code == 404, response.status_code
+        session = login(admin_url, user.username)
         response = session.get(f"{main_url}/some/page?x=1", allow_redirects=False)
         assert _served_by(response) == ["bound"]
         assert response.json()["path"] == "/some/page"

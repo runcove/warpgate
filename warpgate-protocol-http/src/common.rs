@@ -23,13 +23,16 @@ use warpgate_common::helpers::username::username_eq_ci;
 use warpgate_common::{Protocol, UserSessionId, WarpgateError};
 use warpgate_common_http::auth::UnauthenticatedRequestContext;
 pub use warpgate_common_http::auth::is_localhost_host;
-use warpgate_common_http::ext::{construct_external_url, is_navigation_request};
+use warpgate_common_http::ext::{
+    construct_control_plane_url, construct_external_url, is_navigation_request,
+};
 use warpgate_common_http::logging::get_client_ip_addr;
 use warpgate_common_http::ticket_query::without_ticket_query_param;
 use warpgate_common_http::{
     AuthenticatedRequestContext, RequestAuthorization, SessionAuthorization,
     X_WARPGATE_CLUSTER_IDENTITY, X_WARPGATE_TOKEN, is_cluster_peer_request,
 };
+use warpgate_core::live_streams::host_binding;
 use warpgate_core::{ConfigProvider, WarpgateServerHandle, vet_credential_bearer};
 use warpgate_db_entities::User;
 use warpgate_sso::WarpgateIdToken;
@@ -40,7 +43,7 @@ use crate::catchall::{
 use crate::middleware::ticket::TemporaryTicketSession;
 use crate::middleware::{
     assert_mfa_setup_gate, credentials_refused_on_bound_host, is_session_bootstrap_path,
-    warpgate_surface_path,
+    target_bound_to_request_host, warpgate_surface_path,
 };
 use crate::session::SessionStore;
 use crate::session_storage::SharedSessionStorage;
@@ -483,11 +486,11 @@ pub fn page_auth<E: Endpoint + 'static>(e: E) -> impl Endpoint {
                 // single-provider SSO auto-redirect, jump straight to the IdP
                 // authorize URL (preserving the original path) instead of
                 // flashing the gateway login SPA. Otherwise fall through to the
-                // existing gateway-redirect / 401 behaviour unchanged.
+                // login page / 401 ([`login_redirect`]).
                 if let Some(resp) = try_auto_sso_redirect(&req).await? {
                     return Ok(resp);
                 }
-                Ok(gateway_redirect(&req).into_response())
+                Ok(login_redirect(&req).await)
             }
         }
     })
@@ -801,6 +804,129 @@ pub fn gateway_redirect(req: &Request) -> Response {
         ),
         StatusCode::UNAUTHORIZED,
     )
+}
+
+/// Where an unauthenticated navigation goes to sign in. A host bound to an
+/// HTTP target serves no login page (`is_served_on_bound_host`), so there the
+/// browser is sent to the control-plane host's login page
+/// ([`bound_host_login_location`]); elsewhere it is [`gateway_redirect`]. If
+/// the host's binding cannot be resolved, or no control-plane host is
+/// configured, there is no login page to send it to and it gets a plain 401.
+pub(crate) async fn login_redirect(req: &Request) -> Response {
+    match gateway_pages_for(req).await {
+        GatewayPages::Here => gateway_redirect(req),
+        GatewayPages::ControlPlane {
+            control_plane,
+            binding,
+        } => {
+            let path = next_after_login(req).unwrap_or_default();
+            redirect_navigations(
+                req,
+                bound_host_login_location(&control_plane, &binding, &path),
+                StatusCode::UNAUTHORIZED,
+            )
+        }
+        GatewayPages::Unavailable => StatusCode::UNAUTHORIZED.into_response(),
+    }
+}
+
+/// Where a navigation on this request's host finds Warpgate's own pages
+/// (login, MFA enrolment).
+pub(crate) enum GatewayPages {
+    /// On this host, at `/@warpgate`.
+    Here,
+    /// The host is bound to an HTTP target (its stored `external_host` is
+    /// `binding`) and serves none of them: they are on the control-plane
+    /// host, whose origin is built from configuration only.
+    ControlPlane {
+        control_plane: url::Url,
+        binding: String,
+    },
+    /// The host is, or may be, bound, and there is nowhere to send the
+    /// browser: the lookup failed or no control-plane host is configured.
+    Unavailable,
+}
+
+pub(crate) async fn gateway_pages_for(req: &Request) -> GatewayPages {
+    let Some(ctx) = req.data::<UnauthenticatedRequestContext>() else {
+        return GatewayPages::Here;
+    };
+    let target = match target_bound_to_request_host(ctx, req).await {
+        Ok(None) => return GatewayPages::Here,
+        Ok(Some(target)) => target,
+        Err(error) => {
+            tracing::warn!(%error, "Could not resolve the request host to a target; not redirecting to Warpgate's pages");
+            return GatewayPages::Unavailable;
+        }
+    };
+    let control_plane = {
+        let config = ctx.services().config.lock().await;
+        construct_control_plane_url(&config).await
+    };
+    match (control_plane, host_binding(&target.options)) {
+        (Ok(control_plane), Some(binding)) => GatewayPages::ControlPlane {
+            control_plane,
+            binding,
+        },
+        _ => {
+            tracing::warn!(target = %target.name, "No control-plane host is configured to send a browser on a bound host to");
+            GatewayPages::Unavailable
+        }
+    }
+}
+
+/// The control-plane login page for a visitor to the host a target is bound
+/// to (`binding`, the target's stored `external_host`), with `next` the
+/// absolute address of `path` on that host ([`bound_host_return_url`]). Both
+/// origins come from configuration and the target row, never from the
+/// request's Host. A `path` that would not stay on the bound host is dropped.
+pub(crate) fn bound_host_login_location(
+    control_plane: &url::Url,
+    binding: &str,
+    path: &str,
+) -> String {
+    let mut location = format!(
+        "{}/@warpgate#/login",
+        control_plane.origin().ascii_serialization()
+    );
+    if let Some(next) = bound_host_return_url(control_plane.scheme(), binding, path) {
+        location.push_str("?next=");
+        location.extend(utf8_percent_encode(&next, NON_ALPHANUMERIC));
+    }
+    location
+}
+
+/// `path` on the host a target is bound to, as an absolute URL with the
+/// control plane's scheme: the binding's origin (only its host and port
+/// count) followed by `path`. A `path` that does not start with `/` could
+/// run on into the authority and is refused.
+pub(crate) fn bound_host_return_url(scheme: &str, binding: &str, path: &str) -> Option<String> {
+    if !path.starts_with('/') {
+        return None;
+    }
+    let origin = url::Url::parse(&format!("{scheme}://{binding}"))
+        .ok()?
+        .origin()
+        .ascii_serialization();
+    Some(
+        url::Url::parse(&format!("{origin}{path}"))
+            .ok()?
+            .to_string(),
+    )
+}
+
+/// The origin to put before a `/@warpgate…` address sent to a browser on
+/// this request's host: empty (site-relative) where this host serves
+/// Warpgate's pages, the control-plane origin where it is bound to an HTTP
+/// target ([`gateway_pages_for`]). When there is nowhere else to send it,
+/// it stays site-relative.
+pub(crate) async fn gateway_pages_origin(req: &Request) -> String {
+    match gateway_pages_for(req).await {
+        GatewayPages::ControlPlane { control_plane, .. } => {
+            control_plane.origin().ascii_serialization()
+        }
+        GatewayPages::Here | GatewayPages::Unavailable => String::new(),
+    }
 }
 
 pub async fn get_or_create_auth_state_for_request(
@@ -1226,6 +1352,66 @@ mod tests {
         // Positive control: the address under test is the one the code reads.
         assert_eq!(req.original_uri().to_string(), uri);
         req
+    }
+
+    /// The page to return to after signing in on the control plane is on the
+    /// bound host whatever the requested path; a path that could run on into
+    /// the authority is refused.
+    #[test]
+    fn bound_host_return_url_stays_on_the_bound_host() {
+        use super::bound_host_return_url;
+
+        assert_eq!(
+            bound_host_return_url("https", "vm.example.test:8443", "/app?a=1#x").as_deref(),
+            Some("https://vm.example.test:8443/app?a=1#x")
+        );
+        assert_eq!(
+            bound_host_return_url("http", "vm.example.test", "/").as_deref(),
+            Some("http://vm.example.test/")
+        );
+        // Attacker-chosen paths stay paths on the bound host.
+        for path in [
+            "//evil.example/x",
+            "/\\evil.example/x",
+            "/@evil.example",
+            "/%2F%2Fevil.example",
+            "/..//evil.example",
+        ] {
+            let next = bound_host_return_url("https", "vm.example.test:8443", path).unwrap();
+            let next = url::Url::parse(&next).unwrap();
+            assert_eq!(next.host_str(), Some("vm.example.test"), "{path}");
+            assert_eq!(next.port(), Some(8443), "{path}");
+        }
+        // Anything not a path is refused: it would continue the host name.
+        for path in [
+            "",
+            ".evil.example/x",
+            "@evil.example",
+            "https://evil.example/",
+        ] {
+            assert_eq!(
+                bound_host_return_url("https", "vm.example.test", path),
+                None,
+                "{path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bound_host_login_location_is_on_the_control_plane() {
+        use super::bound_host_login_location;
+
+        let control_plane = url::Url::parse("https://admin.example.test:8443").unwrap();
+        assert_eq!(
+            bound_host_login_location(&control_plane, "vm.example.test:8443", "/app?a=1"),
+            "https://admin.example.test:8443/@warpgate#/login?next=\
+             https%3A%2F%2Fvm%2Eexample%2Etest%3A8443%2Fapp%3Fa%3D1"
+        );
+        // No `next` rather than one off the bound host.
+        assert_eq!(
+            bound_host_login_location(&control_plane, "vm.example.test", ".evil.example/"),
+            "https://admin.example.test:8443/@warpgate#/login"
+        );
     }
 
     /// A ticket in the address of a request sent to the login page is not

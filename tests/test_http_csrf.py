@@ -146,9 +146,12 @@ class TestHttpCsrf:
 
         resp = session.get(f"{target}/app", headers=NAVIGATION, allow_redirects=False)
         assert resp.status_code == 307
-        assert resp.headers["Location"].startswith("/@warpgate#/login?next=")
+        # The target host serves no login page: sign-in is on the control
+        # plane.
+        cp = _url(CONTROL_PLANE, wg.http_port)
+        assert resp.headers["Location"].startswith(f"{cp}/@warpgate#/login?next=")
 
-        session = _login(TARGET_HOST, wg.http_port, setup["admin"].username)
+        session = _login(CONTROL_PLANE, wg.http_port, setup["admin"].username)
         resp = session.get(f"{target}/app", allow_redirects=False)
         assert resp.status_code // 100 == 2, resp.text
 
@@ -164,15 +167,16 @@ class TestHttpCsrfMfaGate:
                 sdk.ParameterUpdate(mfa_enforcement=sdk.MfaEnforcement.ENROLL)
             )
         try:
-            session = _login(TARGET_HOST, wg.http_port, user.username)
+            session = _login(CONTROL_PLANE, wg.http_port, user.username)
 
+            # The target host serves no enrolment page: it is on the control
+            # plane.
             resp = session.get(f"{target}/app", headers=NAVIGATION, allow_redirects=False)
             assert resp.status_code == 307
-            assert resp.headers["Location"] == "/@warpgate#/mfa-setup"
+            assert resp.headers["Location"] == f"{cp}/@warpgate#/mfa-setup"
 
-            info = session.get(f"{target}/@warpgate/api/info").json()
+            info = session.get(f"{cp}/@warpgate/api/info").json()
             assert info["needs_mfa_setup"] is True
-            assert info["control_plane_host"] == CONTROL_PLANE
 
             resp = session.post(
                 f"{cp}/@warpgate/api/profile/credentials/otp",

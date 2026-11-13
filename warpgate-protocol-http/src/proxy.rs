@@ -591,7 +591,10 @@ pub async fn proxy_normal_request(
     // The embedded UI can go in if the response is a usable HTML page - we for example
     // don't want to embed into a 404 page or a JS file - and it has something to show:
     // the session menu, the login banner, or both. An encoded body can't be edited.
-    let embed_ui = response.status() == StatusCode::OK
+    // Not on a host bound to the target: the embedded UI reads `info` and
+    // signs out, which that host does not serve ([`embeds_session_ui`]).
+    let embed_ui = embeds_session_ui(&options)
+        && response.status() == StatusCode::OK
         && !response
             .headers()
             .contains_key(http::header::CONTENT_ENCODING)
@@ -620,6 +623,15 @@ pub async fn proxy_normal_request(
 
     rewrite_response(&mut response, &options, &uri)?;
     Ok(response)
+}
+
+/// Whether the embedded UI (session menu and banner) may go into this
+/// target's pages. A target bound to a host (`external_host`) is served only
+/// on that host, which serves none of the routes the embedded UI calls
+/// (`is_served_on_bound_host`), so its pages get none; it would show nothing
+/// and its links would 404.
+fn embeds_session_ui(options: &TargetHTTPOptions) -> bool {
+    options.external_host.as_deref().is_none_or(str::is_empty)
 }
 
 async fn copy_client_body(
@@ -1816,6 +1828,18 @@ mod tests {
             public: false,
             unix_socket: None,
         }
+    }
+
+    /// The embedded UI goes into the pages of a target served on the main
+    /// host, and never into those of a target bound to its own host.
+    #[test]
+    fn session_ui_is_not_embedded_on_a_bound_host() {
+        let mut options = make_options("http://backend.internal");
+        assert!(embeds_session_ui(&options));
+        options.external_host = Some(String::new());
+        assert!(embeds_session_ui(&options));
+        options.external_host = Some("vm.example.test:8443".into());
+        assert!(!embeds_session_ui(&options));
     }
 
     #[test]

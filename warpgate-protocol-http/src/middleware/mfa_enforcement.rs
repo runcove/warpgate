@@ -14,6 +14,8 @@ use warpgate_common_http::auth::{
 use warpgate_common_http::ext::is_navigation_request;
 use warpgate_db_entities::Parameters::MfaEnforcement;
 
+use crate::common::{GatewayPages, gateway_pages_for};
+
 pub static MFA_SETUP_REQUIRED_HEADER: HeaderName =
     HeaderName::from_static("x-warpgate-mfa-setup-required");
 
@@ -84,16 +86,36 @@ pub fn is_session_bootstrap_path(method: &Method, path: &str) -> bool {
 #[derive(Debug, Error)]
 #[error("MFA setup required")]
 struct MfaSetupRequiredError {
-    should_redirect: bool,
+    /// Where a navigation is sent to enrol; `None` for any other request.
+    redirect_to: Option<String>,
 }
 
 impl MfaSetupRequiredError {
-    fn for_request(req: &Request) -> Self {
+    async fn for_request(req: &Request) -> Self {
         Self {
-            should_redirect: is_navigation_request(req),
+            redirect_to: if is_navigation_request(req) {
+                mfa_setup_location(gateway_pages_for(req).await)
+            } else {
+                None
+            },
         }
     }
 }
+
+/// The MFA enrolment page: on this host, or on the control-plane host when
+/// this one is bound to an HTTP target and serves no enrolment page.
+fn mfa_setup_location(pages: GatewayPages) -> Option<String> {
+    match pages {
+        GatewayPages::Here => Some(MFA_SETUP_PAGE.to_owned()),
+        GatewayPages::ControlPlane { control_plane, .. } => Some(format!(
+            "{}{MFA_SETUP_PAGE}",
+            control_plane.origin().ascii_serialization()
+        )),
+        GatewayPages::Unavailable => None,
+    }
+}
+
+const MFA_SETUP_PAGE: &str = "/@warpgate#/mfa-setup";
 
 impl ResponseError for MfaSetupRequiredError {
     fn status(&self) -> StatusCode {
@@ -104,12 +126,11 @@ impl ResponseError for MfaSetupRequiredError {
     where
         Self: std::error::Error + Send + Sync + 'static,
     {
-        let mut response = if !self.should_redirect {
-            Response::builder()
+        let mut response = match &self.redirect_to {
+            None => Response::builder()
                 .status(StatusCode::FORBIDDEN)
-                .body("MFA setup required")
-        } else {
-            Redirect::temporary("/@warpgate#/mfa-setup").into_response()
+                .body("MFA setup required"),
+            Some(location) => Redirect::temporary(location).into_response(),
         };
         response.headers_mut().insert(
             MFA_SETUP_REQUIRED_HEADER.clone(),
@@ -148,7 +169,7 @@ pub async fn assert_mfa_setup_gate(
         .mfa_setup_required(parameters, user_id)
         .await?
     {
-        return Err(MfaSetupRequiredError::for_request(req).into());
+        return Err(MfaSetupRequiredError::for_request(req).await.into());
     }
 
     session.set(MFA_GATE_PASSED_SESSION_KEY, true);
@@ -158,6 +179,25 @@ pub async fn assert_mfa_setup_gate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A bound host serves no enrolment page, so enrolment from there goes
+    /// to the control-plane host.
+    #[test]
+    fn mfa_setup_location_follows_the_gateway_pages() {
+        assert_eq!(
+            mfa_setup_location(GatewayPages::Here).as_deref(),
+            Some("/@warpgate#/mfa-setup")
+        );
+        assert_eq!(
+            mfa_setup_location(GatewayPages::ControlPlane {
+                control_plane: url::Url::parse("https://admin.example.test:8443").unwrap(),
+                binding: "vm.example.test:8443".into(),
+            })
+            .as_deref(),
+            Some("https://admin.example.test:8443/@warpgate#/mfa-setup")
+        );
+        assert_eq!(mfa_setup_location(GatewayPages::Unavailable), None);
+    }
 
     #[test]
     fn allowlist() {

@@ -149,22 +149,29 @@ class TestHTTPOriginCheck:
         )
         assert response.status_code // 100 == 2, response.status_code
 
-    def test_login_post_with_own_origin_on_target_host_is_allowed(self, setup):
-        own_origin = setup.target_url
-        session, response = setup.login(setup.target_url, origin=own_origin)
+    def test_login_flow_on_target_host_is_not_served_whatever_the_origin(self, setup):
+        # The target's own pages share the target host's origin, so passing
+        # the origin check there must not reach the login flow: the host
+        # does not serve it at all.
+        session, response = setup.login(setup.main_url)
         assert response.status_code // 100 == 2, response.text
+        for origin in [setup.target_url, FOREIGN_ORIGIN]:
+            _, response = setup.login(setup.target_url, origin=origin)
+            assert response.status_code == 404, (origin, response.status_code)
+            response = session.post(
+                f"{setup.target_url}/@warpgate/api/auth/logout",
+                headers={"Origin": origin},
+            )
+            assert response.status_code == 404, (origin, response.status_code)
 
-        response = session.get(f"{setup.target_url}/@warpgate/api/info")
+        # Still logged in on the main host.
+        response = session.get(f"{setup.main_url}/@warpgate/api/info")
         assert response.json()["username"] == setup.user.username
 
-        response = session.post(
-            f"{setup.target_url}/@warpgate/api/auth/logout",
-            headers={"Origin": own_origin},
-        )
-        assert response.status_code // 100 == 2, response.status_code
-
-        # Another origin is refused even on a login route.
-        _, response = setup.login(setup.target_url, origin=FOREIGN_ORIGIN)
+    def test_login_on_main_host_is_still_origin_checked(self, setup):
+        _, response = setup.login(setup.main_url, origin=FOREIGN_ORIGIN)
+        assert response.status_code == 403, response.status_code
+        _, response = setup.login(setup.main_url, origin=setup.target_url)
         assert response.status_code == 403, response.status_code
 
     def test_sdk_client_without_origin_is_allowed(self, setup):

@@ -3,7 +3,7 @@ use poem::http::{Method, StatusCode};
 use poem::web::Data;
 use poem::{Endpoint, FromRequest, IntoResponse, Middleware, Request, Response};
 use tracing::warn;
-use warpgate_common::WarpgateError;
+use warpgate_common::{Target, WarpgateError};
 use warpgate_common_http::auth::UnauthenticatedRequestContext;
 use warpgate_common_http::is_cluster_peer_request;
 
@@ -13,8 +13,7 @@ use crate::catchall::{bound_to_host, get_target_by_request_host};
 /// Whether `method` and `path` are part of signing in or out: the gateway
 /// shell and its assets (the login page is a route inside the shell), the
 /// login steps, the browser's own login state, SSO start, return and logout,
-/// `info` for the login page and the embedded session bar, and the custom logo
-/// the login page shows.
+/// `info` for the login page, and the custom logo the login page shows.
 ///
 /// This set has two users, each through its own function so either can
 /// change without the other: [`is_origin_checked_route`] (the origin check)
@@ -73,12 +72,37 @@ pub fn is_origin_checked_route(method: &Method, path: &str) -> bool {
 
 /// Whether a host bound to an HTTP target still serves this route of
 /// Warpgate's own and honours a session or token on it
-/// ([`credentials_refused_on_bound_host`]): today the whole login flow
-/// ([`is_login_flow_route`]). Everything else, including the admin API, the
-/// rest of the user API and forced MFA enrolment, is only usable on other
-/// hosts.
+/// ([`credentials_refused_on_bound_host`]). That host serves the target's
+/// own pages, which share its origin, so it serves only what neither reads
+/// nor changes the sign-in: the gateway's assets (GET), and the SSO return,
+/// which completes only a handshake this browser started (bound to its
+/// session, single use, checked by `state`, nonce and PKCE) and is where the
+/// identity provider sends the browser when the global `external_host` is a
+/// bound site. Everything else (the login page, the login steps, `info`,
+/// sign-out, the user API and the admin API) is only usable on other hosts;
+/// a visitor without a session is sent to the control-plane host to sign in
+/// (`common::login_redirect`).
 pub fn is_served_on_bound_host(method: &Method, path: &str) -> bool {
     is_login_flow_route(method, path)
+        && warpgate_surface_path(path)
+            .is_some_and(|path| path.starts_with("/assets/") || path == "/api/sso/return")
+}
+
+/// The HTTP target bound to the request's host, if any, resolved as
+/// [`target_binding`] resolves it. A cluster peer's forwarded request is
+/// never treated as on a bound host.
+pub async fn target_bound_to_request_host(
+    ctx: &UnauthenticatedRequestContext,
+    req: &Request,
+) -> Result<Option<Target>, WarpgateError> {
+    if is_cluster_peer_request(req) {
+        return Ok(None);
+    }
+    let Some(host) = ctx.trusted_host_header(req) else {
+        return Ok(None);
+    };
+    let target = get_target_by_request_host(ctx.services(), &host).await?;
+    Ok(target.filter(|target| bound_to_host(target, &host)))
 }
 
 /// Whether the request's host is bound to an HTTP target, resolved as the
@@ -273,21 +297,73 @@ mod tests {
                     allowed,
                     "{method} {path}"
                 );
+                // The origin check still covers the whole login flow.
+                assert_eq!(
+                    is_origin_checked_route(&method, &path),
+                    allowed,
+                    "{method} {path}"
+                );
             }
         }
         // Proxied target paths are not management routes at all.
         assert!(!is_login_flow_route(&Method::GET, "/api/info"));
     }
 
-    /// Both sign-out routes are origin-checked and served on bound hosts, and
-    /// only as POST: a GET can be triggered by any page.
+    /// A bound host serves the gateway's assets and the SSO return, and
+    /// nothing that reads or changes the sign-in.
+    #[test]
+    fn bound_host_serves_only_assets_and_sso_return() {
+        for prefix in ["/@warpgate", "/_warpgate"] {
+            for (method, path, served) in [
+                (Method::GET, "/assets/index-abc123.js", true),
+                (Method::GET, "/assets/embed/index.css", true),
+                (Method::GET, "/api/sso/return", true),
+                (Method::POST, "/api/sso/return", true),
+                // The login page and everything it calls
+                (Method::GET, "", false),
+                (Method::GET, "/", false),
+                (Method::GET, "/api/info", false),
+                (Method::GET, "/api/logo", false),
+                (Method::POST, "/api/auth/login", false),
+                (Method::POST, "/api/auth/otp", false),
+                (Method::POST, "/api/auth/logout", false),
+                (Method::GET, "/api/auth/state", false),
+                (Method::DELETE, "/api/auth/state", false),
+                (Method::GET, "/api/sso/providers", false),
+                (Method::GET, "/api/sso/providers/corp-idp/start", false),
+                (Method::GET, "/api/sso/auto-start", false),
+                (Method::POST, "/api/sso/logout", false),
+                // Path shapes and methods the login flow refuses stay refused
+                (Method::POST, "/assets/index-abc123.js", false),
+                (Method::GET, "/assets/../api/info", false),
+                (Method::GET, "/assets/%2e%2e/api/info", false),
+                (Method::GET, "/assets", false),
+                (Method::GET, "/api/sso/return/", false),
+                (Method::PUT, "/api/sso/return", false),
+                (Method::GET, "/admin/api/users", false),
+            ] {
+                let path = format!("{prefix}{path}");
+                assert_eq!(
+                    is_served_on_bound_host(&method, &path),
+                    served,
+                    "{method} {path}"
+                );
+            }
+        }
+        // A target's own paths are not Warpgate's at all.
+        assert!(!is_served_on_bound_host(&Method::GET, "/assets/app.js"));
+        assert!(!is_served_on_bound_host(&Method::GET, "/api/sso/return"));
+    }
+
+    /// Both sign-out routes are origin-checked, only as POST (a GET can be
+    /// triggered by any page), and served on no bound host.
     #[test]
     fn sign_out_is_post_only_and_origin_checked() {
         for prefix in ["/@warpgate", "/_warpgate"] {
             for route in ["/api/auth/logout", "/api/sso/logout"] {
                 let path = format!("{prefix}{route}");
                 assert!(is_origin_checked_route(&Method::POST, &path), "{path}");
-                assert!(is_served_on_bound_host(&Method::POST, &path), "{path}");
+                assert!(!is_served_on_bound_host(&Method::POST, &path), "{path}");
                 assert!(!is_origin_checked_route(&Method::GET, &path), "{path}");
                 assert!(!is_served_on_bound_host(&Method::GET, &path), "{path}");
             }
@@ -363,15 +439,28 @@ mod tests {
         (Method::POST, "/@warpgate/api/auth/state/x/approve"),
     ];
 
-    const LOGIN_FLOW: [(Method, &str); 8] = [
-        (Method::GET, "/@warpgate"),
+    /// What a bound host serves.
+    const BOUND_HOST_SERVED: [(Method, &str); 4] = [
         (Method::GET, "/@warpgate/assets/index.js"),
+        (Method::GET, "/_warpgate/assets/index.js"),
+        (Method::GET, "/@warpgate/api/sso/return"),
+        (Method::POST, "/@warpgate/api/sso/return"),
+    ];
+
+    /// The rest of the login flow: served on every other host, on none bound
+    /// to a target.
+    const SIGN_IN: [(Method, &str); 11] = [
+        (Method::GET, "/@warpgate"),
         (Method::GET, "/@warpgate/api/info"),
+        (Method::GET, "/_warpgate/api/info"),
         (Method::POST, "/@warpgate/api/auth/login"),
+        (Method::POST, "/@warpgate/api/auth/otp"),
         (Method::POST, "/@warpgate/api/auth/logout"),
+        (Method::GET, "/@warpgate/api/auth/state"),
+        (Method::GET, "/@warpgate/api/sso/providers"),
         (Method::GET, "/@warpgate/api/sso/providers/corp-idp/start"),
         (Method::GET, "/@warpgate/api/sso/auto-start"),
-        (Method::POST, "/@warpgate/api/sso/return"),
+        (Method::POST, "/@warpgate/api/sso/logout"),
     ];
 
     /// Builds a request as the server does (poem's `TestClient` leaves
@@ -424,11 +513,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn target_host_accepts_credentials_on_login_flow() {
+    async fn target_host_accepts_credentials_on_assets_and_sso_return_only() {
         let (ctx, _db) = context(false).await;
-        for (method, path) in LOGIN_FLOW {
+        for (method, path) in BOUND_HOST_SERVED {
             assert!(
                 !refused(&ctx, &method, path, &[("host", TARGET_HOST)]).await,
+                "{method} {path}"
+            );
+        }
+        // A page on the bound host cannot read who is signed in, sign the
+        // browser out, or sign it in as someone else.
+        for (method, path) in SIGN_IN {
+            assert!(
+                refused(&ctx, &method, path, &[("host", TARGET_HOST)]).await,
                 "{method} {path}"
             );
         }
@@ -438,7 +535,12 @@ mod tests {
     async fn other_hosts_accept_credentials_on_every_route() {
         let (ctx, _db) = context(false).await;
         for host in [MAIN_HOST, OTHER_HOST, "localhost:8888", "127.0.0.1"] {
-            for (method, path) in ADMIN_API.into_iter().chain(USER_API).chain(LOGIN_FLOW) {
+            for (method, path) in ADMIN_API
+                .into_iter()
+                .chain(USER_API)
+                .chain(BOUND_HOST_SERVED)
+                .chain(SIGN_IN)
+            {
                 assert!(
                     !refused(&ctx, &method, path, &[("host", host)]).await,
                     "{method} {path} on {host}"
@@ -483,14 +585,17 @@ mod tests {
         db.execute_unprepared("DROP TABLE targets").await.unwrap();
         let admin = "/@warpgate/admin/api/users";
         let login = "/@warpgate/api/auth/login";
+        let asset = "/@warpgate/assets/index.js";
         for host in [TARGET_HOST, MAIN_HOST] {
+            for (method, path) in [(Method::GET, admin), (Method::POST, login)] {
+                assert!(
+                    refused(&ctx, &method, path, &[("host", host)]).await,
+                    "{method} {path} on {host}"
+                );
+            }
+            // What every host serves does not depend on the lookup.
             assert!(
-                refused(&ctx, &Method::GET, admin, &[("host", host)]).await,
-                "{host}"
-            );
-            // The login flow does not depend on the lookup.
-            assert!(
-                !refused(&ctx, &Method::POST, login, &[("host", host)]).await,
+                !refused(&ctx, &Method::GET, asset, &[("host", host)]).await,
                 "{host}"
             );
         }
@@ -545,13 +650,211 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bound_target_is_resolved_from_the_trusted_host() {
+        let (ctx, _db) = context(false).await;
+        let bound = |headers: &'static [(&'static str, &'static str)], peer: bool| {
+            let mut req = scoped_request(&Method::GET, "/app", headers);
+            if peer {
+                req.extensions_mut().insert(ClusterPeer {
+                    node_id: NodeId(Uuid::new_v4()),
+                });
+            }
+            let ctx = &ctx;
+            async move {
+                target_bound_to_request_host(ctx, &req)
+                    .await
+                    .unwrap()
+                    .is_some()
+            }
+        };
+        assert!(bound(&[("host", TARGET_HOST)], false).await);
+        assert!(!bound(&[("host", TARGET_HOST)], true).await);
+        assert!(!bound(&[("host", MAIN_HOST)], false).await);
+        assert!(!bound(&[("host", "vm.example.test")], false).await);
+        assert!(
+            !bound(
+                &[("host", MAIN_HOST), ("x-forwarded-host", TARGET_HOST)],
+                false
+            )
+            .await
+        );
+    }
+
+    const NAVIGATION: [(&str, &str); 2] = [
+        ("accept", "text/html,application/xhtml+xml,*/*;q=0.8"),
+        ("sec-fetch-mode", "navigate"),
+    ];
+
+    /// The login redirect for an unauthenticated request, as `page_auth`
+    /// sends it: its status and `Location`.
+    async fn login_redirect_for(
+        ctx: &UnauthenticatedRequestContext,
+        path: &str,
+        headers: &[(&str, &str)],
+    ) -> (StatusCode, Option<String>) {
+        let mut builder = poem::http::Request::builder().uri(path);
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let (parts, ()) = builder.body(()).unwrap().into_parts();
+        let mut req = Request::from_parts(
+            poem::RequestParts::from((
+                parts,
+                poem::web::LocalAddr::default(),
+                poem::web::RemoteAddr::default(),
+                poem::http::uri::Scheme::HTTP,
+            )),
+            poem::Body::empty(),
+        );
+        // Positive control: the address under test, query and all, is the
+        // one the redirect reads.
+        assert_eq!(req.original_uri().to_string(), path);
+        req.extensions_mut().insert(ctx.clone());
+        let response = crate::common::login_redirect(&req).await;
+        let location = response
+            .headers()
+            .get(poem::http::header::LOCATION)
+            .map(|value| value.to_str().unwrap().to_owned());
+        (response.status(), location)
+    }
+
+    /// A visitor without a session on a bound host is sent to sign in on the
+    /// control-plane host named in the configuration, with `next` the page on
+    /// the bound host; the request's Host chooses neither origin. Other
+    /// hosts keep their own login page.
+    #[tokio::test]
+    async fn bound_host_sends_sign_in_to_the_control_plane() {
+        let (ctx, _db) = context(true).await;
+        {
+            let mut config = ctx.services().config.lock().await;
+            config.store.external_host = Some("warpgate.example.test".into());
+            config.store.http.external_port = Some(8443);
+        }
+        let control_plane = "https://warpgate.example.test:8443/@warpgate#/login";
+        let on_target = [("host", TARGET_HOST), NAVIGATION[0], NAVIGATION[1]];
+        let (status, location) = login_redirect_for(&ctx, "/app?a=1", &on_target).await;
+        assert_eq!(status, StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            location.as_deref(),
+            Some(
+                "https://warpgate.example.test:8443/@warpgate#/login?next=\
+                 https%3A%2F%2Fvm%2Eexample%2Etest%3A8443%2Fapp%3Fa%3D1"
+            )
+        );
+
+        // An attacker-chosen path is still a page on the bound host.
+        let (_, location) = login_redirect_for(&ctx, "//evil.example/x", &on_target).await;
+        let location = location.unwrap();
+        assert!(location.starts_with(control_plane), "{location}");
+        assert!(
+            location
+                .ends_with("next=https%3A%2F%2Fvm%2Eexample%2Etest%3A8443%2F%2Fevil%2Eexample%2Fx"),
+            "{location}"
+        );
+
+        // The bound host reached through a trusted X-Forwarded-Host is bound
+        // all the same, and the redirect names the configured hosts only.
+        let forwarded = [
+            ("host", "other.example"),
+            ("x-forwarded-host", TARGET_HOST),
+            NAVIGATION[0],
+            NAVIGATION[1],
+        ];
+        let (_, location) = login_redirect_for(&ctx, "/app", &forwarded).await;
+        let location = location.unwrap();
+        assert!(location.starts_with(control_plane), "{location}");
+        assert!(!location.contains("other"), "{location}");
+
+        // A fetch gets the 401 without a redirect.
+        let (status, location) = login_redirect_for(&ctx, "/app", &[("host", TARGET_HOST)]).await;
+        assert_eq!((status, location), (StatusCode::UNAUTHORIZED, None));
+
+        // Other hosts keep their own login page.
+        let on_main = [("host", MAIN_HOST), NAVIGATION[0], NAVIGATION[1]];
+        let (status, location) = login_redirect_for(&ctx, "/app", &on_main).await;
+        assert_eq!(status, StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(location.as_deref(), Some("/@warpgate#/login?next=%2Fapp"));
+    }
+
+    /// Addresses of Warpgate's own pages (such as a failed SSO return's) sent
+    /// from a bound host carry the configured control-plane origin; from
+    /// other hosts they stay site-relative.
+    #[tokio::test]
+    async fn gateway_pages_origin_is_the_control_plane_on_a_bound_host() {
+        let (ctx, _db) = context(false).await;
+        {
+            let mut config = ctx.services().config.lock().await;
+            config.store.external_host = Some("warpgate.example.test".into());
+            config.store.http.external_port = Some(8443);
+        }
+        let origin = |host: &'static str| {
+            let mut req =
+                scoped_request(&Method::GET, "/@warpgate/api/sso/return", &[("host", host)]);
+            req.extensions_mut().insert(ctx.clone());
+            async move { crate::common::gateway_pages_origin(&req).await }
+        };
+        assert_eq!(
+            origin(TARGET_HOST).await,
+            "https://warpgate.example.test:8443"
+        );
+        assert_eq!(origin(MAIN_HOST).await, "");
+    }
+
+    /// With `http.external_host` naming the control plane apart from the
+    /// global `external_host` (which may itself be a bound site), sign-in
+    /// goes to `http.external_host`.
+    #[tokio::test]
+    async fn bound_host_sign_in_goes_to_http_external_host() {
+        let (ctx, _db) = context(false).await;
+        {
+            let mut config = ctx.services().config.lock().await;
+            config.store.external_host = Some("vm.example.test".into());
+            config.store.http.external_host = Some("admin.example.test".into());
+            config.store.http.external_port = Some(8443);
+        }
+        let on_target = [("host", TARGET_HOST), NAVIGATION[0], NAVIGATION[1]];
+        let (status, location) = login_redirect_for(&ctx, "/", &on_target).await;
+        assert_eq!(status, StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            location.as_deref(),
+            Some(
+                "https://admin.example.test:8443/@warpgate#/login?next=\
+                 https%3A%2F%2Fvm%2Eexample%2Etest%3A8443%2F"
+            )
+        );
+    }
+
+    /// Without a configured control-plane host, or when the binding cannot
+    /// be looked up, a bound host sends the visitor to no login page.
+    #[tokio::test]
+    async fn bound_host_without_a_control_plane_redirects_nowhere() {
+        let on_target = [("host", TARGET_HOST), NAVIGATION[0], NAVIGATION[1]];
+        let (ctx, db) = context(false).await;
+        assert_eq!(
+            login_redirect_for(&ctx, "/app", &on_target).await,
+            (StatusCode::UNAUTHORIZED, None)
+        );
+
+        ctx.services().config.lock().await.store.external_host =
+            Some("warpgate.example.test".into());
+        db.execute_unprepared("DROP TABLE targets").await.unwrap();
+        assert_eq!(
+            login_redirect_for(&ctx, "/app", &on_target).await,
+            (StatusCode::UNAUTHORIZED, None)
+        );
+    }
+
+    #[tokio::test]
     async fn underscore_prefix_is_scoped_too() {
         let (ctx, _db) = context(false).await;
         for (method, path, expected) in [
             (Method::GET, "/_warpgate/admin/api/users", true),
             (Method::GET, "/_warpgate/api/targets", true),
-            (Method::GET, "/_warpgate/api/info", false),
-            (Method::POST, "/_warpgate/api/auth/login", false),
+            (Method::GET, "/_warpgate/api/info", true),
+            (Method::POST, "/_warpgate/api/auth/login", true),
+            (Method::POST, "/_warpgate/api/auth/logout", true),
+            (Method::GET, "/_warpgate/assets/index.js", false),
+            (Method::GET, "/_warpgate/api/sso/return", false),
         ] {
             assert_eq!(
                 refused(&ctx, &method, path, &[("host", TARGET_HOST)]).await,
@@ -561,9 +864,10 @@ mod tests {
         }
     }
 
-    /// The middleware over both mounts: out-of-scope routes are 404 on the
-    /// bound host whatever the credentials, the login flow is served, other
-    /// hosts are untouched, and a failed lookup is 503.
+    /// The middleware over both mounts: out-of-scope routes, the sign-in
+    /// routes among them, are 404 on the bound host whatever the credentials,
+    /// assets and the SSO return are served, other hosts are untouched, and a
+    /// failed lookup is 503.
     #[tokio::test]
     async fn middleware_hides_the_management_surface_on_a_bound_host() {
         let (ctx, db) = context(false).await;
@@ -578,7 +882,7 @@ mod tests {
             async move { app.get_response(req).await.status() }
         };
 
-        for (method, path) in ADMIN_API.into_iter().chain(USER_API) {
+        for (method, path) in ADMIN_API.into_iter().chain(USER_API).chain(SIGN_IN) {
             assert_eq!(
                 status(method.clone(), path, TARGET_HOST).await,
                 StatusCode::NOT_FOUND,
@@ -590,26 +894,31 @@ mod tests {
                 "{method} {path}"
             );
         }
-        for (method, path) in LOGIN_FLOW {
-            assert_eq!(
-                status(method.clone(), path, TARGET_HOST).await,
-                StatusCode::OK,
-                "{method} {path}"
-            );
+        for (method, path) in BOUND_HOST_SERVED {
+            for host in [TARGET_HOST, MAIN_HOST] {
+                assert_eq!(
+                    status(method.clone(), path, host).await,
+                    StatusCode::OK,
+                    "{method} {path} on {host}"
+                );
+            }
         }
-        // The custom logo is part of the login page.
+        // The login page's custom logo goes with it.
         assert_eq!(
             status(Method::GET, "/@warpgate/api/logo", TARGET_HOST).await,
-            StatusCode::OK
+            StatusCode::NOT_FOUND
         );
 
         db.execute_unprepared("DROP TABLE targets").await.unwrap();
+        for path in ["/@warpgate/admin/api/users", "/@warpgate/api/info"] {
+            assert_eq!(
+                status(Method::GET, path, TARGET_HOST).await,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{path}"
+            );
+        }
         assert_eq!(
-            status(Method::GET, "/@warpgate/admin/api/users", TARGET_HOST).await,
-            StatusCode::SERVICE_UNAVAILABLE
-        );
-        assert_eq!(
-            status(Method::POST, "/@warpgate/api/auth/login", TARGET_HOST).await,
+            status(Method::GET, "/@warpgate/assets/index.js", TARGET_HOST).await,
             StatusCode::OK
         );
     }
