@@ -1427,6 +1427,24 @@ impl WarpgateConfig {
             }
         }
 
+        // The session cookie is `SameSite=Lax`, so a provider that posts its
+        // response back from its own site arrives without the session the
+        // handshake is bound to, and the sign-in cannot complete.
+        for provider in &self.store.sso_providers {
+            if provider
+                .provider
+                .extra_parameters()
+                .get("response_mode")
+                .is_some_and(|mode| mode == "form_post")
+            {
+                emit_config_warning(format!(
+                    "SSO provider `{}` ({}) returns its response by a cross-site form POST (`response_mode=form_post`). The session cookie is `SameSite=Lax`, so the browser does not send it on that POST and sign-in with this provider fails; it needs the `query` response mode, which Warpgate does not use for this provider.",
+                    provider.name,
+                    provider.provider.label(),
+                ));
+            }
+        }
+
         if self.store.ssh.web_auth_wait_timeout > MAX_WEB_AUTH_WAIT_TIMEOUT {
             let requested = self.store.ssh.web_auth_wait_timeout;
             self.store.ssh.web_auth_wait_timeout = MAX_WEB_AUTH_WAIT_TIMEOUT;
@@ -1791,6 +1809,48 @@ step_up_interval: {}
             warnings
                 .iter()
                 .any(|w| w.contains(&format!("entry for `{user}` lists the key"))),
+            "{warnings:?}"
+        );
+    }
+
+    fn sso_provider(name: &str, provider: &str) -> warpgate_sso::SsoProviderConfig {
+        serde_json::from_value(serde_json::json!({
+            "name": name,
+            "provider": serde_json::from_str::<serde_json::Value>(provider).unwrap(),
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn unit_form_post_sso_provider_warns_that_sign_in_fails() {
+        let apple = format!("apple-{}", uuid::Uuid::new_v4());
+        let google = format!("google-{}", uuid::Uuid::new_v4());
+        let mut config = WarpgateConfig {
+            store: WarpgateConfigStore {
+                sso_providers: vec![
+                    sso_provider(
+                        &apple,
+                        r#"{"type":"apple","client_id":"c","client_secret":"s","key_id":"k","team_id":"t"}"#,
+                    ),
+                    sso_provider(
+                        &google,
+                        r#"{"type":"google","client_id":"c","client_secret":"s"}"#,
+                    ),
+                ],
+                ..Default::default()
+            },
+        };
+        config.validate();
+
+        let warnings = super::warnings();
+        assert!(
+            warnings.iter().any(|w| w.contains(&format!("`{apple}` (Apple)"))
+                && w.contains("response_mode=form_post")
+                && w.contains("`query` response mode")),
+            "{warnings:?}"
+        );
+        assert!(
+            !warnings.iter().any(|w| w.contains(&format!("`{google}`"))),
             "{warnings:?}"
         );
     }

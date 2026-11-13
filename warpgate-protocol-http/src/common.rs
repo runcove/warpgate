@@ -83,11 +83,14 @@ pub static WARPGATE_COOKIE_NAMES: [&str; 4] = [
 /// answered with a redirect that sets this cookie, and the browser follows it
 /// in a navigation that began cross-site, in which it does not send a Strict
 /// cookie: every such link would land unauthenticated, with its ticket
-/// already spent. On HTTPS, `CookieHostMiddleware` sets `SameSite=None` for
-/// localhost, the base domain and its subdomains (and when there is no Host
-/// header and a base domain is set); on any other host, and on plain HTTP,
-/// the cookie carries no attribute, which browsers treat as `Lax` or `None`.
-/// Both are sent there.
+/// already spent. The cookie is `SameSite=Lax` instead: it is sent on a
+/// top-level navigation from another site and across the base domain and its
+/// subdomains (one site), but not on a form POST or a background request from
+/// another site's page. `CookieHostMiddleware` stamps `Lax` again on HTTPS.
+/// The one flow this costs is an SSO provider that posts its response back
+/// (`response_mode=form_post`, Apple): that POST arrives without the session,
+/// so the handshake bound to it is not found and sign-in fails;
+/// `WarpgateConfig::validate` warns when such a provider is configured.
 ///
 /// The one exception is a plain-HTTP loopback listener, which the operator
 /// opts into: there `LoopbackSessionCookieMiddleware` makes the browser's
@@ -96,6 +99,7 @@ pub static WARPGATE_COOKIE_NAMES: [&str; 4] = [
 pub fn session_cookie_config() -> CookieConfig {
     CookieConfig::default()
         .secure(false)
+        .same_site(poem::web::cookie::SameSite::Lax)
         .name(SESSION_COOKIE_NAME)
 }
 
@@ -175,10 +179,10 @@ fn session_host_is_authorized(request_host: Option<&str>, base_host: &str) -> bo
 
 /// Whether a state-changing (or WebSocket) request to Warpgate's own endpoints
 /// came from a page on any other origin, so the session cookie it carries must
-/// not count. The cookie is `SameSite=None` on HTTPS and shared with every
-/// target subdomain, so the browser attaches it to requests from other sites
-/// and from target pages alike - hence `same-site` is no better than
-/// `cross-site`. Target traffic is left alone; targets do their own CSRF
+/// not count. The cookie is `SameSite=Lax` and shared with every target
+/// subdomain, which is the same site, so the browser attaches it to requests
+/// from target pages (and to top-level navigations from other sites) - hence
+/// `same-site` is no better than `cross-site`. Target traffic is left alone; targets do their own CSRF
 /// checks. A request without `Origin`, `Referer` or `Sec-Fetch-Site` did not
 /// come from a browser page.
 ///

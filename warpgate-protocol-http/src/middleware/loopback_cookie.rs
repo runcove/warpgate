@@ -243,7 +243,7 @@ mod tests {
         let cookie = only_set_cookie(&resp);
         assert_eq!(cookie.name(), SESSION_COOKIE_NAME);
         assert_eq!(cookie.http_only(), Some(true));
-        assert_eq!(cookie.same_site(), None);
+        assert_eq!(cookie.same_site(), Some(SameSite::Lax));
         assert_eq!(cookie.max_age(), Some(cookie::time::Duration::hours(24)));
     }
 

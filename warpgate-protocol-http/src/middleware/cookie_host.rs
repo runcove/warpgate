@@ -76,10 +76,10 @@ fn rewrite_session_cookie(cookie: &mut Cookie<'_>, action: &DomainChange, is_htt
     }
     if is_https {
         cookie.set_secure(true);
-        if *action != DomainChange::Keep {
-            // disable SameSite when cookie is shared between domains
-            cookie.set_same_site(cookie::SameSite::None);
-        }
+        // SameSite is per site, not per host: Lax still shares the cookie
+        // across the base domain and its subdomains, and keeps it off another
+        // site's form POSTs and background requests.
+        cookie.set_same_site(cookie::SameSite::Lax);
     }
 }
 
@@ -197,17 +197,63 @@ mod tests {
     }
 
     #[test]
-    fn host_scoped_cookie_keeps_default_same_site() {
-        let c = rewritten(Some("other.net"), Some("example.com"), true);
-        assert_eq!(c.domain(), None);
-        assert_eq!(c.same_site(), None);
+    fn https_cookie_is_always_lax() {
+        for (host, base) in [
+            (Some("app.example.com"), Some("example.com")),
+            (Some("example.com"), Some("example.com")),
+            (Some("other.net"), Some("example.com")),
+            (Some("other.net"), None),
+            (Some("localhost"), Some("example.com")),
+            (None, Some("example.com")),
+            (None, None),
+        ] {
+            assert_eq!(
+                rewritten(host, base, true).same_site(),
+                Some(cookie::SameSite::Lax),
+                "{host:?} {base:?}"
+            );
+        }
     }
 
     #[test]
-    fn shared_domain_cookie_is_cross_site() {
+    fn https_rewrite_replaces_a_cross_site_attribute() {
+        let mut c = Cookie::new(SESSION_COOKIE_NAME, "v");
+        c.set_same_site(cookie::SameSite::None);
+        rewrite_session_cookie(
+            &mut c,
+            &decide_domain_change(Some("app.example.com"), Some("example.com")),
+            true,
+        );
+        assert_eq!(c.same_site(), Some(cookie::SameSite::Lax));
+    }
+
+    #[test]
+    fn host_scoped_cookie_keeps_no_domain() {
+        let c = rewritten(Some("other.net"), Some("example.com"), true);
+        assert_eq!(c.domain(), None);
+    }
+
+    #[test]
+    fn shared_domain_cookie_is_scoped_to_the_base_domain() {
         let c = rewritten(Some("app.example.com"), Some("example.com"), true);
         assert_eq!(c.domain(), Some("example.com"));
-        assert_eq!(c.same_site(), Some(cookie::SameSite::None));
+    }
+
+    #[test]
+    fn plain_http_rewrite_leaves_same_site_alone() {
+        let c = rewritten(Some("app.example.com"), Some("example.com"), false);
+        assert_eq!(c.same_site(), None);
+    }
+
+    /// The cookie as `ServerSession` mints it, before any rewrite: `Lax` on
+    /// every listener and host, so plain HTTP and the hosts the middleware
+    /// leaves alone get the same attribute.
+    #[test]
+    fn minted_session_cookie_is_lax() {
+        let jar = poem::web::cookie::CookieJar::default();
+        crate::common::session_cookie_config().set_cookie_value(&jar, "v");
+        let c = jar.get(SESSION_COOKIE_NAME).expect("session cookie set");
+        assert_eq!(c.same_site(), Some(cookie::SameSite::Lax));
     }
 
     #[test]
