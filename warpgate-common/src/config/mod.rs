@@ -1,4 +1,5 @@
 mod defaults;
+mod host_binding;
 mod specific_target;
 mod target;
 mod warnings;
@@ -15,6 +16,7 @@ use defaults::{
     _default_ssh_inactivity_timeout, _default_ssh_listen, _default_ssh_target_handshake_timeout,
     _default_vnc_listen, _default_web_auth_wait_timeout,
 };
+pub use host_binding::*;
 use poem::http::uri::Authority;
 use poem_openapi::{Object, Union};
 use schemars::JsonSchema;

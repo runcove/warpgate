@@ -16,10 +16,11 @@ use warpgate_common_http::auth::UnauthenticatedRequestContext;
 use warpgate_common_http::logging::get_client_ip;
 use warpgate_common_http::ticket_query::without_ticket_query_param;
 use warpgate_common_http::{SessionAuthorization, authorization_token};
-use warpgate_core::{authorize_and_spend_ticket, session_user_still_admitted};
+use warpgate_core::{ValidatedTicket, session_user_still_admitted, validate_ticket};
 use warpgate_db_entities::Ticket;
 
 use crate::api::common::end_login;
+use crate::catchall::ticket_target_served_on_host;
 use crate::common::{SessionExt, SessionRotation, get_auth_state_for_request};
 use crate::session::SessionStore;
 
@@ -235,6 +236,31 @@ async fn pending_login_user_id(
     })
 }
 
+/// Whether the ticket's target is served on this request's host, as the
+/// catchall judges a ticket session's requests
+/// ([`ticket_target_served_on_host`]). A binding that check refuses with an
+/// error is refused here too (fail closed), so no use is spent on it.
+async fn ticket_served_on_request_host(
+    req: &Request,
+    ctx: &UnauthenticatedRequestContext,
+    ticket: &ValidatedTicket,
+) -> bool {
+    let request_host = ctx.trusted_host_header(req);
+    match ticket_target_served_on_host(ctx.services(), ticket.target(), request_host.as_deref())
+        .await
+    {
+        Ok(true) => true,
+        Ok(false) => {
+            warn!(ticket_id = %ticket.id(), "Ticket presented on a host its target is not served on, ignoring it");
+            false
+        }
+        Err(error) => {
+            warn!(ticket_id = %ticket.id(), %error, "Ticket target's host binding is refused, ignoring the ticket");
+            false
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct QueryParams {
     #[serde(rename = "warpgate-ticket")]
@@ -367,15 +393,30 @@ impl<E: Endpoint> Endpoint for TicketMiddlewareEndpoint<E> {
                 let client_ip: Option<IpAddr> = get_client_ip(&req, ctx.services())
                     .await
                     .and_then(|s| s.parse().ok());
-                if let Some(authorization) = authorize_and_spend_ticket(
+                let validated = validate_ticket(
                     &ctx.services().db,
                     &ctx.services().login_protection,
                     &ticket_secret,
                     client_ip,
                     crate::common::PROTOCOL_NAME,
                 )
-                .await?
-                {
+                .await?;
+                // The host check runs before the spend: a ticket presented
+                // on a host its target is not served on (or whose binding is
+                // refused) keeps its use and starts no session.
+                let validated = match validated {
+                    Some(validated)
+                        if ticket_served_on_request_host(&req, &ctx, &validated).await =>
+                    {
+                        Some(validated)
+                    }
+                    _ => None,
+                };
+                let authorization = match validated {
+                    Some(validated) => validated.spend(&ctx.services().db).await?,
+                    None => None,
+                };
+                if let Some(authorization) = authorization {
                     session.set_auth(SessionAuthorization::Ticket {
                         user_id: authorization.user_info().id,
                         username: authorization.user_info().username.clone(),
@@ -765,5 +806,158 @@ mod tests {
         });
 
         assert_ne!(first_key, ticket_session_key(&req, &session));
+    }
+
+    mod spend_after_host_check {
+        //! A ticket is spent only once its target is known to be served on
+        //! the request's host: one presented elsewhere keeps its uses and
+        //! starts no session.
+        use poem::session::{CookieConfig, MemoryStorage, ServerSession};
+        use poem::test::TestClient;
+        use poem::{EndpointExt, Route, get, handler};
+        use sea_orm::ActiveValue::Set;
+        use sea_orm::{ActiveModelTrait, DatabaseConnection, EntityTrait};
+        use warpgate_common::helpers::hash::hash_secret;
+        use warpgate_db_entities::Target::TargetKind;
+        use warpgate_db_entities::{Target, Ticket};
+
+        use super::*;
+        use crate::common::SessionExt;
+        use crate::test_db::{insert_user, memory_db, services};
+
+        const SECRET: &str = "t1cket-for-host-check";
+
+        #[handler]
+        fn who(session: &Session) -> String {
+            match session.get_auth() {
+                Some(SessionAuthorization::Ticket { username, .. }) => username,
+                Some(SessionAuthorization::User { username, .. }) => username,
+                None => "nobody".into(),
+            }
+        }
+
+        /// A user, an HTTP target bound to `external_host` and a two-use
+        /// ticket for it; returns the ticket id.
+        async fn seed(db: &DatabaseConnection, external_host: &str) -> Uuid {
+            let user_id = Uuid::new_v4();
+            insert_user(db, user_id, "alice").await;
+            let target_id = Uuid::new_v4();
+            Target::ActiveModel {
+                id: Set(target_id),
+                name: Set("bound".into()),
+                description: Set(String::new()),
+                kind: Set(TargetKind::Http),
+                options: Set(serde_json::json!({
+                    "http": {"url": "http://h", "external_host": external_host}
+                })),
+                rate_limit_bytes_per_second: Set(None),
+                group_id: Set(None),
+                ticket_max_duration_seconds: Set(None),
+                ticket_requests_disabled: Set(false),
+                ticket_require_approval: Set(false),
+                ticket_max_uses: Set(None),
+                require_approval: Set(false),
+            }
+            .insert(db)
+            .await
+            .unwrap();
+            let ticket_id = Uuid::new_v4();
+            Ticket::ActiveModel {
+                id: Set(ticket_id),
+                secret_hash: Set(hash_secret(SECRET)),
+                user_id: Set(user_id),
+                description: Set(String::new()),
+                target_id: Set(target_id),
+                uses_left: Set(Some(2)),
+                self_service: Set(false),
+                expiry: Set(None),
+                created: Set(OffsetDateTime::now_utc()),
+            }
+            .insert(db)
+            .await
+            .unwrap();
+            ticket_id
+        }
+
+        async fn uses_left(db: &DatabaseConnection, ticket_id: Uuid) -> Option<i16> {
+            Ticket::Entity::find_by_id(ticket_id)
+                .one(db)
+                .await
+                .unwrap()
+                .unwrap()
+                .uses_left
+        }
+
+        async fn client(db: &DatabaseConnection) -> TestClient<impl Endpoint> {
+            let services = services(db.clone()).await;
+            services.config.lock().await.store.external_host = Some("warp.example.com".into());
+            let ctx = UnauthenticatedRequestContext::new(services).await;
+            TestClient::new(
+                Route::new()
+                    .at("/*", get(who))
+                    .with(TicketMiddleware::new())
+                    .data(Arc::new(Mutex::new(SessionStore::new())))
+                    .data(ctx)
+                    .with(ServerSession::new(
+                        CookieConfig::default(),
+                        MemoryStorage::new(),
+                    )),
+            )
+        }
+
+        /// Who the request ran as, presenting the ticket in the query or in
+        /// the `Authorization` header, on `host`.
+        async fn present(cli: &TestClient<impl Endpoint>, host: &str, in_header: bool) -> String {
+            let request = if in_header {
+                cli.get("/page")
+                    .header("authorization", format!("Warpgate {SECRET}"))
+            } else {
+                cli.get("/page").query("warpgate-ticket", &SECRET)
+            };
+            let response = request.header("host", host).send().await;
+            response.assert_status_is_ok();
+            response.0.into_body().into_string().await.unwrap()
+        }
+
+        #[tokio::test]
+        async fn a_ticket_on_a_wrong_host_keeps_its_uses_and_sets_no_session() {
+            let db = memory_db().await;
+            let ticket_id = seed(&db, "vm.example.com:3000").await;
+            let cli = client(&db).await;
+            for host in [
+                "warp.example.com",
+                "other.example.com",
+                "vm.example.com:3001",
+            ] {
+                for in_header in [false, true] {
+                    assert_eq!(
+                        present(&cli, host, in_header).await,
+                        "nobody",
+                        "{host} header={in_header}"
+                    );
+                    assert_eq!(uses_left(&db, ticket_id).await, Some(2), "{host}");
+                }
+            }
+
+            // The same ticket on its own host is spent and starts a session.
+            assert_eq!(present(&cli, "vm.example.com:3000", true).await, "alice");
+            assert_eq!(uses_left(&db, ticket_id).await, Some(1));
+        }
+
+        /// A target bound to the control-plane host is refused, so a ticket
+        /// presented on that very host is not spent either.
+        #[tokio::test]
+        async fn a_ticket_on_a_refused_binding_keeps_its_uses_and_sets_no_session() {
+            let db = memory_db().await;
+            let ticket_id = seed(&db, "warp.example.com:8443").await;
+            let cli = client(&db).await;
+            for in_header in [false, true] {
+                assert_eq!(
+                    present(&cli, "warp.example.com:8443", in_header).await,
+                    "nobody"
+                );
+                assert_eq!(uses_left(&db, ticket_id).await, Some(2));
+            }
+        }
     }
 }

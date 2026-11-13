@@ -6,7 +6,7 @@ use tracing::warn;
 use uuid::Uuid;
 use warpgate_common::{
     AdminPermission, Role as RoleConfig, StoredSecrets, Target as TargetConfig, TargetOptions,
-    TargetSSHOptions, WarpgateError,
+    TargetSSHOptions, WarpgateError, host_binding_conflict,
 };
 use warpgate_common_http::errors::invalid_field;
 use warpgate_core::AccessChange;
@@ -33,6 +33,57 @@ async fn unix_socket_refusal(admin: &AdminContext, options: &TargetOptions) -> O
         .http
         .plain_http_on_loopback;
     options.check_unix_socket(loopback).err()
+}
+
+/// Why an HTTP target's `external_host` binding is refused, if it is: it is
+/// on the control-plane host (at any port), or another target's binding
+/// shares its hostname (at any port), compared ASCII case-insensitively
+/// ([`host_binding_conflict`]). `id` is the target being updated, left out of
+/// the comparison; `None` on create.
+async fn host_binding_refusal(
+    admin: &AdminContext,
+    options: &TargetOptions,
+    id: Option<Uuid>,
+) -> Result<Option<String>, WarpgateError> {
+    let services = admin.services();
+    let control_plane = services.config.lock().await.control_plane_host();
+    binding_refusal_in(&services.db, control_plane.as_deref(), options, id).await
+}
+
+/// [`host_binding_refusal`] against the targets stored in `db` and the
+/// control-plane host `control_plane`.
+async fn binding_refusal_in(
+    db: &sea_orm::DatabaseConnection,
+    control_plane: Option<&str>,
+    options: &TargetOptions,
+    id: Option<Uuid>,
+) -> Result<Option<String>, WarpgateError> {
+    let Some(binding) = options.external_host().filter(|host| !host.is_empty()) else {
+        return Ok(None);
+    };
+    let others: Vec<(String, String)> = Target::Entity::find()
+        .all(db)
+        .await?
+        .into_iter()
+        .filter(|other| Some(other.id) != id)
+        .filter_map(|other| {
+            let host = other
+                .options
+                .pointer("/http/external_host")
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.is_empty())?
+                .to_owned();
+            Some((other.name, host))
+        })
+        .collect();
+    Ok(host_binding_conflict(
+        binding,
+        control_plane,
+        others
+            .iter()
+            .map(|(name, host)| (name.as_str(), host.as_str())),
+    )
+    .map(|conflict| conflict.to_string()))
 }
 
 pub(crate) fn maybe_redacted_target(
@@ -111,6 +162,10 @@ impl ListApi {
                 "unix_socket",
                 &reason,
             )));
+        }
+        if let Some(reason) = host_binding_refusal(&admin, &body.options, None).await? {
+            warn!("Rejecting request: {reason}");
+            return Ok(CreateTargetResponse::Conflict(Json(reason)));
         }
 
         match store::create(&admin.services().db, &body).await {
@@ -205,6 +260,10 @@ impl DetailApi {
         if let Some(reason) = unix_socket_refusal(&admin, &body.options).await {
             warn!("Rejecting request: {reason}");
             return Ok(UpdateTargetResponse::BadRequest);
+        }
+        if let Some(reason) = host_binding_refusal(&admin, &body.options, Some(id.0)).await? {
+            warn!("Rejecting request: {reason}");
+            return Ok(UpdateTargetResponse::Conflict(Json(reason)));
         }
 
         let services = admin.services();
@@ -418,6 +477,121 @@ impl RolesApi {
             }
             Err(ResourceError::NotFound) => Ok(DeleteTargetRoleResponse::NotFound),
             Err(err) => Err(err.into()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sea_orm::ActiveValue::Set;
+    use sea_orm::{ActiveModelTrait, Database, DatabaseConnection};
+    use warpgate_db_entities::Parameters::{ConfigMigrationValues, set_config_migration_values};
+    use warpgate_db_entities::Target::TargetKind;
+
+    use super::*;
+
+    const CONTROL_PLANE: Option<&str> = Some("warp.example.com");
+
+    async fn memory_db() -> DatabaseConnection {
+        set_config_migration_values(ConfigMigrationValues::default());
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        warpgate_db_migrations::migrate_database(&db).await.unwrap();
+        db
+    }
+
+    async fn bound_target(db: &DatabaseConnection, name: &str, external_host: &str) -> Uuid {
+        let id = Uuid::new_v4();
+        Target::ActiveModel {
+            id: Set(id),
+            name: Set(name.into()),
+            description: Set(String::new()),
+            kind: Set(TargetKind::Http),
+            options: Set(serde_json::to_value(http_options(external_host)).unwrap()),
+            rate_limit_bytes_per_second: Set(None),
+            group_id: Set(None),
+            ticket_max_duration_seconds: Set(None),
+            ticket_requests_disabled: Set(false),
+            ticket_require_approval: Set(false),
+            ticket_max_uses: Set(None),
+            require_approval: Set(false),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        id
+    }
+
+    fn http_options(external_host: &str) -> TargetOptions {
+        serde_json::from_value(serde_json::json!({
+            "http": {"url": "http://h", "external_host": external_host}
+        }))
+        .unwrap()
+    }
+
+    /// An update is checked against every OTHER target: a target keeping
+    /// (or re-casing, or changing the port of) its own hostname passes.
+    #[tokio::test]
+    async fn an_update_keeping_its_own_hostname_passes() {
+        let db = memory_db().await;
+        let own = bound_target(&db, "own", "vm.example.com:3000").await;
+        bound_target(&db, "other", "other.example.com").await;
+        for binding in [
+            "vm.example.com:3000",
+            "VM.example.com:8080",
+            "vm.example.com",
+        ] {
+            assert_eq!(
+                binding_refusal_in(&db, CONTROL_PLANE, &http_options(binding), Some(own))
+                    .await
+                    .unwrap(),
+                None,
+                "{binding}"
+            );
+        }
+        // The same binding on create is another target's: refused.
+        assert!(
+            binding_refusal_in(
+                &db,
+                CONTROL_PLANE,
+                &http_options("vm.example.com:3000"),
+                None
+            )
+            .await
+            .unwrap()
+            .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_update_to_the_control_plane_host_is_refused() {
+        let db = memory_db().await;
+        let own = bound_target(&db, "own", "vm.example.com:3000").await;
+        for binding in ["warp.example.com", "WARP.example.com:8443"] {
+            let refusal = binding_refusal_in(&db, CONTROL_PLANE, &http_options(binding), Some(own))
+                .await
+                .unwrap();
+            assert!(
+                refusal
+                    .as_deref()
+                    .is_some_and(|r| r.contains("Warpgate's own host")),
+                "{binding}: {refusal:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_update_to_another_targets_hostname_is_refused() {
+        let db = memory_db().await;
+        let own = bound_target(&db, "own", "vm.example.com:3000").await;
+        bound_target(&db, "other", "other.example.com:3000").await;
+        for binding in ["other.example.com:3000", "OTHER.example.com:8080"] {
+            let refusal = binding_refusal_in(&db, CONTROL_PLANE, &http_options(binding), Some(own))
+                .await
+                .unwrap();
+            assert!(
+                refusal.as_deref().is_some_and(|r| r.contains("`other`")),
+                "{binding}: {refusal:?}"
+            );
         }
     }
 }

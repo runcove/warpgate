@@ -9,15 +9,17 @@ use tokio::sync::{Mutex, broadcast};
 use tracing::{Instrument, debug, info_span, warn};
 use uuid::Uuid;
 use warpgate_common::auth::AuthStateUserInfo;
-use warpgate_common::{Target, TargetHTTPOptions, TargetOptions, WarpgateError};
+use warpgate_common::{
+    HostBindingConflict, Target, TargetHTTPOptions, TargetOptions, WarpgateError,
+    host_binding_conflict,
+};
 use warpgate_common_http::auth::UnauthenticatedRequestContext;
 use warpgate_common_http::{
     AuthenticatedRequestContext, RequestAuthorization, SessionAuthorization, SessionKeepalive,
 };
 use warpgate_core::live_streams::{LiveStreamKind, host_binding};
 use warpgate_core::{
-    ConfigProvider, ConfigProviderEnum, Services, TargetAuthorization, TargetSessionStart,
-    authorize_for_target,
+    ConfigProvider, Services, TargetAuthorization, TargetSessionStart, authorize_for_target,
 };
 
 use crate::approval_gate::resolve_admin_approval;
@@ -228,8 +230,8 @@ pub(crate) fn host_without_default_port(host: &str) -> Option<&str> {
 /// Whether a request whose Host header is `request_host` is for the host a
 /// target is bound to, `bound`: the same value, or the same value once the
 /// request's default port is dropped ([`host_without_default_port`]). Any
-/// other port must match exactly, since two targets may share a hostname and
-/// differ only by port (per-VM proxy).
+/// other port must match exactly. (Two targets may not share a hostname at
+/// any port: [`host_binding_conflict`].)
 pub(crate) fn host_matches_binding(bound: &str, request_host: &str) -> bool {
     request_host == bound || host_without_default_port(request_host) == Some(bound)
 }
@@ -237,22 +239,54 @@ pub(crate) fn host_matches_binding(bound: &str, request_host: &str) -> bool {
 /// The target bound to the request's Host header, `host`: the target whose
 /// `external_host` is exactly `host`, else, when `host` carries a default
 /// port, the one bound to the host without it. An exact binding wins.
+///
+/// A binding the admin API would refuse today is an error, not served: one
+/// on the control-plane host (here) or on a hostname another target shares
+/// (in the config provider's lookup), see [`host_binding_conflict`].
 pub(crate) async fn get_target_by_request_host(
-    config_provider: &ConfigProviderEnum,
+    services: &Services,
     host: &str,
 ) -> Result<Option<Target>, WarpgateError> {
-    if let Some(target) = config_provider.get_target_by_hostname(host).await? {
-        return Ok(Some(target));
+    let config_provider = &services.config_provider;
+    let mut found = config_provider.get_target_by_hostname(host).await?;
+    if found.is_none()
+        && let Some(name) = host_without_default_port(host)
+    {
+        found = config_provider.get_target_by_hostname(name).await?;
     }
-    match host_without_default_port(host) {
-        Some(name) => config_provider.get_target_by_hostname(name).await,
-        None => Ok(None),
+    let Some(target) = found else {
+        return Ok(None);
+    };
+    refuse_control_plane_binding(services, &target).await?;
+    Ok(Some(target))
+}
+
+/// Refuses a target bound to the control-plane host, at any port.
+async fn refuse_control_plane_binding(
+    services: &Services,
+    target: &Target,
+) -> Result<(), WarpgateError> {
+    let Some(binding) = target.options.external_host() else {
+        return Ok(());
+    };
+    let control_plane = services.config.lock().await.control_plane_host();
+    match host_binding_conflict(binding, control_plane.as_deref(), []) {
+        None => Ok(()),
+        Some(conflict) => {
+            warn!(target = %target.name, %conflict, "Refusing a target's host binding");
+            Err(WarpgateError::InconsistentState(format!(
+                "target {} is not served: {conflict}",
+                target.name
+            )))
+        }
     }
 }
 
 /// Filter a candidate target list down to an HTTP target whose
 /// `external_host` matches the given host header ([`host_matches_binding`]:
-/// port-aware, but a default port may be dropped).
+/// port-aware, but a default port may be dropped). A match whose hostname
+/// another candidate also binds, at any port, is refused
+/// ([`host_binding_conflict`]).
 ///
 /// Pure over `targets` so unit tests don't need a real config provider. The
 /// async caller narrows the candidates first — `get_target_by_request_host`
@@ -261,19 +295,32 @@ pub(crate) async fn get_target_by_request_host(
 pub(crate) fn find_http_target_by_external_host(
     targets: &[Target],
     host: &str,
-) -> Option<(Target, TargetHTTPOptions)> {
-    targets
-        .iter()
-        .filter_map(|t| match t.options {
-            TargetOptions::Http(ref options) => Some((t, options)),
-            _ => None,
-        })
-        .find(|(_, o)| {
-            o.external_host
+) -> Result<Option<(Target, TargetHTTPOptions)>, HostBindingConflict> {
+    fn bound(t: &Target) -> Option<(&str, &TargetHTTPOptions)> {
+        match t.options {
+            TargetOptions::Http(ref options) => options
+                .external_host
                 .as_deref()
-                .is_some_and(|bound| host_matches_binding(bound, host))
-        })
-        .map(|(t, o)| (t.clone(), o.clone()))
+                .filter(|bound| !bound.is_empty())
+                .map(|bound| (bound, options)),
+            _ => None,
+        }
+    }
+    let Some((target, binding, options)) = targets.iter().find_map(|t| {
+        bound(t)
+            .filter(|(binding, _)| host_matches_binding(binding, host))
+            .map(|(binding, options)| (t, binding, options))
+    }) else {
+        return Ok(None);
+    };
+    let others = targets
+        .iter()
+        .filter(|other| !std::ptr::eq(*other, target))
+        .filter_map(|other| Some((other.name.as_str(), bound(other)?.0)));
+    match host_binding_conflict(binding, None, others) {
+        Some(conflict) => Err(conflict),
+        None => Ok(Some((target.clone(), options.clone()))),
+    }
 }
 
 /// Async wrapper around the host→target lookup + `decide_public_target_access`
@@ -288,11 +335,14 @@ pub(crate) async fn resolve_public_target_decision(
     let Some(host) = host else {
         return Ok((None, PublicTargetDecision::NotApplicable));
     };
-    let candidates: Vec<Target> = get_target_by_request_host(&services.config_provider, host)
+    let candidates: Vec<Target> = get_target_by_request_host(services, host)
         .await?
         .into_iter()
         .collect();
-    let resolved = find_http_target_by_external_host(&candidates, host);
+    let resolved = find_http_target_by_external_host(&candidates, host).map_err(|conflict| {
+        warn!(%conflict, "Refusing a target's host binding");
+        WarpgateError::InconsistentState(conflict.to_string())
+    })?;
     let decision = decide_public_target_access(
         resolved.as_ref().map(|(_, o)| o),
         resolved.as_ref().is_some_and(|(t, _)| t.require_approval),
@@ -344,6 +394,30 @@ fn target_served_on_host(target: &Target, request_host: Option<&str>) -> bool {
     served_on_host(external_host, request_host)
 }
 
+/// [`target_served_on_host`] for a ticket's target, which is resolved by id,
+/// not by host. A bound target is also resolved from the request's host as
+/// any request on it is ([`get_target_by_request_host`]), so a binding that
+/// lookup refuses (on the control-plane host, at any port, or on a hostname
+/// another target shares) is refused for a ticket too, as an error.
+pub(crate) async fn ticket_target_served_on_host(
+    services: &Services,
+    target: &Target,
+    request_host: Option<&str>,
+) -> Result<bool, WarpgateError> {
+    if !target_served_on_host(target, request_host) {
+        return Ok(false);
+    }
+    let bound = target
+        .options
+        .external_host()
+        .is_some_and(|bound| !bound.is_empty());
+    let (true, Some(host)) = (bound, request_host) else {
+        return Ok(true);
+    };
+    let found = get_target_by_request_host(services, host).await?;
+    Ok(found.is_some_and(|found| found.id == target.id))
+}
+
 /// Whether `target` is bound to `request_host`: it has a binding, and
 /// [`served_on_host`] serves it there. With `get_target_by_request_host` this is
 /// how the management scope tells a bound host, so it and the catchall agree
@@ -393,9 +467,9 @@ async fn get_target_for_request(
         }
 
         // A target bound to a host is served only on that host, for a ticket
-        // as for anyone else.
+        // as for anyone else, and not at all if that binding is refused.
         let request_host = ctx.trusted_host_header(req);
-        if !target_served_on_host(&target, request_host.as_deref()) {
+        if !ticket_target_served_on_host(ctx.services(), &target, request_host.as_deref()).await? {
             debug!(
                 "Ticket target {} is not served on host {:?}",
                 target.name, request_host
@@ -423,13 +497,12 @@ async fn get_target_for_request(
     let session = <&Session>::from_request_without_body(req).await?;
     let params: QueryParams = req.params()?;
 
-    // Full Host header including `:port` — two HTTP targets may share a hostname
-    // and differ only by port (per-VM proxy), and `get_target_by_request_host`
-    // matches `external_host` with the port, dropping only a default one.
+    // Full Host header including `:port`: `get_target_by_request_host` matches
+    // `external_host` with the port, dropping only a default one.
     let request_host = ctx.trusted_host_header(req);
 
     let host_based_target = if let Some(host) = request_host.as_deref() {
-        let found = get_target_by_request_host(config_provider, host).await?;
+        let found = get_target_by_request_host(ctx.services(), host).await?;
         if found.is_some() {
             debug!(
                 "Domain rebinding detected: host={} -> target={:?}",
@@ -660,7 +733,10 @@ mod live_stream_tests {
     use warpgate_db_entities::Target::TargetKind;
     use warpgate_db_entities::{Role, Target, TargetRoleAssignment, User, UserRoleAssignment};
 
-    use super::{watch_admitted_live_stream, watch_live_stream, watch_public_live_stream};
+    use super::{
+        ticket_target_served_on_host, watch_admitted_live_stream, watch_live_stream,
+        watch_public_live_stream,
+    };
     use crate::test_db::{memory_db, services};
 
     async fn deregistered(services: &warpgate_core::Services) -> bool {
@@ -761,6 +837,81 @@ mod live_stream_tests {
         .await
         .unwrap();
         id
+    }
+
+    /// An HTTP target bound to `external_host`, read back as the ticket path
+    /// reads it, by id.
+    async fn bound_target(
+        services: &warpgate_core::Services,
+        db: &DatabaseConnection,
+        name: &str,
+        external_host: &str,
+    ) -> warpgate_common::Target {
+        use warpgate_core::ConfigProvider;
+
+        let id = Uuid::new_v4();
+        Target::ActiveModel {
+            id: Set(id),
+            name: Set(name.into()),
+            description: Set(String::new()),
+            kind: Set(TargetKind::Http),
+            options: Set(serde_json::json!({
+                "http": {"url": "http://h", "external_host": external_host}
+            })),
+            rate_limit_bytes_per_second: Set(None),
+            group_id: Set(None),
+            ticket_max_duration_seconds: Set(None),
+            ticket_requests_disabled: Set(false),
+            ticket_require_approval: Set(false),
+            ticket_max_uses: Set(None),
+            require_approval: Set(false),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        services
+            .config_provider
+            .get_target_by_id(id)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    /// A ticket's target is resolved by id, not by host, yet a binding the
+    /// host lookup refuses is refused for it too: one on the control-plane
+    /// host at any port, and one on a hostname another target shares.
+    #[tokio::test]
+    async fn a_ticket_target_with_a_refused_binding_is_not_served() {
+        let db = memory_db().await;
+        let services = services(db.clone()).await;
+        services.config.lock().await.store.external_host = Some("warp.example.com".into());
+
+        let own = bound_target(&services, &db, "own", "vm.example.com:3000").await;
+        assert!(
+            ticket_target_served_on_host(&services, &own, Some("vm.example.com:3000"))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !ticket_target_served_on_host(&services, &own, Some("warp.example.com"))
+                .await
+                .unwrap()
+        );
+
+        let control_plane = bound_target(&services, &db, "cp", "WARP.example.com:8443").await;
+        assert!(
+            ticket_target_served_on_host(&services, &control_plane, Some("WARP.example.com:8443"))
+                .await
+                .is_err()
+        );
+
+        let shared = bound_target(&services, &db, "a", "shared.example.com:3000").await;
+        bound_target(&services, &db, "b", "shared.example.com:8080").await;
+        assert!(
+            ticket_target_served_on_host(&services, &shared, Some("shared.example.com:3000"))
+                .await
+                .is_err()
+        );
     }
 
     /// The user a real ticket session runs as in these tests.
@@ -1032,7 +1183,7 @@ mod public_target_tests {
     //!   * Lookup is HTTP-only and port-aware.
 
     use uuid::Uuid;
-    use warpgate_common::{Target, TargetHTTPOptions, TargetOptions, Tls};
+    use warpgate_common::{HostBindingConflict, Target, TargetHTTPOptions, TargetOptions, Tls};
     use warpgate_common_http::{RequestAuthorization, SessionAuthorization};
 
     use super::{
@@ -1228,11 +1379,41 @@ mod public_target_tests {
     fn finds_http_target_by_exact_host_with_port() {
         let targets = vec![
             http_target("vm-1-3000", true, Some("vm-1.example.com:3000")),
-            http_target("vm-1-8080", true, Some("vm-1.example.com:8080")),
+            http_target("vm-2-8080", true, Some("vm-2.example.com:8080")),
         ];
         let (t, _) = find_http_target_by_external_host(&targets, "vm-1.example.com:3000")
-            .expect("must match the :3000 target, not :8080");
+            .unwrap()
+            .expect("must match the :3000 target");
         assert_eq!(t.name, "vm-1-3000");
+        assert!(
+            find_http_target_by_external_host(&targets, "vm-1.example.com:8080")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// A hostname serves one target: two bindings that share it, at any port
+    /// or case, are refused rather than one of them being served.
+    #[test]
+    fn a_hostname_shared_by_two_targets_is_refused_whatever_the_port() {
+        for (first, second) in [
+            ("vm-1.example.com:3000", "vm-1.example.com:8080"),
+            ("vm-1.example.com:3000", "vm-1.example.com"),
+            ("vm-1.example.com:3000", "VM-1.Example.com:3000"),
+        ] {
+            let targets = vec![
+                http_target("vm-1-a", true, Some(first)),
+                http_target("vm-1-b", true, Some(second)),
+            ];
+            assert_eq!(
+                find_http_target_by_external_host(&targets, first).unwrap_err(),
+                HostBindingConflict::Shared {
+                    hostname: "vm-1.example.com".into(),
+                    other: "vm-1-b".into(),
+                },
+                "{first} and {second}"
+            );
+        }
     }
 
     #[test]
@@ -1241,19 +1422,28 @@ mod public_target_tests {
         // `Host: vm-1.example.com:443`, so the client got 401, not the share.
         let targets = vec![http_target("vm-1", true, Some("vm-1.example.com"))];
         let (t, options) = find_http_target_by_external_host(&targets, "vm-1.example.com:443")
+            .unwrap()
             .expect("the default port must not hide the share");
         assert_eq!(t.name, "vm-1");
         assert_eq!(
             decide_public_target_access(Some(&options), false, None),
             PublicTargetDecision::Bypass,
         );
-        assert!(find_http_target_by_external_host(&targets, "vm-1.example.com:8443").is_none());
+        assert!(
+            find_http_target_by_external_host(&targets, "vm-1.example.com:8443")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
     fn returns_none_when_no_target_matches() {
         let targets = vec![http_target("vm-1", true, Some("vm-1.example.com:3000"))];
-        assert!(find_http_target_by_external_host(&targets, "other.example.com:3000").is_none());
+        assert!(
+            find_http_target_by_external_host(&targets, "other.example.com:3000")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -1273,7 +1463,9 @@ mod public_target_tests {
         );
         let targets = vec![ssh_target];
         assert!(
-            find_http_target_by_external_host(&targets, "vm-1.example.com:3000").is_none(),
+            find_http_target_by_external_host(&targets, "vm-1.example.com:3000")
+                .unwrap()
+                .is_none(),
             "non-HTTP targets must be skipped by the HTTP catchall lookup",
         );
     }
@@ -1281,7 +1473,11 @@ mod public_target_tests {
     #[test]
     fn ignores_targets_with_no_external_host() {
         let targets = vec![http_target("vm-1", true, None)];
-        assert!(find_http_target_by_external_host(&targets, "vm-1.example.com:3000").is_none());
+        assert!(
+            find_http_target_by_external_host(&targets, "vm-1.example.com:3000")
+                .unwrap()
+                .is_none()
+        );
     }
 
     // ─── is_warpgate_management_path (defence-in-depth path guard) ──────

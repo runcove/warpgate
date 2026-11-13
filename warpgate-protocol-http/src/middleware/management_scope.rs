@@ -92,7 +92,7 @@ async fn target_binding(
     let Some(host) = ctx.trusted_host_header(req) else {
         return Ok(false);
     };
-    let target = get_target_by_request_host(&ctx.services().config_provider, &host).await?;
+    let target = get_target_by_request_host(ctx.services(), &host).await?;
     Ok(target.is_some_and(|target| bound_to_host(&target, &host)))
 }
 

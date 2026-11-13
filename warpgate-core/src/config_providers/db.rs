@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use data_encoding::BASE64;
-use sea_orm::sea_query::{Expr, Func, IntoIden, Query};
+use sea_orm::sea_query::{Expr, ExprTrait, Func, IntoIden, Query};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection,
     EntityTrait, ModelTrait, QueryFilter, QueryOrder, Set,
@@ -18,7 +18,7 @@ use warpgate_common::helpers::hash::{hash_secret, verify_password_hash};
 use warpgate_common::helpers::otp::verify_totp;
 use warpgate_common::{
     Protocol, Target, User, UserAuthCredential, UserPublicKeyCredential,
-    UserRequireCredentialsPolicy, UserSsoCredential, WarpgateError,
+    UserRequireCredentialsPolicy, UserSsoCredential, WarpgateError, host_binding_conflict,
 };
 use warpgate_db_entities as entities;
 use warpgate_sso::SsoProviderConfig;
@@ -374,10 +374,23 @@ impl ConfigProvider for DatabaseConfigProvider {
             .map_err(Into::into)
     }
 
+    /// The target bound to exactly `hostname`. A binding whose hostname
+    /// another target shares (at any port, in any case) is refused with an
+    /// error rather than served: such rows predate the admin API's check
+    /// ([`warpgate_common::host_binding_conflict`]).
     async fn get_target_by_hostname(
         &self,
         hostname: &str,
     ) -> Result<Option<Target>, WarpgateError> {
+        /// A row's `external_host` binding, if it has one.
+        fn binding(target: &entities::Target::Model) -> Option<&str> {
+            target
+                .options
+                .pointer("/http/external_host")
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.is_empty())
+        }
+
         let db = &self.db;
 
         let hostname_query = match db.get_database_backend() {
@@ -388,15 +401,33 @@ impl ConfigProvider for DatabaseConfigProvider {
             DatabaseBackend::Sqlite => Expr::cust(r"json_extract(options, '$.http.external_host')"),
         };
 
-        let target = entities::Target::Entity::find()
-            .filter(hostname_query.eq(hostname))
-            .one(db)
+        // Every bound target, so a shared hostname is seen whatever its port
+        // or case; the exact match is picked out below.
+        let bound = entities::Target::Entity::find()
+            .filter(hostname_query.is_not_null())
+            .all(db)
             .await?;
 
-        target
-            .map(TryInto::try_into)
-            .transpose()
-            .map_err(Into::into)
+        let Some(target) = bound
+            .iter()
+            .find(|target| binding(target) == Some(hostname))
+        else {
+            return Ok(None);
+        };
+
+        let others = bound
+            .iter()
+            .filter(|other| other.id != target.id)
+            .filter_map(|other| Some((other.name.as_str(), binding(other)?)));
+        if let Some(conflict) = host_binding_conflict(hostname, None, others) {
+            warn!(target = %target.name, %conflict, "Refusing a target's host binding");
+            return Err(WarpgateError::InconsistentState(format!(
+                "target {} is not served: {conflict}",
+                target.name
+            )));
+        }
+
+        target.clone().try_into().map(Some).map_err(Into::into)
     }
 
     async fn get_credential_policy(
@@ -1379,5 +1410,62 @@ mod tests {
                 .unwrap(),
             None,
         );
+    }
+
+    async fn bound_target(db: &DatabaseConnection, name: &str, external_host: &str) {
+        entities::Target::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            name: Set(name.to_owned()),
+            description: Set(String::new()),
+            kind: Set(entities::Target::TargetKind::Http),
+            options: Set(serde_json::json!({
+                "http": { "url": "http://127.0.0.1:1", "external_host": external_host }
+            })),
+            rate_limit_bytes_per_second: Set(None),
+            group_id: Set(None),
+            ticket_max_duration_seconds: Set(None),
+            ticket_requests_disabled: Set(false),
+            ticket_require_approval: Set(false),
+            ticket_max_uses: Set(None),
+            require_approval: Set(false),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+    }
+
+    /// A stored binding whose hostname another target shares, at any port or
+    /// in any case, is refused at lookup rather than one row being served.
+    #[tokio::test]
+    async fn a_shared_hostname_is_refused_at_lookup() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        migrate_database(&db).await.unwrap();
+        bound_target(&db, "alone", "alone.example.com:3000").await;
+        bound_target(&db, "a", "shared.example.com:3000").await;
+        bound_target(&db, "b", "SHARED.example.com:8080").await;
+        let provider = DatabaseConfigProvider::new(&db);
+
+        let alone = provider
+            .get_target_by_hostname("alone.example.com:3000")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(alone.name, "alone");
+        assert!(
+            provider
+                .get_target_by_hostname("nothing.example.com")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        for host in ["shared.example.com:3000", "SHARED.example.com:8080"] {
+            assert!(
+                matches!(
+                    provider.get_target_by_hostname(host).await,
+                    Err(WarpgateError::InconsistentState(_))
+                ),
+                "{host}"
+            );
+        }
     }
 }

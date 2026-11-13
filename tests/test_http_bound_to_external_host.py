@@ -1,11 +1,9 @@
-"""An HTTP target bound to Warpgate's own external host.
+"""HTTP targets and Warpgate's own external host.
 
-The layout where a deployment's bare host is the whole site: the target's
-`external_host` is the gateway's own host (the global `external_host`, plus the
-port, which a binding compares as part of the Host header). A user opens the
-bare host, signs in once and lands in the target without seeing the target
-list; Warpgate's own management routes stay out of reach there, and are
-reached on a host bound to nothing.
+A target may not be bound to the control-plane host, at any port: that host
+would share its cookies with the target's pages. The supported layout binds
+the site to the global `external_host` and names the control plane with
+`http.external_host`, a different hostname (the split layout below).
 """
 
 from uuid import uuid4
@@ -21,132 +19,46 @@ from .test_http_user_auth_oidc import _resolve_hosts_to_localhost
 from .util import wait_port
 
 MAIN_HOST = "warpgate.whole-site.test"
-ADMIN_TOKEN = {"X-Warpgate-Token": "token-value"}
-BROWSER_NAVIGATION = {
-    "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
-    "Sec-Fetch-Mode": "navigate",
-}
 
 
 @pytest.fixture(scope="module")
 def whole_site_wg(processes: ProcessManager):
-    # Its own gateway: a target bound to the main host makes that host a bound
-    # host for every test sharing the gateway.
+    # The control plane is the global `external_host` (no `http.external_host`).
     wg = processes.start_wg(config_patch={"external_host": MAIN_HOST})
     wait_port(wg.http_port, for_process=wg.process, recv=False)
     yield wg
 
 
-def test_a_target_bound_to_the_external_host_itself_is_the_whole_site(
+def test_a_target_cannot_be_bound_to_the_control_plane_host(
     echo_server_port,
     whole_site_wg: WarpgateProcess,
 ):
     port = whole_site_wg.http_port
-    main_host = f"{MAIN_HOST}:{port}"
-    url = f"https://{main_host}"
-    # `localhost`, which no target is bound to; setup goes through here
-    # because the main host serves no admin API.
     setup_url = f"https://localhost:{port}"
-    # Another name for the same Warpgate, bound to nothing.
-    admin_host = f"admin-{uuid4().hex[:8]}.{MAIN_HOST}:{port}"
-
     with admin_client(setup_url) as api:
         role = api.create_role(sdk.RoleDataRequest(name=f"role-{uuid4()}"))
-        user = api.create_user(sdk.CreateUserRequest(username=f"user-{uuid4()}"))
-        api.create_password_credential(
-            user.id, sdk.NewPasswordCredential(password="123")
-        )
-        api.add_user_role(user.id, role.id)
-        # The user is authorized for both; one is bound to the main host.
-        bound = _echo_target(api, echo_server_port, role, "bound", main_host)
-        other = _echo_target(api, echo_server_port, role, "other")
+        for binding in [f"{MAIN_HOST}:{port}", MAIN_HOST, f"{MAIN_HOST.upper()}:8443"]:
+            with pytest.raises(sdk.ApiException) as e:
+                _echo_target(api, echo_server_port, role, "bound", binding)
+            assert e.value.status == 409, binding
+            assert "own host" in e.value.body, binding
 
-    with _resolve_hosts_to_localhost(MAIN_HOST):
-        # Signed out, a browser's page load is sent to the login page on the
-        # same host, carrying the page it asked for.
-        response = requests.get(
-            f"{url}/some/page?x=1",
-            headers=BROWSER_NAVIGATION,
-            verify=False,
-            allow_redirects=False,
-        )
-        assert response.status_code == 307, response.text
-        assert (
-            response.headers["location"]
-            == "/@warpgate#/login?next=%2Fsome%2Fpage%3Fx%3D1"
-        )
 
-        # Logging in on the host (the login flow is served there) ...
-        session = requests.Session()
-        session.verify = False
-        response = session.post(
-            f"{url}/@warpgate/api/auth/login",
-            json={"username": user.username, "password": "123"},
-        )
-        assert response.status_code == 201, response.text
-
-        # ... and asking for the page again is answered by the target, not
-        # the target list.
-        response = session.get(f"{url}/some/page?x=1", allow_redirects=False)
-        assert _served_by(response) == ["bound"]
-        assert response.json()["path"] == "/some/page"
-
-        # The bound target is the whole site: another target named in the
-        # query parameter is ignored.
-        response = session.get(
-            f"{url}/some/page?warpgate-target={other.name}",
-            allow_redirects=False,
-        )
-        assert _served_by(response) == ["bound"]
-        response = session.get(f"{url}/", allow_redirects=False)
-        assert _served_by(response) == ["bound"]
-
-        # The login flow stays served there: the session is visible.
-        response = session.get(f"{url}/@warpgate/api/info")
-        assert response.status_code == 200, response.text
-        assert response.json()["username"] == user.username
-
-        # Warpgate's own management routes are not: they answer 404 on the
-        # bound host, whether the request carries the session, the admin
-        # token or both.
-        for path in [
-            "/@warpgate/admin/api/users",
-            "/@warpgate/admin/api/targets",
-            "/@warpgate/admin",
-        ]:
-            for headers in [{}, ADMIN_TOKEN]:
-                response = session.get(
-                    f"{url}{path}", headers=headers, allow_redirects=False
-                )
-                assert response.status_code == 404, (
-                    f"{path} {sorted(headers)}: {response.status_code}"
-                )
-        response = requests.get(
-            f"{url}/@warpgate/admin/api/users", headers=ADMIN_TOKEN, verify=False
-        )
-        assert response.status_code == 404, response.status_code
-        for path in [
-            "/@warpgate/api/targets",
-            "/@warpgate/api/profile/credentials",
-        ]:
-            response = session.get(f"{url}{path}", allow_redirects=False)
-            assert response.status_code == 404, f"{path}: {response.status_code}"
-
-    # On a name bound to nothing, the admin API works for an admin.
-    response = requests.get(
-        f"{setup_url}/@warpgate/admin/api/users",
-        headers={**ADMIN_TOKEN, "Host": admin_host},
-        verify=False,
-    )
-    assert response.status_code == 200, response.status_code
-    assert bound.name in [
-        target["name"]
-        for target in requests.get(
-            f"{setup_url}/@warpgate/admin/api/targets",
-            headers={**ADMIN_TOKEN, "Host": admin_host},
-            verify=False,
-        ).json()
-    ]
+def test_a_hostname_is_bound_to_one_target_whatever_the_port(
+    echo_server_port,
+    whole_site_wg: WarpgateProcess,
+):
+    port = whole_site_wg.http_port
+    setup_url = f"https://localhost:{port}"
+    name = f"vm-{uuid4().hex[:8]}.{MAIN_HOST}"
+    with admin_client(setup_url) as api:
+        role = api.create_role(sdk.RoleDataRequest(name=f"role-{uuid4()}"))
+        first = _echo_target(api, echo_server_port, role, "first", f"{name}:{port}")
+        for binding in [f"{name}:{port}", f"{name}:8443", name, name.upper()]:
+            with pytest.raises(sdk.ApiException) as e:
+                _echo_target(api, echo_server_port, role, "second", binding)
+            assert e.value.status == 409, binding
+            assert first.name in e.value.body, binding
 
 
 SPLIT_MAIN_HOST = "warpgate.split-site.test"
