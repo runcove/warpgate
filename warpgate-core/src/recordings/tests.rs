@@ -1113,29 +1113,218 @@ fn acl_entries(path: &Path) -> Vec<String> {
 /// ACL giving `reader` read on files and read + execute on directories, nothing to the
 /// owning group or others. An error saying why when ACLs are not available here.
 fn grant_reader_by_default_acl(root: &Path, reader: u32) -> std::result::Result<(), String> {
-    let setfacl = |args: &[&str]| {
-        let output = std::process::Command::new("setfacl")
-            .args(args)
-            .arg(root)
-            .output()
-            .map_err(|e| format!("running setfacl (is the acl package installed?): {e}"))?;
-        if output.status.success() {
-            Ok(())
-        } else {
-            Err(format!(
-                "setfacl {args:?} {} failed (no ACL support on this filesystem?): {}",
-                root.display(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            ))
-        }
-    };
-    setfacl(&["-m", &format!("u:{reader}:x")])?;
-    setfacl(&["-d", "-m", &format!("u::rwx,g::---,o::---,u:{reader}:rX")])
+    set_acl(root, &["-m", &format!("u:{reader}:x")])?;
+    set_acl(
+        root,
+        &["-d", "-m", &format!("u::rwx,g::---,o::---,u:{reader}:rX")],
+    )
 }
 
-/// Set to `1` to let the real-ACL test skip where ACLs are not available. Without
+/// Runs `setfacl ARGS path`. An error saying why when ACLs are not available here.
+fn set_acl(path: &Path, args: &[&str]) -> std::result::Result<(), String> {
+    let output = std::process::Command::new("setfacl")
+        .args(args)
+        .arg(path)
+        .output()
+        .map_err(|e| format!("running setfacl (is the acl package installed?): {e}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "setfacl {args:?} {} failed (no ACL support on this filesystem?): {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+/// Set to `1` to let the real-ACL tests skip where ACLs are not available. Without
 /// it, missing `setfacl` / `getfacl` or ACL support fails the test.
 const SKIP_ACL_TEST: &str = "WARPGATE_TEST_SKIP_ACL";
+
+/// Fails the test `test` because ACLs are not available here (`why`), unless
+/// [`SKIP_ACL_TEST`] is `1`, which turns that into a skip that says so.
+fn acl_unavailable(test: &str, why: &str) {
+    assert!(
+        std::env::var_os(SKIP_ACL_TEST).is_some_and(|v| v == "1"),
+        "{why}. This test needs POSIX ACLs; set {SKIP_ACL_TEST}=1 to skip it where \
+         they are not available"
+    );
+    eprintln!("SKIPPED {test} ({SKIP_ACL_TEST}=1): {why}; nothing was asserted");
+}
+
+/// The bits of an ACL entry's rights (`rwx`, `r-x`, `---`, ...).
+fn acl_bits(rights: &str) -> u32 {
+    rights
+        .chars()
+        .zip([4, 2, 1])
+        .map(|(c, bit)| if c == '-' { 0 } else { bit })
+        .sum()
+}
+
+/// Asserts that `path`'s mode is within `ceiling` and that its access ACL's effective
+/// rights are too: every named entry and the owning-group entry, limited by the mask,
+/// within the ceiling's group bits, and the other entry within its other bits. With a
+/// ceiling of 0750 or 0640 nobody but the owner can write. Default entries grant no
+/// access to `path` itself and are not checked.
+fn assert_effective_rights_within(path: &Path, ceiling: u32) {
+    let mode = mode_of(path);
+    assert_eq!(
+        mode & !ceiling,
+        0,
+        "{}: mode {mode:o} is wider than {ceiling:o}",
+        path.display()
+    );
+    let acl = acl_entries(path);
+    let entries: Vec<(&str, &str, u32)> = acl
+        .iter()
+        .filter(|e| !e.starts_with("default:"))
+        .map(|e| {
+            let mut parts = e.splitn(3, ':');
+            let (Some(tag), Some(qualifier), Some(rights)) =
+                (parts.next(), parts.next(), parts.next())
+            else {
+                panic!("{}: unexpected ACL entry {e:?}", path.display());
+            };
+            (tag, qualifier, acl_bits(rights))
+        })
+        .collect();
+    let mask = entries
+        .iter()
+        .find(|(tag, _, _)| *tag == "mask")
+        .map_or(0o7, |(_, _, bits)| *bits);
+    for (tag, qualifier, bits) in &entries {
+        let (effective, allowed) = match *tag {
+            "user" if qualifier.is_empty() => continue,
+            "mask" => continue,
+            "other" => (*bits, ceiling & 0o7),
+            "user" | "group" => (bits & mask, (ceiling >> 3) & 0o7),
+            _ => panic!("{}: unexpected ACL entry tag {tag:?}", path.display()),
+        };
+        assert_eq!(
+            effective & !allowed,
+            0,
+            "{}: {tag}:{qualifier} has effective rights {effective:o}, beyond {allowed:o}: {acl:?}",
+            path.display()
+        );
+    }
+}
+
+/// Made-up ids for named ACL entries: no such user or group needs to exist, so the
+/// ACL tests that use them check the same as root and as any user.
+const NAMED_USER: u32 = 4242;
+const NAMED_GROUP: u32 = 4343;
+
+/// A default ACL on the recordings root that grants write to a named user, a named
+/// group, the owning group and others does not widen what Warpgate creates under the
+/// flag: the session directory, the recording directory and both recording files end
+/// within 0750 / 0640 by their effective rights, mask included, so nobody but the
+/// owner can write and others get nothing. Under a default ACL the kernel ignores the
+/// umask, so only Warpgate's creation modes and masking bound them. The named ids are
+/// made up and the root is this process's own, so this checks the same as root and as
+/// any user. Fails where ACLs are not available, unless [`SKIP_ACL_TEST`] is `1`.
+#[tokio::test]
+async fn a_default_acl_granting_write_does_not_widen_new_recordings() {
+    for s3 in [false, true] {
+        let h = Harness::with_securing(s3.then(FakeS3::default), true, true).await;
+        let base = if s3 { scratch_root(&h) } else { disk_root(&h) };
+        std::fs::create_dir_all(&base).unwrap();
+        set_mode(&base, 0o700);
+        let default_acl =
+            format!("u::rwx,g::rwx,o::rwx,u:{NAMED_USER}:rwx,g:{NAMED_GROUP}:rwx,m::rwx");
+        if let Err(why) = set_acl(&base, &["-d", "-m", &default_acl]) {
+            acl_unavailable(
+                "a_default_acl_granting_write_does_not_widen_new_recordings",
+                &why,
+            );
+            return;
+        }
+
+        let recording = start_named(&h).await.unwrap().unwrap();
+        h.wait_for_writers(2).await;
+        let session = base.join(h.session_id.to_string());
+        let leaf = session.join(NAME);
+
+        // The default ACL did apply: the write-granting entries were inherited, so
+        // only the mask and the mode stand between them and a write.
+        for dir in [&session, &leaf] {
+            let acl = acl_entries(dir);
+            for entry in [
+                format!("user:{NAMED_USER}:rwx"),
+                format!("group:{NAMED_GROUP}:rwx"),
+            ] {
+                assert!(
+                    acl.contains(&entry),
+                    "s3: {s3}: {} did not inherit {entry}: {acl:?}",
+                    dir.display()
+                );
+            }
+            assert_effective_rights_within(dir, 0o750);
+        }
+        for file in [RecordingFile::NDJsonData, RecordingFile::Index] {
+            let file = leaf.join(file.filename());
+            let acl = acl_entries(&file);
+            assert!(
+                acl.contains(&format!("user:{NAMED_USER}:rwx")),
+                "s3: {s3}: {} did not inherit the named entry: {acl:?}",
+                file.display()
+            );
+            assert_effective_rights_within(&file, 0o640);
+        }
+
+        drop(recording);
+        h.wait_for_writers(0).await;
+    }
+}
+
+/// A recordings root that already has an access ACL granting write (to a named user, a
+/// named group and the owning group) is tightened through its mask: under the flag the
+/// root's mode becomes `current & 0750`, and on a root with an ACL the group bits are
+/// the ACL mask. The named entries are left in place (neither removed nor refused), but
+/// the mask caps their effective rights at r-x, others get nothing, and the recording
+/// starts. The named ids are made up and the root is this process's own, so this
+/// checks the same as root and as any user. Fails where ACLs are not available,
+/// unless [`SKIP_ACL_TEST`] is `1`.
+#[tokio::test]
+async fn a_root_access_acl_granting_write_is_capped_by_its_mask() {
+    for s3 in [false, true] {
+        let h = Harness::with_securing(s3.then(FakeS3::default), true, true).await;
+        let base = if s3 { scratch_root(&h) } else { disk_root(&h) };
+        std::fs::create_dir_all(&base).unwrap();
+        set_mode(&base, 0o777);
+        let access_acl = format!("g::rwx,u:{NAMED_USER}:rwx,g:{NAMED_GROUP}:rwx,m::rwx");
+        if let Err(why) = set_acl(&base, &["-m", &access_acl]) {
+            acl_unavailable(
+                "a_root_access_acl_granting_write_is_capped_by_its_mask",
+                &why,
+            );
+            return;
+        }
+        assert_eq!(mode_of(&base), 0o777, "s3: {s3}: the root starts wide");
+
+        let recording = start_named(&h).await.unwrap().unwrap();
+        h.wait_for_writers(2).await;
+
+        assert_eq!(mode_of(&base), 0o750, "s3: {s3}");
+        let acl = acl_entries(&base);
+        for entry in [
+            format!("user:{NAMED_USER}:rwx"),
+            format!("group:{NAMED_GROUP}:rwx"),
+            "group::rwx".to_owned(),
+            "mask::r-x".to_owned(),
+            "other::---".to_owned(),
+        ] {
+            assert!(
+                acl.contains(&entry),
+                "s3: {s3}: root lacks {entry}: {acl:?}"
+            );
+        }
+        assert_effective_rights_within(&base, 0o750);
+
+        drop(recording);
+        h.wait_for_writers(0).await;
+    }
+}
 
 /// End to end on a real default ACL (this process's own uid stands in for the
 /// reader): with the flag, a new directory's ACL mask is r-x and a new file's r--,
@@ -1158,14 +1347,9 @@ async fn a_default_acl_reader_keeps_read_and_nobody_else_gains_it() {
         std::fs::create_dir_all(&base).unwrap();
         set_mode(&base, 0o700);
         if let Err(why) = grant_reader_by_default_acl(&base, reader) {
-            assert!(
-                std::env::var_os(SKIP_ACL_TEST).is_some_and(|v| v == "1"),
-                "{why}. This test needs POSIX ACLs; set {SKIP_ACL_TEST}=1 to skip it where \
-                 they are not available"
-            );
-            eprintln!(
-                "SKIPPED a_default_acl_reader_keeps_read_and_nobody_else_gains_it ({SKIP_ACL_TEST}=1): \
-                 {why}; nothing was asserted"
+            acl_unavailable(
+                "a_default_acl_reader_keeps_read_and_nobody_else_gains_it",
+                &why,
             );
             return;
         }

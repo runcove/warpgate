@@ -107,13 +107,9 @@ primary group, not the root's.
   another user (even when Warpgate runs as root), or a failure to chmod one
   fails the recording start. Each recording file must be new: an existing file
   of that name fails the start too, so starting a recording with the same name
-  again is refused under the flag. A failed start leaves the session without
-  that recording and logs one line per failed recording start: per channel on
-  SSH, per API request or exec/attach stream on Kubernetes. SSH, web SSH and
-  Kubernetes exec/attach log it at error level; Kubernetes API requests, RDP,
-  VNC and the web desktop at warning level. Below the root, each directory and
-  file is created and opened relative to the directory above it, never through
-  a symlink, so nothing is created or chmodded through a symlink there, and the
+  again is refused under the flag. Below the root, each directory and file is
+  created and opened relative to the directory above it, never through a
+  symlink, so nothing is created or chmodded through a symlink there, and the
   directory checked is the one written to.
 - **The root and the directories above it are resolved by path.** The
   guarantee above holds for a root that only Warpgate's user (and root) can
