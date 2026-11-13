@@ -130,7 +130,7 @@ class TestHTTPUserAuthOIDCBackchannelLogout:
         assert session.post(f"{wg_url}/@warpgate/api/auth/logout").status_code == 403
         assert _username(wg_url, session) == user.username
 
-        response = session.get(f"{wg_url}/@warpgate/api/sso/logout")
+        response = session.post(f"{wg_url}/@warpgate/api/sso/logout")
         assert response.status_code == 200
         assert response.json()["url"].startswith(f"http://localhost:{oidc_port}/")
         assert _username(wg_url, session) is None

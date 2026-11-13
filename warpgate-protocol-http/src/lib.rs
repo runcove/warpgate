@@ -531,6 +531,41 @@ mod tests {
         (accepted.is_ok_and(|accepted| accepted.is_ok()), received)
     }
 
+    /// SSO logout ends the login, so it must not be reachable by a GET (a
+    /// link or an image could fire it): the user API, nested under both
+    /// prefixes as `bind` nests it, answers GET with 405 and routes POST.
+    #[tokio::test]
+    async fn sso_logout_is_not_a_get_route_under_either_prefix() {
+        let api = || {
+            Route::new().nest(
+                "/api",
+                OpenApiService::new(crate::api::get(), "test", "0").server("/@warpgate/api"),
+            )
+        };
+        let app = Route::new()
+            .nest("/@warpgate", api())
+            .nest("/_warpgate", api())
+            .with(ServerSession::new(
+                poem::session::CookieConfig::default(),
+                poem::session::MemoryStorage::new(),
+            ));
+        let cli = poem::test::TestClient::new(app);
+        for prefix in ["/@warpgate", "/_warpgate"] {
+            let path = format!("{prefix}/api/sso/logout");
+            cli.get(&path)
+                .send()
+                .await
+                .assert_status(http::StatusCode::METHOD_NOT_ALLOWED);
+            // POST is routed: not a missing route or a refused method.
+            let status = cli.post(&path).send().await.0.status();
+            assert!(
+                status != http::StatusCode::METHOD_NOT_ALLOWED
+                    && status != http::StatusCode::NOT_FOUND,
+                "POST {path}: {status}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn loopback_listener_refuses_to_start_as_root() {
         let address = ListenEndpoint::from("127.0.0.1:0".parse::<SocketAddr>().unwrap());

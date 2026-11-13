@@ -172,7 +172,7 @@ mod tests {
             (Method::GET, "/@warpgate/api/info", true),
             (Method::POST, "/@warpgate/api/profile/credentials/otp", true),
             (Method::POST, "/_warpgate/api/auth/logout", true),
-            (Method::GET, "/@warpgate/api/sso/logout", true),
+            (Method::POST, "/@warpgate/api/sso/logout", true),
             (Method::GET, "/@warpgate/api/auth/state", true),
             (Method::DELETE, "/@warpgate/api/auth/state", true),
             (Method::POST, "/@warpgate/api/auth/login", true),

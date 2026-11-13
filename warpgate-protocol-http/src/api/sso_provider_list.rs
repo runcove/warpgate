@@ -713,7 +713,7 @@ impl Api {
 
     #[oai(
         path = "/sso/logout",
-        method = "get",
+        method = "post",
         operation_id = "initiate_sso_logout"
     )]
     async fn api_start_slo(

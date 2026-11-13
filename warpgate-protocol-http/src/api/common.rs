@@ -580,7 +580,7 @@ mod logout_tests {
             .await
             .assert_status_is_ok();
 
-        cli.get("/api/sso/logout")
+        cli.post("/api/sso/logout")
             .header("cookie", &login.cookie)
             .header("host", "localhost")
             .send()

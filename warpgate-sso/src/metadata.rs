@@ -64,7 +64,7 @@ fn check_endpoint_scheme(endpoint: &str, url: &Url) -> Result<(), SsoError> {
 /// their scheme, so a hostile or compromised provider can advertise something
 /// like `javascript:...` as its `authorization_endpoint` or
 /// `end_session_endpoint`. Both of those reach the browser as a URL to
-/// navigate to (`GET /sso/providers/:name/start` and `GET /sso/logout` return
+/// navigate to (`GET /sso/providers/:name/start` and `POST /sso/logout` return
 /// them to the frontend, which assigns them to `location.href`), so a
 /// `javascript:` URL there would execute on the gateway's own origin. The
 /// remaining endpoints are only ever fetched server-side, but there is no
@@ -244,7 +244,7 @@ pub mod tests {
 
     #[test]
     fn javascript_end_session_endpoint_is_rejected() {
-        // This one is handed to the browser by `GET /sso/logout`.
+        // This one is handed to the browser by `POST /sso/logout`.
         assert_eq!(
             rejected_endpoint(&json!({
                 "end_session_endpoint": "javascript:alert(document.cookie)",

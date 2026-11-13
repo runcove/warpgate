@@ -10,18 +10,20 @@ use warpgate_common_http::is_cluster_peer_request;
 use super::mfa_enforcement::warpgate_surface_path;
 use crate::catchall::{bound_to_host, get_target_by_request_host};
 
-/// Whether `method` and `path` are part of signing in or out: the routes
-/// under `/@warpgate` and `/_warpgate` on which a host bound to an HTTP target
-/// still honours a session or token ([`credentials_refused_on_bound_host`]). That covers the gateway shell and its assets (the login page
-/// is a route inside the shell), the login steps, the browser's own login
-/// state, SSO start, return and logout, `info` for the login page and the
-/// embedded session bar, and the custom logo the login page shows. Everything
-/// else, including the admin API, the rest of the user API and forced MFA
-/// enrolment, is only usable on other hosts.
+/// Whether `method` and `path` are part of signing in or out: the gateway
+/// shell and its assets (the login page is a route inside the shell), the
+/// login steps, the browser's own login state, SSO start, return and logout,
+/// `info` for the login page and the embedded session bar, and the custom logo
+/// the login page shows.
+///
+/// This set has two users, each through its own function so either can
+/// change without the other: [`is_origin_checked_route`] (the origin check)
+/// and [`is_served_on_bound_host`] (what a host bound to an HTTP target
+/// serves).
 ///
 /// Paths are matched exactly; a dot or empty segment, or an escape in an
 /// asset path, is never part of the login flow.
-pub(crate) fn is_login_flow_route(method: &Method, path: &str) -> bool {
+fn is_login_flow_route(method: &Method, path: &str) -> bool {
     let Some(path) = warpgate_surface_path(path) else {
         return false;
     };
@@ -45,12 +47,12 @@ pub(crate) fn is_login_flow_route(method: &Method, path: &str) -> bool {
         return method == Method::GET && !name.contains('/');
     }
     match path {
-        "/api/info"
-        | "/api/logo"
-        | "/api/sso/providers"
-        | "/api/sso/auto-start"
-        | "/api/sso/logout" => method == Method::GET,
-        "/api/auth/login" | "/api/auth/otp" | "/api/auth/logout" => method == Method::POST,
+        "/api/info" | "/api/logo" | "/api/sso/providers" | "/api/sso/auto-start" => {
+            method == Method::GET
+        }
+        "/api/auth/login" | "/api/auth/otp" | "/api/auth/logout" | "/api/sso/logout" => {
+            method == Method::POST
+        }
         // The browser's own login only; `/api/auth/state/:id` and its
         // approve and reject routes act on someone else's.
         "/api/auth/state" => method == Method::GET || method == Method::DELETE,
@@ -58,6 +60,25 @@ pub(crate) fn is_login_flow_route(method: &Method, path: &str) -> bool {
         "/api/sso/return" => method == Method::GET || method == Method::POST,
         _ => false,
     }
+}
+
+/// Whether a state-changing request to this route must come from Warpgate's
+/// own origin (`OriginCheckMiddleware`): the whole login flow, sign-out
+/// included ([`is_login_flow_route`]). Kept apart from
+/// [`is_served_on_bound_host`] so that narrowing what bound hosts serve never
+/// drops the origin check on a sign-in or sign-out route.
+pub fn is_origin_checked_route(method: &Method, path: &str) -> bool {
+    is_login_flow_route(method, path)
+}
+
+/// Whether a host bound to an HTTP target still serves this route of
+/// Warpgate's own and honours a session or token on it
+/// ([`credentials_refused_on_bound_host`]): today the whole login flow
+/// ([`is_login_flow_route`]). Everything else, including the admin API, the
+/// rest of the user API and forced MFA enrolment, is only usable on other
+/// hosts.
+pub fn is_served_on_bound_host(method: &Method, path: &str) -> bool {
+    is_login_flow_route(method, path)
 }
 
 /// Whether the request's host is bound to an HTTP target, resolved as the
@@ -76,8 +97,8 @@ async fn target_binding(
 }
 
 /// Whether a route of Warpgate's own on this request's host is out of scope:
-/// the host is bound to an HTTP target and the route is not part of the login
-/// flow ([`is_login_flow_route`]). A cluster peer's forwarded request was
+/// the host is bound to an HTTP target and the route is not one it serves
+/// ([`is_served_on_bound_host`]). A cluster peer's forwarded request was
 /// scoped on the node the client reached.
 async fn out_of_scope(
     ctx: &UnauthenticatedRequestContext,
@@ -86,7 +107,7 @@ async fn out_of_scope(
     let path = req.original_uri().path();
     if is_cluster_peer_request(req)
         || warpgate_surface_path(path).is_none()
-        || is_login_flow_route(req.method(), path)
+        || is_served_on_bound_host(req.method(), path)
     {
         return Ok(false);
     }
@@ -95,7 +116,7 @@ async fn out_of_scope(
 
 /// Whether the session or token a request to Warpgate's own routes carries
 /// must not count, because its host is bound to an HTTP target and the route
-/// is not part of the login flow ([`is_login_flow_route`]).
+/// is not one it serves ([`is_served_on_bound_host`]).
 ///
 /// This is upstream's session restriction on hosts other than the control
 /// plane (`inject_request_authorization`), extended: a bound host serves the
@@ -115,8 +136,8 @@ pub async fn credentials_refused_on_bound_host(
 }
 
 /// Hides Warpgate's own management surface on hosts bound to an HTTP target:
-/// every route under `/@warpgate` and `/_warpgate` that is not part of the
-/// login flow ([`is_login_flow_route`]) answers 404 there, whatever the
+/// every route under `/@warpgate` and `/_warpgate` that such a host does not
+/// serve ([`is_served_on_bound_host`]) answers 404 there, whatever the
 /// request's credentials, as if it were not mounted. If the host cannot be
 /// resolved, those routes answer 503 rather than being served.
 ///
@@ -197,7 +218,8 @@ mod tests {
                 (Method::GET, "/api/sso/auto-start", true),
                 (Method::GET, "/api/sso/return", true),
                 (Method::POST, "/api/sso/return", true),
-                (Method::GET, "/api/sso/logout", true),
+                (Method::POST, "/api/sso/logout", true),
+                (Method::GET, "/api/sso/logout", false),
                 // Wrong methods on login routes
                 (Method::POST, "/api/info", false),
                 (Method::POST, "/api/logo", false),
@@ -255,6 +277,21 @@ mod tests {
         }
         // Proxied target paths are not management routes at all.
         assert!(!is_login_flow_route(&Method::GET, "/api/info"));
+    }
+
+    /// Both sign-out routes are origin-checked and served on bound hosts, and
+    /// only as POST: a GET can be triggered by any page.
+    #[test]
+    fn sign_out_is_post_only_and_origin_checked() {
+        for prefix in ["/@warpgate", "/_warpgate"] {
+            for route in ["/api/auth/logout", "/api/sso/logout"] {
+                let path = format!("{prefix}{route}");
+                assert!(is_origin_checked_route(&Method::POST, &path), "{path}");
+                assert!(is_served_on_bound_host(&Method::POST, &path), "{path}");
+                assert!(!is_origin_checked_route(&Method::GET, &path), "{path}");
+                assert!(!is_served_on_bound_host(&Method::GET, &path), "{path}");
+            }
+        }
     }
 
     #[test]

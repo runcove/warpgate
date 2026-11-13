@@ -7,7 +7,7 @@ use warpgate_common_http::auth::UnauthenticatedRequestContext;
 use warpgate_common_http::{PlainHttpListener, is_cluster_peer_request};
 
 use super::loopback_host::request_host;
-use super::management_scope::is_login_flow_route;
+use super::management_scope::is_origin_checked_route;
 use super::mfa_enforcement::warpgate_surface_path;
 use crate::common::{accepted_origins, is_cross_origin_request, is_warpgate_cookie_name};
 
@@ -103,7 +103,7 @@ fn login_flow_request_allowed(
     request_host: Option<&str>,
     accepted: &[Origin],
 ) -> bool {
-    !is_login_flow_route(&check.method, check.path)
+    !is_origin_checked_route(&check.method, check.path)
         || !is_cross_origin_request(req, request_host, accepted)
 }
 
@@ -314,6 +314,8 @@ mod tests {
             "/@warpgate/api/auth/otp",
             LOGOUT,
             "/_warpgate/api/auth/login",
+            "/@warpgate/api/sso/logout",
+            "/_warpgate/api/sso/logout",
         ] {
             assert!(!allows(&post_from(path, FOREIGN), MAIN), "{path}");
             // A target's page under the main host is another origin too ...
