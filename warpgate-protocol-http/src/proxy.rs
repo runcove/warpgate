@@ -38,7 +38,7 @@ use warpgate_tls::{TlsMode, configure_tls_connector};
 use warpgate_web::lookup_built_file;
 
 use crate::client_cache::{HttpClientCache, build_client};
-use crate::common::{SessionExt, is_public_session_authorization, is_warpgate_session_cookie_name};
+use crate::common::{SessionExt, is_public_session_authorization, is_warpgate_cookie_name};
 use crate::unix_socket::checked_unix_socket;
 
 static X_WARPGATE_USERNAME: HeaderName = HeaderName::from_static("x-warpgate-username");
@@ -188,9 +188,51 @@ fn copy_client_response<R: SomeResponse>(
             e.remove_entry();
         }
     }
+    // An upstream must not wipe Warpgate's own cookies and storage for the
+    // whole origin. Stripped here only: the shared deny-list also serves the
+    // cluster and Kubernetes paths.
+    headers.remove(&CLEAR_SITE_DATA);
     server_response.headers_mut().extend(headers);
+    // After `extend`, which replaces same-name headers.
+    add_frame_protection(server_response.headers_mut());
 
     server_response.set_status(client_response.status());
+}
+
+static CLEAR_SITE_DATA: HeaderName = HeaderName::from_static("clear-site-data");
+/// Appended to every proxied response as its own header, so it adds to an
+/// upstream policy and never replaces it.
+const PROXIED_FRAME_ANCESTORS_CSP: &str = "frame-ancestors 'self'";
+/// Appended instead when the upstream sent `X-Frame-Options: DENY`: browsers
+/// ignore `X-Frame-Options` once a CSP names `frame-ancestors`, so
+/// [`PROXIED_FRAME_ANCESTORS_CSP`] would loosen a DENY to same-origin.
+const PROXIED_FRAME_ANCESTORS_DENY_CSP: &str = "frame-ancestors 'none'";
+
+/// Keeps a proxied page from being framed by another origin: appends a
+/// `frame-ancestors` policy as a separate `Content-Security-Policy` header
+/// (browsers enforce every policy, so the strictest wins) and sets
+/// `X-Frame-Options`. An upstream `DENY` (in any value, including a
+/// comma-joined one) keeps `DENY` and gets `frame-ancestors 'none'`;
+/// otherwise both are same-origin.
+fn add_frame_protection(headers: &mut http::HeaderMap) {
+    let upstream_denies = headers
+        .get_all(http::header::X_FRAME_OPTIONS)
+        .iter()
+        .any(|value| {
+            String::from_utf8_lossy(value.as_bytes())
+                .split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("deny"))
+        });
+    let (csp, xfo) = if upstream_denies {
+        (PROXIED_FRAME_ANCESTORS_DENY_CSP, "DENY")
+    } else {
+        (PROXIED_FRAME_ANCESTORS_CSP, "SAMEORIGIN")
+    };
+    headers.append(
+        http::header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(csp),
+    );
+    headers.insert(http::header::X_FRAME_OPTIONS, HeaderValue::from_static(xfo));
 }
 
 fn rewrite_request<B: SomeRequestBuilder>(mut req: B, options: &TargetHTTPOptions) -> Result<B> {
@@ -304,16 +346,16 @@ fn rewrite_response(
 }
 
 /// Whether a target's `Set-Cookie` value is dropped: it is nameless, or names
-/// one of Warpgate's session cookies. The name is read as the browser stores
-/// it (RFC 6265: the text before the first `=` of the first `;`-separated
-/// part, trimmed; with no `=` the cookie is nameless) and compared the way
-/// poem reads it back: percent-decoded, exact and case-sensitive, through the
-/// same helper as the request side.
+/// one of Warpgate's cookies. The name is read as the browser stores it
+/// (RFC 6265: the text before the first `=` of the first `;`-separated part,
+/// trimmed; with no `=` the cookie is nameless) and compared through the same
+/// helper as the request side ([`is_warpgate_cookie_name`]: decoded, trimmed,
+/// ASCII case-insensitive, so a look-alike is dropped too).
 fn target_set_cookie_is_dropped(value: &HeaderValue) -> bool {
     let value = String::from_utf8_lossy(value.as_bytes());
     let pair = value.split(';').next().unwrap_or_default();
     let name = pair.split_once('=').map_or("", |(name, _)| name);
-    name.trim().is_empty() || is_warpgate_session_cookie_name(name)
+    name.trim().is_empty() || is_warpgate_cookie_name(name)
 }
 
 fn cookie_header_for_target(req: &Request) -> Result<Option<String>> {
@@ -322,7 +364,7 @@ fn cookie_header_for_target(req: &Request) -> Result<Option<String>> {
     for value in req.headers().get_all(http::header::COOKIE) {
         for cookie in Cookie::split_parse(value.to_str()?) {
             let cookie = cookie?;
-            if !is_warpgate_session_cookie_name(cookie.name()) {
+            if !is_warpgate_cookie_name(cookie.name()) {
                 cookies.push(cookie.stripped().to_string());
             }
         }
@@ -1544,6 +1586,139 @@ mod tests {
         assert_eq!(response.status(), StatusCode::CREATED);
     }
 
+    fn copied_response(upstream: http::response::Builder) -> Response {
+        let mut response: Response = "".into();
+        copy_client_response(&upstream.body(()).unwrap(), &mut response);
+        response
+    }
+
+    fn header_values(response: &Response, name: &str) -> Vec<String> {
+        response
+            .headers()
+            .get_all(name)
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn upstream_clear_site_data_is_not_copied_to_the_client() {
+        let response = copied_response(
+            http::Response::builder()
+                .header("Clear-Site-Data", "\"cookies\", \"storage\"")
+                .header("clear-site-data", "\"*\"")
+                .header("X-Kept", "1"),
+        );
+        assert!(!response.headers().contains_key("clear-site-data"));
+        assert_eq!(response.headers().get("x-kept").unwrap(), "1");
+    }
+
+    #[test]
+    fn proxied_response_gets_frame_protection_without_upstream_headers() {
+        let response = copied_response(http::Response::builder());
+        assert_eq!(
+            header_values(&response, "content-security-policy"),
+            ["frame-ancestors 'self'"]
+        );
+        assert_eq!(header_values(&response, "x-frame-options"), ["SAMEORIGIN"]);
+    }
+
+    #[test]
+    fn frame_ancestors_csp_is_appended_beside_the_upstream_csp() {
+        let response = copied_response(
+            http::Response::builder()
+                .header(
+                    "Content-Security-Policy",
+                    "default-src 'self'; frame-ancestors *",
+                )
+                .header("Content-Security-Policy", "img-src https:"),
+        );
+        assert_eq!(
+            header_values(&response, "content-security-policy"),
+            [
+                "default-src 'self'; frame-ancestors *",
+                "img-src https:",
+                "frame-ancestors 'self'"
+            ]
+        );
+    }
+
+    #[test]
+    fn x_frame_options_is_sameorigin_unless_upstream_denies() {
+        for (upstream, expected) in [
+            (vec!["DENY"], "DENY"),
+            (vec![" deny "], "DENY"),
+            (vec!["SAMEORIGIN"], "SAMEORIGIN"),
+            (vec!["ALLOW-FROM https://evil.example"], "SAMEORIGIN"),
+            (vec!["ALLOWALL"], "SAMEORIGIN"),
+            (vec!["ALLOWALL", "DENY"], "DENY"),
+            (vec!["DENY, SAMEORIGIN"], "DENY"),
+            (vec!["sameorigin,deny"], "DENY"),
+        ] {
+            let mut builder = http::Response::builder();
+            for value in &upstream {
+                builder = builder.header("X-Frame-Options", *value);
+            }
+            let response = copied_response(builder);
+            assert_eq!(
+                header_values(&response, "x-frame-options"),
+                [expected],
+                "{upstream:?}"
+            );
+        }
+    }
+
+    /// A CSP `frame-ancestors` overrides `X-Frame-Options` in browsers, so an
+    /// upstream DENY must get `'none'`, never `'self'`, or it becomes
+    /// same-origin frameable.
+    #[test]
+    fn upstream_deny_gets_frame_ancestors_none() {
+        for upstream in [
+            vec!["DENY"],
+            vec![" deny "],
+            vec!["DENY, SAMEORIGIN"],
+            vec!["SameOrigin,Deny"],
+            vec!["SAMEORIGIN", "deny"],
+        ] {
+            let mut builder = http::Response::builder();
+            for value in &upstream {
+                builder = builder.header("X-Frame-Options", *value);
+            }
+            let response = copied_response(builder);
+            assert_eq!(
+                header_values(&response, "content-security-policy"),
+                ["frame-ancestors 'none'"],
+                "{upstream:?}"
+            );
+            assert_eq!(
+                header_values(&response, "x-frame-options"),
+                ["DENY"],
+                "{upstream:?}"
+            );
+        }
+    }
+
+    /// The frame headers are added after `extend`, which would otherwise
+    /// replace them with the upstream's same-name headers; a websocket
+    /// response (built before the copy) gets them too.
+    #[test]
+    fn frame_protection_survives_a_prefilled_response() {
+        let mut response: Response = Response::builder()
+            .header("Content-Security-Policy", "frame-ancestors 'self'")
+            .finish();
+        let upstream = http::Response::builder()
+            .status(StatusCode::SWITCHING_PROTOCOLS)
+            .header("Content-Security-Policy", "script-src 'none'")
+            .body(())
+            .unwrap();
+        copy_client_response(&upstream, &mut response);
+        assert_eq!(
+            header_values(&response, "content-security-policy"),
+            ["script-src 'none'", "frame-ancestors 'self'"]
+        );
+        assert_eq!(header_values(&response, "x-frame-options"), ["SAMEORIGIN"]);
+    }
+
     fn forwarded_cookie_header(values: &[&str]) -> Option<String> {
         let mut request = Request::builder();
         for value in values {
@@ -1590,16 +1765,14 @@ mod tests {
     }
 
     #[test]
-    fn request_cookie_header_omits_only_warpgate_session() {
+    fn request_cookie_header_omits_only_warpgate_cookies() {
         assert_eq!(
             forwarded_cookie_header(&[
                 "target-session=one; warpgate-http-session=secret",
                 "warpgate-http-session-extra=two; Warpgate-Http-Session=three",
+                "__Host-warpgate-http-session=four; __Host-warpgate-handoff=five; handoff=six",
             ]),
-            Some(
-                "target-session=one; warpgate-http-session-extra=two; Warpgate-Http-Session=three"
-                    .to_string()
-            )
+            Some("target-session=one; warpgate-http-session-extra=two; handoff=six".to_string())
         );
     }
 
@@ -1609,9 +1782,10 @@ mod tests {
             forwarded_cookie_header(&[
                 "warpgate%2Dhttp%2Dsession=a; warpgate%2dloopback%2dsession=b; app=1",
                 " warpgate-loopback-session =c;\twarpgate-http-session\t=d; %77arpgate-http-session=e",
-                "warpgate-http-session%20=f; Warpgate%2DHttp%2DSession=g",
+                "warpgate-http-session%20=f; Warpgate%2DHttp%2DSession=g; kept=h",
+                "%5F%5FHost-warpgate-http-session=i; %5f%5fhost-warpgate-handoff=j",
             ]),
-            Some("app=1; warpgate-http-session%20=f; Warpgate%2DHttp%2DSession=g".to_string())
+            Some("app=1; kept=h".to_string())
         );
     }
 
@@ -1778,7 +1952,7 @@ mod tests {
     }
 
     #[test]
-    fn target_set_cookie_check_reads_names_as_browser_and_poem_do() {
+    fn target_set_cookie_check_drops_warpgate_names_and_look_alikes() {
         let is_dropped =
             |value: &str| target_set_cookie_is_dropped(&HeaderValue::from_str(value).unwrap());
 
@@ -1796,14 +1970,23 @@ mod tests {
             "warpgate-http-session",
             "warpgate-http-session; Path=/",
             "",
+            "Warpgate-Http-Session=x",
+            "warpgate-http-session%20=x",
+            "WARPGATE-LOOPBACK-SESSION=x",
+            "__Host-warpgate-http-session=x; Path=/; Secure",
+            "__host-WARPGATE-http-session=x",
+            "%5F%5FHost-warpgate-http-session=x; Domain=example.com",
+            "__Host-warpgate-handoff=x",
+            "__HOST-Warpgate-Handoff=x",
         ] {
             assert!(is_dropped(value), "{value:?} must be dropped");
         }
         for value in [
             "app=1",
-            "Warpgate-Http-Session=x",
             "warpgate-http-session-extra=x",
-            "warpgate-http-session%20=x",
+            "warpgate-http-session%21=x",
+            "__Secure-warpgate-http-session=x",
+            "warpgate-handoff=x",
             "app=warpgate-http-session=x",
         ] {
             assert!(!is_dropped(value), "{value:?} must be kept");

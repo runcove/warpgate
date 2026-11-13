@@ -9,7 +9,7 @@ use warpgate_common_http::{PlainHttpListener, is_cluster_peer_request};
 use super::loopback_host::request_host;
 use super::management_scope::is_login_flow_route;
 use super::mfa_enforcement::warpgate_surface_path;
-use crate::common::{accepted_origins, is_cross_origin_request, is_warpgate_session_cookie_name};
+use crate::common::{accepted_origins, is_cross_origin_request, is_warpgate_cookie_name};
 
 static SEC_FETCH_SITE: HeaderName = HeaderName::from_static("sec-fetch-site");
 
@@ -70,8 +70,8 @@ fn loopback_own_origin(req: &Request) -> Option<Origin> {
         .map(|url| url.origin())
 }
 
-/// Whether any `Cookie` header names one of Warpgate's session cookies, read
-/// as the session layer reads names (trimmed, percent-decoded). Leniently:
+/// Whether any `Cookie` header names one of Warpgate's cookies, by
+/// [`is_warpgate_cookie_name`] (decoded, trimmed, case-insensitive). Leniently:
 /// an empty, invalid or valueless session cookie still counts, and so does a
 /// header that is not valid UTF-8.
 fn carries_session_cookie(req: &Request) -> bool {
@@ -80,7 +80,7 @@ fn carries_session_cookie(req: &Request) -> bool {
             .split(';')
             .any(|pair| {
                 let name = pair.split_once('=').map_or(pair, |(name, _)| name);
-                is_warpgate_session_cookie_name(name)
+                is_warpgate_cookie_name(name)
             })
     })
 }
@@ -709,6 +709,9 @@ mod tests {
             &["warpgate-loopback-session"],
             &[" warpgate-loopback-session =not a valid value"],
             &["warpgate%2Dloopback%2Dsession=abc"],
+            &["Warpgate-Loopback-Session=abc"],
+            &["__Host-warpgate-http-session=abc"],
+            &["%5F%5Fhost-warpgate-handoff=abc"],
         ] {
             assert!(carries(cookies), "{cookies:?}");
         }

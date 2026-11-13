@@ -55,6 +55,20 @@ pub static SESSION_COOKIE_NAME: &str = "warpgate-http-session";
 /// The session cookie's name in the browser on a plain-HTTP loopback listener
 /// (`http.plain_http_on_loopback`); see `LoopbackSessionCookieMiddleware`.
 pub static LOOPBACK_SESSION_COOKIE_NAME: &str = "warpgate-loopback-session";
+/// The session cookie's `__Host-` name (not yet issued).
+pub static HOST_SESSION_COOKIE_NAME: &str = "__Host-warpgate-http-session";
+/// The target-host handoff cookie (not yet issued).
+pub static HANDOFF_COOKIE_NAME: &str = "__Host-warpgate-handoff";
+
+/// Every cookie name Warpgate owns. A target never sees one of these in a
+/// request and never sets one in a response, whatever spelling it uses
+/// ([`is_warpgate_cookie_name`]).
+pub static WARPGATE_COOKIE_NAMES: [&str; 4] = [
+    SESSION_COOKIE_NAME,
+    LOOPBACK_SESSION_COOKIE_NAME,
+    HOST_SESSION_COOKIE_NAME,
+    HANDOFF_COOKIE_NAME,
+];
 
 /// The session cookie's shape — name and (absence of) signing — defined once:
 /// the `ServerSession` middleware writes the cookie through this config, and
@@ -88,11 +102,17 @@ pub fn decoded_cookie_name(raw: &str) -> Cow<'_, str> {
     percent_decode_str(raw.trim()).decode_utf8_lossy()
 }
 
-/// Whether a raw cookie name reads, once decoded, as one of Warpgate's
-/// session cookies ([`SESSION_COOKIE_NAME`], [`LOOPBACK_SESSION_COOKIE_NAME`]).
-pub fn is_warpgate_session_cookie_name(raw: &str) -> bool {
+/// Whether a raw cookie name reads as one of [`WARPGATE_COOKIE_NAMES`]: trimmed,
+/// percent-decoded, trimmed again and compared ASCII case-insensitively, so a
+/// look-alike spelling counts too. Used wherever a Warpgate cookie must not
+/// cross the proxy or must be noticed; it is deliberately wider than the names
+/// the session layer itself reads.
+pub fn is_warpgate_cookie_name(raw: &str) -> bool {
     let name = decoded_cookie_name(raw);
-    name == SESSION_COOKIE_NAME || name == LOOPBACK_SESSION_COOKIE_NAME
+    let name = name.trim();
+    WARPGATE_COOKIE_NAMES
+        .iter()
+        .any(|known| name.eq_ignore_ascii_case(known))
 }
 
 /// The browser session's storage id from the request's cookie — poem keeps it
