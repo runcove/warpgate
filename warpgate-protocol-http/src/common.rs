@@ -354,6 +354,14 @@ impl BoundSessionAuthorization {
     }
 }
 
+/// Whether `session` is a target-host session only: it carries the bound
+/// authorization and none of its own. Its user session id is the one it
+/// shares with the control-plane sign-in, so a login started on it must not
+/// use that id.
+pub(crate) fn is_target_host_session(session: &Session) -> bool {
+    session.get_auth().is_none() && session.get_bound_auth().is_some()
+}
+
 pub trait SessionExt {
     /// The target-host session's authorization, if this is one.
     fn get_bound_auth(&self) -> Option<BoundSessionAuthorization>;
@@ -1134,6 +1142,12 @@ pub async fn get_auth_state_for_request(
         .await
         .context("Session not in request")?;
 
+    // A target-host session names the user session it shares with the
+    // control plane, under which that sign-in's own auth state is kept: it
+    // carries no login attempt of its own.
+    if is_target_host_session(session) {
+        return Ok(None);
+    }
     let Some(session_id) = session.get_session_id() else {
         return Ok(None);
     };
