@@ -984,7 +984,9 @@ pub(crate) async fn gateway_pages_for(req: &Request) -> GatewayPages {
 /// the nonce cookie, and sends it to the control plane's handoff start. The
 /// page to return to is this request's path on this host. `None` for a
 /// request that is not a navigation, not over HTTPS (the nonce cookie is a
-/// `__Host-` cookie), or when the handoff cannot be recorded.
+/// `__Host-` cookie), or when the handoff cannot be recorded. A source
+/// address past its rate limit, or a full handoff store, gets a plain
+/// refusal and records nothing.
 async fn handoff_redirect(
     req: &Request,
     control_plane: &url::Url,
@@ -996,6 +998,9 @@ async fn handoff_redirect(
         return None;
     }
     let next = next_after_login(req).filter(|next| next.starts_with('/'))?;
+    if !crate::handoff::within_rate_limit(req, ctx.services(), crate::handoff::Step::Open).await {
+        return Some(crate::handoff::rate_limited());
+    }
     let opened = crate::handoff::open(
         &ctx.services().db,
         target_id,
@@ -1006,6 +1011,9 @@ async fn handoff_redirect(
     .await
     .inspect_err(|error| tracing::error!(%error, "Could not record a target-host handoff"))
     .ok()?;
+    let Some(opened) = opened else {
+        return Some(crate::handoff::busy());
+    };
     let mut location = control_plane.clone();
     location.set_path(&format!("/@warpgate{}", crate::handoff::START_PATH));
     location.set_query(None);

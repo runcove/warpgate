@@ -715,6 +715,16 @@ mod tests {
         path: &str,
         headers: &[(&str, &str)],
     ) -> (StatusCode, Option<String>) {
+        login_redirect_limited(ctx, path, headers, None).await
+    }
+
+    /// [`login_redirect_for`] under the handoff rate limit `limit`, if given.
+    async fn login_redirect_limited(
+        ctx: &UnauthenticatedRequestContext,
+        path: &str,
+        headers: &[(&str, &str)],
+        limit: Option<std::sync::Arc<crate::handoff::RateLimit>>,
+    ) -> (StatusCode, Option<String>) {
         let mut builder = poem::http::Request::builder().uri(path);
         for (name, value) in headers {
             builder = builder.header(*name, *value);
@@ -733,6 +743,9 @@ mod tests {
         // one the redirect reads.
         assert_eq!(req.original_uri().to_string(), path);
         req.extensions_mut().insert(ctx.clone());
+        if let Some(limit) = limit {
+            req.extensions_mut().insert(limit);
+        }
         let response = crate::common::login_redirect(&req).await;
         let location = response
             .headers()
@@ -841,6 +854,29 @@ mod tests {
             location
                 .starts_with("https://admin.example.test:8443/@warpgate/handoff/start?challenge="),
             "{location}"
+        );
+    }
+
+    /// Past the source address's rate limit, a bound host opens no handoff
+    /// and refuses with a plain 429.
+    #[tokio::test]
+    async fn bound_host_sign_in_past_the_rate_limit_is_refused() {
+        let (ctx, db) = context(false).await;
+        {
+            let mut config = ctx.services().config.lock().await;
+            config.store.external_host = Some("warpgate.example.test".into());
+        }
+        let limit = std::sync::Arc::new(crate::handoff::RateLimit::per_minute(
+            std::num::NonZeroU32::new(1).unwrap(),
+        ));
+        let on_target = [("host", TARGET_HOST), NAVIGATION[0], NAVIGATION[1]];
+        let (status, _) = login_redirect_limited(&ctx, "/", &on_target, Some(limit.clone())).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        let (status, location) = login_redirect_limited(&ctx, "/", &on_target, Some(limit)).await;
+        assert_eq!((status, location), (StatusCode::TOO_MANY_REQUESTS, None));
+        assert_eq!(
+            warpgate_db_entities::HttpHandoff::count(&db).await.unwrap(),
+            1
         );
     }
 

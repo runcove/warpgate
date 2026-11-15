@@ -1,5 +1,5 @@
 use sea_orm::entity::prelude::*;
-use sea_orm::{QueryFilter, Set, TransactionTrait};
+use sea_orm::{PaginatorTrait, QueryFilter, Set, TransactionTrait};
 use time::OffsetDateTime;
 use warpgate_common::WarpgateError;
 
@@ -144,6 +144,12 @@ pub async fn take<C: ConnectionTrait + TransactionTrait>(
         .await?;
     tx.commit().await?;
     Ok((deleted.rows_affected == 1 && row.expires > now).then_some(row))
+}
+
+/// How many handoffs are stored, expired or not: what [`open`] is refused
+/// past (`warpgate_protocol_http::handoff`'s ceiling).
+pub async fn count<C: ConnectionTrait>(db: &C) -> Result<u64, WarpgateError> {
+    Ok(Entity::find().count(db).await?)
 }
 
 /// Deletes every expired handoff.

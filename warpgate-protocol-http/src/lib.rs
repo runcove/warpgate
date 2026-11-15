@@ -411,6 +411,7 @@ impl ProtocolServer for HTTPProtocolServer {
                 {
                     warn!(%error, "Failed to purge expired target-host handoffs");
                 }
+                handoff::vacuum_rate_limit();
                 tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             }
         });

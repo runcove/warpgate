@@ -9280,6 +9280,7 @@ dependencies = [
  "data-encoding",
  "delegate",
  "futures",
+ "governor",
  "html-escape",
  "http",
  "libc",

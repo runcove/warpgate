@@ -27,8 +27,12 @@
 //! no-referrer`, and the request log and the proxy never see the token
 //! ([`HANDOFF_TOKEN_PARAM`] is scrubbed like the ticket parameter).
 
-use std::sync::Arc;
+use std::net::IpAddr;
+use std::num::NonZeroU32;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
+
+use governor::{DefaultKeyedRateLimiter, Quota};
 
 use http::StatusCode;
 use poem::error::NotFoundError;
@@ -48,6 +52,7 @@ use warpgate_common_http::auth::{
     UnauthenticatedRequestContext,
 };
 use warpgate_common_http::ext::is_navigation_request;
+use warpgate_common_http::logging::get_client_ip_addr;
 use warpgate_core::ConfigProvider;
 use warpgate_core::authorize_for_target;
 use warpgate_core::live_streams::host_binding;
@@ -88,6 +93,96 @@ pub const OPEN_LIFETIME: Duration = Duration::from_secs(120);
 /// How long a minted token can be redeemed: one redirect.
 pub const TOKEN_LIFETIME: Duration = Duration::from_secs(60);
 
+/// The most handoffs the store holds, expired ones not yet purged included.
+/// At the ceiling [`open`] records none and the browser is refused
+/// ([`busy`]); stored handoffs are never evicted to make room, so a flood
+/// cannot push out the handoff of a browser already on its way.
+pub const MAX_STORED: u64 = 10_000;
+
+/// How many handoff steps of each kind one source address may take a minute
+/// (opening on a bound host, starting on the control plane, redeeming), as
+/// a burst that refills at the same rate. Each sign-in on a new host takes
+/// one of each.
+const PER_ADDRESS_PER_MINUTE: NonZeroU32 = NonZeroU32::MIN.saturating_add(59);
+
+/// A rate-limited step of the handoff.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub(crate) enum Step {
+    Open,
+    Start,
+    Redeem,
+}
+
+/// The per-source-address limit on each [`Step`], in memory on each node.
+/// A request whose address is unknown counts against one shared bucket.
+pub(crate) struct RateLimit(DefaultKeyedRateLimiter<(Step, Option<IpAddr>)>);
+
+impl RateLimit {
+    pub(crate) fn per_minute(per_minute: NonZeroU32) -> Self {
+        Self(DefaultKeyedRateLimiter::keyed(Quota::per_minute(
+            per_minute,
+        )))
+    }
+
+    /// Whether `ip` may take one more `step` now.
+    pub(crate) fn allows(&self, step: Step, ip: Option<IpAddr>) -> bool {
+        self.0.check_key(&(step, ip)).is_ok()
+    }
+}
+
+static RATE_LIMIT: LazyLock<RateLimit> =
+    LazyLock::new(|| RateLimit::per_minute(PER_ADDRESS_PER_MINUTE));
+
+/// Whether this request's source address may take one more `step`, from the
+/// [`RateLimit`] in the request's data if there is one (tests), else the
+/// node's own.
+pub(crate) async fn within_rate_limit(
+    req: &Request,
+    services: &warpgate_core::Services,
+    step: Step,
+) -> bool {
+    let ip = get_client_ip_addr(req, services).await;
+    let limit = req
+        .data::<Arc<RateLimit>>()
+        .map_or(&*RATE_LIMIT, |limit| &**limit);
+    let allowed = limit.allows(step, ip);
+    if !allowed {
+        tracing::info!(?step, client_ip = ?ip, "Refused a target-host handoff step: rate limited");
+    }
+    allowed
+}
+
+/// Forgets the addresses whose limit has refilled; run with the session
+/// sweep.
+pub fn vacuum_rate_limit() {
+    RATE_LIMIT.0.retain_recent();
+    RATE_LIMIT.0.shrink_to_fit();
+}
+
+/// The refusal of a handoff step past its rate limit.
+pub(crate) fn rate_limited() -> Response {
+    plain(
+        StatusCode::TOO_MANY_REQUESTS,
+        "Too many sign-in attempts from this address. Wait a minute, then reload the page.\n",
+    )
+}
+
+/// The refusal of a handoff when the store is at [`MAX_STORED`].
+pub(crate) fn busy() -> Response {
+    plain(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Signing in to this site is not possible right now. Try again in a few minutes.\n",
+    )
+}
+
+fn plain(status: StatusCode, body: &'static str) -> Response {
+    Response::builder()
+        .status(status)
+        .header(http::header::CACHE_CONTROL, "no-store")
+        .content_type("text/plain; charset=utf-8")
+        .body(body)
+}
+
 /// An opened handoff: the challenge goes to the control plane in the URL, the
 /// nonce to the browser in the [`crate::common::HANDOFF_COOKIE_NAME`] cookie.
 pub struct Opened {
@@ -96,14 +191,38 @@ pub struct Opened {
 }
 
 /// Records a handoff for the target `target_id` bound to `binding`, returning
-/// to `next` (a path on that host) once redeemed.
+/// to `next` (a path on that host) once redeemed. `None`, recording nothing,
+/// when the store already holds [`MAX_STORED`] handoffs.
 pub async fn open<C: ConnectionTrait>(
     db: &C,
     target_id: Uuid,
     binding: &str,
     next: &str,
     now: OffsetDateTime,
-) -> Result<Opened, WarpgateError> {
+) -> Result<Option<Opened>, WarpgateError> {
+    open_below(db, MAX_STORED, target_id, binding, next, now).await
+}
+
+/// [`open`] with the ceiling `max_stored`. Counted, then inserted: nodes
+/// opening handoffs at the same moment can each pass the count, so the store
+/// can go past the ceiling by as many handoffs as are opened at once.
+async fn open_below<C: ConnectionTrait>(
+    db: &C,
+    max_stored: u64,
+    target_id: Uuid,
+    binding: &str,
+    next: &str,
+    now: OffsetDateTime,
+) -> Result<Option<Opened>, WarpgateError> {
+    let stored = HttpHandoff::count(db).await?;
+    if stored >= max_stored {
+        tracing::warn!(
+            stored,
+            max_stored,
+            "Refused to open a target-host handoff: the handoff store is full"
+        );
+        return Ok(None);
+    }
     let challenge = generate_ticket_secret().expose_secret().clone();
     let nonce = generate_ticket_secret().expose_secret().clone();
     HttpHandoff::open(
@@ -118,7 +237,7 @@ pub async fn open<C: ConnectionTrait>(
         },
     )
     .await?;
-    Ok(Opened { challenge, nonce })
+    Ok(Some(Opened { challenge, nonce }))
 }
 
 /// The opened, unminted handoff this challenge names, for the control plane to
@@ -266,6 +385,9 @@ pub async fn start_endpoint(req: &Request, session: &Session) -> poem::Result<Re
     if !is_navigation_request(req) {
         return Ok(refusal(StatusCode::FORBIDDEN));
     }
+    if !within_rate_limit(req, ctx.services(), Step::Start).await {
+        return Ok(rate_limited());
+    }
     let Some(challenge) = query_value(req, HANDOFF_CHALLENGE_PARAM) else {
         return Ok(refusal(StatusCode::BAD_REQUEST));
     };
@@ -366,6 +488,9 @@ pub async fn redeem_endpoint(req: &Request, session: &Session) -> poem::Result<R
     else {
         return Err(NotFoundError.into());
     };
+    if !within_rate_limit(req, ctx.services(), Step::Redeem).await {
+        return Ok(rate_limited());
+    }
     let nonce = <&CookieJar>::from_request_without_body(req)
         .await?
         .get(HANDOFF_COOKIE_NAME)
@@ -599,7 +724,10 @@ mod tests {
         let target = Uuid::new_v4();
         let user = Uuid::new_v4();
         let session = Uuid::new_v4();
-        let opened = open(db, target, HOST, "/page?x=1", at(0)).await.unwrap();
+        let opened = open(db, target, HOST, "/page?x=1", at(0))
+            .await
+            .unwrap()
+            .unwrap();
         let row = super::opened(db, &opened.challenge, at(1))
             .await
             .unwrap()
@@ -763,7 +891,10 @@ mod tests {
     #[tokio::test]
     async fn unit_handoff_challenge_mints_once_and_only_if_issued() {
         let db = memory_db().await;
-        let opened = open(&db, Uuid::new_v4(), HOST, "/", at(0)).await.unwrap();
+        let opened = open(&db, Uuid::new_v4(), HOST, "/", at(0))
+            .await
+            .unwrap()
+            .unwrap();
         let (user, session) = (Uuid::new_v4(), Uuid::new_v4());
         assert!(
             mint(&db, "not-issued", user, session, None, at(1))
@@ -800,7 +931,10 @@ mod tests {
     #[tokio::test]
     async fn unit_handoff_challenge_expires_and_is_purged() {
         let db = memory_db().await;
-        let opened = open(&db, Uuid::new_v4(), HOST, "/", at(0)).await.unwrap();
+        let opened = open(&db, Uuid::new_v4(), HOST, "/", at(0))
+            .await
+            .unwrap()
+            .unwrap();
         let late = at(0) + OPEN_LIFETIME;
         assert!(
             super::opened(&db, &opened.challenge, late)
@@ -823,7 +957,10 @@ mod tests {
     async fn unit_handoff_stores_no_secret() {
         use sea_orm::EntityTrait;
         let db = memory_db().await;
-        let opened = open(&db, Uuid::new_v4(), HOST, "/", at(0)).await.unwrap();
+        let opened = open(&db, Uuid::new_v4(), HOST, "/", at(0))
+            .await
+            .unwrap()
+            .unwrap();
         let token = mint(
             &db,
             &opened.challenge,
@@ -840,6 +977,65 @@ mod tests {
         for secret in [&opened.challenge, &opened.nonce, &token] {
             assert!(!stored.contains(secret.as_str()));
         }
+    }
+
+    /// At the ceiling a handoff is refused and none is recorded, and every
+    /// stored handoff stays usable: nothing is evicted to make room. Once
+    /// the expired ones are purged, handoffs open again.
+    #[tokio::test]
+    async fn unit_handoff_store_ceiling_refuses_and_evicts_nothing() {
+        let db = memory_db().await;
+        let target = Uuid::new_v4();
+        let mut kept = vec![];
+        for _ in 0..3 {
+            let opened = open_below(&db, 3, target, HOST, "/", at(0)).await.unwrap();
+            kept.push(opened.expect("below the ceiling").challenge);
+        }
+        assert!(
+            open_below(&db, 3, target, HOST, "/", at(1))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(HttpHandoff::count(&db).await.unwrap(), 3);
+        for challenge in &kept {
+            assert!(
+                opened(&db, challenge, at(1)).await.unwrap().is_some(),
+                "a stored handoff was evicted"
+            );
+        }
+        let token = mint(&db, &kept[0], Uuid::new_v4(), Uuid::new_v4(), None, at(1))
+            .await
+            .unwrap();
+        assert!(token.is_some(), "a handoff at the ceiling no longer mints");
+
+        let late = at(OPEN_LIFETIME.as_secs() as i64 + 1);
+        purge_expired(&db, late).await.unwrap();
+        assert!(
+            open_below(&db, 3, target, HOST, "/", late)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// Each source address has its own limit for each step, and the
+    /// unknown address one shared limit.
+    #[test]
+    fn unit_handoff_rate_limit_is_per_address_and_step() {
+        let limit = RateLimit::per_minute(NonZeroU32::new(2).unwrap());
+        let a: Option<IpAddr> = Some("192.0.2.1".parse().unwrap());
+        let b: Option<IpAddr> = Some("192.0.2.2".parse().unwrap());
+        assert!(limit.allows(Step::Open, a));
+        assert!(limit.allows(Step::Open, a));
+        assert!(!limit.allows(Step::Open, a));
+        assert!(limit.allows(Step::Redeem, a));
+        assert!(limit.allows(Step::Start, a));
+        assert!(limit.allows(Step::Open, b));
+        assert!(limit.allows(Step::Open, None));
+        assert!(limit.allows(Step::Open, None));
+        assert!(!limit.allows(Step::Open, None));
+        assert!(!limit.allows(Step::Open, a));
     }
 
     mod endpoint {
@@ -973,6 +1169,36 @@ mod tests {
             }
         }
 
+        /// Past its rate limit a source address gets a plain 429 from the
+        /// redeem route, which then spends and changes nothing.
+        #[tokio::test]
+        async fn redeem_past_the_rate_limit_is_refused() {
+            let db = memory_db().await;
+            let target = bound_target(&db).await;
+            let limit = Arc::new(RateLimit::per_minute(NonZeroU32::new(1).unwrap()));
+            let cli = TestClient::new(app(db.clone()).await.data(limit));
+            let path = format!("/@warpgate{REDEEM_PATH}?{HANDOFF_TOKEN_PARAM}=junk");
+            let resp = cli.get(&path).header("host", HOST).send().await;
+            resp.assert_status(StatusCode::SEE_OTHER);
+
+            let token = token_for(&db, target, "/page").await;
+            let resp = cli
+                .get(format!(
+                    "/@warpgate{REDEEM_PATH}?{HANDOFF_TOKEN_PARAM}={token}"
+                ))
+                .header("host", HOST)
+                .send()
+                .await;
+            resp.assert_status(StatusCode::TOO_MANY_REQUESTS);
+            resp.assert_header("cache-control", "no-store");
+            assert!(!clears_the_nonce(&resp));
+            assert_eq!(
+                HttpHandoff::count(&db).await.unwrap(),
+                1,
+                "a refused redeem spent the handoff"
+            );
+        }
+
         /// A junk token in a browser already signed in on this host for its
         /// target sends it back to the page with no retry marker: there is
         /// nothing to retry, and the marker would reach the target and the
@@ -1033,7 +1259,10 @@ mod tests {
             let cli = TestClient::new(app(db.clone()).await);
             let cookie = session_cookie(&cli.get("/seed").header("host", HOST).send().await);
             let now = OffsetDateTime::now_utc();
-            let opened = open(&db, target, HOST, "/page?x=1", now).await.unwrap();
+            let opened = open(&db, target, HOST, "/page?x=1", now)
+                .await
+                .unwrap()
+                .unwrap();
             let token = mint(
                 &db,
                 &opened.challenge,
@@ -1066,7 +1295,7 @@ mod tests {
         /// Mints a token for a handoff opened for `next`.
         async fn token_for(db: &DatabaseConnection, target: Uuid, next: &str) -> String {
             let now = OffsetDateTime::now_utc();
-            let opened = open(db, target, HOST, next, now).await.unwrap();
+            let opened = open(db, target, HOST, next, now).await.unwrap().unwrap();
             mint(
                 db,
                 &opened.challenge,
@@ -1252,6 +1481,7 @@ mod tests {
                 let cookie = session_cookie(&resp);
                 let opened = open(db, target, HOST, "/page", OffsetDateTime::now_utc())
                     .await
+                    .unwrap()
                     .unwrap();
                 (cookie, opened, stamp)
             }
