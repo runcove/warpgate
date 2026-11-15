@@ -312,12 +312,17 @@ pub async fn migrate_database_up(connection: &DatabaseConnection, steps: u32) ->
     run_maybe_in_tx(connection, Direction::Up, Some(steps)).await
 }
 
-/// Revert `steps` applied migrations.
+/// Revert `steps` applied migrations, under the same lock as
+/// [`migrate_database`], so a rollback never runs alongside a node starting up
+/// and migrating forward.
 pub async fn migrate_database_down(
     connection: &DatabaseConnection,
     steps: u32,
 ) -> Result<(), DbErr> {
-    run_maybe_in_tx(connection, Direction::Down, Some(steps)).await
+    run_locked(connection, MIGRATION_LOCK_KEY, async move || {
+        run_maybe_in_tx(connection, Direction::Down, Some(steps)).await
+    })
+    .await
 }
 
 enum Direction {
