@@ -442,6 +442,9 @@ pub async fn start_endpoint(req: &Request, session: &Session) -> poem::Result<Re
     {
         return Err(NotFoundError.into());
     }
+    // The shared stamp a target-host session is checked against: raised
+    // here too, for a sign-in stamped before it was recorded.
+    crate::step_up::raise_shared_stamp(session, &services.db, last_sso_at).await?;
     let Some(token) = mint(
         &services.db,
         &challenge,
@@ -1377,8 +1380,29 @@ mod tests {
                     user_id,
                     username: format!("user-{user_id}"),
                 });
-                session.set_last_sso_at(OffsetDateTime::from_unix_timestamp(stamp).unwrap());
+                // As the SSO return stamps a completed sign-in.
+                crate::step_up::stamp_sso(
+                    session,
+                    &ctx.services().db,
+                    OffsetDateTime::from_unix_timestamp(stamp).unwrap(),
+                )
+                .await
+                .map_err(poem::error::InternalServerError)?;
                 Ok(())
+            }
+
+            /// A page proxied on a bound host: whether the browser session
+            /// counts there.
+            #[handler]
+            fn page(req: &Request) -> &'static str {
+                if req
+                    .data::<warpgate_common_http::auth::AuthenticatedRequestContext>()
+                    .is_some()
+                {
+                    "auth"
+                } else {
+                    "anon"
+                }
             }
 
             /// The browser session's last sign-in, as a unix time.
@@ -1416,6 +1440,10 @@ mod tests {
                 Route::new()
                     .at("/sign-in", get(sign_in))
                     .at("/stamp", get(stamp_page))
+                    .at(
+                        "/page",
+                        get(page).around(crate::common::inject_request_authorization),
+                    )
                     .at(format!("/@warpgate{START_PATH}"), start)
                     .at(format!("/@warpgate{REDEEM_PATH}"), get(redeem_endpoint))
                     .data(SessionStore::new())
@@ -1429,6 +1457,11 @@ mod tests {
 
             /// A user with a role granting `target`.
             async fn user_for(db: &DatabaseConnection, target: Uuid) -> Uuid {
+                user_for_targets(db, &[target]).await
+            }
+
+            /// A user with a role granting each of `targets`.
+            async fn user_for_targets(db: &DatabaseConnection, targets: &[Uuid]) -> Uuid {
                 let user_id = Uuid::new_v4();
                 insert_user(db, user_id, &format!("user-{user_id}")).await;
                 let role_id = Uuid::new_v4();
@@ -1451,13 +1484,15 @@ mod tests {
                 .insert(db)
                 .await
                 .unwrap();
-                TargetRoleAssignment::ActiveModel {
-                    target_id: Set(target),
-                    role_id: Set(role_id),
+                for target in targets {
+                    TargetRoleAssignment::ActiveModel {
+                        target_id: Set(*target),
+                        role_id: Set(role_id),
+                    }
+                    .insert(db)
+                    .await
+                    .unwrap();
                 }
-                .insert(db)
-                .await
-                .unwrap();
                 user_id
             }
 
@@ -1565,6 +1600,147 @@ mod tests {
                     .send()
                     .await;
                 resp.assert_text(stamp.to_string()).await;
+            }
+            mod step_up_ending {
+                //! A step-up on one bound host ends every other bound host's
+                //! session of the same sign-in on its next request.
+                use super::*;
+
+                const OTHER_HOST: &str = "vm2.warp.example";
+
+                /// A second HTTP target, bound to [`OTHER_HOST`].
+                async fn other_bound_target(db: &DatabaseConnection) -> Uuid {
+                    let id = Uuid::new_v4();
+                    Target::ActiveModel {
+                        id: Set(id),
+                        name: Set(format!("target-{id}")),
+                        description: Set(String::new()),
+                        kind: Set(TargetKind::Http),
+                        options: Set(serde_json::json!({
+                            "http": {"url": "http://h2", "external_host": OTHER_HOST}
+                        })),
+                        rate_limit_bytes_per_second: Set(None),
+                        group_id: Set(None),
+                        ticket_max_duration_seconds: Set(None),
+                        ticket_requests_disabled: Set(false),
+                        ticket_require_approval: Set(false),
+                        ticket_max_uses: Set(None),
+                        require_approval: Set(false),
+                    }
+                    .insert(db)
+                    .await
+                    .unwrap();
+                    id
+                }
+
+                /// Signs the control-plane browser in (again, with `cookie`) as
+                /// `user`, its SSO sign-in `ago` seconds back.
+                async fn sign_in_at(
+                    cli: &TestClient<impl poem::Endpoint>,
+                    cookie: Option<&str>,
+                    user: Uuid,
+                    ago: i64,
+                ) -> String {
+                    let stamp = OffsetDateTime::now_utc().unix_timestamp() - ago;
+                    let mut req = cli
+                        .get(format!("/sign-in?user={user}&stamp={stamp}"))
+                        .header("host", CONTROL_PLANE);
+                    if let Some(cookie) = cookie {
+                        req = req.header("cookie", cookie);
+                    }
+                    let resp = req.send().await;
+                    resp.assert_status_is_ok();
+                    cookie.map_or_else(|| session_cookie(&resp), ToOwned::to_owned)
+                }
+
+                /// Hands the control-plane sign-in in `cookie` off to `host`,
+                /// bound to `target`: the session cookie it gets there.
+                async fn hand_off(
+                    cli: &TestClient<impl poem::Endpoint>,
+                    db: &DatabaseConnection,
+                    cookie: &str,
+                    user: Uuid,
+                    target: Uuid,
+                    host: &str,
+                ) -> String {
+                    let opened = open(db, target, host, "/page", OffsetDateTime::now_utc())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let resp = start(cli, cookie, user, &opened.challenge).await;
+                    resp.assert_status(StatusCode::SEE_OTHER);
+                    let location = resp.0.headers()["location"].to_str().unwrap().to_owned();
+                    let redeem = location
+                        .strip_prefix(&format!("https://{host}"))
+                        .expect("sent to the bound host")
+                        .to_owned();
+                    let resp = cli
+                        .get(&redeem)
+                        .header("host", host)
+                        .header("cookie", format!("{HANDOFF_COOKIE_NAME}={}", opened.nonce))
+                        .send()
+                        .await;
+                    resp.assert_status(StatusCode::SEE_OTHER);
+                    resp.assert_header("location", format!("https://{host}/page"));
+                    session_cookie(&resp)
+                }
+
+                async fn page_on(
+                    cli: &TestClient<impl poem::Endpoint>,
+                    host: &str,
+                    cookie: &str,
+                ) -> String {
+                    let resp = cli
+                        .get("/page")
+                        .header("host", host)
+                        .header("cookie", cookie)
+                        .send()
+                        .await;
+                    resp.assert_status_is_ok();
+                    resp.0.into_body().into_string().await.unwrap()
+                }
+
+                /// Signed in on two bound hosts, the user steps up on the first;
+                /// the second host's session, used only after that, is refused on
+                /// its first request and on every later one, and is gone from
+                /// the store. The first host's new session, the control-plane
+                /// sign-in and its user session go on.
+                #[tokio::test]
+                async fn a_step_up_on_one_host_ends_the_other_hosts_older_session() {
+                    let db = memory_db().await;
+                    let first = bound_target(&db).await;
+                    let second = other_bound_target(&db).await;
+                    let user = user_for_targets(&db, &[first, second]).await;
+                    let cli = TestClient::new(app(db.clone()).await);
+
+                    let control = sign_in_at(&cli, None, user, 30).await;
+                    let on_first = hand_off(&cli, &db, &control, user, first, HOST).await;
+                    let on_second = hand_off(&cli, &db, &control, user, second, OTHER_HOST).await;
+                    assert_eq!(page_on(&cli, HOST, &on_first).await, "auth");
+                    assert_eq!(page_on(&cli, OTHER_HOST, &on_second).await, "auth");
+
+                    // The step-up on the first host: a fresh SSO sign-in on the
+                    // control plane, handed off to the first host again.
+                    sign_in_at(&cli, Some(&control), user, 5).await;
+                    let on_first = hand_off(&cli, &db, &control, user, first, HOST).await;
+                    assert_eq!(page_on(&cli, HOST, &on_first).await, "auth");
+
+                    for attempt in 0..3 {
+                        assert_eq!(
+                            page_on(&cli, OTHER_HOST, &on_second).await,
+                            "anon",
+                            "request {attempt} on the second host"
+                        );
+                    }
+                    assert!(
+                        !stored(&db, &on_second).await,
+                        "the second host's older session is still stored"
+                    );
+
+                    assert_eq!(page_on(&cli, HOST, &on_first).await, "auth");
+                    let on_second = hand_off(&cli, &db, &control, user, second, OTHER_HOST).await;
+                    assert_eq!(page_on(&cli, OTHER_HOST, &on_second).await, "auth");
+                }
             }
         }
 

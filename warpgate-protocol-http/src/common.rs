@@ -1351,8 +1351,27 @@ pub async fn inject_request_authorization<E: Endpoint + 'static>(
                 .zip(binding.as_deref())
                 .map(|(t, b)| (t.id, b));
             if bound.counts_on(here, req.method(), req.uri().path()) {
-                session_auth = Some(bound.as_session_authorization());
-                bound_session_counts = true;
+                // A later SSO sign-in of the same user session (a step-up)
+                // ends every target-host session carrying an earlier one, on
+                // its next request: it is purged, so it never counts again,
+                // and the browser starts a new handoff, which carries the
+                // later sign-in.
+                match crate::step_up::is_superseded(session, &ctx.services().db).await {
+                    Ok(false) => {
+                        session_auth = Some(bound.as_session_authorization());
+                        bound_session_counts = true;
+                    }
+                    Ok(true) => {
+                        tracing::info!(
+                            username = %bound.username,
+                            "Target-host session ended: its user session has signed in again since"
+                        );
+                        session.purge();
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "Could not check the target-host session's sign-in; ignoring the session");
+                    }
+                }
             } else {
                 tracing::debug!("Target-host session ignored outside its own target and host");
             }

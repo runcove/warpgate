@@ -12,6 +12,7 @@ macro_rules! with_every_entity {
             CertificateRevocation,
             FailedLoginAttempt,
             HttpSession,
+            HttpSsoStamp,
             IpBlock,
             KnownHost,
             LdapServer,

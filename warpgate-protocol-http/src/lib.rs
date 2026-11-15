@@ -412,6 +412,11 @@ impl ProtocolServer for HTTPProtocolServer {
                     warn!(%error, "Failed to purge expired target-host handoffs");
                 }
                 handoff::vacuum_rate_limit();
+                if let Err(error) =
+                    warpgate_db_entities::HttpSsoStamp::purge_ended(&handoff_db).await
+                {
+                    warn!(%error, "Failed to purge the SSO stamps of ended sessions");
+                }
                 tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             }
         });

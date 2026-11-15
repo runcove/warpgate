@@ -127,6 +127,8 @@ mod m00090_cove_pending_session_closes;
 mod m00095_cove_pending_user_closes;
 // One-time handoffs of a sign-in to a host bound to an HTTP target.
 mod m00096_cove_http_handoffs;
+// The latest SSO sign-in of each HTTP user session.
+mod m00097_cove_http_sso_stamps;
 
 pub(crate) mod helpers;
 
@@ -240,6 +242,7 @@ impl MigratorTrait for Migrator {
             Box::new(m00090_cove_pending_session_closes::Migration),
             Box::new(m00095_cove_pending_user_closes::Migration),
             Box::new(m00096_cove_http_handoffs::Migration),
+            Box::new(m00097_cove_http_sso_stamps::Migration),
         ]
     }
 }

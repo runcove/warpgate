@@ -426,3 +426,18 @@ ticket, gets no page from the target.
   read from the config file only; the admin API and UI cannot change it. It is
   meant to be turned off again once every web target has a hostname.
 - The default is `false`. Bound targets behave the same either way.
+
+## A step-up ends older target-host sessions
+
+A browser gets a session on a target's own hostname through a one-time
+handoff from the control-plane host; that session carries the time of the
+SSO sign-in it was handed off from. When the same sign-in (user session)
+completes a later SSO sign-in, a step-up, Warpgate records the later time for
+every node to see.
+
+- From then on, every target-host session still carrying an earlier sign-in
+  is refused on its next request and deleted, so it never acts again. The
+  browser starts a new handoff on that host, which carries the later sign-in.
+- Only those target-host sessions end: the control-plane sign-in, its user
+  session and target-host sessions already handed the later sign-in go on.
+- A sign-in that never used SSO records nothing and ends nothing this way.

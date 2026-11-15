@@ -30,7 +30,6 @@ use crate::common::{
     session_id_for_login,
 };
 use crate::session::SessionStore;
-use crate::step_up::StepUpSessionExt;
 
 pub struct Api;
 
@@ -713,7 +712,12 @@ impl Api {
                     // user who only ever logs in via password would never
                     // re-SSO and the step-up gate would silently become a
                     // no-op.
-                    session.set_last_sso_at(OffsetDateTime::now_utc());
+                    //
+                    // It also raises the user session's shared stamp, which
+                    // ends every target-host session still carrying an
+                    // earlier one (`step_up::is_superseded`).
+                    crate::step_up::stamp_sso(session, &services.db, OffsetDateTime::now_utc())
+                        .await?;
                     state.emit_authenticated_event_once();
                     if let Some(ip) = client_ip {
                         let _ = services

@@ -45,9 +45,14 @@
 use std::time::Duration;
 
 use poem::session::Session;
+use sea_orm::ConnectionTrait;
 use time::OffsetDateTime;
+use warpgate_common::WarpgateError;
 use warpgate_common_http::SessionAuthorization;
 use warpgate_core::auth::step_up::is_fresh;
+use warpgate_db_entities::HttpSsoStamp;
+
+use crate::common::SessionExt;
 
 /// Session claim key under which we persist the last SSO handshake timestamp
 /// for the HTTP surface. Stored as `i64` unix seconds to sidestep
@@ -84,6 +89,54 @@ impl StepUpSessionExt for Session {
     fn clear_last_sso_at(&self) {
         self.remove(LAST_SSO_AT_SESSION_KEY);
     }
+}
+
+/// Stamps a completed SSO sign-in at `now` on the browser session, and raises
+/// its user session's shared stamp ([`HttpSsoStamp`]) to the same second: a
+/// target-host session of that user session carrying an earlier stamp is
+/// then refused ([`is_superseded`]). The SSO return's only way to stamp.
+pub(crate) async fn stamp_sso<C: ConnectionTrait>(
+    session: &Session,
+    db: &C,
+    now: OffsetDateTime,
+) -> Result<(), WarpgateError> {
+    // The session keeps whole seconds; the shared stamp must compare equal.
+    let now = OffsetDateTime::from_unix_timestamp(now.unix_timestamp()).unwrap_or(now);
+    session.set_last_sso_at(now);
+    raise_shared_stamp(session, db, Some(now)).await
+}
+
+/// Raises the shared stamp of `session`'s user session to `stamp`, if both
+/// are known; a later shared stamp stays.
+pub(crate) async fn raise_shared_stamp<C: ConnectionTrait>(
+    session: &Session,
+    db: &C,
+    stamp: Option<OffsetDateTime>,
+) -> Result<(), WarpgateError> {
+    match (session.get_session_id(), stamp) {
+        (Some(id), Some(stamp)) => HttpSsoStamp::raise(db, id.0, stamp).await,
+        _ => Ok(()),
+    }
+}
+
+/// Whether this target-host session's sign-in was superseded: its user
+/// session signed in again by SSO (a step-up) after the sign-in the session
+/// carries, or carries none while the user session has one. Such a session
+/// never counts again. A session with no user session, or a user session
+/// with no recorded SSO sign-in, is not superseded.
+pub(crate) async fn is_superseded<C: ConnectionTrait>(
+    session: &Session,
+    db: &C,
+) -> Result<bool, WarpgateError> {
+    let Some(id) = session.get_session_id() else {
+        return Ok(false);
+    };
+    let Some(latest) = HttpSsoStamp::latest(db, id.0).await? else {
+        return Ok(false);
+    };
+    Ok(session
+        .get_last_sso_at()
+        .is_none_or(|carried| carried < latest))
 }
 
 /// Pure freshness decision for an HTTP session.
