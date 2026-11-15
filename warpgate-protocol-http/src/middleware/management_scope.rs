@@ -74,25 +74,22 @@ pub fn is_origin_checked_route(method: &Method, path: &str) -> bool {
 /// Warpgate's own and honours a session or token on it
 /// ([`credentials_refused_on_bound_host`]). That host serves the target's
 /// own pages, which share its origin, so it serves only what neither reads
-/// nor changes the sign-in: the gateway's assets (GET), and the SSO return,
-/// which completes only a handshake this browser started (bound to its
-/// session, single use, checked by `state`, nonce and PKCE; the identity
-/// provider returns the browser to the host its sign-in started on, the
-/// control-plane host, never a bound one, where no sign-in starts); the
-/// handoff's redeem route (`crate::handoff::REDEEM_PATH`),
-/// which is how a browser gets a session on this host; and sign-out, which
-/// there ends only this host's session. Everything else (the login page, the
-/// login steps, `info`, the user API and the admin API) is only usable on
-/// other hosts; a visitor without a session is sent through a handoff
-/// (`common::login_redirect`).
+/// nor changes the sign-in: the gateway's assets (GET); the handoff's redeem
+/// route (`crate::handoff::REDEEM_PATH`), which is how a browser gets a
+/// session on this host; and sign-out, which there ends only this host's
+/// session. Everything else (the login page, the login steps, `info`, the
+/// SSO return, the user API and the admin API) is only usable on other
+/// hosts; a visitor without a session is sent through a handoff
+/// (`common::login_redirect`). No sign-in starts on a bound host, so an
+/// identity provider never returns a browser to one: there the SSO return
+/// answers as any unknown route does.
 pub fn is_served_on_bound_host(method: &Method, path: &str) -> bool {
     if method == Method::GET && warpgate_surface_path(path) == Some(crate::handoff::REDEEM_PATH) {
         return true;
     }
     is_login_flow_route(method, path)
-        && warpgate_surface_path(path).is_some_and(|path| {
-            path.starts_with("/assets/") || path == "/api/sso/return" || path == "/api/auth/logout"
-        })
+        && warpgate_surface_path(path)
+            .is_some_and(|path| path.starts_with("/assets/") || path == "/api/auth/logout")
 }
 
 /// The HTTP target bound to the request's host, if any, resolved as
@@ -316,10 +313,11 @@ mod tests {
         assert!(!is_login_flow_route(&Method::GET, "/api/info"));
     }
 
-    /// A bound host serves the gateway's assets and the SSO return, and
-    /// nothing that reads or changes the sign-in.
+    /// A bound host serves the gateway's assets, the handoff's redeem route
+    /// and host-local sign-out, and nothing that reads or changes the
+    /// sign-in; not the SSO return either.
     #[test]
-    fn bound_host_serves_only_assets_sso_return_handoff_and_logout() {
+    fn bound_host_serves_only_assets_handoff_and_logout() {
         for prefix in ["/@warpgate", "/_warpgate"] {
             for (method, path, served) in [
                 // The handoff's redeem route, GET only; never its start
@@ -332,8 +330,9 @@ mod tests {
                 (Method::GET, "/api/auth/logout", false),
                 (Method::GET, "/assets/index-abc123.js", true),
                 (Method::GET, "/assets/embed/index.css", true),
-                (Method::GET, "/api/sso/return", true),
-                (Method::POST, "/api/sso/return", true),
+                // No sign-in starts here, so no SSO return comes back here
+                (Method::GET, "/api/sso/return", false),
+                (Method::POST, "/api/sso/return", false),
                 // The login page and everything it calls
                 (Method::GET, "", false),
                 (Method::GET, "/", false),
@@ -460,20 +459,20 @@ mod tests {
     ];
 
     /// What a bound host serves.
-    const BOUND_HOST_SERVED: [(Method, &str); 7] = [
+    const BOUND_HOST_SERVED: [(Method, &str); 5] = [
         (Method::GET, "/@warpgate/handoff"),
         (Method::GET, "/_warpgate/handoff"),
         (Method::POST, "/@warpgate/api/auth/logout"),
         (Method::GET, "/@warpgate/assets/index.js"),
         (Method::GET, "/_warpgate/assets/index.js"),
-        (Method::GET, "/@warpgate/api/sso/return"),
-        (Method::POST, "/@warpgate/api/sso/return"),
     ];
 
     /// The rest of the login flow: served on every other host, on none bound
     /// to a target.
-    const SIGN_IN: [(Method, &str); 11] = [
+    const SIGN_IN: [(Method, &str); 13] = [
         (Method::GET, "/@warpgate/handoff/start"),
+        (Method::GET, "/@warpgate/api/sso/return"),
+        (Method::POST, "/@warpgate/api/sso/return"),
         (Method::GET, "/@warpgate"),
         (Method::GET, "/@warpgate/api/info"),
         (Method::GET, "/_warpgate/api/info"),
@@ -520,7 +519,7 @@ mod tests {
             poem::Body::empty(),
         );
         // Positive control: the path under test is the one the rule reads.
-        assert_eq!(req.original_uri().path(), path);
+        assert_eq!(req.original_uri().to_string(), path);
         req
     }
 
@@ -536,7 +535,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn target_host_accepts_credentials_on_assets_and_sso_return_only() {
+    async fn target_host_accepts_credentials_on_assets_handoff_and_logout_only() {
         let (ctx, _db) = context(false).await;
         for (method, path) in BOUND_HOST_SERVED {
             assert!(
@@ -810,9 +809,10 @@ mod tests {
         assert_eq!(location.as_deref(), Some("/@warpgate#/login?next=%2Fapp"));
     }
 
-    /// Addresses of Warpgate's own pages (such as a failed SSO return's) sent
-    /// from a bound host carry the configured control-plane origin; from
-    /// other hosts they stay site-relative.
+    /// Addresses of Warpgate's own pages sent from a bound host carry the
+    /// configured control-plane origin; from other hosts they stay
+    /// site-relative. (A bound host does not serve the SSO return, whose
+    /// failure redirect uses this, so for it this is defence in depth.)
     #[tokio::test]
     async fn gateway_pages_origin_is_the_control_plane_on_a_bound_host() {
         let (ctx, _db) = context(false).await;
@@ -1012,7 +1012,7 @@ mod tests {
             (Method::POST, "/_warpgate/api/auth/logout", false),
             (Method::GET, "/_warpgate/handoff", false),
             (Method::GET, "/_warpgate/assets/index.js", false),
-            (Method::GET, "/_warpgate/api/sso/return", false),
+            (Method::GET, "/_warpgate/api/sso/return", true),
         ] {
             assert_eq!(
                 refused(&ctx, &method, path, &[("host", TARGET_HOST)]).await,
@@ -1022,10 +1022,81 @@ mod tests {
         }
     }
 
+    /// On a bound host the SSO return does not exist: GET and POST answer
+    /// exactly as an unknown route under the user API does (status, headers
+    /// and body), with the real user API mounted under both prefixes. The
+    /// control-plane host still routes it.
+    #[tokio::test]
+    async fn sso_return_on_a_bound_host_answers_as_an_unknown_route() {
+        let (ctx, _db) = context(false).await;
+        let mount = || {
+            Route::new()
+                .nest(
+                    "/api",
+                    poem_openapi::OpenApiService::new(crate::api::get(), "test", "0")
+                        .server("/@warpgate/api"),
+                )
+                .with(ManagementScopeMiddleware)
+        };
+        let app = Route::new()
+            .nest("/@warpgate", mount())
+            .nest("/_warpgate", mount())
+            .data(ctx)
+            .with(poem::session::ServerSession::new(
+                poem::session::CookieConfig::default(),
+                poem::session::MemoryStorage::new(),
+            ));
+        let response = |method: Method, path: String, host: &'static str| {
+            let req = scoped_request(&method, &path, &[("host", host)]);
+            let app = &app;
+            async move {
+                let response = app.get_response(req).await;
+                let status = response.status();
+                let mut headers: Vec<(String, String)> = response
+                    .headers()
+                    .iter()
+                    .map(|(name, value)| {
+                        (name.to_string(), value.to_str().unwrap_or("").to_owned())
+                    })
+                    .collect();
+                headers.sort();
+                let body = response.into_body().into_vec().await.unwrap();
+                (status, headers, body)
+            }
+        };
+
+        for prefix in ["/@warpgate", "/_warpgate"] {
+            let unknown = format!("{prefix}/api/no-such-route");
+            let sso_return = format!("{prefix}/api/sso/return");
+            for method in [Method::GET, Method::POST] {
+                let expected = response(method.clone(), unknown.clone(), TARGET_HOST).await;
+                assert_eq!(expected.0, StatusCode::NOT_FOUND, "{method} {unknown}");
+                for path in [sso_return.clone(), format!("{sso_return}?code=c&state=s")] {
+                    assert_eq!(
+                        response(method.clone(), path.clone(), TARGET_HOST).await,
+                        expected,
+                        "{method} {path}"
+                    );
+                }
+
+                // The control-plane host routes the SSO return (it fails
+                // here without a handshake, but not as a missing route) and
+                // answers 404 for the unknown one.
+                let (status, ..) = response(method.clone(), sso_return.clone(), MAIN_HOST).await;
+                assert!(
+                    status != StatusCode::NOT_FOUND && status != StatusCode::METHOD_NOT_ALLOWED,
+                    "{method} {sso_return} on {MAIN_HOST}: {status}"
+                );
+                let (status, ..) = response(method.clone(), unknown.clone(), MAIN_HOST).await;
+                assert_eq!(status, StatusCode::NOT_FOUND, "{method} {unknown}");
+            }
+        }
+    }
+
     /// The middleware over both mounts: out-of-scope routes, the sign-in
-    /// routes among them, are 404 on the bound host whatever the credentials,
-    /// assets and the SSO return are served, other hosts are untouched, and a
-    /// failed lookup is 503.
+    /// routes and the SSO return among them, are 404 on the bound host
+    /// whatever the credentials, assets are served, other hosts are
+    /// untouched, and a failed lookup is 503.
     #[tokio::test]
     async fn middleware_hides_the_management_surface_on_a_bound_host() {
         let (ctx, db) = context(false).await;
