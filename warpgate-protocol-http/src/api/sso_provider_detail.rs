@@ -10,11 +10,11 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 use warpgate_common::WarpgateError;
 use warpgate_common_http::auth::UnauthenticatedRequestContext;
-use warpgate_common_http::ext::construct_external_url;
+use warpgate_common_http::ext::{construct_control_plane_url, construct_external_url};
 use warpgate_sso::{SsoClient, SsoLoginRequest, SsoReturnUrlDomainPreference};
 
 use crate::api::sso_provider_list::is_safe_redirect_target;
-use crate::common::{host_is_subdomain_of_or_equal, should_auto_sso_redirect};
+use crate::common::should_auto_sso_redirect;
 
 pub struct Api;
 
@@ -67,8 +67,9 @@ pub(crate) enum StartSsoOutcome {
     Ok(String),
     /// No SSO provider with the given name is configured.
     NotFound,
-    /// The request host has no cookie-domain relationship with `external_host`
-    /// while the provider prefers `external_host` for its return URL.
+    /// The provider returns to the control-plane host (`external_host` mode)
+    /// and the request is on another host, whose host-only session cookie
+    /// the return would not carry.
     IncompatibleSsoDomain,
 }
 
@@ -100,32 +101,38 @@ pub(crate) async fn start_sso_and_get_auth_url(
         return Ok(StartSsoOutcome::NotFound);
     };
 
+    // The session cookie is host-only, so the identity provider must send
+    // the browser back to the host it started on. In `external_host` mode
+    // the return URL is on the control-plane host (`http.external_host`, or
+    // the global `external_host`), so only a sign-in started there can
+    // complete.
     if matches!(
         provider_config.return_url_domain,
         SsoReturnUrlDomainPreference::ExternalHost
-    ) && let (Some(request_host), Some(external_host)) =
-        (ctx.trusted_hostname(req), config.external_host_name())
-        && !host_is_subdomain_of_or_equal(&request_host, &external_host)
+    ) && let (Some(request_host), Some(control_plane_host)) =
+        (ctx.trusted_hostname(req), config.control_plane_host())
+        && !sso_starts_on_control_plane(&request_host, &control_plane_host)
     {
         warn!(
             %request_host,
-            %external_host,
+            %control_plane_host,
             provider = %provider_name,
-            "SSO login refused: this provider returns to `external_host`, and the host the browser used is neither that host nor a subdomain of it. Point `external_host` at the hostname users open Warpgate on, or set `return_url_domain: host_header` on the provider."
+            "SSO login refused: this provider returns to the control-plane host (`http.external_host`, or `external_host`), and the browser started on another host, whose session cookie that host never receives. Sign in on the control-plane host, or set `return_url_domain: host_header` on the provider."
         );
         return Ok(StartSsoOutcome::IncompatibleSsoDomain);
     }
 
-    let mut return_url = construct_external_url(
-        match provider_config.return_url_domain {
-            // Let `construct_external_url` fall back to config file
-            SsoReturnUrlDomainPreference::ExternalHost => None,
-            SsoReturnUrlDomainPreference::HostHeader => Some(req),
-        },
-        &config,
-        provider_config.return_domain_whitelist.as_deref(),
-    )
-    .await?;
+    let mut return_url = match provider_config.return_url_domain {
+        SsoReturnUrlDomainPreference::ExternalHost => construct_control_plane_url(&config).await?,
+        SsoReturnUrlDomainPreference::HostHeader => {
+            construct_external_url(
+                Some(req),
+                &config,
+                provider_config.return_domain_whitelist.as_deref(),
+            )
+            .await?
+        }
+    };
     return_url.set_path(&format!(
         "{}warpgate/api/sso/return",
         provider_config.return_url_prefix
@@ -133,13 +140,11 @@ pub(crate) async fn start_sso_and_get_auth_url(
     debug!("Return URL: {return_url}");
 
     // The post-login redirect lands on the host the user started from, which
-    // in `external_host` mode is not the return URL's host — the IdP callback
-    // goes to the parent domain there and hands off via the shared cookie.
-    // Built through `construct_external_url` so the authority is parsed
-    // rather than interpolated from the raw `Host` header. No whitelist is
-    // passed because this host has already been checked: `external_host` mode
-    // by the `IncompatibleSsoDomain` guard above, `host_header` mode by the
-    // return URL, which is this same host.
+    // is the return URL's host in both modes: `external_host` mode by the
+    // `IncompatibleSsoDomain` guard above, `host_header` mode by
+    // construction. Built through `construct_external_url` so the authority
+    // is parsed rather than interpolated from the raw `Host` header. No
+    // whitelist is passed because this host has already been checked.
     let return_origin = construct_external_url(Some(req), &config, None)
         .await?
         .origin()
@@ -303,9 +308,30 @@ fn login_spa_fallback_url(next: Option<&str>, has_password_bypass: bool) -> Stri
     url
 }
 
+/// Whether an SSO sign-in in `external_host` mode may start on
+/// `request_host`: only on the control-plane host, where its return URL is,
+/// since the session cookie is sent to no other host.
+fn sso_starts_on_control_plane(request_host: &str, control_plane_host: &str) -> bool {
+    warpgate_common::same_binding_hostname(request_host, control_plane_host)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::login_spa_fallback_url;
+    use super::{login_spa_fallback_url, sso_starts_on_control_plane};
+
+    #[test]
+    fn external_host_sso_starts_only_on_the_control_plane() {
+        assert!(sso_starts_on_control_plane("wg.example", "wg.example"));
+        assert!(sso_starts_on_control_plane("WG.example.", "wg.example"));
+        // A subdomain's cookie never reaches the control plane.
+        assert!(!sso_starts_on_control_plane("sub.wg.example", "wg.example"));
+        // Nor does the global `external_host`'s when `http.external_host`
+        // names another control-plane host.
+        assert!(!sso_starts_on_control_plane(
+            "wg.example",
+            "admin.wg.example"
+        ));
+    }
 
     #[test]
     fn fallback_url_preserves_next_and_reemits_break_glass() {

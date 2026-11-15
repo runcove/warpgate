@@ -78,10 +78,40 @@ def _make_sso_provider_config(
     return sso_entry
 
 
+_NAVIGATE = {"Accept": "text/html", "Sec-Fetch-Mode": "navigate"}
+
+
+def _hand_off(session, bound_url, main_url, path):
+    """Follows a target-host handoff for `session`, signed in on `main_url`,
+    and checks that `path` is then served on `bound_url`."""
+    response = session.get(f"{bound_url}{path}", headers=_NAVIGATE, allow_redirects=False)
+    assert response.status_code == 303, response.text
+    start = response.headers["Location"]
+    assert start.startswith(f"{main_url}/@warpgate/handoff/start?"), start
+    response = session.get(start, headers=_NAVIGATE, allow_redirects=False)
+    assert response.status_code == 303, response.text
+    redeem = response.headers["Location"]
+    assert redeem.startswith(f"{bound_url}/@warpgate/handoff?"), redeem
+    response = session.get(redeem, headers=_NAVIGATE, allow_redirects=False)
+    assert response.status_code == 303, response.text
+    assert response.headers["Location"] == f"{bound_url}{path}"
+    response = session.get(
+        f"{bound_url}{path}", headers={"Accept": "application/json"}, allow_redirects=False
+    )
+    assert response.status_code // 100 == 2, response.text
+    assert response.json()["path"] == path
+
+
 def _start_wg_with_oidc(processes, wg_http_port, oidc_port, *, external_host="127.0.0.1", **sso_kwargs):
     """Start a warpgate instance wired to the OIDC mock."""
     sso_config = _make_sso_provider_config(oidc_port, **sso_kwargs)
-    config_patch = {"sso_providers": [sso_config], "external_host": external_host}
+    config_patch = {
+        "sso_providers": [sso_config],
+        "external_host": external_host,
+        # These tests reach echo targets with no hostname by name
+        # (`?warpgate-target=`), which is off by default.
+        "http": {"serve_unbound_http_targets": True},
+    }
     wg = processes.start_wg(
         http_port=wg_http_port,
         config_patch=config_patch,
@@ -238,23 +268,33 @@ class TestHTTPUserAuthOIDC:
     @pytest.mark.parametrize(
         "case",
         [
-            # Login at external_host: SSO return URL pinned to external_host.
+            # Login at external_host: SSO return URL pinned to external_host,
+            # and the bound target host gets its session by a handoff.
             dict(
                 login_host="warpgate.acme.inc",
                 return_url_domain="external_host",
                 expected_return_host="warpgate.acme.inc",
             ),
-            # Login at a subdomain with ExternalHost: return URL is still external_host.
+            # Login at a subdomain with ExternalHost: the return would reach
+            # the control-plane host, which never gets the subdomain's
+            # host-only cookie, so the start is refused.
             dict(
-                login_host="target.warpgate.acme.inc",
+                login_host="sub.warpgate.acme.inc",
                 return_url_domain="external_host",
-                expected_return_host="warpgate.acme.inc",
+                expected_return_host=None,
             ),
-            # Login at a subdomain with HostHeader: return URL follows the request host.
+            # Login at a subdomain with HostHeader: return URL follows the
+            # request host, and the session stays on that host.
+            dict(
+                login_host="sub.warpgate.acme.inc",
+                return_url_domain="host_header",
+                expected_return_host="sub.warpgate.acme.inc",
+            ),
+            # A bound target host serves no sign-in at all.
             dict(
                 login_host="target.warpgate.acme.inc",
                 return_url_domain="host_header",
-                expected_return_host="target.warpgate.acme.inc",
+                expected_return_host=None,
             ),
         ],
     )
@@ -270,7 +310,7 @@ class TestHTTPUserAuthOIDC:
         wg_http_port = alloc_port()
         redirect_uris = [
             f"https://{login_host}:{wg_http_port}/@warpgate/api/sso/return",
-            f"https://{expected_return_host}:{wg_http_port}/@warpgate/api/sso/return",
+            f"https://warpgate.acme.inc:{wg_http_port}/@warpgate/api/sso/return",
         ]
         oidc_port = processes.start_oidc_server(
             wg_http_port,
@@ -291,6 +331,7 @@ class TestHTTPUserAuthOIDC:
 
         with _resolve_hosts_to_localhost(
             "warpgate.acme.inc",
+            "sub.warpgate.acme.inc",
             "target.warpgate.acme.inc",
         ):
             with admin_client(external_host_url) as api:
@@ -320,6 +361,12 @@ class TestHTTPUserAuthOIDC:
             start_resp = session.get(
                 f"{wg_url}/@warpgate/api/sso/providers/test-oidc/start"
             )
+            if login_host == "target.warpgate.acme.inc":
+                assert start_resp.status_code == 404, start_resp.text[:500]
+                return
+            if expected_return_host is None:
+                assert start_resp.status_code == 400, start_resp.text[:500]
+                return
             assert start_resp.status_code == 200, (
                 f"Failed to start SSO: {start_resp.status_code} {start_resp.text[:500]}"
             )
@@ -332,32 +379,44 @@ class TestHTTPUserAuthOIDC:
             callback_resp = session.get(redirect_url, allow_redirects=False)
             assert callback_resp.status_code in (302, 307)
             assert callback_resp.headers["Location"] == f"{wg_url}/@warpgate#/login"
+            # The session cookie is host-only, on the host the login ran on.
+            assert _session_cookie_domains(session) == {login_host}
 
-            target_resp = session.get(
-                f"{target_url}/some/path?warpgate-target={target.name}",
-                allow_redirects=False,
-            )
-            assert target_resp.status_code // 100 == 2
-            assert target_resp.json()["path"] == "/some/path"
+            if login_host != "warpgate.acme.inc":
+                return
+            # The bound target host takes the sign-in through a handoff.
+            _hand_off(session, target_url, external_host_url, "/some/path")
 
     @pytest.mark.parametrize(
         "case",
         [
-            # Login at external_host: cookie Domain=.warpgate.acme.inc so all subdomains inherit it.
+            # Login at external_host: the cookie is host-only, so a
+            # subdomain never receives it.
             dict(
                 login_host="warpgate.acme.inc",
                 return_url_domain="external_host",
                 expect_start_ok=True,
                 cross_check_host="sub.warpgate.acme.inc",
-                expect_cross_access=True,
+                expect_cross_access=False,
             ),
-            # Login at a subdomain: cookie Domain=.warpgate.acme.inc, valid at parent too.
+            # Login at a subdomain: the cookie stays on the subdomain, and the
+            # parent never receives it.
             dict(
                 login_host="sub.warpgate.acme.inc",
                 return_url_domain="host_header",
                 expect_start_ok=True,
                 cross_check_host="warpgate.acme.inc",
-                expect_cross_access=True,
+                expect_cross_access=False,
+            ),
+            # Subdomain + external_host: the IdP callback would reach the
+            # control-plane host, which never receives the subdomain's
+            # host-only cookie, so the start is refused with HTTP 400.
+            dict(
+                login_host="sub.warpgate.acme.inc",
+                return_url_domain="external_host",
+                expect_start_ok=False,
+                cross_check_host=None,
+                expect_cross_access=False,
             ),
             # Unrelated domain + external_host: IdP callback would reach external_host while
             # session lives on not-sub-domain.acme.inc — rejected early with HTTP 400.
@@ -442,8 +501,8 @@ class TestHTTPUserAuthOIDC:
             )
 
             if not expect_start_ok:
-                # Incompatible domain: external_host ≠ login_host and no
-                # subdomain relationship while return_url_domain=external_host.
+                # Incompatible host: return_url_domain=external_host and
+                # login_host is not the control-plane host.
                 assert start_resp.status_code == 400
                 return
 
@@ -454,11 +513,8 @@ class TestHTTPUserAuthOIDC:
             callback_resp = session.get(redirect_url, allow_redirects=False)
             assert callback_resp.status_code in (302, 307)
 
-            # Verify the session cookie domain covers login_host.
-            cookie_domains = _session_cookie_domains(session)
-            assert cookie_domains, (
-                "Expected at least one domain with the session cookie"
-            )
+            # The session cookie is host-only, on login_host.
+            assert _session_cookie_domains(session) == {login_host}
 
             # Access the echo target from cross_check_host using the session
             assert cross_check_host is not None
