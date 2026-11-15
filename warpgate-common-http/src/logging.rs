@@ -145,6 +145,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn handoff_token_value_is_redacted() {
+        let uri: Uri = "/@warpgate/handoff?warpgate-handoff=s3cret"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            redacted_uri(&uri),
+            "/@warpgate/handoff?warpgate-handoff=redacted"
+        );
+    }
+
+    #[test]
     fn ticket_query_value_is_redacted() {
         let uri: Uri = "/app/x?a=1&warpgate-ticket=s3cret&b=2".parse().unwrap();
         assert_eq!(

@@ -127,7 +127,8 @@ fn strip_warpgate_internal_query_params(pq: &PathAndQuery) -> Result<PathAndQuer
         .filter(|segment| {
             !matches!(
                 form_urlencoded::parse(segment.as_bytes()).next(),
-                Some((key, _)) if key == "warpgate-target" || key == "warpgate-ticket"
+                Some((key, _)) if key == "warpgate-target"
+                    || warpgate_common_http::ticket_query::is_credential_query_key(&key)
             )
         })
         .collect::<Vec<_>>()
