@@ -299,7 +299,7 @@ async fn negotiate_and_authorize(
     // Either way the session takes the same decode-and-re-encode path below, so the
     // interactive-auth / connecting screens (which render into the viewer framebuffer)
     // keep working and the viewer never needs a JPEG decoder.
-    let recorder = warpgate_desktop_auth::start_recording(services, &admitted.id(), "vnc").await;
+    let recorder = warpgate_desktop_auth::start_recording(services, &admitted.id(), "vnc").await?;
 
     // A single backend client connection decodes every update (Tight/JPEG included, see
     // PROXY_ENCODINGS); we both record it and re-encode it toward the viewer as RFB Raw.

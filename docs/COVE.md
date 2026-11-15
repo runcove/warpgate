@@ -162,3 +162,46 @@ its HTTP status only, never with the upstream's headers or body.
   included. Everything above holds at info level and above.
 - **Path segments are logged as written.** Warpgate's own routes carry only
   IDs there.
+
+## Sessions whose recording cannot start: `--recordings-refuse-unrecorded-sessions`
+
+When recording is enabled but a session's recording fails to start (for
+example, with `--recordings-keep-group-read`, a recording directory that
+cannot be secured), Warpgate first logs the failure with one of these texts,
+which alerts can match:
+
+- `Failed to start recording` (SSH, Kubernetes)
+- `Failed to start terminal recording` (web SSH client)
+- `Failed to start desktop recording` (web desktop client)
+- `Failed to start desktop session recording` (native RDP and VNC)
+
+The texts are pinned by a test (`warpgate_core::recordings::log_text`); a
+change to one needs every alert that matches it changed too.
+
+With `--recordings-refuse-unrecorded-sessions true` (off by default, so a full
+disk cannot lock operators out of a host), the session is then refused rather
+than continuing unrecorded:
+
+- **SSH:** the client is shown `session refused: its recording could not be
+  started` and the connection is closed. This covers shell and exec channels
+  and recorded port forwards.
+- **Kubernetes:** the API request is answered with that error (HTTP 503) and
+  is not forwarded; an exec or attach stream fails before it is opened.
+- **Web SSH client:** the shell is not opened on the target; the viewer gets
+  the error and the session ends.
+- **Web desktop client:** the session ends with the error.
+- **Native RDP and VNC:** the connection is closed.
+
+With the option off (the default), the failure is logged and the session
+continues unrecorded. Whether a host turns it on is for the host's owner: it
+trades access during an incident for the audit trail.
+
+What the option does not cover:
+
+- **Recording switched off** in the settings is not a failure and refuses
+  nothing. Nor does repointing the recordings root through the admin
+  settings (ConfigEdit): a session whose recording starts under the new root
+  is recorded there, and nothing is refused.
+- **What is never recorded**, so never refused for want of a recording: the
+  SSH SFTP subsystem, X11 and agent-forwarding channels, `scp` with
+  `record_scp` off, and MySQL, PostgreSQL and HTTP targets.

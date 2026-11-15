@@ -229,6 +229,14 @@ impl SessionRecordings {
         }
     }
 
+    /// Whether a session whose recording fails to start is refused rather than
+    /// continued unrecorded (`--recordings-refuse-unrecorded-sessions`, off by default).
+    /// A caller whose [`Self::start`] returned `Err` logs the pinned
+    /// [`log_text`] line first, then refuses the session when this is true.
+    pub const fn refuses_unrecorded_sessions(&self) -> bool {
+        self.params.refuse_unrecorded_sessions()
+    }
+
     /// Signal every in-flight writer to finalize, then wait (bounded)
     pub async fn shutdown(&self) {
         self.shutdown.cancel();

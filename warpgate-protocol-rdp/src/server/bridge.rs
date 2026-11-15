@@ -102,7 +102,7 @@ pub(super) async fn connect_backend(
     info!(target=%admitted.target().name, "Authorized");
 
     let recorder = warpgate_desktop_auth::start_recording(services, &admitted.id(), "rdp")
-        .await
+        .await?
         .map(Arc::new);
 
     let DesktopClientHandles {

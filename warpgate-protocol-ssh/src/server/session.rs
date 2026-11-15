@@ -1893,8 +1893,7 @@ mod tests {
             _client: std::net::TcpStream,
         }
 
-        async fn services(db: &DatabaseConnection) -> Services {
-            let params = GlobalParams::new(PathBuf::from("/warpgate.yaml"), false).unwrap();
+        async fn services(db: &DatabaseConnection, params: GlobalParams) -> Services {
             let rate_limiter_registry = Arc::new(Mutex::new(RateLimiterRegistry::new(db.clone())));
             let cluster = Arc::new(Cluster::new(db.clone(), 0).await.unwrap());
             Services {
@@ -1924,6 +1923,14 @@ mod tests {
         /// A connection from `ip` whose sign-in is about to complete, as the
         /// server registers it: before its credentials are checked.
         async fn sign_in_from(ip: &str) -> SignIn {
+            sign_in_with(
+                ip,
+                GlobalParams::new(PathBuf::from("/warpgate.yaml"), false).unwrap(),
+            )
+            .await
+        }
+
+        async fn sign_in_with(ip: &str, params: GlobalParams) -> SignIn {
             set_config_migration_values(ConfigMigrationValues::default());
             let db = Database::connect("sqlite::memory:").await.unwrap();
             migrate_database(&db).await.unwrap();
@@ -1941,7 +1948,7 @@ mod tests {
             .insert(&db)
             .await
             .unwrap();
-            let services = services(&db).await;
+            let services = services(&db, params).await;
 
             let remote_address = SocketAddr::new(ip.parse().unwrap(), 22);
             let server_handle = State::register_node_local_user_session(
@@ -2169,6 +2176,83 @@ mod tests {
                 Some(s.user.clone())
             );
             assert_eq!(s.handle_user().await, Some(s.user.clone()));
+        }
+
+        /// A session whose recording is enabled but cannot start: the recordings
+        /// root is a regular file, so creating the recording directory fails.
+        mod unrecorded {
+            use entities::Parameters::{RecordingsDiskConfig, RecordingsStorageConfig};
+            use sea_orm::IntoActiveModel;
+
+            use super::*;
+
+            struct Failing {
+                s: SignIn,
+                _dir: tempfile::TempDir,
+            }
+
+            async fn shell_with_failing_recording(refuse: bool, enable: bool) -> Failing {
+                let dir = tempfile::tempdir().unwrap();
+                std::fs::write(dir.path().join("recordings"), "not a directory").unwrap();
+                let params = GlobalParams::new(dir.path().join("warpgate.yaml"), false)
+                    .unwrap()
+                    .with_refuse_unrecorded_sessions(refuse);
+                let mut s = sign_in_with(INSIDE, params).await;
+                let mut parameters = entities::Parameters::Entity::get(&s.db)
+                    .await
+                    .unwrap()
+                    .into_active_model();
+                parameters.recordings_enable = Set(enable);
+                parameters.recordings_storage = Set(serde_json::to_string(
+                    &RecordingsStorageConfig::Disk(RecordingsDiskConfig {
+                        path: "recordings".into(),
+                    }),
+                )
+                .unwrap());
+                parameters.update(&s.db).await.unwrap();
+
+                s.session.target_session_id = Some(TargetSessionId(Uuid::new_v4()));
+                s.session
+                    .start_terminal_recording(
+                        Uuid::new_v4(),
+                        SshRecordingMetadata::Shell { channel: 0 },
+                    )
+                    .await;
+                Failing { s, _dir: dir }
+            }
+
+            fn closed(s: &SignIn) -> bool {
+                s.session.client_socket.is_none()
+            }
+
+            #[tokio::test]
+            async fn a_shell_whose_recording_fails_closes_the_connection_when_required() {
+                assert!(
+                    !GlobalParams::new(PathBuf::from("/warpgate.yaml"), false)
+                        .unwrap()
+                        .refuse_unrecorded_sessions()
+                );
+                let f = shell_with_failing_recording(true, true).await;
+                assert!(closed(&f.s), "the connection is closed");
+                assert_eq!(
+                    f.s.session.disconnect_description,
+                    WarpgateError::SessionNotRecorded.to_string()
+                );
+            }
+
+            #[tokio::test]
+            async fn with_refusal_off_the_shell_continues_unrecorded() {
+                let f = shell_with_failing_recording(false, true).await;
+                assert!(!closed(&f.s), "the connection stays open");
+                assert_eq!(f.s.session.disconnect_description, "");
+            }
+
+            /// Recording switched off is not a failure: nothing is refused.
+            #[tokio::test]
+            async fn recording_switched_off_refuses_nothing() {
+                let f = shell_with_failing_recording(true, false).await;
+                assert!(!closed(&f.s), "the connection stays open");
+            }
         }
     }
 }
@@ -4005,13 +4089,31 @@ impl ServerSession {
                 }
             }
             Ok(None) => (),
-            Err(error) => error!(
-                channel=%channel_id,
-                ?error,
-                "{}",
-                recordings::log_text::FAILED_TO_START_RECORDING
-            ),
+            Err(error) => {
+                error!(
+                    channel=%channel_id,
+                    ?error,
+                    "{}",
+                    recordings::log_text::FAILED_TO_START_RECORDING
+                );
+                self.refuse_unrecorded_session().await;
+            }
         }
+    }
+
+    /// A recording failed to start (already logged). With unrecorded sessions
+    /// refused, tell the client and close the connection; otherwise (the default)
+    /// the session continues unrecorded.
+    async fn refuse_unrecorded_session(&mut self) {
+        if !self.services.recordings.refuses_unrecorded_sessions() {
+            return;
+        }
+        let reason = WarpgateError::SessionNotRecorded.to_string();
+        warn!(session = %self.id, "Closing the connection: its recording could not be started");
+        let _ = self.emit_pty_error(&reason);
+        self.disconnect_description = reason;
+        self.request_disconnect();
+        self.disconnect_server().await;
     }
 
     /// Starts the recordings parked while no target session existed yet — the
@@ -4140,6 +4242,8 @@ impl ServerSession {
                         "{}",
                         recordings::log_text::FAILED_TO_START_RECORDING
                     );
+                    self.refuse_unrecorded_session().await;
+                    return None;
                 }
             }
         }

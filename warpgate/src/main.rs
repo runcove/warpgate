@@ -44,6 +44,13 @@ pub struct Cli {
     /// opens up existing files. Has no effect with --skip-securing-files
     #[clap(long)]
     recordings_keep_group_read: bool,
+
+    /// Refuse a session whose recording is enabled but fails to start (an SSH
+    /// connection is closed, a web or Kubernetes request fails, a desktop session
+    /// ends), instead of logging the failure and letting it continue unrecorded.
+    /// Off by default: such sessions are logged and continue unrecorded
+    #[clap(long, default_value_t = false, action = ArgAction::Set, value_name = "BOOL")]
+    recordings_refuse_unrecorded_sessions: bool,
 }
 
 impl Cli {
@@ -51,7 +58,8 @@ impl Cli {
     pub fn into_global_params(&self) -> anyhow::Result<GlobalParams> {
         Ok(
             warpgate_common::GlobalParams::new(self.config.clone(), !self.skip_securing_files)?
-                .with_recordings_keep_group_read(self.recordings_keep_group_read),
+                .with_recordings_keep_group_read(self.recordings_keep_group_read)
+                .with_refuse_unrecorded_sessions(self.recordings_refuse_unrecorded_sessions),
         )
     }
 }
@@ -299,5 +307,36 @@ async fn main() {
     if let Err(error) = _main().await {
         error!(?error, "Fatal error");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn refuses(args: &[&str]) -> bool {
+        Cli::try_parse_from(args)
+            .unwrap()
+            .into_global_params()
+            .unwrap()
+            .refuse_unrecorded_sessions()
+    }
+
+    /// Sessions whose recording cannot start are refused only when the flag turns it on.
+    #[test]
+    fn unrecorded_sessions_are_not_refused_by_default() {
+        assert!(!refuses(&["warpgate", "check"]));
+        assert!(refuses(&[
+            "warpgate",
+            "--recordings-refuse-unrecorded-sessions",
+            "true",
+            "check"
+        ]));
+        assert!(!refuses(&[
+            "warpgate",
+            "--recordings-refuse-unrecorded-sessions",
+            "false",
+            "check"
+        ]));
     }
 }

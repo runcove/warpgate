@@ -8,7 +8,7 @@ use tokio::sync::{Mutex, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 use uuid::Uuid;
-use warpgate_common::{TargetSSHOptions, TargetSessionId, UserSessionId};
+use warpgate_common::{TargetSSHOptions, TargetSessionId, UserSessionId, WarpgateError};
 use warpgate_core::WarpgateServerHandle;
 use warpgate_core::recordings::{SessionRecordings, TerminalRecorder};
 use warpgate_db_entities::Target::TargetKind;
@@ -95,11 +95,14 @@ impl WebSshSession {
         let _ = self.command_tx.send((RCCommand::Connect(chain), None));
     }
 
+    /// `Ok(None)` when recording is disabled. A failure to start is logged; it is then
+    /// [`WarpgateError::SessionNotRecorded`] when unrecorded sessions are refused, and
+    /// `Ok(None)` otherwise (the default).
     async fn start_recording(
         &self,
         target_session_id: &TargetSessionId,
         channel_id: Uuid,
-    ) -> Option<TerminalRecorder> {
+    ) -> Result<Option<TerminalRecorder>, WarpgateError> {
         let channel_number = self
             .channel_counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -114,7 +117,7 @@ impl WebSshSession {
             )
             .await
         {
-            Ok(recorder) => recorder,
+            Ok(recorder) => Ok(recorder),
             Err(e) => {
                 error!(
                     %channel_id,
@@ -122,7 +125,11 @@ impl WebSshSession {
                     "{}",
                     warpgate_core::recordings::log_text::FAILED_TO_START_TERMINAL_RECORDING
                 );
-                None
+                if self.recordings.refuses_unrecorded_sessions() {
+                    Err(WarpgateError::SessionNotRecorded)
+                } else {
+                    Ok(None)
+                }
             }
         }
     }
@@ -151,8 +158,19 @@ impl WebSshSession {
         let mut audit = ChannelAudit::new(channel_id);
         let (cols, rows) = pty_request.screen_size();
         audit.start_command_detection(cols, rows);
-        if let Some(recorder) = self.start_recording(target_session_id, channel_id).await {
-            audit.set_recorder(recorder);
+        match self.start_recording(target_session_id, channel_id).await {
+            Ok(Some(recorder)) => audit.set_recorder(recorder),
+            Ok(None) => (),
+            // Refused before the shell is opened on the target: tell the viewer, then end
+            // the session.
+            Err(error) => {
+                self.push(ServerMessage::Error {
+                    message: error.to_string(),
+                })
+                .await;
+                self.abort();
+                return None;
+            }
         }
         // seeds the recording with the initial screen size
         audit.on_resize(&pty_request).await;

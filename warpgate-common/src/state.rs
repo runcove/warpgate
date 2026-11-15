@@ -7,6 +7,7 @@ pub struct GlobalParams {
     config_path: PathBuf,
     should_secure_files: bool,
     recordings_keep_group_read: bool,
+    refuse_unrecorded_sessions: bool,
     paths_relative_to: PathBuf,
 }
 
@@ -20,6 +21,7 @@ impl GlobalParams {
             config_path,
             should_secure_files,
             recordings_keep_group_read: false,
+            refuse_unrecorded_sessions: false,
         })
     }
 
@@ -27,6 +29,14 @@ impl GlobalParams {
     #[must_use]
     pub const fn with_recordings_keep_group_read(mut self, enabled: bool) -> Self {
         self.recordings_keep_group_read = enabled;
+        self
+    }
+
+    /// Whether a session whose recording fails to start is refused (see
+    /// [`Self::refuse_unrecorded_sessions`]). Off by default.
+    #[must_use]
+    pub const fn with_refuse_unrecorded_sessions(mut self, enabled: bool) -> Self {
+        self.refuse_unrecorded_sessions = enabled;
         self
     }
 
@@ -53,6 +63,15 @@ impl GlobalParams {
     /// for the recordings tree.
     pub const fn recordings_keep_group_read(&self) -> bool {
         self.recordings_keep_group_read
+    }
+
+    /// Whether a session (or, for SSH, the connection) is refused when its recording
+    /// is enabled but fails to start, for example because the recordings tree cannot
+    /// be secured. When false, the failure is logged and the session continues
+    /// unrecorded. Off by default. Recording switched off in the config is not a
+    /// failure and refuses nothing.
+    pub const fn refuse_unrecorded_sessions(&self) -> bool {
+        self.refuse_unrecorded_sessions
     }
 
     /// With [`Self::recordings_keep_group_read`] in effect, an error unless the

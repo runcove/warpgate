@@ -14,3 +14,11 @@ warpgate-common = { path = "../warpgate-common", default-features = false }
 warpgate-common-http = { path = "../warpgate-common-http", default-features = false }
 warpgate-core = { path = "../warpgate-core", default-features = false }
 warpgate-desktop-ui = { path = "../warpgate-desktop-ui" }
+
+[dev-dependencies]
+sea-orm.workspace = true
+serde_json.workspace = true
+tempfile = "3"
+tokio = { workspace = true, features = ["rt", "macros"] }
+warpgate-db-entities = { path = "../warpgate-db-entities", default-features = false }
+warpgate-db-migrations = { path = "../warpgate-db-migrations", features = ["sqlite"] }

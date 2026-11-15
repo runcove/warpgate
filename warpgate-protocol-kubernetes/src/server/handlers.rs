@@ -365,6 +365,9 @@ async fn _handle_normal_request_inner(
                 warpgate_core::recordings::log_text::FAILED_TO_START_RECORDING,
                 e
             );
+            if services.recordings.refuses_unrecorded_sessions() {
+                return Err(WarpgateError::SessionNotRecorded);
+            }
             None
         }
     };
@@ -628,6 +631,9 @@ async fn _handle_websocket_request_inner(
                     warpgate_core::recordings::log_text::FAILED_TO_START_RECORDING,
                     e
                 );
+                if services.recordings.refuses_unrecorded_sessions() {
+                    return Err(WarpgateError::SessionNotRecorded.into());
+                }
             }
             Ok(Some(recorder)) => {
                 tokio::spawn(run_websocket_recording(recorder, recorder_rx));

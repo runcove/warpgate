@@ -32,7 +32,7 @@ use warpgate_common_http::ext::construct_control_plane_url;
 use warpgate_core::approvals::{GatedConnection, admit_target_session};
 use warpgate_core::auth::submit_credential;
 use warpgate_core::login_protection::FailedAttemptInfo;
-use warpgate_core::recordings::{DesktopRecorder, DesktopRecordingMetadata};
+use warpgate_core::recordings::{DesktopRecorder, DesktopRecordingMetadata, SessionRecordings};
 use warpgate_core::{
     AdmittedTarget, AuthorizedIdentity, Services, TargetAuthorization, WarpgateServerHandle,
     authorize_and_spend_ticket, authorize_for_target_by_name,
@@ -302,19 +302,30 @@ async fn web_approval_url(services: &Services, state: &Arc<Mutex<AuthState>>) ->
     Some(url.to_string())
 }
 
-/// Start a Desktop recording for a native desktop session (RDP / VNC). Returns `None` when
-/// recording is disabled, or fails to start (logged against `protocol_label`).
-pub async fn start_recording(
-    services: &Services,
+/// Start a Desktop recording for a native desktop session (RDP / VNC). `Ok(None)` when
+/// recording is disabled. A failure to start is logged against `protocol_label`; it is
+/// then [`WarpgateError::SessionNotRecorded`] when unrecorded sessions are refused, and
+/// `Ok(None)` (the session continues unrecorded) otherwise, the default.
+///
+/// Not an `async fn` wrapper, so the future callers hold is no deeper than before.
+pub fn start_recording<'a>(
+    services: &'a Services,
+    target_session_id: &'a TargetSessionId,
+    protocol_label: &'a str,
+) -> impl Future<Output = Result<Option<DesktopRecorder>, WarpgateError>> + Send + 'a {
+    start_recording_in(&services.recordings, target_session_id, protocol_label)
+}
+
+async fn start_recording_in(
+    recordings: &SessionRecordings,
     target_session_id: &TargetSessionId,
     protocol_label: &str,
-) -> Option<DesktopRecorder> {
-    match services
-        .recordings
+) -> Result<Option<DesktopRecorder>, WarpgateError> {
+    match recordings
         .start::<DesktopRecorder, _>(target_session_id, None, DesktopRecordingMetadata::Desktop)
         .await
     {
-        Ok(recorder) => recorder,
+        Ok(recorder) => Ok(recorder),
         Err(error) => {
             warn!(
                 %error,
@@ -322,7 +333,11 @@ pub async fn start_recording(
                 "{}",
                 warpgate_core::recordings::log_text::FAILED_TO_START_DESKTOP_SESSION_RECORDING
             );
-            None
+            if recordings.refuses_unrecorded_sessions() {
+                Err(WarpgateError::SessionNotRecorded)
+            } else {
+                Ok(None)
+            }
         }
     }
 }
@@ -347,5 +362,79 @@ pub async fn auth_prompt(
         })
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sea_orm::ActiveValue::Set;
+    use sea_orm::{ActiveModelTrait, Database, IntoActiveModel};
+    use uuid::Uuid;
+    use warpgate_common::GlobalParams;
+    use warpgate_db_entities::Parameters::{
+        self, ConfigMigrationValues, RecordingsDiskConfig, RecordingsStorageConfig,
+        set_config_migration_values,
+    };
+    use warpgate_db_migrations::migrate_database;
+
+    use super::*;
+
+    /// Recordings enabled on a root that is a regular file, so every start fails,
+    /// with unrecorded sessions refused or not.
+    async fn failing_recordings(
+        dir: &std::path::Path,
+        refuse: bool,
+        enable: bool,
+    ) -> SessionRecordings {
+        set_config_migration_values(ConfigMigrationValues::default());
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        migrate_database(&db).await.unwrap();
+        std::fs::write(dir.join("recordings"), "not a directory").unwrap();
+        let mut parameters = Parameters::Entity::get(&db)
+            .await
+            .unwrap()
+            .into_active_model();
+        parameters.recordings_enable = Set(enable);
+        parameters.recordings_storage = Set(serde_json::to_string(&RecordingsStorageConfig::Disk(
+            RecordingsDiskConfig {
+                path: "recordings".into(),
+            },
+        ))
+        .unwrap());
+        parameters.update(&db).await.unwrap();
+        let params = GlobalParams::new(dir.join("warpgate.yaml"), false)
+            .unwrap()
+            .with_refuse_unrecorded_sessions(refuse);
+        SessionRecordings::new(db, &params)
+    }
+
+    async fn start(refuse: bool, enable: bool) -> Result<Option<DesktopRecorder>, WarpgateError> {
+        let dir = tempfile::tempdir().unwrap();
+        let recordings = failing_recordings(dir.path(), refuse, enable).await;
+        start_recording_in(&recordings, &TargetSessionId(Uuid::new_v4()), "rdp").await
+    }
+
+    #[tokio::test]
+    async fn a_desktop_session_whose_recording_fails_is_refused_when_required() {
+        assert!(
+            !GlobalParams::new("/warpgate.yaml".into(), false)
+                .unwrap()
+                .refuse_unrecorded_sessions()
+        );
+        assert!(matches!(
+            start(true, true).await,
+            Err(WarpgateError::SessionNotRecorded)
+        ));
+    }
+
+    #[tokio::test]
+    async fn with_refusal_off_a_desktop_session_continues_unrecorded() {
+        assert!(matches!(start(false, true).await, Ok(None)));
+    }
+
+    /// Recording switched off is not a failure: nothing is refused.
+    #[tokio::test]
+    async fn recording_switched_off_refuses_nothing() {
+        assert!(matches!(start(true, false).await, Ok(None)));
     }
 }

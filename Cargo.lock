@@ -9304,12 +9304,17 @@ name = "warpgate-desktop-auth"
 version = "0.23.4"
 dependencies = [
  "anyhow",
+ "sea-orm",
+ "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "uuid",
  "warpgate-common",
  "warpgate-common-http",
  "warpgate-core",
+ "warpgate-db-entities",
+ "warpgate-db-migrations",
  "warpgate-desktop-ui",
 ]
 
@@ -9539,6 +9544,8 @@ dependencies = [
  "russh",
  "sea-orm",
  "serde",
+ "serde_json",
+ "tempfile",
  "termcolor",
  "termwiz",
  "thiserror 2.0.21",

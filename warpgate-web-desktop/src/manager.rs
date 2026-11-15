@@ -178,6 +178,9 @@ async fn connect(
                 "{}",
                 warpgate_core::recordings::log_text::FAILED_TO_START_DESKTOP_RECORDING
             );
+            if services.recordings.refuses_unrecorded_sessions() {
+                return Err(WarpgateError::SessionNotRecorded);
+            }
             None
         }
     };

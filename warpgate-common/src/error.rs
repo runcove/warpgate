@@ -100,6 +100,9 @@ pub enum WarpgateError {
     SecretBackend(#[from] SecretError),
     #[error("an administrator did not approve this session")]
     SessionNotApproved,
+    /// The session's recording could not be started and unrecorded sessions are refused.
+    #[error("session refused: its recording could not be started")]
+    SessionNotRecorded,
     #[error("cluster peer unreachable: {0}")]
     ClusterPeerUnreachable(String),
     #[error(transparent)]
@@ -129,6 +132,7 @@ impl UserFacingReason for WarpgateError {
             | Self::UserNotFound(_)
             | Self::UserAlreadyExists(_)
             | Self::SessionNotApproved
+            | Self::SessionNotRecorded
             | Self::UserSessionAlreadyAttributed
             | Self::UserSessionEnded
             | Self::UserNoLongerAdmitted
@@ -232,6 +236,7 @@ impl ResponseError for WarpgateError {
             }
             Self::SessionLimitReached => poem::http::StatusCode::TOO_MANY_REQUESTS,
             Self::SessionNotApproved => poem::http::StatusCode::FORBIDDEN,
+            Self::SessionNotRecorded => poem::http::StatusCode::SERVICE_UNAVAILABLE,
             Self::ClusterPeerUnreachable(_) => poem::http::StatusCode::BAD_GATEWAY,
             _ => poem::http::StatusCode::INTERNAL_SERVER_ERROR,
         }
