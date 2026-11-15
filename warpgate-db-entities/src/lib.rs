@@ -56,3 +56,5 @@ with_every_entity!(declare_modules);
 // only closes sessions.
 pub mod PendingSessionClose;
 pub mod PendingUserClose;
+// Handoffs live for seconds; copying the database drops them.
+pub mod HttpHandoff;

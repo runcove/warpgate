@@ -125,6 +125,8 @@ mod m00089_cove_open_session_indexes;
 mod m00090_cove_pending_session_closes;
 // Users whose sessions are all still to be closed after a saved edit.
 mod m00095_cove_pending_user_closes;
+// One-time handoffs of a sign-in to a host bound to an HTTP target.
+mod m00096_cove_http_handoffs;
 
 pub(crate) mod helpers;
 
@@ -237,6 +239,7 @@ impl MigratorTrait for Migrator {
             Box::new(m00089_cove_open_session_indexes::Migration),
             Box::new(m00090_cove_pending_session_closes::Migration),
             Box::new(m00095_cove_pending_user_closes::Migration),
+            Box::new(m00096_cove_http_handoffs::Migration),
         ]
     }
 }

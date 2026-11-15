@@ -3,6 +3,7 @@ mod approval_gate;
 mod catchall;
 mod client_cache;
 mod common;
+mod handoff;
 mod health;
 mod loopback_owner;
 mod middleware;
