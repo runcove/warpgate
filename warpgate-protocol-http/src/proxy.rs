@@ -418,19 +418,30 @@ fn target_set_cookie_is_dropped(value: &HeaderValue) -> bool {
     name.trim().is_empty() || is_warpgate_cookie_name(name)
 }
 
-fn cookie_header_for_target(req: &Request) -> Result<Option<String>> {
+/// The caller's `Cookie` headers as the target receives them: every cookie
+/// except Warpgate's own, joined into one header. A header is read as UTF-8,
+/// not only visible ASCII (the cookie gate moves a pair with a UTF-8 value
+/// into a header of its own); a header that is not UTF-8, or a part that is
+/// not a cookie, is left out. Never an error: a cookie the browser holds,
+/// planted for a parent domain or not, must not stop the page being served.
+fn cookie_header_for_target(req: &Request) -> Option<String> {
     let mut cookies = Vec::new();
 
     for value in req.headers().get_all(http::header::COOKIE) {
-        for cookie in Cookie::split_parse(value.to_str()?) {
-            let cookie = cookie?;
+        let Ok(value) = std::str::from_utf8(value.as_bytes()) else {
+            continue;
+        };
+        for cookie in Cookie::split_parse(value) {
+            let Ok(cookie) = cookie else {
+                continue;
+            };
             if !is_warpgate_cookie_name(cookie.name()) {
                 cookies.push(cookie.stripped().to_string());
             }
         }
     }
 
-    Ok((!cookies.is_empty()).then(|| cookies.join("; ")))
+    (!cookies.is_empty()).then(|| cookies.join("; "))
 }
 
 /// True for an `Authorization` value in Warpgate's own `Warpgate <ticket>`
@@ -509,7 +520,7 @@ fn copy_server_request<B: SomeRequestBuilder>(req: &Request, mut target: B) -> R
             continue;
         }
         if k == http::header::COOKIE {
-            if let Some(value) = cookie_header_for_target(req)? {
+            if let Some(value) = cookie_header_for_target(req) {
                 target = target.header(k.clone(), value);
             }
             continue;
@@ -1938,7 +1949,7 @@ mod tests {
         for value in values {
             request = request.header(http::header::COOKIE, *value);
         }
-        cookie_header_for_target(&request.finish()).unwrap()
+        cookie_header_for_target(&request.finish())
     }
 
     #[test]
@@ -2010,6 +2021,71 @@ mod tests {
                 " first = value ; warpgate-http-session=secret; token=abc== "
             ]),
             Some("first=value; token=abc==".to_string())
+        );
+    }
+
+    /// A cookie with a UTF-8 value (a pair planted for a parent domain, say)
+    /// is forwarded to the target as the browser sent it, and never stops
+    /// the page being served. The cookie gate moves such a pair into a
+    /// header of its own, beside the session it reads out; the proxy then
+    /// builds the target's request from both headers.
+    #[tokio::test]
+    async fn a_non_ascii_cookie_beside_the_session_still_reaches_the_target() {
+        use poem::test::TestClient;
+        use poem::{EndpointExt, handler};
+        use warpgate_common_http::auth::UnauthenticatedRequestContext;
+
+        use crate::middleware::CookieGateMiddleware;
+        use crate::test_db::{memory_db, services};
+
+        #[handler]
+        fn to_target(req: &Request) -> poem::Result<Vec<u8>> {
+            let target = copy_server_request(req, http::Request::builder()).map_err(|e| {
+                poem::Error::from_string(e.to_string(), StatusCode::INTERNAL_SERVER_ERROR)
+            })?;
+            Ok(target
+                .headers_ref()
+                .and_then(|headers| headers.get(http::header::COOKIE))
+                .map(|value| value.as_bytes().to_vec())
+                .unwrap_or_default())
+        }
+
+        let ctx = UnauthenticatedRequestContext::new(services(memory_db().await).await).await;
+        let app = to_target
+            .with(CookieGateMiddleware::new(true, None))
+            .data(ctx);
+        let sent = "__Host-warpgate-http-session=S; pref=caf\u{e9}; b=2";
+        let resp = TestClient::new(app)
+            .get("/")
+            .header("host", "localhost")
+            .header(
+                http::header::COOKIE,
+                HeaderValue::from_bytes(sent.as_bytes()).unwrap(),
+            )
+            .send()
+            .await;
+        resp.assert_status_is_ok();
+        resp.assert_bytes("pref=caf\u{e9}; b=2".as_bytes()).await;
+    }
+
+    /// A header that is not UTF-8, or a part that is not a cookie, is left
+    /// out; the rest of the cookies still go.
+    #[test]
+    fn request_cookie_header_skips_what_is_not_text_or_a_cookie() {
+        let mut request = Request::builder();
+        for value in [
+            &b"a=1; pref=caf\xe9"[..],
+            "pref=caf\u{e9}; b=2".as_bytes(),
+            b"nameless; c=3",
+        ] {
+            request = request.header(
+                http::header::COOKIE,
+                HeaderValue::from_bytes(value).unwrap(),
+            );
+        }
+        assert_eq!(
+            cookie_header_for_target(&request.finish()),
+            Some("pref=caf\u{e9}; b=2; c=3".to_string())
         );
     }
 
