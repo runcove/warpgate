@@ -360,7 +360,11 @@ async fn _handle_normal_request_inner(
     let mut recorder_opt = match start_recording_api(&admitted.id(), &services.recordings).await {
         Ok(recorder) => recorder,
         Err(e) => {
-            warn!("Failed to start recording: {}", e);
+            warn!(
+                "{}: {}",
+                warpgate_core::recordings::log_text::FAILED_TO_START_RECORDING,
+                e
+            );
             None
         }
     };
@@ -619,7 +623,11 @@ async fn _handle_websocket_request_inner(
     {
         match start_recording_exec(&admitted.id(), &services.recordings, metadata).await {
             Err(e) => {
-                error!("Failed to start recording: {}", e);
+                error!(
+                    "{}: {}",
+                    warpgate_core::recordings::log_text::FAILED_TO_START_RECORDING,
+                    e
+                );
             }
             Ok(Some(recorder)) => {
                 tokio::spawn(run_websocket_recording(recorder, recorder_rx));

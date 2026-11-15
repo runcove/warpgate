@@ -173,7 +173,11 @@ async fn connect(
         }
         Ok(None) => None,
         Err(error) => {
-            warn!(%error, "Failed to start desktop recording");
+            warn!(
+                %error,
+                "{}",
+                warpgate_core::recordings::log_text::FAILED_TO_START_DESKTOP_RECORDING
+            );
             None
         }
     };

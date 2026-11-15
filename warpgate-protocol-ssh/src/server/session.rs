@@ -4005,7 +4005,12 @@ impl ServerSession {
                 }
             }
             Ok(None) => (),
-            Err(error) => error!(channel=%channel_id, ?error, "Failed to start recording"),
+            Err(error) => error!(
+                channel=%channel_id,
+                ?error,
+                "{}",
+                recordings::log_text::FAILED_TO_START_RECORDING
+            ),
         }
     }
 
@@ -4129,7 +4134,12 @@ impl ServerSession {
                 }
                 Ok(None) => (),
                 Err(error) => {
-                    error!(?key, ?error, "Failed to start recording");
+                    error!(
+                        ?key,
+                        ?error,
+                        "{}",
+                        recordings::log_text::FAILED_TO_START_RECORDING
+                    );
                 }
             }
         }

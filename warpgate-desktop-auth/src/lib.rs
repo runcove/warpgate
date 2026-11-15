@@ -316,7 +316,12 @@ pub async fn start_recording(
     {
         Ok(recorder) => recorder,
         Err(error) => {
-            warn!(%error, protocol = protocol_label, "Failed to start desktop session recording");
+            warn!(
+                %error,
+                protocol = protocol_label,
+                "{}",
+                warpgate_core::recordings::log_text::FAILED_TO_START_DESKTOP_SESSION_RECORDING
+            );
             None
         }
     }

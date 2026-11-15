@@ -37,6 +37,45 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(25);
 
 const RECORDING_GENERATION: i32 = 3;
 
+/// The log texts written when a recording fails to start. An operator alert
+/// matches these texts exactly to count failed recording starts, so a rewording
+/// would silently read as zero failures: changing one needs the alert changed too
+/// (the tests in `log_text_tests` pin them).
+pub mod log_text {
+    /// SSH (shell, exec and traffic recordings) and Kubernetes (API and exec).
+    pub const FAILED_TO_START_RECORDING: &str = "Failed to start recording";
+    /// The web SSH client's terminal recording.
+    pub const FAILED_TO_START_TERMINAL_RECORDING: &str = "Failed to start terminal recording";
+    /// The web desktop client's recording (RDP / VNC in the browser).
+    pub const FAILED_TO_START_DESKTOP_RECORDING: &str = "Failed to start desktop recording";
+    /// Native RDP / VNC sessions.
+    pub const FAILED_TO_START_DESKTOP_SESSION_RECORDING: &str =
+        "Failed to start desktop session recording";
+}
+
+#[cfg(test)]
+mod log_text_tests {
+    use super::log_text::*;
+
+    /// An operator alert matches these texts; changing one needs the alert changed too.
+    #[test]
+    fn failed_recording_start_log_texts_are_pinned() {
+        assert_eq!(FAILED_TO_START_RECORDING, "Failed to start recording");
+        assert_eq!(
+            FAILED_TO_START_TERMINAL_RECORDING,
+            "Failed to start terminal recording"
+        );
+        assert_eq!(
+            FAILED_TO_START_DESKTOP_RECORDING,
+            "Failed to start desktop recording"
+        );
+        assert_eq!(
+            FAILED_TO_START_DESKTOP_SESSION_RECORDING,
+            "Failed to start desktop session recording"
+        );
+    }
+}
+
 /// The live-broadcast channel for a recording's primary data stream, keyed by
 /// recording id. Each item carries its end byte offset so a viewer can splice
 /// the live tail onto a history snapshot without gaps (see [`LiveChunk`]).

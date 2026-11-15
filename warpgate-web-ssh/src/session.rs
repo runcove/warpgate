@@ -116,7 +116,12 @@ impl WebSshSession {
         {
             Ok(recorder) => recorder,
             Err(e) => {
-                error!(%channel_id, ?e, "Failed to start terminal recording");
+                error!(
+                    %channel_id,
+                    ?e,
+                    "{}",
+                    warpgate_core::recordings::log_text::FAILED_TO_START_TERMINAL_RECORDING
+                );
                 None
             }
         }
