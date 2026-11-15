@@ -76,9 +76,10 @@ pub fn is_origin_checked_route(method: &Method, path: &str) -> bool {
 /// own pages, which share its origin, so it serves only what neither reads
 /// nor changes the sign-in: the gateway's assets (GET), and the SSO return,
 /// which completes only a handshake this browser started (bound to its
-/// session, single use, checked by `state`, nonce and PKCE) and is where the
-/// identity provider sends the browser when the global `external_host` is a
-/// bound site; the handoff's redeem route (`crate::handoff::REDEEM_PATH`),
+/// session, single use, checked by `state`, nonce and PKCE; the identity
+/// provider returns the browser to the host its sign-in started on, the
+/// control-plane host, never a bound one, where no sign-in starts); the
+/// handoff's redeem route (`crate::handoff::REDEEM_PATH`),
 /// which is how a browser gets a session on this host; and sign-out, which
 /// there ends only this host's session. Everything else (the login page, the
 /// login steps, `info`, the user API and the admin API) is only usable on
