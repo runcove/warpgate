@@ -386,7 +386,8 @@ pub(crate) fn served_on_host(external_host: Option<&str>, request_host: Option<&
 
 /// [`served_on_host`] for a target row: its `external_host`, if it is an
 /// HTTP target. A target with no hostname of its own is served only when
-/// `serve_unbound` (`http.serve_unbound_http_targets`) is on.
+/// `serve_unbound` is true: [`unbound_targets_served_on_host`] for this
+/// request's host.
 fn target_served_on_host(target: &Target, request_host: Option<&str>, serve_unbound: bool) -> bool {
     let external_host = match &target.options {
         TargetOptions::Http(options) => options.external_host.as_deref(),
@@ -410,6 +411,30 @@ async fn serve_unbound_http_targets(services: &Services) -> bool {
         .serve_unbound_http_targets
 }
 
+/// Whether a web target with no hostname of its own may be served on a
+/// request whose Host header is `request_host`: only when
+/// `http.serve_unbound_http_targets` is on, and never on a hostname a web
+/// target is bound to, at any port (a browser's cookies do not tell ports
+/// apart) and whether or not that binding is refused.
+async fn unbound_targets_served_on_host(
+    services: &Services,
+    request_host: Option<&str>,
+) -> Result<bool, WarpgateError> {
+    if !serve_unbound_http_targets(services).await {
+        return Ok(false);
+    }
+    let Some(host) = request_host else {
+        return Ok(true);
+    };
+    let targets = services.config_provider.list_targets().await?;
+    Ok(!targets.iter().any(|target| {
+        target
+            .options
+            .external_host()
+            .is_some_and(|bound| !bound.is_empty() && same_binding_hostname(bound, host))
+    }))
+}
+
 /// [`target_served_on_host`] for a ticket's target, which is resolved by id,
 /// not by host. The request's host is resolved as any request on it is
 /// ([`get_target_by_request_host`]): a bound target is served only if that
@@ -422,48 +447,19 @@ pub(crate) async fn ticket_target_served_on_host(
     target: &Target,
     request_host: Option<&str>,
 ) -> Result<bool, WarpgateError> {
-    if !target_served_on_host(
-        target,
-        request_host,
-        serve_unbound_http_targets(services).await,
-    ) {
-        return Ok(false);
-    }
-    let Some(host) = request_host else {
-        return Ok(true);
-    };
     let bound = target
         .options
         .external_host()
         .is_some_and(|bound| !bound.is_empty());
-    if bound {
-        let host_owner = get_target_by_request_host(services, host).await?;
-        Ok(host_owner.is_some_and(|owner| owner.id == target.id))
-    } else {
-        unbound_target_served_on_host(services, host).await
+    let serve_unbound = !bound && unbound_targets_served_on_host(services, request_host).await?;
+    if !target_served_on_host(target, request_host, serve_unbound) {
+        return Ok(false);
     }
-}
-
-/// Whether a target bound to no host is served on `request_host`: only if no
-/// target is bound to its hostname, at any port.
-pub(crate) async fn unbound_target_served_on_host(
-    services: &Services,
-    request_host: &str,
-) -> Result<bool, WarpgateError> {
-    Ok(!hostname_is_bound(services, request_host).await?)
-}
-
-/// Whether any target is bound to the hostname of `request_host`, at any
-/// port: a hostname serves one target, whatever the port.
-async fn hostname_is_bound(services: &Services, request_host: &str) -> Result<bool, WarpgateError> {
-    Ok(services
-        .config_provider
-        .list_targets()
-        .await?
-        .iter()
-        .filter_map(|target| target.options.external_host())
-        .filter(|bound| !bound.is_empty())
-        .any(|bound| same_binding_hostname(bound, request_host)))
+    let (true, Some(host)) = (bound, request_host) else {
+        return Ok(true);
+    };
+    let found = get_target_by_request_host(services, host).await?;
+    Ok(found.is_some_and(|found| found.id == target.id))
 }
 
 /// Whether `target` is bound to `request_host`: it has a binding, and
@@ -590,20 +586,14 @@ async fn get_target_for_request(
                     .get_target_by_name(target_name.as_str())
                     .await?
             };
-        // A target bound to no host is not served on a hostname another
-        // target is bound to, at any port.
-        let unbound_served = match request_host.as_deref() {
-            Some(host) => unbound_target_served_on_host(ctx.services(), host).await?,
-            None => true,
+        let serve_unbound = match &target {
+            Some(target) if target.options.external_host().is_none_or(str::is_empty) => {
+                unbound_targets_served_on_host(ctx.services(), request_host.as_deref()).await?
+            }
+            _ => false,
         };
-        let serve_unbound = serve_unbound_http_targets(ctx.services()).await;
         let target = target.filter(|target| {
-            let unbound = target
-                .options
-                .external_host()
-                .is_none_or(|bound| bound.is_empty());
-            let served = target_served_on_host(target, request_host.as_deref(), serve_unbound)
-                && (unbound_served || !unbound);
+            let served = target_served_on_host(target, request_host.as_deref(), serve_unbound);
             if !served {
                 debug!(
                     "Target {} is not served on host {:?}",
@@ -794,7 +784,7 @@ mod live_stream_tests {
     use warpgate_db_entities::{Role, Target, TargetRoleAssignment, User, UserRoleAssignment};
 
     use super::{
-        ticket_target_served_on_host, unbound_target_served_on_host, watch_admitted_live_stream,
+        ticket_target_served_on_host, unbound_targets_served_on_host, watch_admitted_live_stream,
         watch_live_stream, watch_public_live_stream,
     };
     use crate::test_db::{memory_db, services};
@@ -974,102 +964,104 @@ mod live_stream_tests {
         );
     }
 
-    /// A ticket for a target bound to no host is not served on a host bound
-    /// to another target, whose origin it would share; it is served on a host
-    /// no target is bound to. A bound target is served on its own host.
+    /// A target with no hostname is never served on a hostname another
+    /// target is bound to, at any port and whether or not that binding is
+    /// refused, even with `http.serve_unbound_http_targets` on; elsewhere
+    /// the switch decides.
     #[tokio::test]
-    async fn an_unbound_ticket_target_is_not_served_on_another_targets_host() {
+    async fn an_unbound_ticket_target_is_not_served_on_a_bound_host() {
         use warpgate_core::ConfigProvider;
 
         let db = memory_db().await;
         let services = services(db.clone()).await;
         services.config.lock().await.store.external_host = Some("warp.example.com".into());
-
-        let bound = bound_target(&services, &db, "bound", "vm.example.com:3000").await;
-        let unbound_id = public_target(&db).await;
+        bound_target(&services, &db, "own", "vm.example.com:3000").await;
+        bound_target(&services, &db, "a", "shared.example.com:3000").await;
+        bound_target(&services, &db, "b", "shared.example.com:8080").await;
+        let unbound = public_target(&db).await;
         let unbound = services
             .config_provider
-            .get_target_by_id(unbound_id)
+            .get_target_by_id(unbound)
             .await
             .unwrap()
             .unwrap();
 
-        assert!(
-            !ticket_target_served_on_host(&services, &unbound, Some("vm.example.com:3000"))
+        let served = async |host: Option<&str>| {
+            ticket_target_served_on_host(&services, &unbound, host)
                 .await
                 .unwrap()
-        );
-        // a host bound without a port, requested at a default port
-        bound_target(&services, &db, "app", "app.example.com").await;
-        assert!(
-            !ticket_target_served_on_host(&services, &unbound, Some("app.example.com:443"))
-                .await
-                .unwrap()
-        );
-        assert!(
-            ticket_target_served_on_host(&services, &unbound, Some("free.example.com"))
-                .await
-                .unwrap()
-        );
-        assert!(
-            ticket_target_served_on_host(&services, &unbound, Some("warp.example.com"))
-                .await
-                .unwrap()
-        );
-        assert!(
-            ticket_target_served_on_host(&services, &unbound, None)
-                .await
-                .unwrap()
-        );
-        assert!(
-            ticket_target_served_on_host(&services, &bound, Some("vm.example.com:3000"))
-                .await
-                .unwrap()
-        );
+        };
+        services
+            .config
+            .lock()
+            .await
+            .store
+            .http
+            .serve_unbound_http_targets = true;
+        for host in [
+            "vm.example.com:3000",
+            "vm.example.com",
+            "VM.example.com.:443",
+            "shared.example.com:3000",
+            "shared.example.com",
+        ] {
+            assert!(!served(Some(host)).await, "{host}");
+        }
+        for host in [Some("warp.example.com"), Some("free.example.com"), None] {
+            assert!(served(host).await, "{host:?}");
+        }
+        services
+            .config
+            .lock()
+            .await
+            .store
+            .http
+            .serve_unbound_http_targets = false;
+        for host in [Some("warp.example.com"), Some("free.example.com"), None] {
+            assert!(!served(host).await, "{host:?}");
+        }
     }
 
     /// A hostname serves one target whatever the port: with `vm.example.com`
-    /// bound at :3000, a target bound to nothing is refused on the same
-    /// hostname at another port and with none, for a ticket and for the
-    /// user path's `warpgate-target`; the bound target is still served on its
-    /// own host.
+    /// bound at :3000 and `app.example.com` bound without a port, a target
+    /// bound to nothing is refused on the same hostname at another port, at
+    /// a default port and with none, on the user path's `warpgate-target` as
+    /// for a ticket; it is served elsewhere only while
+    /// `http.serve_unbound_http_targets` is on.
     #[tokio::test]
     async fn an_unbound_target_is_not_served_on_a_bound_hostname_at_another_port() {
-        use warpgate_core::ConfigProvider;
-
         let db = memory_db().await;
         let services = services(db.clone()).await;
-
-        let bound = bound_target(&services, &db, "bound", "vm.example.com:3000").await;
-        let unbound_id = public_target(&db).await;
-        let unbound = services
-            .config_provider
-            .get_target_by_id(unbound_id)
+        bound_target(&services, &db, "bound", "vm.example.com:3000").await;
+        bound_target(&services, &db, "app", "app.example.com").await;
+        services
+            .config
+            .lock()
             .await
-            .unwrap()
-            .unwrap();
+            .store
+            .http
+            .serve_unbound_http_targets = true;
 
-        for host in ["vm.example.com:4000", "vm.example.com", "VM.example.com."] {
+        for host in [
+            "vm.example.com:4000",
+            "vm.example.com",
+            "VM.example.com.",
+            "app.example.com:443",
+        ] {
             assert!(
-                !ticket_target_served_on_host(&services, &unbound, Some(host))
-                    .await
-                    .unwrap(),
-                "ticket on {host}"
-            );
-            assert!(
-                !unbound_target_served_on_host(&services, host)
+                !unbound_targets_served_on_host(&services, Some(host))
                     .await
                     .unwrap(),
                 "user path on {host}"
             );
         }
         assert!(
-            unbound_target_served_on_host(&services, "other.example.com:4000")
+            unbound_targets_served_on_host(&services, Some("other.example.com:4000"))
                 .await
                 .unwrap()
         );
         assert!(
-            ticket_target_served_on_host(&services, &bound, Some("vm.example.com:3000"))
+            unbound_targets_served_on_host(&services, None)
                 .await
                 .unwrap()
         );
