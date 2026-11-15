@@ -441,3 +441,35 @@ every node to see.
 - Only those target-host sessions end: the control-plane sign-in, its user
   session and target-host sessions already handed the later sign-in go on.
 - A sign-in that never used SSO records nothing and ends nothing this way.
+
+## Rolling back to the previous release
+
+The way back from this release is to deploy the previous release,
+v0.30.2-cove.24. That release refuses to start on a database this release
+has migrated (`Migration file of version 'm00097_cove_http_sso_stamps' is
+missing`), so the database goes back first:
+
+1. Stop every Warpgate node.
+2. Once, against the shared database, with this release's binary and config:
+   `warpgate --config <config> migrate-database -2 --destructive`. This
+   reverts `m00097_cove_http_sso_stamps` and `m00096_cove_http_handoffs`,
+   dropping their two tables. They hold only short-lived handoffs and
+   sign-in times; nothing in them needs keeping.
+3. In the same stop, delete every row of `http_sessions`. The previous
+   release does not know this release's session cookies and passes them on
+   to targets; with the rows gone, those cookies name no session, now or
+   after a later upgrade.
+4. Deploy the previous release.
+
+What users see afterwards:
+
+- Every browser is signed out, on the control-plane host and on target
+  hosts, and signs in again on the control plane. The previous release reads
+  only the `warpgate-http-session` cookie, which this release never sets and
+  expires; this release's `__Host-warpgate-http-session` and
+  `__Host-warpgate-handoff` cookies are ignored.
+- A new sign-in gets the previous release's domain-wide cookie, so target
+  hosts under Warpgate's own hostname work as before this release.
+- The previous release serves targets with no hostname on Warpgate's own
+  host again, whatever `http.serve_unbound_http_targets` says; it warns that
+  the key is unknown. Remove the key to silence the warning.
