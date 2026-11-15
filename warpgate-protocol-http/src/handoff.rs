@@ -73,6 +73,12 @@ pub const HANDOFF_CHALLENGE_PARAM: &str =
     warpgate_common_http::ticket_query::HANDOFF_CHALLENGE_QUERY_PARAM;
 /// The query parameter carrying the token to [`REDEEM_PATH`].
 pub const HANDOFF_TOKEN_PARAM: &str = warpgate_common_http::ticket_query::HANDOFF_QUERY_PARAM;
+/// The query parameter a refused handoff adds to the page it sends the
+/// browser back to, so the handoff that page opens is known to be a retry.
+/// A retry that is refused too ends on a 403 instead of another retry: a
+/// browser that blocks this host's cookies never holds the nonce. Removed
+/// again from the page a handoff completes on.
+pub const HANDOFF_RETRY_PARAM: &str = "warpgate-handoff-retry";
 
 /// How long an opened handoff waits for the control plane. A sign-in there
 /// that takes longer leaves the browser on a refusal; opening the page again
@@ -346,6 +352,8 @@ pub async fn start_endpoint(req: &Request, session: &Session) -> poem::Result<Re
 /// the page the handoff was opened for when that is known, or this host's
 /// root, where a browser without a session opens a new handoff: so a tab
 /// whose nonce cookie another tab's handoff replaced simply tries again.
+/// That retry is marked ([`HANDOFF_RETRY_PARAM`]); a refusal of a handoff
+/// opened for a marked page gets a 403 saying sign-in needs cookies.
 #[poem::handler]
 pub async fn redeem_endpoint(req: &Request, session: &Session) -> poem::Result<Response> {
     let ctx = Data::<&UnauthenticatedRequestContext>::from_request_without_body(req).await?;
@@ -396,12 +404,13 @@ pub async fn redeem_endpoint(req: &Request, session: &Session) -> poem::Result<R
             if spent {
                 session.purge();
             }
-            let retry = next
-                .and_then(|next| bound_host_return_url("https", &binding, &next))
-                .or_else(|| bound_host_return_url("https", &binding, "/"));
+            let next = next.unwrap_or_else(|| "/".to_owned());
+            let retry = (!has_retry_marker(&next))
+                .then(|| bound_host_return_url("https", &binding, &with_retry_marker(&next)))
+                .flatten();
             match retry {
                 Some(location) => see_other(&location).finish(),
-                None => refusal(StatusCode::FORBIDDEN),
+                None => cookies_needed(),
             }
         }
     };
@@ -475,9 +484,59 @@ async fn complete_redeem(
     {
         return Err("TargetAccess".to_owned());
     }
-    let location = bound_host_return_url("https", binding, &redeemed.next).ok_or("BadNext")?;
+    let location = bound_host_return_url("https", binding, &without_retry_marker(&redeemed.next))
+        .ok_or("BadNext")?;
     Ok(see_other(&location).finish())
 }
+
+/// Whether `next`, a page on a bound host, carries [`HANDOFF_RETRY_PARAM`]:
+/// the handoff opened for it was already a retry.
+fn has_retry_marker(next: &str) -> bool {
+    next.split_once('?').is_some_and(|(_, query)| {
+        url::form_urlencoded::parse(query.as_bytes()).any(|(key, _)| key == HANDOFF_RETRY_PARAM)
+    })
+}
+
+/// `next` with [`HANDOFF_RETRY_PARAM`] added to its query.
+fn with_retry_marker(next: &str) -> String {
+    let separator = if next.contains('?') { '&' } else { '?' };
+    format!("{next}{separator}{HANDOFF_RETRY_PARAM}=1")
+}
+
+/// `next` without [`HANDOFF_RETRY_PARAM`]; the rest of its query is kept
+/// exactly.
+fn without_retry_marker(next: &str) -> String {
+    let Some((path, query)) = next.split_once('?') else {
+        return next.to_owned();
+    };
+    let query = query
+        .split('&')
+        .filter(|pair| {
+            url::form_urlencoded::parse(pair.as_bytes())
+                .next()
+                .is_none_or(|(key, _)| key != HANDOFF_RETRY_PARAM)
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    if query.is_empty() {
+        path.to_owned()
+    } else {
+        format!("{path}?{query}")
+    }
+}
+
+/// The refusal of a retried handoff that failed again: a browser that keeps
+/// no cookie for this host would otherwise go round forever.
+fn cookies_needed() -> Response {
+    Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .header(http::header::CACHE_CONTROL, "no-store")
+        .content_type("text/plain; charset=utf-8")
+        .body(COOKIES_NEEDED)
+}
+
+const COOKIES_NEEDED: &str =
+    "Signing in to this site needs cookies. Allow cookies for this host, then reload the page.\n";
 
 /// The first value of the query parameter `name`.
 fn query_value(req: &Request, name: &str) -> Option<String> {
@@ -878,7 +937,10 @@ mod tests {
                     .send()
                     .await;
                 resp.assert_status(StatusCode::SEE_OTHER);
-                resp.assert_header("location", format!("https://{HOST}/"));
+                resp.assert_header(
+                    "location",
+                    format!("https://{HOST}/?{HANDOFF_RETRY_PARAM}=1"),
+                );
                 assert!(!clears_the_nonce(&resp), "{path}");
                 assert!(stored(&db, &cookie).await, "{path} dropped the session");
             }
@@ -916,9 +978,83 @@ mod tests {
                 .send()
                 .await;
             resp.assert_status(StatusCode::SEE_OTHER);
-            resp.assert_header("location", format!("https://{HOST}/page?x=1"));
+            resp.assert_header(
+                "location",
+                format!("https://{HOST}/page?x=1&{HANDOFF_RETRY_PARAM}=1"),
+            );
             assert!(clears_the_nonce(&resp));
             assert!(!stored(&db, &cookie).await, "the session survived");
+        }
+
+        /// Mints a token for a handoff opened for `next`.
+        async fn token_for(db: &DatabaseConnection, target: Uuid, next: &str) -> String {
+            let now = OffsetDateTime::now_utc();
+            let opened = open(db, target, HOST, next, now).await.unwrap();
+            mint(
+                db,
+                &opened.challenge,
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                None,
+                now,
+            )
+            .await
+            .unwrap()
+            .unwrap()
+        }
+
+        /// A browser that keeps no cookie for this host never holds the
+        /// nonce: its first refusal retries once, marked, and the refusal of
+        /// that retry is a 403 saying sign-in needs cookies, not another
+        /// round.
+        #[tokio::test]
+        async fn a_browser_without_cookies_retries_once_then_is_told_why() {
+            let db = memory_db().await;
+            let target = bound_target(&db).await;
+            let cli = TestClient::new(app(db.clone()).await);
+
+            let token = token_for(&db, target, "/page").await;
+            let resp = cli
+                .get(format!(
+                    "/@warpgate{REDEEM_PATH}?{HANDOFF_TOKEN_PARAM}={token}"
+                ))
+                .header("host", HOST)
+                .send()
+                .await;
+            resp.assert_status(StatusCode::SEE_OTHER);
+            let retried = format!("/page?{HANDOFF_RETRY_PARAM}=1");
+            resp.assert_header("location", format!("https://{HOST}{retried}"));
+
+            // The retried page opens a handoff for itself, marker included.
+            let token = token_for(&db, target, &retried).await;
+            let resp = cli
+                .get(format!(
+                    "/@warpgate{REDEEM_PATH}?{HANDOFF_TOKEN_PARAM}={token}"
+                ))
+                .header("host", HOST)
+                .send()
+                .await;
+            resp.assert_status(StatusCode::FORBIDDEN);
+            assert!(resp.0.headers().get("location").is_none());
+            resp.assert_text(COOKIES_NEEDED).await;
+        }
+
+        #[test]
+        fn the_retry_marker_is_added_found_and_removed_exactly() {
+            assert_eq!(with_retry_marker("/"), format!("/?{HANDOFF_RETRY_PARAM}=1"));
+            assert_eq!(
+                with_retry_marker("/p?a=1"),
+                format!("/p?a=1&{HANDOFF_RETRY_PARAM}=1")
+            );
+            assert!(!has_retry_marker("/p?a=1"));
+            assert!(!has_retry_marker(&format!("/{HANDOFF_RETRY_PARAM}")));
+            assert!(has_retry_marker(&with_retry_marker("/p?a=1")));
+            assert_eq!(without_retry_marker(&with_retry_marker("/")), "/");
+            assert_eq!(
+                without_retry_marker(&format!("/p?a=1&{HANDOFF_RETRY_PARAM}=1&b=two%20words")),
+                "/p?a=1&b=two%20words"
+            );
+            assert_eq!(without_retry_marker("/p?a=1"), "/p?a=1");
         }
     }
 }
