@@ -152,6 +152,18 @@ pub async fn count<C: ConnectionTrait>(db: &C) -> Result<u64, WarpgateError> {
     Ok(Entity::find().count(db).await?)
 }
 
+/// How many handoffs are stored for the target `target_id`, expired or not:
+/// the per-target budget [`open`] is refused past.
+pub async fn count_for_target<C: ConnectionTrait>(
+    db: &C,
+    target_id: Uuid,
+) -> Result<u64, WarpgateError> {
+    Ok(Entity::find()
+        .filter(Column::TargetId.eq(target_id))
+        .count(db)
+        .await?)
+}
+
 /// Deletes every expired handoff.
 pub async fn purge_expired<C: ConnectionTrait>(
     db: &C,

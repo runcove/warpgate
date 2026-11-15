@@ -99,6 +99,11 @@ pub const TOKEN_LIFETIME: Duration = Duration::from_secs(60);
 /// cannot push out the handoff of a browser already on its way.
 pub const MAX_STORED: u64 = 10_000;
 
+/// The most handoffs the store holds for any one target, and so its one
+/// host: a flood of handoffs opened on a single host is refused there
+/// ([`busy`]) long before it fills the store for every other host.
+pub const MAX_STORED_PER_TARGET: u64 = MAX_STORED / 10;
+
 /// How many handoff steps of each kind one source address may take a minute
 /// (opening on a bound host, starting on the control plane, redeeming), as
 /// a burst that refills at the same rate. Each sign-in on a new host takes
@@ -114,8 +119,21 @@ pub(crate) enum Step {
 }
 
 /// The per-source-address limit on each [`Step`], in memory on each node.
-/// A request whose address is unknown counts against one shared bucket.
+/// An IPv6 address counts by its /64 prefix, which one client typically holds
+/// whole ([`rate_limit_address`]). A request whose address is unknown counts
+/// against one shared bucket.
 pub(crate) struct RateLimit(DefaultKeyedRateLimiter<(Step, Option<IpAddr>)>);
+
+/// The address a request is rate-limited as: an IPv4 address (an IPv4-mapped
+/// IPv6 one included) as it is, an IPv6 address as its /64 prefix.
+fn rate_limit_address(ip: IpAddr) -> IpAddr {
+    match ip.to_canonical() {
+        IpAddr::V4(v4) => IpAddr::V4(v4),
+        IpAddr::V6(v6) => IpAddr::V6(std::net::Ipv6Addr::from_bits(
+            v6.to_bits() & !u128::from(u64::MAX),
+        )),
+    }
+}
 
 impl RateLimit {
     pub(crate) fn per_minute(per_minute: NonZeroU32) -> Self {
@@ -126,7 +144,9 @@ impl RateLimit {
 
     /// Whether `ip` may take one more `step` now.
     pub(crate) fn allows(&self, step: Step, ip: Option<IpAddr>) -> bool {
-        self.0.check_key(&(step, ip)).is_ok()
+        self.0
+            .check_key(&(step, ip.map(rate_limit_address)))
+            .is_ok()
     }
 }
 
@@ -192,7 +212,8 @@ pub struct Opened {
 
 /// Records a handoff for the target `target_id` bound to `binding`, returning
 /// to `next` (a path on that host) once redeemed. `None`, recording nothing,
-/// when the store already holds [`MAX_STORED`] handoffs.
+/// when the store already holds [`MAX_STORED`] handoffs, or
+/// [`MAX_STORED_PER_TARGET`] for this target.
 pub async fn open<C: ConnectionTrait>(
     db: &C,
     target_id: Uuid,
@@ -200,26 +221,48 @@ pub async fn open<C: ConnectionTrait>(
     next: &str,
     now: OffsetDateTime,
 ) -> Result<Option<Opened>, WarpgateError> {
-    open_below(db, MAX_STORED, target_id, binding, next, now).await
+    let ceiling = Ceiling {
+        stored: MAX_STORED,
+        per_target: MAX_STORED_PER_TARGET,
+    };
+    open_below(db, ceiling, target_id, binding, next, now).await
 }
 
-/// [`open`] with the ceiling `max_stored`. Counted, then inserted: nodes
-/// opening handoffs at the same moment can each pass the count, so the store
-/// can go past the ceiling by as many handoffs as are opened at once.
+/// The most handoffs [`open_below`] lets the store hold, in all and for one
+/// target.
+#[derive(Clone, Copy)]
+struct Ceiling {
+    stored: u64,
+    per_target: u64,
+}
+
+/// [`open`] below `ceiling`. Counted, then inserted: nodes opening handoffs
+/// at the same moment can each pass the counts, so the store can go past
+/// either ceiling by as many handoffs as are opened at once.
 async fn open_below<C: ConnectionTrait>(
     db: &C,
-    max_stored: u64,
+    ceiling: Ceiling,
     target_id: Uuid,
     binding: &str,
     next: &str,
     now: OffsetDateTime,
 ) -> Result<Option<Opened>, WarpgateError> {
     let stored = HttpHandoff::count(db).await?;
-    if stored >= max_stored {
+    if stored >= ceiling.stored {
         tracing::warn!(
             stored,
-            max_stored,
+            max_stored = ceiling.stored,
             "Refused to open a target-host handoff: the handoff store is full"
+        );
+        return Ok(None);
+    }
+    let for_target = HttpHandoff::count_for_target(db, target_id).await?;
+    if for_target >= ceiling.per_target {
+        tracing::warn!(
+            %target_id,
+            stored = for_target,
+            max_stored = ceiling.per_target,
+            "Refused to open a target-host handoff: this target's share of the handoff store is full"
         );
         return Ok(None);
     }
@@ -982,6 +1025,60 @@ mod tests {
         }
     }
 
+    /// A ceiling of `stored` handoffs in all, with no lower one per target.
+    fn total(stored: u64) -> Ceiling {
+        Ceiling {
+            stored,
+            per_target: stored,
+        }
+    }
+
+    /// One target at its share of the store is refused a handoff and none is
+    /// recorded, while other targets still open theirs; once its expired
+    /// handoffs are purged it opens again.
+    #[tokio::test]
+    async fn unit_handoff_one_target_cannot_fill_the_store() {
+        let db = memory_db().await;
+        let ceiling = Ceiling {
+            stored: 10,
+            per_target: 2,
+        };
+        let flooded = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        for _ in 0..2 {
+            assert!(
+                open_below(&db, ceiling, flooded, HOST, "/", at(0))
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        assert!(
+            open_below(&db, ceiling, flooded, HOST, "/", at(1))
+                .await
+                .unwrap()
+                .is_none(),
+            "a target past its share opened a handoff"
+        );
+        assert_eq!(HttpHandoff::count(&db).await.unwrap(), 2);
+        assert!(
+            open_below(&db, ceiling, other, "vm2.warp.example", "/", at(1))
+                .await
+                .unwrap()
+                .is_some(),
+            "another target was refused"
+        );
+
+        let late = at(OPEN_LIFETIME.as_secs() as i64 + 2);
+        purge_expired(&db, late).await.unwrap();
+        assert!(
+            open_below(&db, ceiling, flooded, HOST, "/", late)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
     /// At the ceiling a handoff is refused and none is recorded, and every
     /// stored handoff stays usable: nothing is evicted to make room. Once
     /// the expired ones are purged, handoffs open again.
@@ -991,11 +1088,11 @@ mod tests {
         let target = Uuid::new_v4();
         let mut kept = vec![];
         for _ in 0..3 {
-            let opened = open_below(&db, 3, target, HOST, "/", at(0)).await.unwrap();
+            let opened = open_below(&db, total(3), target, HOST, "/", at(0)).await.unwrap();
             kept.push(opened.expect("below the ceiling").challenge);
         }
         assert!(
-            open_below(&db, 3, target, HOST, "/", at(1))
+            open_below(&db, total(3), target, HOST, "/", at(1))
                 .await
                 .unwrap()
                 .is_none()
@@ -1015,7 +1112,7 @@ mod tests {
         let late = at(OPEN_LIFETIME.as_secs() as i64 + 1);
         purge_expired(&db, late).await.unwrap();
         assert!(
-            open_below(&db, 3, target, HOST, "/", late)
+            open_below(&db, total(3), target, HOST, "/", late)
                 .await
                 .unwrap()
                 .is_some()
@@ -1039,6 +1136,24 @@ mod tests {
         assert!(limit.allows(Step::Open, None));
         assert!(!limit.allows(Step::Open, None));
         assert!(!limit.allows(Step::Open, a));
+    }
+
+    /// An IPv6 client counts by its /64: every address in one /64 shares a
+    /// limit, the next /64 has its own, and an IPv4-mapped address counts as
+    /// its IPv4 address.
+    #[test]
+    fn unit_handoff_rate_limit_counts_ipv6_by_its_64() {
+        let limit = RateLimit::per_minute(NonZeroU32::new(2).unwrap());
+        let ip = |s: &str| Some(s.parse::<IpAddr>().unwrap());
+        assert!(limit.allows(Step::Open, ip("2001:db8:1:2::1")));
+        assert!(limit.allows(Step::Open, ip("2001:db8:1:2:ffff:ffff:ffff:ffff")));
+        assert!(!limit.allows(Step::Open, ip("2001:db8:1:2:abcd::9")));
+        assert!(limit.allows(Step::Open, ip("2001:db8:1:3::1")));
+
+        assert!(limit.allows(Step::Open, ip("192.0.2.7")));
+        assert!(limit.allows(Step::Open, ip("::ffff:192.0.2.7")));
+        assert!(!limit.allows(Step::Open, ip("192.0.2.7")));
+        assert!(limit.allows(Step::Open, ip("192.0.2.8")));
     }
 
     mod endpoint {
