@@ -442,6 +442,27 @@ every node to see.
   session and target-host sessions already handed the later sign-in go on.
 - A sign-in that never used SSO records nothing and ends nothing this way.
 
+## What a target's page can do on its own host
+
+A page a target serves on its own hostname shares that origin with the
+browser's session there. Through that session the page can:
+
+- Make requests to its own target on its own host as the signed-in user. The
+  target receives `X-Warpgate-Username` (the user's name) and
+  `X-Warpgate-Authentication-Type: user`.
+- Load Warpgate's gateway assets under `/@warpgate/assets/`.
+- Sign that host's browser session out (`POST /@warpgate/api/auth/logout`).
+  That ends the session on this host only; the control-plane sign-in and the
+  sessions on other target hosts go on.
+- Send the browser to the handoff's redeem route (`/@warpgate/handoff`). It
+  signs a browser in, on this host only, with a token handed off for this
+  host's target to that same browser.
+
+Every other route under `/@warpgate` and `/_warpgate` on that host answers
+404, and the session counts nowhere else: not on the control-plane host and
+not on another target's host. The target never receives a Warpgate cookie,
+and a cookie it sets under a Warpgate cookie name never reaches the browser.
+
 ## Rolling back to the previous release
 
 The way back from this release is to deploy the previous release,
@@ -451,10 +472,10 @@ missing`), so the database goes back first:
 
 1. Stop every Warpgate node, and keep them all stopped until step 4.
 2. With the database's own client (`sqlite3`, `psql` or `mysql`), delete
-   every row of `http_sessions`: `DELETE FROM http_sessions;`. The sessions
-   must go because the previous release would pass this release's session
-   cookies on to targets. This step is required: step 3 refuses while any
-   row remains, and changes nothing when it refuses.
+   every row of `http_sessions`: `DELETE FROM http_sessions;`. The previous
+   release cannot use this release's sessions, so they must go. This step is
+   required: step 3 refuses while any row remains, and changes nothing when
+   it refuses.
 3. Once, against the shared database, with this release's binary and config:
    `warpgate --config <config> migrate-database -2 --destructive`. This
    reverts `m00097_cove_http_sso_stamps` and `m00096_cove_http_handoffs`,
@@ -479,8 +500,7 @@ What users see afterwards:
   only the `warpgate-http-session` cookie, which this release never sets and
   expires; this release's `__Host-warpgate-http-session` and
   `__Host-warpgate-handoff` cookies are ignored.
-- A new sign-in gets the previous release's domain-wide cookie, so target
-  hosts under Warpgate's own hostname work as before this release.
+- A new sign-in works on the previous release as it always did there.
 - The previous release serves targets with no hostname on Warpgate's own
   host again, whatever `http.serve_unbound_http_targets` says; it warns that
   the key is unknown. Remove the key to silence the warning.
