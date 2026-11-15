@@ -379,4 +379,78 @@ mod tests {
         db.close().await.unwrap();
         std::fs::remove_file(path).unwrap();
     }
+
+    async fn table_exists(db: &sea_orm::DatabaseConnection, table: &str) -> bool {
+        use sea_orm::{ConnectionTrait, Statement};
+        db.query_one(Statement::from_sql_and_values(
+            db.get_database_backend(),
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+            [table.into()],
+        ))
+        .await
+        .unwrap()
+        .is_some()
+    }
+
+    async fn applied(db: &sea_orm::DatabaseConnection, version: &str) -> bool {
+        use sea_orm::{ConnectionTrait, Statement};
+        db.query_one(Statement::from_sql_and_values(
+            db.get_database_backend(),
+            "SELECT version FROM seaql_migrations WHERE version = ?",
+            [version.into()],
+        ))
+        .await
+        .unwrap()
+        .is_some()
+    }
+
+    /// Rolling back the two cove HTTP handoff migrations refuses while any
+    /// `http_sessions` row remains, and the refusal leaves both tables and
+    /// their `seaql_migrations` rows in place. With the rows gone it succeeds.
+    #[tokio::test]
+    async fn rolling_back_cove_http_migrations_requires_no_http_sessions() {
+        use sea_orm::{ConnectionTrait, Statement};
+
+        set_config_migration_values(ConfigMigrationValues::default());
+        let path = std::env::temp_dir().join(format!(
+            "warpgate-migrations-sessions-{}.sqlite3",
+            std::process::id()
+        ));
+        let mut opt = ConnectOptions::new(format!("sqlite://{}?mode=rwc", path.display()));
+        opt.max_connections(100);
+        let db = Database::connect(opt).await.unwrap();
+        migrate_database(&db).await.unwrap();
+
+        let tables = ["cove_http_handoffs", "cove_http_sso_stamps"];
+        let versions = ["m00096_cove_http_handoffs", "m00097_cove_http_sso_stamps"];
+        let backend = db.get_database_backend();
+        db.execute(Statement::from_string(
+            backend,
+            "INSERT INTO http_sessions (id, expires, data, updated) \
+             VALUES ('s1', NULL, '{}', CURRENT_TIMESTAMP)",
+        ))
+        .await
+        .unwrap();
+
+        let error = migrate_database_down(&db, 2).await.unwrap_err().to_string();
+        assert!(error.contains("m00097_cove_http_sso_stamps"), "{error}");
+        assert!(error.contains("DELETE FROM http_sessions;"), "{error}");
+        for (table, version) in tables.iter().zip(versions) {
+            assert!(table_exists(&db, table).await, "{table} dropped");
+            assert!(applied(&db, version).await, "{version} unrecorded");
+        }
+
+        db.execute(Statement::from_string(backend, "DELETE FROM http_sessions"))
+            .await
+            .unwrap();
+        migrate_database_down(&db, 2).await.unwrap();
+        for (table, version) in tables.iter().zip(versions) {
+            assert!(!table_exists(&db, table).await, "{table} kept");
+            assert!(!applied(&db, version).await, "{version} still recorded");
+        }
+        assert!(applied(&db, "m00095_cove_pending_user_closes").await);
+
+        db.close().await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
 }

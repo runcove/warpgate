@@ -450,15 +450,14 @@ has migrated (`Migration file of version 'm00097_cove_http_sso_stamps' is
 missing`), so the database goes back first:
 
 1. Stop every Warpgate node.
-2. Once, against the shared database, with this release's binary and config:
+2. Delete every row of `http_sessions` (`DELETE FROM http_sessions;`). This
+   step is required: step 3 refuses while any row remains, and changes
+   nothing when it refuses.
+3. Once, against the shared database, with this release's binary and config:
    `warpgate --config <config> migrate-database -2 --destructive`. This
    reverts `m00097_cove_http_sso_stamps` and `m00096_cove_http_handoffs`,
    dropping their two tables. They hold only short-lived handoffs and
    sign-in times; nothing in them needs keeping.
-3. In the same stop, delete every row of `http_sessions`. The previous
-   release does not know this release's session cookies and passes them on
-   to targets; with the rows gone, those cookies name no session, now or
-   after a later upgrade.
 4. Deploy the previous release.
 
 What users see afterwards:
