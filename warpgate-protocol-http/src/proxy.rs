@@ -575,8 +575,15 @@ fn inject_forwarding_headers<B: SomeRequestBuilder>(
 async fn inject_own_headers<B: SomeRequestBuilder>(req: &Request, mut target: B) -> Result<B> {
     let session = <&Session>::from_request_without_body(req).await?;
     // The public-target bypass's throwaway session names no one: an
-    // anonymous request goes upstream with no identity headers at all.
-    if let Some(auth) = session.get_auth()
+    // anonymous request goes upstream with no identity headers at all. A
+    // target-host session names its user through the same authorization it
+    // is admitted as (`inject_request_authorization`).
+    let auth = session.get_auth().or_else(|| {
+        session
+            .get_bound_auth()
+            .map(|bound| bound.as_session_authorization())
+    });
+    if let Some(auth) = auth
         && !is_public_session_authorization(&auth)
     {
         target = target.header(&X_WARPGATE_USERNAME, auth.username()).header(

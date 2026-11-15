@@ -1405,6 +1405,25 @@ mod tests {
                 }
             }
 
+            /// A page proxied on a bound host: the identity headers the proxy
+            /// sends its target, as `username/type` (`-` for one not sent).
+            #[handler]
+            async fn upstream(req: &Request) -> String {
+                let headers = crate::proxy::upstream_headers_for_test(req).await;
+                let header = |name: &str| {
+                    headers
+                        .get(name)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("-")
+                        .to_owned()
+                };
+                format!(
+                    "{}/{}",
+                    header("x-warpgate-username"),
+                    header("x-warpgate-authentication-type")
+                )
+            }
+
             /// The browser session's last sign-in, as a unix time.
             #[handler]
             fn stamp_page(session: &Session) -> String {
@@ -1443,6 +1462,10 @@ mod tests {
                     .at(
                         "/page",
                         get(page).around(crate::common::inject_request_authorization),
+                    )
+                    .at(
+                        "/upstream",
+                        get(upstream).around(crate::common::inject_request_authorization),
                     )
                     .at(format!("/@warpgate{START_PATH}"), start)
                     .at(format!("/@warpgate{REDEEM_PATH}"), get(redeem_endpoint))
@@ -1601,6 +1624,74 @@ mod tests {
                     .await;
                 resp.assert_text(stamp.to_string()).await;
             }
+            /// Hands the control-plane sign-in in `cookie` off to `host`,
+            /// bound to `target`: the session cookie it gets there.
+            async fn hand_off(
+                cli: &TestClient<impl poem::Endpoint>,
+                db: &DatabaseConnection,
+                cookie: &str,
+                user: Uuid,
+                target: Uuid,
+                host: &str,
+            ) -> String {
+                let opened = open(db, target, host, "/page", OffsetDateTime::now_utc())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let resp = start(cli, cookie, user, &opened.challenge).await;
+                resp.assert_status(StatusCode::SEE_OTHER);
+                let location = resp.0.headers()["location"].to_str().unwrap().to_owned();
+                let redeem = location
+                    .strip_prefix(&format!("https://{host}"))
+                    .expect("sent to the bound host")
+                    .to_owned();
+                let resp = cli
+                    .get(&redeem)
+                    .header("host", host)
+                    .header("cookie", format!("{HANDOFF_COOKIE_NAME}={}", opened.nonce))
+                    .send()
+                    .await;
+                resp.assert_status(StatusCode::SEE_OTHER);
+                resp.assert_header("location", format!("https://{host}/page"));
+                session_cookie(&resp)
+            }
+
+            async fn page_on(
+                cli: &TestClient<impl poem::Endpoint>,
+                host: &str,
+                cookie: &str,
+            ) -> String {
+                let resp = cli
+                    .get("/page")
+                    .header("host", host)
+                    .header("cookie", cookie)
+                    .send()
+                    .await;
+                resp.assert_status_is_ok();
+                resp.0.into_body().into_string().await.unwrap()
+            }
+
+            /// A request proxied on a bound host names the handed-off user to
+            /// the target, as a user sign-in, exactly as on the control plane.
+            #[tokio::test]
+            async fn a_bound_host_request_names_its_user_upstream() {
+                let db = memory_db().await;
+                let target = bound_target(&db).await;
+                let user = user_for(&db, target).await;
+                let cli = TestClient::new(app(db.clone()).await);
+                let (control, _, _) = signed_in(&cli, &db, target, user, 10).await;
+                let bound = hand_off(&cli, &db, &control, user, target, HOST).await;
+
+                let resp = cli
+                    .get("/upstream")
+                    .header("host", HOST)
+                    .header("cookie", &bound)
+                    .send()
+                    .await;
+                resp.assert_status_is_ok();
+                resp.assert_text(format!("user-{user}/user")).await;
+            }
+
             mod step_up_ending {
                 //! A step-up on one bound host ends every other bound host's
                 //! session of the same sign-in on its next request.
@@ -1651,53 +1742,6 @@ mod tests {
                     let resp = req.send().await;
                     resp.assert_status_is_ok();
                     cookie.map_or_else(|| session_cookie(&resp), ToOwned::to_owned)
-                }
-
-                /// Hands the control-plane sign-in in `cookie` off to `host`,
-                /// bound to `target`: the session cookie it gets there.
-                async fn hand_off(
-                    cli: &TestClient<impl poem::Endpoint>,
-                    db: &DatabaseConnection,
-                    cookie: &str,
-                    user: Uuid,
-                    target: Uuid,
-                    host: &str,
-                ) -> String {
-                    let opened = open(db, target, host, "/page", OffsetDateTime::now_utc())
-                        .await
-                        .unwrap()
-                        .unwrap();
-                    let resp = start(cli, cookie, user, &opened.challenge).await;
-                    resp.assert_status(StatusCode::SEE_OTHER);
-                    let location = resp.0.headers()["location"].to_str().unwrap().to_owned();
-                    let redeem = location
-                        .strip_prefix(&format!("https://{host}"))
-                        .expect("sent to the bound host")
-                        .to_owned();
-                    let resp = cli
-                        .get(&redeem)
-                        .header("host", host)
-                        .header("cookie", format!("{HANDOFF_COOKIE_NAME}={}", opened.nonce))
-                        .send()
-                        .await;
-                    resp.assert_status(StatusCode::SEE_OTHER);
-                    resp.assert_header("location", format!("https://{host}/page"));
-                    session_cookie(&resp)
-                }
-
-                async fn page_on(
-                    cli: &TestClient<impl poem::Endpoint>,
-                    host: &str,
-                    cookie: &str,
-                ) -> String {
-                    let resp = cli
-                        .get("/page")
-                        .header("host", host)
-                        .header("cookie", cookie)
-                        .send()
-                        .await;
-                    resp.assert_status_is_ok();
-                    resp.0.into_body().into_string().await.unwrap()
                 }
 
                 /// Signed in on two bound hosts, the user steps up on the first;
