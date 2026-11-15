@@ -344,9 +344,24 @@ impl<E: Endpoint> Endpoint for TicketMiddlewareEndpoint<E> {
                 .await;
                 session.clear();
             }
+        } else if !session_is_temporary && let Some(bound) = session.get_bound_auth() {
+            // A target-host session is re-checked by its user the same way,
+            // but it shares its user session with the control plane and
+            // every other bound host: only this host's browser session is
+            // dropped, and the login goes on (it is re-checked there too).
+            let client_ip = get_client_ip(&req, ctx.services())
+                .await
+                .and_then(|s| s.parse().ok());
+            if !session_user_still_admitted(&ctx.services().db, bound.user_id, client_ip).await? {
+                session.purge();
+            }
         }
 
-        if let Some(ticket) = ticket_value {
+        if let Some(ticket) = ticket_value
+            // A purged session ignores every later write, so a ticket
+            // presented with it could not start a session: it is not spent.
+            && session.status() != SessionStatus::Purged
+        {
             let ticket_secret = Secret::new(ticket);
 
             let presented_owner =
@@ -967,6 +982,291 @@ mod tests {
                 );
                 assert_eq!(uses_left(&db, ticket_id).await, Some(2));
             }
+        }
+    }
+
+    mod bound_sessions {
+        //! A target-host session (bound auth only) through the ticket
+        //! middleware over the shared table: it is re-checked by its user, it
+        //! takes no ticket, and nothing here ends the user session it shares.
+        use poem::session::ServerSession;
+        use poem::test::{TestClient, TestResponse};
+        use poem::web::Query;
+        use poem::{EndpointExt, Route, get, handler};
+        use sea_orm::ActiveValue::Set;
+        use sea_orm::{ActiveModelTrait, DatabaseConnection, EntityTrait};
+        use warpgate_common::UserSessionId;
+        use warpgate_common::helpers::hash::hash_secret;
+        use warpgate_db_entities::Target::TargetKind;
+        use warpgate_db_entities::{Target, Ticket, User};
+
+        use super::*;
+        use crate::common::{
+            BoundSessionAuthorization, SESSION_COOKIE_NAME, SessionExt, session_cookie_config,
+        };
+        use crate::session::SESSION_ID_SESSION_KEY;
+        use crate::session_storage::SharedSessionStorage;
+        use crate::test_db::{
+            browser_session_stored, insert_open_user_session, insert_user, memory_db, services,
+            user_session_open,
+        };
+
+        const HOST: &str = "vm.example.com:3000";
+        const B_SECRET: &str = "t1cket-of-another-user";
+
+        #[handler]
+        fn who(session: &Session) -> String {
+            match (session.get_auth(), session.get_bound_auth()) {
+                (Some(auth), _) => format!("auth:{}", auth.user_id()),
+                (None, Some(bound)) => format!("bound:{}", bound.user_id),
+                (None, None) => "nobody".into(),
+            }
+        }
+
+        #[derive(Deserialize)]
+        struct Seed {
+            user: Uuid,
+            user_session: Uuid,
+            target: Uuid,
+            /// Also a ticket authorization for this ticket id, as an older
+            /// version could write into a target-host session.
+            ticket: Option<Uuid>,
+            /// The control plane's own browser session instead, which backs
+            /// the user session too.
+            control_plane: Option<bool>,
+        }
+
+        #[handler]
+        fn seed(session: &Session, Query(seed): Query<Seed>) {
+            session.set(SESSION_ID_SESSION_KEY, UserSessionId(seed.user_session));
+            if seed.control_plane == Some(true) {
+                session.set_auth(SessionAuthorization::User {
+                    user_id: seed.user,
+                    username: "alice".into(),
+                });
+                return;
+            }
+            session.set_bound_auth(BoundSessionAuthorization {
+                user_id: seed.user,
+                username: "alice".into(),
+                target_id: seed.target,
+                hostname: HOST.into(),
+            });
+            if let Some(ticket_id) = seed.ticket {
+                session.set_auth(SessionAuthorization::Ticket {
+                    user_id: seed.user,
+                    username: "alice".into(),
+                    target_id: seed.target,
+                    ticket_id: Some(ticket_id),
+                });
+            }
+        }
+
+        async fn bound_target(db: &DatabaseConnection) -> Uuid {
+            let target_id = Uuid::new_v4();
+            Target::ActiveModel {
+                id: Set(target_id),
+                name: Set("bound".into()),
+                description: Set(String::new()),
+                kind: Set(TargetKind::Http),
+                options: Set(serde_json::json!({
+                    "http": {"url": "http://h", "external_host": HOST}
+                })),
+                rate_limit_bytes_per_second: Set(None),
+                group_id: Set(None),
+                ticket_max_duration_seconds: Set(None),
+                ticket_requests_disabled: Set(false),
+                ticket_require_approval: Set(false),
+                ticket_max_uses: Set(None),
+                require_approval: Set(false),
+            }
+            .insert(db)
+            .await
+            .unwrap();
+            target_id
+        }
+
+        async fn insert_ticket(
+            db: &DatabaseConnection,
+            user_id: Uuid,
+            target_id: Uuid,
+            secret: &str,
+            expiry: Option<OffsetDateTime>,
+        ) -> Uuid {
+            let ticket_id = Uuid::new_v4();
+            Ticket::ActiveModel {
+                id: Set(ticket_id),
+                secret_hash: Set(hash_secret(secret)),
+                user_id: Set(user_id),
+                description: Set(String::new()),
+                target_id: Set(target_id),
+                uses_left: Set(Some(2)),
+                self_service: Set(false),
+                expiry: Set(expiry),
+                created: Set(OffsetDateTime::now_utc()),
+            }
+            .insert(db)
+            .await
+            .unwrap();
+            ticket_id
+        }
+
+        async fn uses_left(db: &DatabaseConnection, ticket_id: Uuid) -> Option<i16> {
+            Ticket::Entity::find_by_id(ticket_id)
+                .one(db)
+                .await
+                .unwrap()
+                .unwrap()
+                .uses_left
+        }
+
+        async fn client(db: &DatabaseConnection) -> TestClient<impl Endpoint> {
+            let services = services(db.clone()).await;
+            {
+                let mut config = services.config.lock().await;
+                config.store.external_host = Some("warp.example.com".into());
+                config.store.http.client_ip_header = Some("x-test-client-ip".into());
+            }
+            let ctx = UnauthenticatedRequestContext::new(services).await;
+            TestClient::new(
+                Route::new()
+                    .at("/seed", get(seed))
+                    .at("/*", get(who))
+                    .with(TicketMiddleware::new())
+                    .data(SessionStore::new())
+                    .data(ctx)
+                    .with(ServerSession::new(
+                        session_cookie_config(),
+                        SharedSessionStorage::new(db.clone()),
+                    )),
+            )
+        }
+
+        fn session_cookie(resp: &TestResponse) -> String {
+            resp.0
+                .headers()
+                .get_all("set-cookie")
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .filter_map(|value| value.split(';').next())
+                .find(|pair| pair.starts_with(&format!("{SESSION_COOKIE_NAME}=")))
+                .expect("a session cookie")
+                .to_owned()
+        }
+
+        /// A target-host session for `user` under the open user session
+        /// `user_session`; returns its cookie.
+        async fn seed_bound(
+            cli: &TestClient<impl Endpoint>,
+            user: Uuid,
+            user_session: UserSessionId,
+            target: Uuid,
+            ticket: Option<Uuid>,
+        ) -> String {
+            let mut query = format!(
+                "/seed?user={user}&user_session={}&target={target}",
+                user_session.0
+            );
+            if let Some(ticket) = ticket {
+                query.push_str(&format!("&ticket={ticket}"));
+            }
+            let resp = cli.get(query).header("host", HOST).send().await;
+            resp.assert_status_is_ok();
+            session_cookie(&resp)
+        }
+
+        /// The control plane's browser session for the same sign-in, so the
+        /// user session has the backing it has in production.
+        async fn seed_control_plane(
+            cli: &TestClient<impl Endpoint>,
+            user: Uuid,
+            user_session: UserSessionId,
+        ) -> String {
+            let query = format!(
+                "/seed?user={user}&user_session={}&target={}&control_plane=true",
+                user_session.0,
+                Uuid::nil()
+            );
+            let resp = cli
+                .get(query)
+                .header("host", "warp.example.com")
+                .send()
+                .await;
+            resp.assert_status_is_ok();
+            session_cookie(&resp)
+        }
+
+        async fn page(
+            cli: &TestClient<impl Endpoint>,
+            cookie: &str,
+            ticket: Option<&str>,
+        ) -> String {
+            let mut request = cli
+                .get("/page")
+                .header("host", HOST)
+                .header("cookie", cookie)
+                .header("x-test-client-ip", "198.51.100.7");
+            if let Some(ticket) = ticket {
+                request = request.header("authorization", format!("Warpgate {ticket}"));
+            }
+            let resp = request.send().await;
+            resp.assert_status_is_ok();
+            resp.0.into_body().into_string().await.unwrap()
+        }
+
+        /// A user whose allowed IP ranges no longer admit the request's
+        /// address loses this host's browser session, and only that: the user
+        /// session it shares with the control plane stays open.
+        #[tokio::test]
+        async fn a_bound_session_outside_its_users_ranges_is_dropped_alone() {
+            let db = memory_db().await;
+            let alice = Uuid::new_v4();
+            insert_user(&db, alice, "alice").await;
+            let target = bound_target(&db).await;
+            let user_session = insert_open_user_session(&db, alice).await;
+            let cli = client(&db).await;
+            let control_plane = seed_control_plane(&cli, alice, user_session).await;
+            let cookie = seed_bound(&cli, alice, user_session, target, None).await;
+            assert_eq!(page(&cli, &cookie, None).await, format!("bound:{alice}"));
+
+            let mut user: User::ActiveModel = User::Entity::find_by_id(alice)
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap()
+                .into();
+            user.allowed_ip_ranges = Set(serde_json::json!(["203.0.113.0/24"]));
+            user.update(&db).await.unwrap();
+
+            assert_eq!(page(&cli, &cookie, None).await, "nobody");
+            assert!(
+                !browser_session_stored(&db, &cookie).await,
+                "the target-host session is still stored"
+            );
+            assert!(
+                user_session_open(&db, user_session).await,
+                "the shared sign-in was ended"
+            );
+            assert!(browser_session_stored(&db, &control_plane).await);
+        }
+
+        /// A deleted user's target-host session is dropped the same way.
+        #[tokio::test]
+        async fn a_bound_session_of_a_deleted_user_is_dropped_alone() {
+            let db = memory_db().await;
+            let alice = Uuid::new_v4();
+            insert_user(&db, alice, "alice").await;
+            let target = bound_target(&db).await;
+            let user_session = insert_open_user_session(&db, alice).await;
+            let cli = client(&db).await;
+            let control_plane = seed_control_plane(&cli, alice, user_session).await;
+            let cookie = seed_bound(&cli, alice, user_session, target, None).await;
+            User::Entity::delete_by_id(alice).exec(&db).await.unwrap();
+
+            assert_eq!(page(&cli, &cookie, None).await, "nobody");
+            assert!(!browser_session_stored(&db, &cookie).await);
+            assert!(user_session_open(&db, user_session).await);
+            assert!(browser_session_stored(&db, &control_plane).await);
         }
     }
 }
