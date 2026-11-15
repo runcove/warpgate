@@ -464,8 +464,10 @@ missing`), so the database goes back first:
 
 The check in step 3 relies on step 1: no node may be running to write a
 session while the rollback runs. On PostgreSQL the rollback also locks
-`http_sessions` against new rows until it finishes. On MySQL each table drop
-commits on its own, so a session written between the two migrations leaves
+`http_sessions` against new rows until it finishes. On MySQL (and SQLite)
+there is no equivalent lock, so the row count is advisory only: it is right
+when taken, and only step 1 keeps it right until the tables are dropped.
+On MySQL each table drop commits on its own, so a session written between the two migrations leaves
 the rollback one step done, with `m00097_cove_http_sso_stamps` reverted and
 `m00096_cove_http_handoffs` refusing. To finish, stop whatever wrote it,
 delete the rows again and run `migrate-database -1 --destructive`.
