@@ -55,20 +55,27 @@ impl<E: Endpoint> Endpoint for LoopbackSessionCookieEndpoint<E> {
     type Output = Response;
 
     async fn call(&self, mut req: Request) -> poem::Result<Self::Output> {
-        // Values that are not text are skipped, as poem's cookie jar skips them.
-        let translated = request_cookie_header(
-            req.headers()
-                .get_all(header::COOKIE)
-                .iter()
-                .filter_map(|value| value.to_str().ok()),
-        );
+        // Only text values are translated: poem's cookie jar skips the
+        // others, so no session can be read from one. They are passed on as
+        // they came, after the translated ones (the cookie gate sends one
+        // beside the session's when the browser's cookies are not all text).
+        let (text, other): (Vec<HeaderValue>, Vec<HeaderValue>) = req
+            .headers()
+            .get_all(header::COOKIE)
+            .iter()
+            .cloned()
+            .partition(|value| value.to_str().is_ok());
+        let translated = request_cookie_header(text.iter().filter_map(|value| value.to_str().ok()));
         if let Some(cookies) = translated {
             let headers = req.headers_mut();
             headers.remove(header::COOKIE);
             if !cookies.is_empty()
                 && let Ok(value) = HeaderValue::from_str(&cookies)
             {
-                headers.insert(header::COOKIE, value);
+                headers.append(header::COOKIE, value);
+            }
+            for value in other {
+                headers.append(header::COOKIE, value);
             }
         }
 
@@ -280,6 +287,36 @@ mod tests {
             .await;
 
         resp.assert_text(format!("{SESSION_COOKIE_NAME}=abc; app=1"))
+            .await;
+    }
+
+    #[handler]
+    async fn echo_cookie_bytes(req: &Request) -> String {
+        req.headers()
+            .get_all(http::header::COOKIE)
+            .iter()
+            .map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned())
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
+
+    /// A `Cookie` header that is not text (the cookie gate sends the
+    /// browser's other cookies in one when they are not) is passed on beside
+    /// the translated one, not lost.
+    #[tokio::test]
+    async fn unit_loopback_request_keeps_a_cookie_header_that_is_not_text() {
+        let cli = TestClient::new(Route::new().at("/echo", get(echo_cookie_bytes)).with(
+            LoopbackSessionCookieMiddleware::new(Duration::from_hours(1)),
+        ));
+        let utf8 = http::HeaderValue::from_bytes("app=caf\u{e9}".as_bytes()).unwrap();
+        let resp = cli
+            .get("/echo")
+            .header("cookie", format!("{LOOPBACK_SESSION_COOKIE_NAME}=abc"))
+            .header("cookie", utf8)
+            .send()
+            .await;
+
+        resp.assert_text(format!("{SESSION_COOKIE_NAME}=abc | app=caf\u{e9}"))
             .await;
     }
 
