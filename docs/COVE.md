@@ -449,16 +449,26 @@ v0.30.2-cove.24. That release refuses to start on a database this release
 has migrated (`Migration file of version 'm00097_cove_http_sso_stamps' is
 missing`), so the database goes back first:
 
-1. Stop every Warpgate node.
-2. Delete every row of `http_sessions` (`DELETE FROM http_sessions;`). This
-   step is required: step 3 refuses while any row remains, and changes
-   nothing when it refuses.
+1. Stop every Warpgate node, and keep them all stopped until step 4.
+2. With the database's own client (`sqlite3`, `psql` or `mysql`), delete
+   every row of `http_sessions`: `DELETE FROM http_sessions;`. The sessions
+   must go because the previous release would pass this release's session
+   cookies on to targets. This step is required: step 3 refuses while any
+   row remains, and changes nothing when it refuses.
 3. Once, against the shared database, with this release's binary and config:
    `warpgate --config <config> migrate-database -2 --destructive`. This
    reverts `m00097_cove_http_sso_stamps` and `m00096_cove_http_handoffs`,
    dropping their two tables. They hold only short-lived handoffs and
    sign-in times; nothing in them needs keeping.
 4. Deploy the previous release.
+
+The check in step 3 relies on step 1: no node may be running to write a
+session while the rollback runs. On PostgreSQL the rollback also locks
+`http_sessions` against new rows until it finishes. On MySQL each table drop
+commits on its own, so a session written between the two migrations leaves
+the rollback one step done, with `m00097_cove_http_sso_stamps` reverted and
+`m00096_cove_http_handoffs` refusing. To finish, stop whatever wrote it,
+delete the rows again and run `migrate-database -1 --destructive`.
 
 What users see afterwards:
 
