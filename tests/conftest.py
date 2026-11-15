@@ -1230,6 +1230,11 @@ class ProcessManager:
                 "certificate": "tls.certificate.pem",
                 "key": "tls.key.pem",
             }
+            # Most tests reach HTTP targets with no hostname of their own by
+            # name (`?warpgate-target=`), which Warpgate refuses by default.
+            # Keep serving them here; a test of the default passes
+            # `{"http": {"serve_unbound_http_targets": False}}`.
+            config.setdefault("http", {})["serve_unbound_http_targets"] = True
             if config_patch:
                 always_merger.merge(config, config_patch)
             with config_path.open("w") as f:

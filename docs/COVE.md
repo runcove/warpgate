@@ -408,3 +408,21 @@ What the option does not cover:
   target and the target is not dialled. A channel closed during the wait
   passes none of its held input, and its queued shell or exec request does
   not run.
+
+## Web targets need a hostname of their own
+
+An HTTP target is served only on the hostname it is bound to
+(`external_host`). An HTTP target with no `external_host` is not served at
+all: opening it, by name (`?warpgate-target=`), from a session or with a
+ticket, gets no page from the target.
+
+- **What operators do on upgrade:** give every HTTP target a hostname of its
+  own (a DNS name that points at Warpgate, covered by its TLS certificate) and
+  set it as the target's `external_host` before taking the release.
+- **The way back, for a deployment that cannot do that yet:** set
+  `http.serve_unbound_http_targets: true` in the config file. Targets with no
+  hostname are then served as before, on Warpgate's own host, and Warpgate
+  logs a warning at every start and shows it in the admin UI. The setting is
+  read from the config file only; the admin API and UI cannot change it. It is
+  meant to be turned off again once every web target has a hostname.
+- The default is `false`. Bound targets behave the same either way.

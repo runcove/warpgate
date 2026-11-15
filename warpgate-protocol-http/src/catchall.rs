@@ -385,13 +385,29 @@ pub(crate) fn served_on_host(external_host: Option<&str>, request_host: Option<&
 }
 
 /// [`served_on_host`] for a target row: its `external_host`, if it is an
-/// HTTP target.
-fn target_served_on_host(target: &Target, request_host: Option<&str>) -> bool {
+/// HTTP target. A target with no hostname of its own is served only when
+/// `serve_unbound` (`http.serve_unbound_http_targets`) is on.
+fn target_served_on_host(target: &Target, request_host: Option<&str>, serve_unbound: bool) -> bool {
     let external_host = match &target.options {
         TargetOptions::Http(options) => options.external_host.as_deref(),
         _ => None,
     };
-    served_on_host(external_host, request_host)
+    match external_host.filter(|host| !host.is_empty()) {
+        Some(bound) => served_on_host(Some(bound), request_host),
+        None => serve_unbound,
+    }
+}
+
+/// `http.serve_unbound_http_targets`: whether a web target with no hostname
+/// of its own is served at all.
+async fn serve_unbound_http_targets(services: &Services) -> bool {
+    services
+        .config
+        .lock()
+        .await
+        .store
+        .http
+        .serve_unbound_http_targets
 }
 
 /// [`target_served_on_host`] for a ticket's target, which is resolved by id,
@@ -406,7 +422,11 @@ pub(crate) async fn ticket_target_served_on_host(
     target: &Target,
     request_host: Option<&str>,
 ) -> Result<bool, WarpgateError> {
-    if !target_served_on_host(target, request_host) {
+    if !target_served_on_host(
+        target,
+        request_host,
+        serve_unbound_http_targets(services).await,
+    ) {
         return Ok(false);
     }
     let Some(host) = request_host else {
@@ -456,7 +476,7 @@ pub(crate) fn bound_to_host(target: &Target, request_host: &str) -> bool {
         _ => None,
     };
     bound.is_some_and(|bound| !bound.is_empty())
-        && target_served_on_host(target, Some(request_host))
+        && target_served_on_host(target, Some(request_host), false)
 }
 
 fn is_http_authorization(
@@ -576,12 +596,13 @@ async fn get_target_for_request(
             Some(host) => unbound_target_served_on_host(ctx.services(), host).await?,
             None => true,
         };
+        let serve_unbound = serve_unbound_http_targets(ctx.services()).await;
         let target = target.filter(|target| {
             let unbound = target
                 .options
                 .external_host()
                 .is_none_or(|bound| bound.is_empty());
-            let served = target_served_on_host(target, request_host.as_deref())
+            let served = target_served_on_host(target, request_host.as_deref(), serve_unbound)
                 && (unbound_served || !unbound);
             if !served {
                 debug!(
@@ -1701,10 +1722,30 @@ mod target_selection_tests {
     #[test]
     fn a_target_row_is_served_on_its_own_host_only() {
         let bound = http_target(Some("t.example"));
-        assert!(target_served_on_host(&bound, Some("t.example")));
-        assert!(!target_served_on_host(&bound, Some("warpgate.example")));
-        let unbound = http_target(None);
-        assert!(target_served_on_host(&unbound, Some("warpgate.example")));
+        for serve_unbound in [false, true] {
+            assert!(target_served_on_host(
+                &bound,
+                Some("t.example"),
+                serve_unbound
+            ));
+            assert!(!target_served_on_host(
+                &bound,
+                Some("warpgate.example"),
+                serve_unbound
+            ));
+        }
+    }
+
+    /// A target with no hostname of its own is not served unless
+    /// `http.serve_unbound_http_targets` is on; then it is served on any host.
+    #[test]
+    fn a_target_with_no_hostname_is_served_only_when_switched_on() {
+        for unbound in [http_target(None), http_target(Some(""))] {
+            for host in [Some("warpgate.example"), Some("t.example"), None] {
+                assert!(!target_served_on_host(&unbound, host, false), "{host:?}");
+                assert!(target_served_on_host(&unbound, host, true), "{host:?}");
+            }
+        }
     }
 
     /// Targets by name and `external_host`: `v` and `c` bound to their own

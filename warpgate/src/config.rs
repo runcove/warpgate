@@ -57,6 +57,9 @@ pub fn load_config(params: &GlobalParams, secure: bool) -> Result<WarpgateConfig
     // An error, not a warning: refused at start-up, and a reload that sets it
     // keeps the running config.
     config.store.http.check_plain_http_on_loopback()?;
+    if let Some(warning) = config.store.http.serve_unbound_http_targets_warning() {
+        emit_config_warning(warning);
+    }
     if let Some(step_up) = &config.store.step_up_interval {
         step_up.check_exempt_max_session()?;
     }

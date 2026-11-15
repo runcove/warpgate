@@ -26,6 +26,7 @@
         "listen": "[::]:8888",
         "plain_http_on_loopback": false,
         "proxy_protocol": false,
+        "serve_unbound_http_targets": false,
         "session_max_age": "30m",
         "sni_certificates": [],
         "trust_x_forwarded_headers": false,
@@ -203,6 +204,11 @@
         },
         "proxy_protocol": {
           "description": "Accept HAProxy PROXY protocol v1/v2 headers from the listener's peer.",
+          "type": "boolean",
+          "default": false
+        },
+        "serve_unbound_http_targets": {
+          "description": "Serve HTTP targets that have no hostname of their own (no\n`external_host`), reached on Warpgate's own host by target name. Off\nby default: such a target is not served, and each web target needs a\nhostname of its own. Turning it on brings back the old behaviour and\nlogs a warning at start-up, because those targets share Warpgate's own\nweb origin. Set in the config file only.",
           "type": "boolean",
           "default": false
         },

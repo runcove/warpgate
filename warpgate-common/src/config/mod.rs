@@ -660,6 +660,15 @@ pub struct HttpConfig {
     #[serde(default)]
     pub plain_http_on_loopback: bool,
 
+    /// Serve HTTP targets that have no hostname of their own (no
+    /// `external_host`), reached on Warpgate's own host by target name. Off
+    /// by default: such a target is not served, and each web target needs a
+    /// hostname of its own. Turning it on brings back the old behaviour and
+    /// logs a warning at start-up, because those targets share Warpgate's own
+    /// web origin. Set in the config file only.
+    #[serde(default)]
+    pub serve_unbound_http_targets: bool,
+
     /// Plain text shown to a browser that opens a target without a Warpgate
     /// session, on a page in place of the redirect to the login form. API and
     /// websocket requests still get a 401.
@@ -682,6 +691,7 @@ impl Default for HttpConfig {
             cookie_max_age: _default_cookie_max_age(),
             sni_certificates: vec![],
             plain_http_on_loopback: false,
+            serve_unbound_http_targets: false,
             unauthenticated_message: None,
         }
     }
@@ -694,6 +704,13 @@ impl HttpConfig {
 
     pub fn external_host(&self) -> Option<String> {
         self.external_host.clone()
+    }
+
+    /// The start-up warning for `serve_unbound_http_targets`, when it is on.
+    pub fn serve_unbound_http_targets_warning(&self) -> Option<String> {
+        self.serve_unbound_http_targets.then(|| {
+            "`http.serve_unbound_http_targets` is on: HTTP targets with no `external_host` are served on Warpgate's own host and share its web origin. Give each web target a hostname of its own and turn this off.".to_owned()
+        })
     }
 
     /// Refuses `plain_http_on_loopback` on a listen address that is not a
@@ -1941,6 +1958,26 @@ ssh:
 
     fn http_config(yaml: &str) -> HttpConfig {
         serde_yaml::from_str(yaml).unwrap()
+    }
+
+    #[test]
+    fn unit_serve_unbound_http_targets_defaults_off() {
+        let config = HttpConfig::default();
+        assert!(!config.serve_unbound_http_targets);
+        assert!(config.serve_unbound_http_targets_warning().is_none());
+        let parsed = http_config("listen: \"0.0.0.0:8888\"");
+        assert!(!parsed.serve_unbound_http_targets);
+        assert!(parsed.serve_unbound_http_targets_warning().is_none());
+    }
+
+    #[test]
+    fn unit_serve_unbound_http_targets_on_warns() {
+        let parsed = http_config("serve_unbound_http_targets: true");
+        assert!(parsed.serve_unbound_http_targets);
+        let warning = parsed
+            .serve_unbound_http_targets_warning()
+            .expect("a warning when it is on");
+        assert!(warning.contains("serve_unbound_http_targets"), "{warning}");
     }
 
     #[test]
