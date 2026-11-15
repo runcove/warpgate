@@ -58,7 +58,7 @@ impl MigrationTrait for Migration {
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        crate::helpers::refuse_down_while_http_sessions_remain(manager, &self.name()).await?;
+        crate::helpers::refuse_down_while_http_sessions_remain(manager, self.name()).await?;
         manager
             .drop_table(
                 Table::drop()
