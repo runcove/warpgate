@@ -363,6 +363,19 @@ class TestHTTPUserAuthOIDC:
             )
             if login_host == "target.warpgate.acme.inc":
                 assert start_resp.status_code == 404, start_resp.text[:500]
+                # Nor the SSO return: it answers as an unknown route does.
+                unknown = f"{wg_url}/@warpgate/api/no-such-route"
+                sso_return = f"{wg_url}/@warpgate/api/sso/return?code=c&state=s"
+                for method in ("GET", "POST"):
+                    expected = session.request(
+                        method, unknown, allow_redirects=False
+                    )
+                    assert expected.status_code == 404, expected.text[:500]
+                    resp = session.request(method, sso_return, allow_redirects=False)
+                    assert (resp.status_code, resp.content) == (
+                        expected.status_code,
+                        expected.content,
+                    ), f"{method}: {resp.status_code} {resp.text[:500]}"
                 return
             if expected_return_host is None:
                 assert start_resp.status_code == 400, start_resp.text[:500]
