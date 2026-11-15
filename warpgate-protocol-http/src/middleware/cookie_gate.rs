@@ -24,6 +24,11 @@
 //! old domain-wide [`SESSION_COOKIE_NAME`] cookie is never read: it is dropped
 //! and expired, so an upgrade signs every browser in once more.
 //!
+//! The headers are read as bytes, and the Warpgate pairs kept are passed on
+//! in a `Cookie` header of their own, before the others: poem's jar skips a
+//! header that is not visible ASCII, so a cookie with a UTF-8 value planted
+//! for the parent domain could otherwise hide the session sent beside it.
+//!
 //! The session is only kept where the browser can hold it safely: on a TLS
 //! listener, only when the request is seen as HTTPS (there is no fallback for
 //! TLS ended at a proxy that is not trusted to say so); on a loopback
@@ -83,11 +88,35 @@ impl Listener {
     }
 }
 
+/// The `Cookie` headers the gate passes on in place of the request's.
+#[derive(Debug, PartialEq, Eq)]
+struct Rewrite {
+    /// The Warpgate pairs kept, under their inner names: visible ASCII, so
+    /// poem's jar, which skips any header that is not, always reads them.
+    ours: String,
+    /// Every other pair, as the browser sent it (perhaps not ASCII).
+    others: Vec<u8>,
+}
+
+impl Rewrite {
+    /// The headers to send on, Warpgate's first (poem's jar keeps the first
+    /// pair of a name); none for an empty part.
+    fn header_values(&self) -> Vec<HeaderValue> {
+        let ours = (!self.ours.is_empty())
+            .then(|| HeaderValue::from_str(&self.ours).ok())
+            .flatten();
+        let others = (!self.others.is_empty())
+            .then(|| HeaderValue::from_bytes(&self.others).ok())
+            .flatten();
+        ours.into_iter().chain(others).collect()
+    }
+}
+
 /// What the gate made of a request's `Cookie` headers.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Gated {
-    /// The `Cookie` header to pass on (`None`: unchanged; empty: none).
-    header: Option<String>,
+    /// The headers to pass on instead (`None`: unchanged).
+    rewrite: Option<Rewrite>,
     /// The old domain-wide session cookie was sent.
     legacy: bool,
     /// Names sent in more than one exact pair; none of their pairs is kept.
@@ -105,7 +134,9 @@ fn is_ip_literal(host: &str) -> bool {
 }
 
 /// Filters the request's cookie pairs for `listener` (see the module docs).
-fn gate_request_cookies<S: AsRef<str>>(
+/// Works on the header bytes: a header that is not visible ASCII is read
+/// too, so that no pair in it can hide the session.
+fn gate_request_cookies<S: AsRef<[u8]>>(
     values: impl IntoIterator<Item = S>,
     listener: Listener,
 ) -> Gated {
@@ -121,24 +152,30 @@ fn gate_request_cookies<S: AsRef<str>>(
     let mut changed = false;
     // (exact name, value) of the Warpgate pairs kept, in order.
     let mut ours: Vec<(&'static str, String)> = Vec::new();
-    let mut others = Vec::new();
-    for value in values {
-        for pair in value.as_ref().split(';') {
-            let pair = pair.trim();
+    let mut others: Vec<&[u8]> = Vec::new();
+    let values: Vec<S> = values.into_iter().collect();
+    for value in &values {
+        for pair in value.as_ref().split(|byte| *byte == b';') {
+            let pair = pair.trim_ascii();
             if pair.is_empty() {
                 continue;
             }
-            let (name, cookie_value) = pair.split_once('=').unwrap_or((pair, ""));
-            if !is_warpgate_cookie_name(name) {
-                others.push(pair.to_owned());
+            let (name, cookie_value) = match pair.iter().position(|byte| *byte == b'=') {
+                Some(at) => (&pair[..at], &pair[at + 1..]),
+                None => (pair, &[][..]),
+            };
+            let name = String::from_utf8_lossy(name);
+            if !is_warpgate_cookie_name(&name) {
+                others.push(pair);
                 continue;
             }
             changed = true;
-            if let Some(kept) = kept_name(name) {
-                ours.push((kept, cookie_value.to_owned()));
+            let kept = kept_name(&name).filter(|_| cookie_value.iter().all(u8::is_ascii_graphic));
+            if let Some(kept) = kept {
+                ours.push((kept, String::from_utf8_lossy(cookie_value).into_owned()));
             } else if name == SESSION_COOKIE_NAME && matches!(listener, Listener::Tls { .. }) {
                 gated.legacy = true;
-            } else if !WARPGATE_COOKIE_NAMES.contains(&name) {
+            } else if !WARPGATE_COOKIE_NAMES.contains(&name.as_ref()) {
                 gated.look_alikes += 1;
             }
         }
@@ -162,8 +199,10 @@ fn gate_request_cookies<S: AsRef<str>>(
         };
         pairs.push(format!("{inner}={value}"));
     }
-    pairs.extend(others);
-    gated.header = Some(pairs.join("; "));
+    gated.rewrite = Some(Rewrite {
+        ours: pairs.join("; "),
+        others: others.join(&b"; "[..]),
+    });
     gated
 }
 
@@ -256,13 +295,14 @@ impl<E: Endpoint> Endpoint for CookieGateEndpoint<E> {
             }
         };
 
-        // Header values that are not text are dropped: poem's jar skips them,
-        // and nothing else may read a Warpgate cookie from them.
-        let values: Vec<String> = req
+        // Read as bytes: poem's jar skips a header that is not visible
+        // ASCII, so a planted pair with a UTF-8 value must not take the
+        // session in the same header down with it.
+        let values: Vec<Vec<u8>> = req
             .headers()
             .get_all(header::COOKIE)
             .iter()
-            .filter_map(|value| value.to_str().ok().map(str::to_owned))
+            .map(|value| value.as_bytes().to_owned())
             .collect();
         let gated = gate_request_cookies(&values, listener);
         if !gated.duplicates.is_empty() || gated.look_alikes > 0 {
@@ -272,13 +312,11 @@ impl<E: Endpoint> Endpoint for CookieGateEndpoint<E> {
                 "Dropped Warpgate cookies sent more than once or under another spelling"
             );
         }
-        if let Some(cookies) = &gated.header {
+        if let Some(rewrite) = &gated.rewrite {
             let headers = req.headers_mut();
             headers.remove(header::COOKIE);
-            if !cookies.is_empty()
-                && let Ok(value) = HeaderValue::from_str(cookies)
-            {
-                headers.insert(header::COOKIE, value);
+            for value in rewrite.header_values() {
+                headers.append(header::COOKIE, value);
             }
         }
 
@@ -331,14 +369,27 @@ mod tests {
     const LOOPBACK_EXTERNAL: Listener = Listener::Loopback { local_host: false };
 
     fn gated(header: &str, listener: Listener) -> Gated {
-        gate_request_cookies([header], listener)
+        gate_request_cookies([header.as_bytes()], listener)
+    }
+
+    /// The headers the gate passes on, joined as one, for comparison.
+    fn joined(g: &Gated) -> Option<String> {
+        let rewrite = g.rewrite.as_ref()?;
+        let others = String::from_utf8_lossy(&rewrite.others);
+        Some(
+            [rewrite.ours.as_str(), &others]
+                .into_iter()
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join("; "),
+        )
     }
 
     #[test]
     fn unit_gate_renames_the_host_cookie_inward() {
         let g = gated("a=1; __Host-warpgate-http-session=S; b=2", HTTPS);
         assert_eq!(
-            g.header.as_deref(),
+            joined(&g).as_deref(),
             Some("warpgate-http-session=S; a=1; b=2")
         );
         assert!(!g.legacy && g.duplicates.is_empty());
@@ -353,7 +404,7 @@ mod tests {
     #[test]
     fn unit_gate_never_reads_the_legacy_cookie() {
         let g = gated("warpgate-http-session=OLD", HTTPS);
-        assert_eq!(g.header.as_deref(), Some(""));
+        assert_eq!(joined(&g).as_deref(), Some(""));
         assert!(g.legacy);
     }
 
@@ -372,7 +423,7 @@ mod tests {
         ] {
             let g = gated(&format!("{planted}; __Host-warpgate-http-session=S"), HTTPS);
             assert_eq!(
-                g.header.as_deref(),
+                joined(&g).as_deref(),
                 Some("warpgate-http-session=S"),
                 "{planted}"
             );
@@ -387,28 +438,31 @@ mod tests {
             "__Host-warpgate-http-session=ATTACKER; __Host-warpgate-http-session=S; a=1",
             HTTPS,
         );
-        assert_eq!(g.header.as_deref(), Some("a=1"));
+        assert_eq!(joined(&g).as_deref(), Some("a=1"));
         assert_eq!(g.duplicates, vec![HOST_SESSION_COOKIE_NAME]);
         let g = gate_request_cookies(
-            ["__Host-warpgate-handoff=N", "__Host-warpgate-handoff=M"],
+            [
+                b"__Host-warpgate-handoff=N".as_slice(),
+                b"__Host-warpgate-handoff=M",
+            ],
             HTTPS,
         );
-        assert_eq!(g.header.as_deref(), Some(""));
+        assert_eq!(joined(&g).as_deref(), Some(""));
     }
 
     #[test]
     fn unit_gate_keeps_the_handoff_cookie_on_https_only() {
         let g = gated("__Host-warpgate-handoff=N", HTTPS);
-        assert_eq!(g.header.as_deref(), Some("__Host-warpgate-handoff=N"));
+        assert_eq!(joined(&g).as_deref(), Some("__Host-warpgate-handoff=N"));
         let g = gated("__Host-warpgate-handoff=N", HTTP_BEHIND_PROXY);
-        assert_eq!(g.header.as_deref(), Some(""));
+        assert_eq!(joined(&g).as_deref(), Some(""));
     }
 
     /// TLS ended at a proxy that Warpgate does not see as HTTPS: no session.
     #[test]
     fn unit_gate_fails_closed_unless_https() {
         let g = gated("__Host-warpgate-http-session=S", HTTP_BEHIND_PROXY);
-        assert_eq!(g.header.as_deref(), Some(""));
+        assert_eq!(joined(&g).as_deref(), Some(""));
         let session = "warpgate-http-session=S; Path=/; HttpOnly";
         assert_eq!(gate_set_cookie(session, HTTP_BEHIND_PROXY), Some(None));
     }
@@ -416,9 +470,9 @@ mod tests {
     #[test]
     fn unit_gate_loopback_cookie_only_on_a_local_host() {
         let g = gated("warpgate-loopback-session=S", LOOPBACK);
-        assert_eq!(g.header.as_deref(), Some("warpgate-loopback-session=S"));
+        assert_eq!(joined(&g).as_deref(), Some("warpgate-loopback-session=S"));
         let g = gated("warpgate-loopback-session=S", LOOPBACK_EXTERNAL);
-        assert_eq!(g.header.as_deref(), Some(""));
+        assert_eq!(joined(&g).as_deref(), Some(""));
         let set = "warpgate-loopback-session=S; Path=/; HttpOnly; SameSite=Strict";
         assert_eq!(gate_set_cookie(set, LOOPBACK), None);
         assert_eq!(gate_set_cookie(set, LOOPBACK_EXTERNAL), Some(None));
@@ -427,7 +481,7 @@ mod tests {
             "__Host-warpgate-http-session=S; warpgate-http-session=T",
             LOOPBACK,
         );
-        assert_eq!(g.header.as_deref(), Some(""));
+        assert_eq!(joined(&g).as_deref(), Some(""));
     }
 
     #[test]
@@ -462,6 +516,30 @@ mod tests {
             && c.max_age() == Some(cookie::time::Duration::ZERO)));
         assert_eq!(cookies[0].domain(), None);
         assert_eq!(cookies[1].domain(), Some("warp.example"));
+    }
+
+    /// A `Cookie` header that is not visible ASCII (a cookie planted for the
+    /// parent domain with a UTF-8 value) is skipped whole by poem's jar, so
+    /// the session in it would be lost: the gate reads the bytes and passes
+    /// Warpgate's pairs on in their own ASCII header, first.
+    #[test]
+    fn unit_gate_reads_the_session_out_of_a_non_ascii_header() {
+        let sent = "pref=caf\u{e9}; __Host-warpgate-http-session=S; b=2";
+        let g = gate_request_cookies([sent.as_bytes()], HTTPS);
+        let rewrite = g.rewrite.unwrap();
+        assert_eq!(rewrite.ours, "warpgate-http-session=S");
+        assert_eq!(rewrite.others, "pref=caf\u{e9}; b=2".as_bytes());
+        let values = rewrite.header_values();
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0].to_str().unwrap(), "warpgate-http-session=S");
+    }
+
+    /// A Warpgate pair whose value is not visible ASCII is never ours.
+    #[test]
+    fn unit_gate_drops_a_session_pair_with_a_non_ascii_value() {
+        let sent = "__Host-warpgate-http-session=caf\u{e9}";
+        let g = gate_request_cookies([sent.as_bytes()], HTTPS);
+        assert_eq!(joined(&g).as_deref(), Some(""));
     }
 
     #[test]
