@@ -382,7 +382,7 @@ fn browser_cookie_header(value: &poem::http::HeaderValue) -> poem::http::HeaderV
             out.push(b';');
         }
         let rest = pair.trim_ascii_start();
-        out.extend_from_slice(&pair[..pair.len() - rest.len()]);
+        out.extend_from_slice(pair.get(..pair.len() - rest.len()).unwrap_or_default());
         match rest
             .strip_prefix(INNER_SESSION_COOKIE_NAME)
             .filter(|tail| tail.first() == Some(&b'='))
