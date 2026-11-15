@@ -297,4 +297,58 @@ mod tests {
             now()
         ));
     }
+
+    mod shared_stamp {
+        //! The SSO return stamps through [`super::super::stamp_sso`] (driving
+        //! the return itself needs an IdP's token exchange, so it is not run
+        //! here): two SSO sign-ins on one session raise the user session's
+        //! shared stamp each time, and a user session with no SSO sign-in
+        //! recorded supersedes nothing.
+        use poem::session::Session;
+        use time::OffsetDateTime;
+        use uuid::Uuid;
+        use warpgate_db_entities::HttpSsoStamp;
+
+        use super::super::{StepUpSessionExt, is_superseded, stamp_sso};
+        use crate::session::SESSION_ID_SESSION_KEY;
+        use crate::test_db::{insert_open_user_session, memory_db};
+
+        #[tokio::test]
+        async fn each_sso_sign_in_raises_the_shared_stamp() {
+            let db = memory_db().await;
+            let id = insert_open_user_session(&db, Uuid::new_v4()).await;
+            let session = Session::default();
+            session.set(SESSION_ID_SESSION_KEY, id);
+            let first = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+            let second = first + time::Duration::minutes(5);
+
+            stamp_sso(&session, &db, first).await.unwrap();
+            assert_eq!(HttpSsoStamp::latest(&db, id.0).await.unwrap(), Some(first));
+            // A target-host session handed off with the first stamp.
+            let bound = Session::default();
+            bound.set(SESSION_ID_SESSION_KEY, id);
+            bound.set_last_sso_at(first);
+            assert!(!is_superseded(&bound, &db).await.unwrap());
+
+            stamp_sso(&session, &db, second).await.unwrap();
+            assert_eq!(HttpSsoStamp::latest(&db, id.0).await.unwrap(), Some(second));
+            assert_eq!(session.get_last_sso_at(), Some(second));
+            assert!(is_superseded(&bound, &db).await.unwrap());
+        }
+
+        /// A user session with no SSO sign-in recorded (only the SSO return
+        /// calls `stamp_sso`) supersedes none of its target-host sessions,
+        /// stamped or not.
+        #[tokio::test]
+        async fn a_user_session_without_an_sso_stamp_supersedes_nothing() {
+            let db = memory_db().await;
+            let id = insert_open_user_session(&db, Uuid::new_v4()).await;
+            let bound = Session::default();
+            bound.set(SESSION_ID_SESSION_KEY, id);
+            assert!(!is_superseded(&bound, &db).await.unwrap());
+            bound.set_last_sso_at(OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap());
+            assert!(!is_superseded(&bound, &db).await.unwrap());
+            assert_eq!(HttpSsoStamp::latest(&db, id.0).await.unwrap(), None);
+        }
+    }
 }

@@ -58,3 +58,18 @@ pub fn admin_api_app() -> impl IntoEndpoint {
             crate::api::cluster_notifications::api_post_cluster_close_sessions,
         )
 }
+
+#[cfg(test)]
+mod tests {
+    use poem_openapi::OpenApiService;
+
+    /// `http.serve_unbound_http_targets` is read from the config file only:
+    /// no admin API operation or schema names it, so the admin API and UI
+    /// cannot change it.
+    #[test]
+    fn the_admin_api_cannot_set_serve_unbound_http_targets() {
+        let spec = OpenApiService::new(crate::api::get(), "test", "0").spec();
+        assert!(spec.contains("\"paths\""), "not an OpenAPI document");
+        assert!(!spec.contains("serve_unbound"));
+    }
+}
