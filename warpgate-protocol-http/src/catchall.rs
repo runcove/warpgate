@@ -2036,11 +2036,18 @@ mod request_target_tests {
 
     #[tokio::test]
     async fn the_target_served_for_a_name_or_a_session() {
+        /// switch, host, path, session target, served
+        type Case = (
+            bool,
+            &'static str,
+            &'static str,
+            Option<&'static str>,
+            Option<&'static str>,
+        );
         let open = Some("open");
         let bound = Some("bound");
         #[rustfmt::skip]
-        let cases: &[(bool, &str, &str, Option<&str>, Option<&str>)] = &[
-            // switch, host, path, session target, served
+        let cases: &[Case] = &[
             (true,  BOUND_HOST,    "/?warpgate-target=open",  None,  bound),
             (true,  BOUND_HOST,    "/",                       open,  bound),
             (true,  CONTROL_PLANE, "/?warpgate-target=open",  None,  open),

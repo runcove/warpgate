@@ -1119,7 +1119,6 @@ mod tests {
         mod step_up {
             //! The start route on the control-plane host with step-up on, and
             //! the stamp the redeemed session carries.
-            use std::sync::Arc;
             use std::time::Duration;
 
             use poem::{Endpoint, IntoResponse};
