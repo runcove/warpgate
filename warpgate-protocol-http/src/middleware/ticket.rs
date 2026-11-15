@@ -326,7 +326,12 @@ impl<E: Endpoint> Endpoint for TicketMiddlewareEndpoint<E> {
                     }
                 }
             };
-            if ended {
+            if ended && session.get_bound_auth().is_some() {
+                // A target-host session that also carries an authorization
+                // (only an older version wrote one into it) still shares its
+                // user session: only this browser session ends.
+                session.purge();
+            } else if ended {
                 // As the step-up logout does: the login is ended, then the
                 // browser session is cleared rather than purged, because a
                 // purged session ignores every later write in this request.
@@ -390,9 +395,14 @@ impl<E: Endpoint> Endpoint for TicketMiddlewareEndpoint<E> {
             };
             let belongs_to_another_user = match presented_owner {
                 Some((ticket_id, ticket_user_id)) if !session_is_temporary => {
-                    let other =
-                        ticket_belongs_to_another_user(session.get_auth().as_ref(), ticket_user_id)
-                            || pending_login_belongs_to_another_user(pending, ticket_user_id);
+                    // A target-host session belongs to its bound user.
+                    let current = session.get_auth().or_else(|| {
+                        session
+                            .get_bound_auth()
+                            .map(|bound| bound.as_session_authorization())
+                    });
+                    let other = ticket_belongs_to_another_user(current.as_ref(), ticket_user_id)
+                        || pending_login_belongs_to_another_user(pending, ticket_user_id);
                     if other {
                         warn!(%ticket_id, "Ticket belongs to a different user than this session, ignoring it");
                     }
@@ -413,7 +423,17 @@ impl<E: Endpoint> Endpoint for TicketMiddlewareEndpoint<E> {
                 ) if session_ticket == presented
             );
 
-            if presented_owner.is_some() && !already_this_ticket && !belongs_to_another_user {
+            // A target-host session never takes a ticket's authorization,
+            // its own user's included: one written beside the bound one would
+            // make the session's sign-out and expiry end the user session it
+            // shares with the control plane. The ticket is not spent.
+            let bound_session = session.get_bound_auth().is_some();
+
+            if presented_owner.is_some()
+                && !already_this_ticket
+                && !belongs_to_another_user
+                && !bound_session
+            {
                 let client_ip: Option<IpAddr> = get_client_ip(&req, ctx.services())
                     .await
                     .and_then(|s| s.parse().ok());
@@ -1131,6 +1151,10 @@ mod tests {
             TestClient::new(
                 Route::new()
                     .at("/seed", get(seed))
+                    .nest(
+                        "/api",
+                        poem_openapi::OpenApiService::new(crate::api::auth::Api, "test", "0"),
+                    )
                     .at("/*", get(who))
                     .with(TicketMiddleware::new())
                     .data(SessionStore::new())
@@ -1207,7 +1231,7 @@ mod tests {
                 .header("cookie", cookie)
                 .header("x-test-client-ip", "198.51.100.7");
             if let Some(ticket) = ticket {
-                request = request.header("authorization", format!("Warpgate {ticket}"));
+                request = request.query("warpgate-ticket", &ticket);
             }
             let resp = request.send().await;
             resp.assert_status_is_ok();
@@ -1266,6 +1290,104 @@ mod tests {
             assert_eq!(page(&cli, &cookie, None).await, "nobody");
             assert!(!browser_session_stored(&db, &cookie).await);
             assert!(user_session_open(&db, user_session).await);
+            assert!(browser_session_stored(&db, &control_plane).await);
+        }
+
+        /// Another user's ticket presented with a target-host session is
+        /// ignored as it is for any other session of a different user: no
+        /// use is spent and the session is unchanged.
+        #[tokio::test]
+        async fn another_users_ticket_leaves_a_bound_session_alone() {
+            let db = memory_db().await;
+            let (alice, bob) = (Uuid::new_v4(), Uuid::new_v4());
+            insert_user(&db, alice, "alice").await;
+            insert_user(&db, bob, "bob").await;
+            let target = bound_target(&db).await;
+            let ticket = insert_ticket(&db, bob, target, B_SECRET, None).await;
+            let user_session = insert_open_user_session(&db, alice).await;
+            let cli = client(&db).await;
+            seed_control_plane(&cli, alice, user_session).await;
+            let cookie = seed_bound(&cli, alice, user_session, target, None).await;
+
+            assert_eq!(
+                page(&cli, &cookie, Some(B_SECRET)).await,
+                format!("bound:{alice}")
+            );
+            assert_eq!(uses_left(&db, ticket).await, Some(2));
+            assert_eq!(page(&cli, &cookie, None).await, format!("bound:{alice}"));
+        }
+
+        /// The bound user's own ticket is not taken into the session either.
+        #[tokio::test]
+        async fn a_bound_session_takes_no_ticket_of_its_own_user() {
+            let db = memory_db().await;
+            let alice = Uuid::new_v4();
+            insert_user(&db, alice, "alice").await;
+            let target = bound_target(&db).await;
+            let ticket = insert_ticket(&db, alice, target, B_SECRET, None).await;
+            let user_session = insert_open_user_session(&db, alice).await;
+            let cli = client(&db).await;
+            seed_control_plane(&cli, alice, user_session).await;
+            let cookie = seed_bound(&cli, alice, user_session, target, None).await;
+
+            assert_eq!(
+                page(&cli, &cookie, Some(B_SECRET)).await,
+                format!("bound:{alice}")
+            );
+            assert_eq!(uses_left(&db, ticket).await, Some(2));
+            assert_eq!(page(&cli, &cookie, None).await, format!("bound:{alice}"));
+        }
+
+        /// A target-host session that also carries a ticket authorization
+        /// (as an older version wrote) ends alone when its ticket expires:
+        /// the shared sign-in and the control plane's session stay.
+        #[tokio::test]
+        async fn an_expired_ticket_in_a_bound_session_ends_only_that_session() {
+            let db = memory_db().await;
+            let alice = Uuid::new_v4();
+            insert_user(&db, alice, "alice").await;
+            let target = bound_target(&db).await;
+            let expired = OffsetDateTime::now_utc() - time::Duration::hours(1);
+            let ticket = insert_ticket(&db, alice, target, B_SECRET, Some(expired)).await;
+            let user_session = insert_open_user_session(&db, alice).await;
+            let cli = client(&db).await;
+            let control_plane = seed_control_plane(&cli, alice, user_session).await;
+            let cookie = seed_bound(&cli, alice, user_session, target, Some(ticket)).await;
+
+            assert_eq!(page(&cli, &cookie, None).await, "nobody");
+            assert!(!browser_session_stored(&db, &cookie).await);
+            assert!(
+                user_session_open(&db, user_session).await,
+                "the shared sign-in was ended"
+            );
+            assert!(browser_session_stored(&db, &control_plane).await);
+        }
+
+        /// Signing out of such a session ends only that session too.
+        #[tokio::test]
+        async fn signing_out_of_a_bound_session_with_a_ticket_keeps_the_sign_in() {
+            let db = memory_db().await;
+            let alice = Uuid::new_v4();
+            insert_user(&db, alice, "alice").await;
+            let target = bound_target(&db).await;
+            let ticket = insert_ticket(&db, alice, target, B_SECRET, None).await;
+            let user_session = insert_open_user_session(&db, alice).await;
+            let cli = client(&db).await;
+            let control_plane = seed_control_plane(&cli, alice, user_session).await;
+            let cookie = seed_bound(&cli, alice, user_session, target, Some(ticket)).await;
+
+            let resp = cli
+                .post("/api/auth/logout")
+                .header("host", HOST)
+                .header("cookie", &cookie)
+                .send()
+                .await;
+            assert!(resp.0.status().is_success(), "{}", resp.0.status());
+            assert!(!browser_session_stored(&db, &cookie).await);
+            assert!(
+                user_session_open(&db, user_session).await,
+                "the shared sign-in was ended"
+            );
             assert!(browser_session_stored(&db, &control_plane).await);
         }
     }

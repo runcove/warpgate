@@ -233,8 +233,9 @@ impl Api {
         session_middleware: Data<&Arc<Mutex<SessionStore>>>,
     ) -> poem::Result<LogoutResponse> {
         // A target-host session ends only itself: the user session it shares
-        // with the control-plane sign-in stays (see `crate::handoff`).
-        if session.get_auth().is_none() && session.get_bound_auth().is_some() {
+        // with the control-plane sign-in stays (see `crate::handoff`), even
+        // when the session also carries an authorization.
+        if session.get_bound_auth().is_some() {
             session.purge();
             return Ok(LogoutResponse::Success);
         }
