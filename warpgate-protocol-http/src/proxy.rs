@@ -128,6 +128,7 @@ fn strip_warpgate_internal_query_params(pq: &PathAndQuery) -> Result<PathAndQuer
             !matches!(
                 form_urlencoded::parse(segment.as_bytes()).next(),
                 Some((key, _)) if key == "warpgate-target"
+                    || key == crate::handoff::HANDOFF_RETRY_PARAM
                     || warpgate_common_http::ticket_query::is_credential_query_key(&key)
             )
         })
@@ -2407,6 +2408,10 @@ mod tests {
         assert_eq!(strip("/?q=x&warpgate-ticket=abc"), "/?q=x");
         assert_eq!(strip("/?warpgate-target=a&warpgate-ticket=b"), "/");
         assert_eq!(strip("/?warpgate%2Dtarget=a&q=x"), "/?q=x");
+        // The handoff's retry marker is Warpgate's, never the target's.
+        assert_eq!(strip("/?warpgate-handoff-retry=1"), "/");
+        assert_eq!(strip("/p?a=1&warpgate-handoff-retry=1&b=2"), "/p?a=1&b=2");
+        assert_eq!(strip("/?warpgate-handoff=t&warpgate-handoff-retry=1"), "/");
     }
 
     #[test]

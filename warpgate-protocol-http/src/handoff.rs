@@ -353,7 +353,10 @@ pub async fn start_endpoint(req: &Request, session: &Session) -> poem::Result<Re
 /// root, where a browser without a session opens a new handoff: so a tab
 /// whose nonce cookie another tab's handoff replaced simply tries again.
 /// That retry is marked ([`HANDOFF_RETRY_PARAM`]); a refusal of a handoff
-/// opened for a marked page gets a 403 saying sign-in needs cookies.
+/// opened for a marked page gets a 403 saying sign-in needs cookies. A
+/// browser that spent nothing and already holds a session for this target on
+/// this host is not retried: it goes back to the page unmarked. The marker
+/// never reaches the target (the proxy strips it from the query).
 #[poem::handler]
 pub async fn redeem_endpoint(req: &Request, session: &Session) -> poem::Result<Response> {
     let ctx = Data::<&UnauthenticatedRequestContext>::from_request_without_body(req).await?;
@@ -405,9 +408,19 @@ pub async fn redeem_endpoint(req: &Request, session: &Session) -> poem::Result<R
                 session.purge();
             }
             let next = next.unwrap_or_else(|| "/".to_owned());
-            let retry = (!has_retry_marker(&next))
-                .then(|| bound_host_return_url("https", &binding, &with_retry_marker(&next)))
-                .flatten();
+            // A browser that already holds a session for this target on this
+            // host has nothing to retry: it goes back to the page unmarked.
+            let signed_in_here = !spent
+                && session.get_bound_auth().is_some_and(|bound| {
+                    bound.counts_on(Some((target.id, &binding)), &http::Method::GET, "/")
+                });
+            let retry = if signed_in_here {
+                bound_host_return_url("https", &binding, &without_retry_marker(&next))
+            } else {
+                (!has_retry_marker(&next))
+                    .then(|| bound_host_return_url("https", &binding, &with_retry_marker(&next)))
+                    .flatten()
+            };
             match retry {
                 Some(location) => see_other(&location).finish(),
                 None => cookies_needed(),
@@ -849,6 +862,19 @@ mod tests {
             session.set("seeded", true);
         }
 
+        /// Gives the browser a target-host session for the target in the
+        /// query, on [`HOST`].
+        #[handler]
+        fn seed_bound(req: &Request, session: &Session) {
+            let target_id = query_value(req, "target").unwrap().parse().unwrap();
+            session.set_bound_auth(BoundSessionAuthorization {
+                user_id: Uuid::new_v4(),
+                username: "user".into(),
+                target_id,
+                hostname: HOST.into(),
+            });
+        }
+
         async fn bound_target(db: &DatabaseConnection) -> Uuid {
             let id = Uuid::new_v4();
             Target::ActiveModel {
@@ -877,6 +903,7 @@ mod tests {
             let ctx = UnauthenticatedRequestContext::new(services(db.clone()).await).await;
             Route::new()
                 .at("/seed", get(seed))
+                .at("/seed-bound", get(seed_bound))
                 .at(format!("/@warpgate{REDEEM_PATH}"), get(redeem_endpoint))
                 .data(SessionStore::new())
                 .data(ctx)
@@ -944,6 +971,56 @@ mod tests {
                 assert!(!clears_the_nonce(&resp), "{path}");
                 assert!(stored(&db, &cookie).await, "{path} dropped the session");
             }
+        }
+
+        /// A junk token in a browser already signed in on this host for its
+        /// target sends it back to the page with no retry marker: there is
+        /// nothing to retry, and the marker would reach the target and the
+        /// browser's history.
+        #[tokio::test]
+        async fn an_unknown_token_with_a_session_here_goes_back_unmarked() {
+            let db = memory_db().await;
+            let target = bound_target(&db).await;
+            let cli = TestClient::new(app(db.clone()).await);
+            let cookie = session_cookie(
+                &cli.get(format!("/seed-bound?target={target}"))
+                    .header("host", HOST)
+                    .send()
+                    .await,
+            );
+
+            let resp = cli
+                .get(format!(
+                    "/@warpgate{REDEEM_PATH}?{HANDOFF_TOKEN_PARAM}=junk"
+                ))
+                .header("host", HOST)
+                .header("cookie", &cookie)
+                .send()
+                .await;
+            resp.assert_status(StatusCode::SEE_OTHER);
+            resp.assert_header("location", format!("https://{HOST}/"));
+            assert!(stored(&db, &cookie).await, "the session was dropped");
+
+            // A session for another target counts for nothing here.
+            let other = Uuid::new_v4();
+            let cookie = session_cookie(
+                &cli.get(format!("/seed-bound?target={other}"))
+                    .header("host", HOST)
+                    .send()
+                    .await,
+            );
+            let resp = cli
+                .get(format!(
+                    "/@warpgate{REDEEM_PATH}?{HANDOFF_TOKEN_PARAM}=junk"
+                ))
+                .header("host", HOST)
+                .header("cookie", &cookie)
+                .send()
+                .await;
+            resp.assert_header(
+                "location",
+                format!("https://{HOST}/?{HANDOFF_RETRY_PARAM}=1"),
+            );
         }
 
         /// A real token redeemed without its nonce (another tab's handoff
