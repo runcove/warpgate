@@ -31,6 +31,9 @@ pub struct Model {
     pub next: String,
     pub user_id: Option<Uuid>,
     pub user_session_id: Option<Uuid>,
+    /// When the control-plane session that minted this handoff last did an
+    /// SSO handshake, for the bound host's step-up gate.
+    pub last_sso_at: Option<OffsetDateTime>,
     pub expires: OffsetDateTime,
 }
 
@@ -60,6 +63,7 @@ pub async fn open<C: ConnectionTrait>(db: &C, opening: Opening) -> Result<(), Wa
         next: Set(opening.next),
         user_id: Set(None),
         user_session_id: Set(None),
+        last_sso_at: Set(None),
         expires: Set(opening.expires),
     })
     .exec_without_returning(db)
@@ -86,6 +90,7 @@ pub struct Minting {
     pub token_hash: String,
     pub user_id: Uuid,
     pub user_session_id: Uuid,
+    pub last_sso_at: Option<OffsetDateTime>,
     pub expires: OffsetDateTime,
 }
 
@@ -103,6 +108,7 @@ pub async fn mint<C: ConnectionTrait>(
             token_hash: Set(Some(minting.token_hash)),
             user_id: Set(Some(minting.user_id)),
             user_session_id: Set(Some(minting.user_session_id)),
+            last_sso_at: Set(minting.last_sso_at),
             expires: Set(minting.expires),
             ..Default::default()
         })

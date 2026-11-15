@@ -56,10 +56,12 @@ use warpgate_db_entities::HttpHandoff;
 use crate::catchall::{bound_to_host, get_target_by_request_host};
 use crate::common::{
     BoundSessionAuthorization, GatewayPages, HANDOFF_COOKIE_NAME, SessionExt, SessionRotation,
-    bound_host_return_url, gateway_pages_for, gateway_redirect,
+    bound_host_return_url, force_step_up, gateway_pages_for, gateway_redirect,
+    http_step_up_interval,
 };
 use crate::middleware::target_bound_to_request_host;
 use crate::session::{SESSION_ID_SESSION_KEY, SessionStore};
+use crate::step_up::{StepUpSessionExt, is_session_step_up_stale};
 
 /// The control plane's mint route, under `/@warpgate`.
 pub const START_PATH: &str = "/handoff/start";
@@ -122,13 +124,15 @@ pub async fn opened<C: ConnectionTrait>(
 }
 
 /// Mints the token for this challenge, for the user signed in on the control
-/// plane under `user_session_id`. `None` when the challenge is unknown,
-/// expired or already minted.
+/// plane under `user_session_id`, whose browser session last did an SSO
+/// handshake at `last_sso_at`. `None` when the challenge is unknown, expired
+/// or already minted.
 pub async fn mint<C: ConnectionTrait>(
     db: &C,
     challenge: &str,
     user_id: Uuid,
     user_session_id: Uuid,
+    last_sso_at: Option<OffsetDateTime>,
     now: OffsetDateTime,
 ) -> Result<Option<String>, WarpgateError> {
     let token = generate_ticket_secret().expose_secret().clone();
@@ -139,6 +143,7 @@ pub async fn mint<C: ConnectionTrait>(
             token_hash: hash_secret(&token),
             user_id,
             user_session_id,
+            last_sso_at,
             expires: now + TOKEN_LIFETIME,
         },
         now,
@@ -152,6 +157,9 @@ pub async fn mint<C: ConnectionTrait>(
 pub struct Redeemed {
     pub user_id: Uuid,
     pub user_session_id: Uuid,
+    /// The control-plane session's SSO stamp at mint, carried to the bound
+    /// host's session so its step-up gate measures the same sign-in.
+    pub last_sso_at: Option<OffsetDateTime>,
     pub target_id: Uuid,
     pub hostname: String,
     pub next: String,
@@ -199,6 +207,7 @@ pub async fn redeem<C: ConnectionTrait + TransactionTrait>(
     Ok(Ok(Redeemed {
         user_id,
         user_session_id,
+        last_sso_at: row.last_sso_at,
         target_id: row.target_id,
         hostname: row.hostname,
         next: row.next,
@@ -255,6 +264,21 @@ pub async fn start_endpoint(req: &Request, session: &Session) -> poem::Result<Re
     let Some(row) = opened(&services.db, &challenge, now).await? else {
         return Ok(refusal(StatusCode::FORBIDDEN));
     };
+    // A stale control-plane sign-in mints nothing: the browser signs in
+    // again, as on any control-plane page, and comes back here.
+    let last_sso_at = session.get_last_sso_at();
+    if is_session_step_up_stale(
+        Some(&SessionAuthorization::User {
+            user_id,
+            username: String::new(),
+        }),
+        last_sso_at,
+        http_step_up_interval(services).await,
+        now,
+    ) {
+        force_step_up(req, session).await?;
+        return Ok(gateway_redirect(req));
+    }
     let target = get_target_by_request_host(services, &row.hostname)
         .await?
         .filter(|target| target.id == row.target_id && bound_to_host(target, &row.hostname));
@@ -268,7 +292,16 @@ pub async fn start_endpoint(req: &Request, session: &Session) -> poem::Result<Re
     {
         return Err(NotFoundError.into());
     }
-    let Some(token) = mint(&services.db, &challenge, user_id, user_session_id.0, now).await? else {
+    let Some(token) = mint(
+        &services.db,
+        &challenge,
+        user_id,
+        user_session_id.0,
+        last_sso_at,
+        now,
+    )
+    .await?
+    else {
         return Ok(refusal(StatusCode::FORBIDDEN));
     };
     let mut redeem = url::form_urlencoded::Serializer::new(format!("/@warpgate{REDEEM_PATH}?"));
@@ -365,6 +398,9 @@ async fn complete_redeem(
         SESSION_ID_SESSION_KEY,
         UserSessionId(redeemed.user_session_id),
     );
+    if let Some(last_sso_at) = redeemed.last_sso_at {
+        session.set_last_sso_at(last_sso_at);
+    }
     session.set_bound_auth(BoundSessionAuthorization {
         user_id: user.id,
         username: user.username,
@@ -447,7 +483,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!((row.target_id, row.hostname.as_str()), (target, HOST));
-        let token = mint(db, &opened.challenge, user, session, at(2))
+        let token = mint(db, &opened.challenge, user, session, Some(at(-5)), at(2))
             .await
             .unwrap()
             .unwrap();
@@ -480,6 +516,7 @@ mod tests {
             Redeemed {
                 user_id: flow.user,
                 user_session_id: flow.session,
+                last_sso_at: Some(at(-5)),
                 target_id: flow.target,
                 hostname: HOST.into(),
                 next: "/page?x=1".into(),
@@ -596,7 +633,7 @@ mod tests {
         let opened = open(&db, Uuid::new_v4(), HOST, "/", at(0)).await.unwrap();
         let (user, session) = (Uuid::new_v4(), Uuid::new_v4());
         assert!(
-            mint(&db, "not-issued", user, session, at(1))
+            mint(&db, "not-issued", user, session, None, at(1))
                 .await
                 .unwrap()
                 .is_none()
@@ -608,7 +645,7 @@ mod tests {
                 .is_none()
         );
         assert!(
-            mint(&db, &opened.challenge, user, session, at(1))
+            mint(&db, &opened.challenge, user, session, None, at(1))
                 .await
                 .unwrap()
                 .is_some()
@@ -620,7 +657,7 @@ mod tests {
                 .is_none()
         );
         assert!(
-            mint(&db, &opened.challenge, user, session, at(1))
+            mint(&db, &opened.challenge, user, session, None, at(1))
                 .await
                 .unwrap()
                 .is_none()
@@ -640,7 +677,7 @@ mod tests {
         );
         let (user, session) = (Uuid::new_v4(), Uuid::new_v4());
         assert!(
-            mint(&db, &opened.challenge, user, session, late)
+            mint(&db, &opened.challenge, user, session, None, late)
                 .await
                 .unwrap()
                 .is_none()
@@ -659,6 +696,7 @@ mod tests {
             &opened.challenge,
             Uuid::new_v4(),
             Uuid::new_v4(),
+            None,
             at(1),
         )
         .await

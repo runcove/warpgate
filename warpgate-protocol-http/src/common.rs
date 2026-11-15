@@ -448,15 +448,7 @@ pub async fn _inner_auth<E: Endpoint + 'static>(
     {
         // Pull the interval first; absent config -> feature off, skip the
         // session read entirely to keep the hot path cheap.
-        let interval = ctx
-            .services()
-            .config
-            .lock()
-            .await
-            .store
-            .step_up_interval
-            .as_ref()
-            .and_then(|s| s.http);
+        let interval = http_step_up_interval(ctx.services()).await;
         if interval.is_some() {
             let session = <&Session>::from_request_without_body(&req).await?;
             let last_sso_at = session.get_last_sso_at();
@@ -471,30 +463,63 @@ pub async fn _inner_auth<E: Endpoint + 'static>(
                     has_stamp = last_sso_at.is_some(),
                     "HTTP step-up required: session last_sso_at is stale or missing"
                 );
-                // A full logout rather than dropping only the auth claim: on
-                // 0.29.1 the browser session's server handle stays attributed
-                // to this user, and a cookie that no longer names the user is
-                // refused (401) by `SessionStore::handle_for_request` on every
-                // route off the login path. The login entry points would
-                // replace such a session (`SessionStore::handle_for_login`),
-                // but the logout leaves nothing stale to refuse or replace.
-                // SSO handshakes in flight live outside the Poem session, so
-                // nothing the re-login needs is lost. The login is ended as in
-                // `logout`, but the browser session is cleared, not purged: a
-                // purged session ignores every later write in this request,
-                // and the caller goes on to the login flow.
-                let session_middleware =
-                    Data::<&Arc<Mutex<SessionStore>>>::from_request_without_body(&req).await?;
-                crate::api::common::end_login(session, session_middleware.0, &ctx.services().db)
-                    .await;
-                session.clear();
-                info!("Logout requested");
+                if session.get_auth().is_none() && session.get_bound_auth().is_some() {
+                    // A target-host session shares its user session with the
+                    // control plane and every other bound host: drop only
+                    // this host's browser session. The caller then starts a
+                    // new handoff, which carries the control plane's stamp
+                    // and sends the browser to sign in there if that is
+                    // stale too. Ending the login here would let any page on
+                    // a sibling host sign the user out everywhere.
+                    session.purge();
+                    return Ok(Err(req));
+                }
+                force_step_up(&req, session).await?;
                 return Ok(Err(req));
             }
         }
     }
 
     return ep.call(req).await.map(Ok);
+}
+
+/// The control plane's forced re-login when its session's SSO stamp is
+/// stale: ends the login, then clears the browser session for the login flow
+/// the caller sends it to.
+///
+/// A full logout rather than dropping only the auth claim: on 0.29.1 the
+/// browser session's server handle stays attributed to this user, and a
+/// cookie that no longer names the user is refused (401) by
+/// `SessionStore::handle_for_request` on every route off the login path. The
+/// login entry points would replace such a session
+/// (`SessionStore::handle_for_login`), but the logout leaves nothing stale to
+/// refuse or replace. SSO handshakes in flight live outside the Poem session,
+/// so nothing the re-login needs is lost. The login is ended as in `logout`,
+/// but the browser session is cleared, not purged: a purged session ignores
+/// every later write in this request, and the caller goes on to the login
+/// flow.
+pub(crate) async fn force_step_up(req: &Request, session: &Session) -> poem::Result<()> {
+    let ctx = Data::<&UnauthenticatedRequestContext>::from_request_without_body(req).await?;
+    let session_middleware =
+        Data::<&Arc<Mutex<SessionStore>>>::from_request_without_body(req).await?;
+    crate::api::common::end_login(session, session_middleware.0, &ctx.services().db).await;
+    session.clear();
+    info!("Logout requested");
+    Ok(())
+}
+
+/// The configured HTTP step-up interval; `None` when step-up is off.
+pub(crate) async fn http_step_up_interval(
+    services: &warpgate_core::Services,
+) -> Option<std::time::Duration> {
+    services
+        .config
+        .lock()
+        .await
+        .store
+        .step_up_interval
+        .as_ref()
+        .and_then(|s| s.http)
 }
 
 // TODO unify both based on the accept header

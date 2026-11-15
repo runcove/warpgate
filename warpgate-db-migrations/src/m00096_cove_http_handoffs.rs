@@ -43,6 +43,11 @@ impl MigrationTrait for Migration {
                     .col(ColumnDef::new(Alias::new("user_id")).uuid().null())
                     .col(ColumnDef::new(Alias::new("user_session_id")).uuid().null())
                     .col(
+                        ColumnDef::new(Alias::new("last_sso_at"))
+                            .timestamp_with_time_zone()
+                            .null(),
+                    )
+                    .col(
                         ColumnDef::new(Alias::new("expires"))
                             .timestamp_with_time_zone()
                             .not_null(),
