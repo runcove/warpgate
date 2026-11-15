@@ -112,6 +112,24 @@ def _username(browser_or_cookie, main_url):
     return response.json()["username"]
 
 
+def hand_off(browser, main_url, bound_url, path="/"):
+    """The whole handoff for a `browser` signed in on `main_url`: a
+    navigation on the bound host is sent to the control plane, which sends
+    the browser back with a token that gives it a session there. For other
+    modules' tests; `Setup.hand_off` checks more on the way."""
+    response = browser.get(f"{bound_url}{path}", headers=NAVIGATE, allow_redirects=False)
+    assert response.status_code == 303, response.text
+    start = response.headers["location"]
+    assert start.startswith(f"{main_url}/@warpgate/handoff/start?"), start
+    response = browser.get(start, headers=NAVIGATE, allow_redirects=False)
+    assert response.status_code == 303, response.text
+    redeem = response.headers["location"]
+    assert redeem.startswith(f"{bound_url}/@warpgate/handoff?"), redeem
+    response = browser.get(redeem, headers=NAVIGATE, allow_redirects=False)
+    assert response.status_code == 303, response.text
+    assert response.headers["location"] == f"{bound_url}{path}"
+
+
 @pytest.fixture(scope="module")
 def handoff_wg(processes: ProcessManager):
     # Its own gateway with a dotted external host, so target hosts can sit

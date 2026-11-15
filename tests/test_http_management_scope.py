@@ -1,14 +1,14 @@
 """Warpgate's management routes on hosts bound to an HTTP target.
 
-A host that is some target's `external_host` serves only the gateway's assets
-and the SSO return under `/@warpgate` and `/_warpgate`. The login page, the
-login steps, `info`, logout, the user API and the admin API answer 404 there
-and are served on every other host as before; a visitor without a session is
-sent to sign in on the control-plane host.
+A host that is some target's `external_host` serves only the gateway's assets,
+the SSO return, the handoff and logout under `/@warpgate` and `/_warpgate`.
+The login page, the login steps, `info`, the user API and the admin API answer
+404 there and are served on every other host as before; a visitor without a
+session there is sent through a handoff from the control-plane host.
 """
 
 import re
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, urlparse
 from uuid import uuid4
 
 import pytest
@@ -17,6 +17,7 @@ import requests
 from .api_client import admin_client, sdk
 from .conftest import ProcessManager, WarpgateProcess
 from .test_http_common import *  # noqa
+from .test_http_handoff import FETCH, HANDOFF_COOKIE, NAVIGATE, _browser, hand_off
 from .test_http_user_auth_oidc import _resolve_hosts_to_localhost
 from .util import wait_port
 
@@ -69,8 +70,8 @@ class _Setup:
             api.add_target_role(self.target.id, role.id)
 
     def login(self, base_url):
-        session = requests.Session()
-        session.verify = False
+        # Host-only cookies stay on their host, as in a browser.
+        session = _browser()
         response = session.post(
             f"{base_url}/@warpgate/api/auth/login",
             json={"username": self.user.username, "password": "123"},
@@ -123,24 +124,34 @@ class TestHTTPManagementScope:
                 f"{method} {path}: {response.status_code}"
             )
 
-    def test_session_from_main_host_works_on_target_host(self, setup):
+    def test_session_from_main_host_counts_on_target_host_only_after_a_handoff(
+        self, setup
+    ):
         session = setup.login(setup.main_url)
+        page = f"{setup.target_url}/some/path?a=b"
 
-        response = session.get(
-            f"{setup.target_url}/some/path?a=b", allow_redirects=False
-        )
+        response = session.get(page, headers=FETCH, allow_redirects=False)
+        assert response.status_code == 401, response.status_code
+        response = session.get(page, headers=NAVIGATE, allow_redirects=False)
+        assert response.status_code == 303, response.status_code
+        start = response.headers["location"]
+        assert start.startswith(f"{setup.main_url}/@warpgate/handoff/start?"), start
+
+        hand_off(session, setup.main_url, setup.target_url, "/some/path?a=b")
+        response = session.get(page, headers=FETCH, allow_redirects=False)
         assert response.status_code // 100 == 2, response.status_code
         assert response.json()["path"] == "/some/path"
 
     def test_sign_in_routes_are_404_on_target_host(self, setup):
         # A page on the target host shares its origin: it must not read who
-        # is signed in, sign the browser out, or sign it in as someone else.
+        # is signed in or sign it in as someone else. (Logout is served
+        # there, for that host's own session.)
         session = setup.login(setup.main_url)
+        hand_off(session, setup.main_url, setup.target_url)
         for method, path in [
             ("GET", "/@warpgate"),
             ("GET", "/@warpgate/api/info"),
             ("GET", "/_warpgate/api/info"),
-            ("POST", "/@warpgate/api/auth/logout"),
             ("POST", "/@warpgate/api/auth/login"),
             ("GET", "/@warpgate/api/sso/providers"),
             ("POST", "/@warpgate/api/sso/logout"),
@@ -155,10 +166,10 @@ class TestHTTPManagementScope:
                 f"{method} {path}: {response.status_code}"
             )
 
-        # None of them reached the session: still signed in.
+        # None of them reached a session: still signed in on both hosts.
         response = session.get(f"{setup.main_url}/@warpgate/api/info")
         assert response.json()["username"] == setup.user.username
-        response = session.get(f"{setup.target_url}/x", allow_redirects=False)
+        response = session.get(f"{setup.target_url}/x", headers=FETCH, allow_redirects=False)
         assert response.status_code // 100 == 2, response.status_code
 
     def test_assets_load_on_target_host(self, setup):
@@ -170,24 +181,56 @@ class TestHTTPManagementScope:
         assert response.status_code == 200, response.status_code
 
     def test_signed_out_visitor_is_sent_to_the_main_host_to_sign_in(self, setup):
-        def sign_in_redirect(path):
-            response = requests.get(
-                f"{setup.target_url}{path}",
-                headers={"Accept": "text/html", "Sec-Fetch-Mode": "navigate"},
-                allow_redirects=False,
-                verify=False,
-            )
-            assert response.status_code == 307, response.status_code
-            login, _, next_url = response.headers["location"].partition("?next=")
-            assert login == f"{setup.main_url}/@warpgate#/login", login
-            return urlparse(unquote(next_url))
+        # A visitor with no session on the target host opens a handoff: the
+        # nonce cookie, and a 303 to the control plane's handoff start
+        # carrying only the challenge. The page to return to stays on the
+        # server, never in the URL.
+        response = requests.get(
+            f"{setup.target_url}/some/page?x=1",
+            headers=NAVIGATE,
+            allow_redirects=False,
+            verify=False,
+        )
+        assert response.status_code == 303, response.status_code
+        location = urlparse(response.headers["location"])
+        assert f"{location.scheme}://{location.netloc}" == setup.main_url, location
+        assert location.path == "/@warpgate/handoff/start", location
+        query = parse_qs(location.query)
+        assert list(query) == ["challenge"], query
+        assert query["challenge"][0]
+        assert "next" not in response.headers["location"]
+        assert response.headers["referrer-policy"] == "no-referrer"
+        cookies = [
+            c
+            for c in response.raw.headers.getlist("Set-Cookie")
+            if c.startswith(f"{HANDOFF_COOKIE}=")
+        ]
+        assert len(cookies) == 1, cookies
+        attributes = {a.strip().split("=")[0].lower(): a.strip() for a in cookies[0].split(";")[1:]}
+        assert "secure" in attributes, cookies
+        assert "httponly" in attributes, cookies
+        assert attributes.get("samesite") == "SameSite=Lax", cookies
+        assert attributes.get("path") == "Path=/", cookies
+        assert "domain" not in attributes, cookies
 
-        next_url = sign_in_redirect("/some/page?x=1")
-        assert next_url.geturl() == f"{setup.target_url}/some/page?x=1"
-
-        # An attacker-chosen path stays a page on the target host.
-        next_url = sign_in_redirect("//evil.example/x")
-        assert next_url.netloc == f"{setup.target_host}:{setup.port}", next_url
+        # An attacker-chosen path stays a page on the target host, through
+        # the whole handoff.
+        session = setup.login(setup.main_url)
+        response = session.get(
+            f"{setup.target_url}//evil.example/x", headers=NAVIGATE, allow_redirects=False
+        )
+        assert response.status_code == 303, response.status_code
+        response = session.get(
+            response.headers["location"], headers=NAVIGATE, allow_redirects=False
+        )
+        assert response.status_code == 303, response.status_code
+        redeem = response.headers["location"]
+        assert redeem.startswith(f"{setup.target_url}/@warpgate/handoff?"), redeem
+        response = session.get(redeem, headers=NAVIGATE, allow_redirects=False)
+        assert response.status_code == 303, response.status_code
+        final = urlparse(response.headers["location"])
+        assert final.netloc == f"{setup.target_host}:{setup.port}", final
+        assert final.scheme == "https", final
 
     def test_admin_api_by_token_works_on_non_target_host(self, setup):
         # Cove's daemon reaches the admin API by a token on a host no target

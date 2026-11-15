@@ -20,6 +20,7 @@ from websocket import WebSocketBadStatusException, create_connection
 from .api_client import admin_client, sdk
 from .conftest import ProcessManager, WarpgateProcess
 from .test_http_common import *  # noqa
+from .test_http_handoff import FETCH, _browser, hand_off
 from .test_http_user_auth_oidc import _resolve_hosts_to_localhost
 from .util import wait_port
 
@@ -73,8 +74,8 @@ class _Setup:
             api.add_target_role(target.id, role.id)
 
     def login(self, base_url, origin=None):
-        session = requests.Session()
-        session.verify = False
+        # Host-only cookies stay on their host, as in a browser.
+        session = _browser()
         headers = {"Origin": origin} if origin else {}
         response = session.post(
             f"{base_url}/@warpgate/api/auth/login",
@@ -152,19 +153,32 @@ class TestHTTPOriginCheck:
     def test_login_flow_on_target_host_is_not_served_whatever_the_origin(self, setup):
         # The target's own pages share the target host's origin, so passing
         # the origin check there must not reach the login flow: the host
-        # does not serve it at all.
+        # does not serve sign-in at all.
         session, response = setup.login(setup.main_url)
         assert response.status_code // 100 == 2, response.text
         for origin in [setup.target_url, FOREIGN_ORIGIN]:
             _, response = setup.login(setup.target_url, origin=origin)
             assert response.status_code == 404, (origin, response.status_code)
-            response = session.post(
-                f"{setup.target_url}/@warpgate/api/auth/logout",
-                headers={"Origin": origin},
-            )
-            assert response.status_code == 404, (origin, response.status_code)
 
-        # Still logged in on the main host.
+    def test_logout_on_target_host_is_origin_checked(self, setup):
+        # Logout is served on the target host, for that host's own session.
+        session, response = setup.login(setup.main_url)
+        assert response.status_code // 100 == 2, response.text
+        hand_off(session, setup.main_url, setup.target_url)
+        logout = f"{setup.target_url}/@warpgate/api/auth/logout"
+
+        response = session.post(logout, headers={"Origin": FOREIGN_ORIGIN})
+        assert response.status_code == 403, response.status_code
+        # The refused logout ended nothing.
+        response = session.get(f"{setup.target_url}/", headers=FETCH, allow_redirects=False)
+        assert response.status_code == 200, response.status_code
+
+        response = session.post(logout, headers={"Origin": setup.target_url})
+        assert response.status_code // 100 == 2, response.status_code
+        response = session.get(f"{setup.target_url}/", headers=FETCH, allow_redirects=False)
+        assert response.status_code == 401, response.status_code
+
+        # It ended that host's session only: still logged in on the main host.
         response = session.get(f"{setup.main_url}/@warpgate/api/info")
         assert response.json()["username"] == setup.user.username
 
