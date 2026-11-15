@@ -67,8 +67,10 @@ use crate::step_up::{StepUpSessionExt, is_session_step_up_stale};
 pub const START_PATH: &str = "/handoff/start";
 /// The bound host's redeem route, under `/@warpgate`.
 pub const REDEEM_PATH: &str = "/handoff";
-/// The query parameter carrying the challenge to [`START_PATH`].
-pub const HANDOFF_CHALLENGE_PARAM: &str = "challenge";
+/// The query parameter carrying the challenge to [`START_PATH`] (redacted
+/// from logs there, as the token is everywhere).
+pub const HANDOFF_CHALLENGE_PARAM: &str =
+    warpgate_common_http::ticket_query::HANDOFF_CHALLENGE_QUERY_PARAM;
 /// The query parameter carrying the token to [`REDEEM_PATH`].
 pub const HANDOFF_TOKEN_PARAM: &str = warpgate_common_http::ticket_query::HANDOFF_QUERY_PARAM;
 
@@ -166,15 +168,35 @@ pub struct Redeemed {
 }
 
 /// Why a bound host refused a handoff token.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RedeemRefusal {
     /// Unknown, expired or already used.
     UnknownToken,
     /// Minted for another host or target.
     WrongHost,
     /// The browser holds no nonce cookie, or not the one this handoff was
-    /// opened with.
-    WrongNonce,
+    /// opened with (another tab's handoff may have replaced it). `next` is
+    /// the page on this host the handoff was opened for.
+    WrongNonce { next: String },
+}
+
+impl RedeemRefusal {
+    /// Whether the refused token was this host's to spend: a handoff row
+    /// was found and deleted. A token that was never issued, or has already
+    /// been spent, proves nothing about the browser holding it, so it
+    /// changes nothing there.
+    const fn spent_a_handoff(&self) -> bool {
+        !matches!(self, Self::UnknownToken)
+    }
+
+    /// The refusal's name for the log, without the page it carries.
+    const fn reason(&self) -> &'static str {
+        match self {
+            Self::UnknownToken => "UnknownToken",
+            Self::WrongHost => "WrongHost",
+            Self::WrongNonce { .. } => "WrongNonce",
+        }
+    }
 }
 
 /// Redeems `token` on the host bound to `target_id` at `hostname`, for a
@@ -199,7 +221,7 @@ pub async fn redeem<C: ConnectionTrait + TransactionTrait>(
             .into()
     });
     if !nonce_matches {
-        return Ok(Err(RedeemRefusal::WrongNonce));
+        return Ok(Err(RedeemRefusal::WrongNonce { next: row.next }));
     }
     let (Some(user_id), Some(user_session_id)) = (row.user_id, row.user_session_id) else {
         return Ok(Err(RedeemRefusal::UnknownToken));
@@ -315,8 +337,15 @@ pub async fn start_endpoint(req: &Request, session: &Session) -> poem::Result<Re
 /// The bound host's [`REDEEM_PATH`]: turns the token in the query into a
 /// session that counts on this host for its target only
 /// ([`crate::common::BoundSessionAuthorization`]), then sends the browser to
-/// the page it started from. The nonce cookie is cleared whatever happens;
-/// any refusal is a 403 with the browser session purged.
+/// the page it started from.
+///
+/// A refused token that spent a handoff (one found and deleted) clears the
+/// nonce cookie and purges this host's browser session. One that spent
+/// nothing (never issued, already used, or no token at all: any site can
+/// send a browser here) changes nothing. Either way the browser is sent to
+/// the page the handoff was opened for when that is known, or this host's
+/// root, where a browser without a session opens a new handoff: so a tab
+/// whose nonce cookie another tab's handoff replaced simply tries again.
 #[poem::handler]
 pub async fn redeem_endpoint(req: &Request, session: &Session) -> poem::Result<Response> {
     let ctx = Data::<&UnauthenticatedRequestContext>::from_request_without_body(req).await?;
@@ -342,22 +371,43 @@ pub async fn redeem_endpoint(req: &Request, session: &Session) -> poem::Result<R
                 OffsetDateTime::now_utc(),
             )
             .await?
-            .map_err(|refusal| format!("{refusal:?}"))
         }
-        None => Err("NoToken".to_owned()),
+        None => Err(RedeemRefusal::UnknownToken),
     };
-    let outcome = match redeemed {
-        Ok(redeemed) => complete_redeem(req, &ctx, session, &target, &binding, redeemed).await,
-        Err(refusal) => Err(refusal),
+    let (outcome, spent, next) = match redeemed {
+        Ok(redeemed) => {
+            let next = redeemed.next.clone();
+            let outcome = complete_redeem(req, &ctx, session, &target, &binding, redeemed).await;
+            (outcome, true, Some(next))
+        }
+        Err(refusal) => {
+            let spent = refusal.spent_a_handoff();
+            let next = match &refusal {
+                RedeemRefusal::WrongNonce { next } => Some(next.clone()),
+                _ => None,
+            };
+            (Err(refusal.reason().to_owned()), spent, next)
+        }
     };
     let mut response = match outcome {
         Ok(response) => response,
         Err(reason) => {
             tracing::warn!(target = %target.name, %reason, "Refused a target-host handoff");
-            session.purge();
-            refusal(StatusCode::FORBIDDEN)
+            if spent {
+                session.purge();
+            }
+            let retry = next
+                .and_then(|next| bound_host_return_url("https", &binding, &next))
+                .or_else(|| bound_host_return_url("https", &binding, "/"));
+            match retry {
+                Some(location) => see_other(&location).finish(),
+                None => refusal(StatusCode::FORBIDDEN),
+            }
         }
     };
+    if !spent {
+        return Ok(response);
+    }
     response.headers_mut().append(
         http::header::SET_COOKIE,
         http::HeaderValue::from_str(&format!(
@@ -579,13 +629,24 @@ mod tests {
                     RedeemRefusal::WrongHost,
                 )
             },
-            |f| (f.target, HOST, None, RedeemRefusal::WrongNonce),
+            |f| {
+                (
+                    f.target,
+                    HOST,
+                    None,
+                    RedeemRefusal::WrongNonce {
+                        next: "/page?x=1".into(),
+                    },
+                )
+            },
             |f| {
                 (
                     f.target,
                     HOST,
                     Some(format!("{}x", f.nonce)),
-                    RedeemRefusal::WrongNonce,
+                    RedeemRefusal::WrongNonce {
+                        next: "/page?x=1".into(),
+                    },
                 )
             },
         ];
@@ -706,6 +767,158 @@ mod tests {
         let stored = format!("{row:?}");
         for secret in [&opened.challenge, &opened.nonce, &token] {
             assert!(!stored.contains(secret.as_str()));
+        }
+    }
+
+    mod endpoint {
+        //! The redeem route behind the session middleware production uses.
+        use poem::session::ServerSession;
+        use poem::test::{TestClient, TestResponse};
+        use poem::{EndpointExt, Route, get, handler};
+        use sea_orm::{ActiveModelTrait, DatabaseConnection, EntityTrait, Set};
+        use warpgate_db_entities::Target::TargetKind;
+        use warpgate_db_entities::{HttpSession, Target};
+
+        use super::*;
+        use crate::common::{SESSION_COOKIE_NAME, session_cookie_config};
+        use crate::session_storage::SharedSessionStorage;
+        use crate::test_db::services;
+
+        /// Gives the browser a session holding something.
+        #[handler]
+        fn seed(session: &Session) {
+            session.set("seeded", true);
+        }
+
+        async fn bound_target(db: &DatabaseConnection) -> Uuid {
+            let id = Uuid::new_v4();
+            Target::ActiveModel {
+                id: Set(id),
+                name: Set(format!("target-{id}")),
+                description: Set(String::new()),
+                kind: Set(TargetKind::Http),
+                options: Set(serde_json::json!({
+                    "http": {"url": "http://h", "external_host": HOST}
+                })),
+                rate_limit_bytes_per_second: Set(None),
+                group_id: Set(None),
+                ticket_max_duration_seconds: Set(None),
+                ticket_requests_disabled: Set(false),
+                ticket_require_approval: Set(false),
+                ticket_max_uses: Set(None),
+                require_approval: Set(false),
+            }
+            .insert(db)
+            .await
+            .unwrap();
+            id
+        }
+
+        async fn app(db: DatabaseConnection) -> impl poem::Endpoint {
+            let ctx = UnauthenticatedRequestContext::new(services(db.clone()).await).await;
+            Route::new()
+                .at("/seed", get(seed))
+                .at(format!("/@warpgate{REDEEM_PATH}"), get(redeem_endpoint))
+                .data(SessionStore::new())
+                .data(ctx)
+                .with(ServerSession::new(
+                    session_cookie_config(),
+                    SharedSessionStorage::new(db),
+                ))
+        }
+
+        fn session_cookie(resp: &TestResponse) -> String {
+            resp.0
+                .headers()
+                .get_all("set-cookie")
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .filter_map(|value| value.split(';').next())
+                .find(|pair| pair.starts_with(&format!("{SESSION_COOKIE_NAME}=")))
+                .expect("a session cookie")
+                .to_owned()
+        }
+
+        fn clears_the_nonce(resp: &TestResponse) -> bool {
+            resp.0
+                .headers()
+                .get_all("set-cookie")
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .any(|value| value.starts_with(&format!("{HANDOFF_COOKIE_NAME}=;")))
+        }
+
+        async fn stored(db: &DatabaseConnection, cookie: &str) -> bool {
+            let (_, id) = cookie.split_once('=').unwrap();
+            HttpSession::Entity::find_by_id(id.to_owned())
+                .one(db)
+                .await
+                .unwrap()
+                .is_some()
+        }
+
+        /// Any site can send a browser to the redeem route with a token that
+        /// was never issued: that changes nothing in the browser, and sends
+        /// it to open a handoff of its own.
+        #[tokio::test]
+        async fn an_unknown_token_leaves_the_browser_session_alone() {
+            let db = memory_db().await;
+            bound_target(&db).await;
+            let cli = TestClient::new(app(db.clone()).await);
+            let cookie = session_cookie(&cli.get("/seed").header("host", HOST).send().await);
+
+            for path in [
+                format!("/@warpgate{REDEEM_PATH}?{HANDOFF_TOKEN_PARAM}=junk"),
+                format!("/@warpgate{REDEEM_PATH}"),
+            ] {
+                let resp = cli
+                    .get(&path)
+                    .header("host", HOST)
+                    .header("cookie", &cookie)
+                    .send()
+                    .await;
+                resp.assert_status(StatusCode::SEE_OTHER);
+                resp.assert_header("location", format!("https://{HOST}/"));
+                assert!(!clears_the_nonce(&resp), "{path}");
+                assert!(stored(&db, &cookie).await, "{path} dropped the session");
+            }
+        }
+
+        /// A real token redeemed without its nonce (another tab's handoff
+        /// replaced the cookie) is spent: the browser session goes, and the
+        /// browser is sent back to its page to open a new handoff.
+        #[tokio::test]
+        async fn a_spent_token_without_its_nonce_retries_from_the_page() {
+            let db = memory_db().await;
+            let target = bound_target(&db).await;
+            let cli = TestClient::new(app(db.clone()).await);
+            let cookie = session_cookie(&cli.get("/seed").header("host", HOST).send().await);
+            let now = OffsetDateTime::now_utc();
+            let opened = open(&db, target, HOST, "/page?x=1", now).await.unwrap();
+            let token = mint(
+                &db,
+                &opened.challenge,
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                None,
+                now,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+            let resp = cli
+                .get(format!(
+                    "/@warpgate{REDEEM_PATH}?{HANDOFF_TOKEN_PARAM}={token}"
+                ))
+                .header("host", HOST)
+                .header("cookie", format!("{cookie}; {HANDOFF_COOKIE_NAME}=other"))
+                .send()
+                .await;
+            resp.assert_status(StatusCode::SEE_OTHER);
+            resp.assert_header("location", format!("https://{HOST}/page?x=1"));
+            assert!(clears_the_nonce(&resp));
+            assert!(!stored(&db, &cookie).await, "the session survived");
         }
     }
 }
