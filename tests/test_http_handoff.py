@@ -14,7 +14,7 @@ from uuid import uuid4
 import pytest
 import requests
 
-from tests.conftest import ProcessManager, WarpgateProcess
+from tests.conftest import SERVE_UNBOUND_HTTP_TARGETS, ProcessManager, WarpgateProcess
 
 from .api_client import admin_client, sdk
 from .test_http_common import *  # noqa
@@ -26,6 +26,8 @@ MAIN_HOST = "warpgate.handoff.test"
 SESSION_COOKIE = "__Host-warpgate-http-session"
 LEGACY_SESSION_COOKIE = "warpgate-http-session"
 HANDOFF_COOKIE = "__Host-warpgate-handoff"
+# What a refused redeem adds to the page it sends the browser back to.
+RETRY_MARKER = "warpgate-handoff-retry=1"
 # A top-level navigation, as a browser sends it.
 NAVIGATE = {"Accept": "text/html", "Sec-Fetch-Mode": "navigate"}
 # A background request: never sent through a handoff.
@@ -122,7 +124,17 @@ def handoff_wg(processes: ProcessManager):
 @pytest.fixture(scope="module")
 def default_wg(processes: ProcessManager):
     # The shipped default: a web target with no hostname is not served.
-    wg = processes.start_wg(config_patch={"http": {"serve_unbound_http_targets": False}})
+    wg = processes.start_wg()
+    wait_port(wg.http_port, for_process=wg.process, recv=False)
+    yield wg
+
+
+@pytest.fixture(scope="module")
+def unbound_wg(processes: ProcessManager):
+    # `http.serve_unbound_http_targets` switched on.
+    wg = processes.start_wg(
+        config_patch={"external_host": MAIN_HOST, **SERVE_UNBOUND_HTTP_TARGETS}
+    )
     wait_port(wg.http_port, for_process=wg.process, recv=False)
     yield wg
 
@@ -206,12 +218,20 @@ def setup(echo_server_port, handoff_wg: WarpgateProcess):
         yield setup
 
 
-def _redeem_refused(response):
-    assert response.status_code == 403, response.text
+def _redeem_refused(response, bound_url, page="/", spent=True):
+    """A refused redeem sends the browser back to `page` on `bound_url` to
+    retry once, marked as a retry. One that spent a handoff (the token was
+    real) also clears the nonce cookie; one that spent nothing changes
+    nothing in the browser."""
+    assert response.status_code == 303, response.text
+    separator = "&" if "?" in page else "?"
+    assert response.headers["location"] == f"{bound_url}{page}{separator}{RETRY_MARKER}"
+    assert response.headers["referrer-policy"] == "no-referrer"
     removals = response.raw.headers.getlist("Set-Cookie")
-    assert any(
+    cleared = any(
         c.startswith(f"{HANDOFF_COOKIE}=;") and "Max-Age=0" in c for c in removals
-    ), removals
+    )
+    assert cleared == spent, removals
 
 
 class Test:
@@ -255,7 +275,7 @@ class Test:
 
         # The same token again, even with the right nonce, gets nothing.
         response = _bare(redeem, f"{HANDOFF_COOKIE}={nonce}", NAVIGATE)
-        _redeem_refused(response)
+        _redeem_refused(response, setup.a_url, spent=False)
         assert SESSION_COOKIE not in response.cookies
 
         # The browser that redeemed it first keeps its session.
@@ -271,12 +291,16 @@ class Test:
         response = browser.get(
             _on_host(redeem_a, setup.b_url), headers=NAVIGATE, allow_redirects=False
         )
-        _redeem_refused(response)
+        _redeem_refused(response, setup.b_url)
         response = browser.get(f"{setup.b_url}/page", headers=FETCH, allow_redirects=False)
         assert response.status_code == 401, response.text
 
         # The token is gone after the refusal: not even its own host takes it.
-        _redeem_refused(browser.get(redeem_a, headers=NAVIGATE, allow_redirects=False))
+        _redeem_refused(
+            browser.get(redeem_a, headers=NAVIGATE, allow_redirects=False),
+            setup.a_url,
+            spent=False,
+        )
         response = browser.get(f"{setup.a_url}/page", headers=FETCH, allow_redirects=False)
         assert response.status_code == 401, response.text
 
@@ -284,10 +308,14 @@ class Test:
         browser, _ = setup.signed_in()
         redeem = setup.start(browser, setup.open(browser, setup.a_url), setup.a_url)
 
-        _redeem_refused(_bare(redeem, None, NAVIGATE))
+        _redeem_refused(_bare(redeem, None, NAVIGATE), setup.a_url, "/page")
 
         # Refused once, refused for good.
-        _redeem_refused(browser.get(redeem, headers=NAVIGATE, allow_redirects=False))
+        _redeem_refused(
+            browser.get(redeem, headers=NAVIGATE, allow_redirects=False),
+            setup.a_url,
+            spent=False,
+        )
         response = browser.get(f"{setup.a_url}/page", headers=FETCH, allow_redirects=False)
         assert response.status_code == 401, response.text
 
@@ -301,14 +329,18 @@ class Test:
         victim, _ = setup.signed_in()
         setup.open(victim, setup.a_url)
         redeem = setup.start(victim, start, setup.a_url)
-        _redeem_refused(victim.get(redeem, headers=NAVIGATE, allow_redirects=False))
+        _redeem_refused(
+            victim.get(redeem, headers=NAVIGATE, allow_redirects=False),
+            setup.a_url,
+            "/page",
+        )
         response = victim.get(f"{setup.a_url}/page", headers=FETCH, allow_redirects=False)
         assert response.status_code == 401, response.text
 
         # Nor does the token minted for the victim work in the browser that
         # started the handoff.
         response = _bare(redeem, f"{HANDOFF_COOKIE}={other_nonce}", NAVIGATE)
-        _redeem_refused(response)
+        _redeem_refused(response, setup.a_url, spent=False)
         assert SESSION_COOKIE not in response.cookies
 
     def test_logout_on_a_host_ends_that_host_only(self, setup):
@@ -442,10 +474,9 @@ class TestUnboundTargets:
         )
 
     def test_a_target_with_no_hostname_is_served_when_switched_on(
-        self, echo_server_port, handoff_wg: WarpgateProcess
+        self, echo_server_port, unbound_wg: WarpgateProcess
     ):
-        # The test suite's gateways switch it on (see `start_wg`).
-        url = f"https://{MAIN_HOST}:{handoff_wg.http_port}"
+        url = f"https://{MAIN_HOST}:{unbound_wg.http_port}"
         with _resolve_hosts_to_localhost(MAIN_HOST):
             session, target, _ = self._unbound(url, echo_server_port)
             response = session.get(

@@ -5,7 +5,7 @@ import pyotp
 import requests
 
 from .api_client import admin_client, sdk
-from .conftest import ProcessManager
+from .conftest import SERVE_UNBOUND_HTTP_TARGETS, ProcessManager
 from .test_http_common import echo_server_port  # noqa: F401
 from .util import wait_port
 
@@ -24,7 +24,7 @@ class Test:
         # the shared sessions table (keyed by the browser session id) and
         # forward the OTP submission to A. Without that forwarding the login
         # thrashes and MFA is impossible behind a non-sticky load balancer.
-        node_a = processes.start_wg()
+        node_a = processes.start_wg(config_patch=SERVE_UNBOUND_HTTP_TARGETS)
         wait_port(node_a.http_port, recv=False)
         node_b = processes.start_wg(share_with=node_a)
         wait_port(node_b.http_port, recv=False)

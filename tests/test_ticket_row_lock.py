@@ -30,7 +30,7 @@ import pytest
 import requests
 
 from .api_client import admin_client, sdk
-from .conftest import ProcessManager
+from .conftest import SERVE_UNBOUND_HTTP_TARGETS, ProcessManager
 from .test_http_common import echo_server_port  # noqa
 from .util import own_database_url, read_until, wait_mysql_port, wait_port
 
@@ -125,7 +125,7 @@ def db_wg(request, processes: ProcessManager):
         port = processes.start_mysql_server()
         wait_mysql_port(port)
     url = own_database_url(kind, port)
-    wg = processes.start_wg(database_url=url)
+    wg = processes.start_wg(database_url=url, config_patch=SERVE_UNBOUND_HTTP_TARGETS)
     wait_port(wg.http_port, for_process=wg.process, recv=False)
     yield kind, url, wg
 

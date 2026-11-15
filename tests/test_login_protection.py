@@ -6,7 +6,7 @@ import subprocess
 import time
 
 from .api_client import admin_client, sdk
-from .conftest import ProcessManager, WarpgateProcess
+from .conftest import SERVE_UNBOUND_HTTP_TARGETS, ProcessManager, WarpgateProcess
 from .test_api import make_limited_admin_role_payload
 from .util import (
     mysql_client_opts,
@@ -66,6 +66,7 @@ def _lp_wg(
     auto_unlock=True,
     unlock_min=2,
     ip_base_min=2,
+    config_patch=None,
 ):
     """Start a dedicated warpgate instance with specific LP thresholds.
 
@@ -75,7 +76,7 @@ def _lp_wg(
     reads Parameters::Entity::get() on every auth call (hot-reload), the new
     values are effective immediately with zero restart.
     """
-    wg = processes.start_wg()
+    wg = processes.start_wg(config_patch=config_patch)
     wait_port(wg.http_port, for_process=wg.process, recv=False)
 
     url = f"https://localhost:{wg.http_port}"
@@ -206,7 +207,10 @@ class TestLoginProtection:
         self, processes: ProcessManager, echo_server_port, timeout
     ):
         """Presenting a ticket is still a login, so a blocked IP can't spend a valid one."""
-        wg = _lp_wg(processes, ip_max=3, user_max=100)
+        # The ticket's echo target has no hostname of its own.
+        wg = _lp_wg(
+            processes, ip_max=3, user_max=100, config_patch=SERVE_UNBOUND_HTTP_TARGETS
+        )
         url = f"https://localhost:{wg.http_port}"
 
         with admin_client(url) as api:
