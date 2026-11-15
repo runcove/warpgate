@@ -120,7 +120,7 @@ def _session_cookie_domains(session):
     domains = set()
     for domain, paths in session.cookies._cookies.items():
         for cookies_by_name in paths.values():
-            if "warpgate-http-session" in cookies_by_name:
+            if "__Host-warpgate-http-session" in cookies_by_name:
                 domains.add(domain)
     return domains
 

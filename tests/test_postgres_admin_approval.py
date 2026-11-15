@@ -219,7 +219,7 @@ class Test:
                     ssl=False,
                     allow_redirects=False,
                 )
-                assert "warpgate-http-session" in ticket_session.cookie_jar.filter_cookies(
+                assert "__Host-warpgate-http-session" in ticket_session.cookie_jar.filter_cookies(
                     yarl.URL(url)
                 ), "the ticket should have authorized a session to act on"
                 read = await ticket_session.get(

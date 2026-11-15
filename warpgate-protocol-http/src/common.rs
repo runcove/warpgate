@@ -58,9 +58,10 @@ pub static SESSION_COOKIE_NAME: &str = "warpgate-http-session";
 /// The session cookie's name in the browser on a plain-HTTP loopback listener
 /// (`http.plain_http_on_loopback`); see `LoopbackSessionCookieMiddleware`.
 pub static LOOPBACK_SESSION_COOKIE_NAME: &str = "warpgate-loopback-session";
-/// The session cookie's `__Host-` name (not yet issued).
+/// The session cookie's name in the browser on a TLS listener; see
+/// `CookieGateMiddleware`.
 pub static HOST_SESSION_COOKIE_NAME: &str = "__Host-warpgate-http-session";
-/// The target-host handoff cookie (not yet issued).
+/// The nonce of a target-host handoff (`crate::handoff`).
 pub static HANDOFF_COOKIE_NAME: &str = "__Host-warpgate-handoff";
 
 /// Every cookie name Warpgate owns. A target never sees one of these in a
@@ -86,7 +87,9 @@ pub static WARPGATE_COOKIE_NAMES: [&str; 4] = [
 /// already spent. The cookie is `SameSite=Lax` instead: it is sent on a
 /// top-level navigation from another site and across the base domain and its
 /// subdomains (one site), but not on a form POST or a background request from
-/// another site's page. `CookieHostMiddleware` stamps `Lax` again on HTTPS.
+/// another site's page. In the browser it is the host-only
+/// `__Host-warpgate-http-session` (`CookieGateMiddleware`), so it is sent to
+/// the host that set it only.
 /// The one flow this costs is an SSO provider that posts its response back
 /// (`response_mode=form_post`, Apple): that POST arrives without the session,
 /// so the handshake bound to it is not found and sign-in fails;

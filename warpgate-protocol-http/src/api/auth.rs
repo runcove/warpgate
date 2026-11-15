@@ -936,7 +936,7 @@ mod tests {
 
     /// A node's session middleware over the shared table, with the session
     /// cookie config production uses. Production also gives the cookie a max
-    /// age and its host attributes (`CookieHostMiddleware`), which these tests
+    /// age and its host attributes (`CookieGateMiddleware`), which these tests
     /// neither add nor assert: they compare cookie values only.
     fn node(routes: Route, storage: SharedSessionStorage) -> impl Endpoint {
         routes.data(storage.clone()).with(ServerSession::new(

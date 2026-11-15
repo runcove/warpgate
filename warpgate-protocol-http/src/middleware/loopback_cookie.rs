@@ -11,7 +11,7 @@ pub const LOOPBACK_SESSION_COOKIE_MAX_AGE_CAP: Duration = Duration::from_hours(1
 
 /// The session cookie on a plain-HTTP loopback listener
 /// (`http.plain_http_on_loopback`), installed outside `ServerSession` and
-/// `CookieHostMiddleware`.
+/// and inside `CookieGateMiddleware`.
 ///
 /// Inside, Warpgate reads and writes the session under [`SESSION_COOKIE_NAME`]
 /// as everywhere else (the API's cookie security schemes name it too). The
@@ -173,8 +173,8 @@ mod tests {
             .to_owned()
     }
 
-    /// The session wiring of `lib.rs`, without `CookieHostMiddleware` (it
-    /// needs a `Services`); the loopback middleware sits outside it there too.
+    /// The session wiring of `lib.rs`, without `CookieGateMiddleware` (it
+    /// needs a `Services`), which sits outside the loopback middleware there.
     fn app(loopback: bool, max_age: Duration) -> impl Endpoint {
         Route::new()
             .at("/login", get(login))
