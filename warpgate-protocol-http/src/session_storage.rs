@@ -402,7 +402,9 @@ impl SessionStorage for SharedSessionStorage {
         let entries: BTreeMap<String, Value> =
             serde_json::from_str(&model.data).map_err(InternalServerError)?;
         if entries.contains_key(crate::common::BOUND_AUTH_SESSION_KEY)
-            && !self.login_is_open(Self::user_session_id_of(&entries)).await?
+            && !self
+                .login_is_open(Self::user_session_id_of(&entries))
+                .await?
         {
             // A target-host session counts only while the sign-in it was
             // handed off from is open; once that ends it loads as nothing,

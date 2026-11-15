@@ -1100,7 +1100,9 @@ mod tests {
         let target = Uuid::new_v4();
         let mut kept = vec![];
         for _ in 0..3 {
-            let opened = open_below(&db, total(3), target, HOST, "/", at(0)).await.unwrap();
+            let opened = open_below(&db, total(3), target, HOST, "/", at(0))
+                .await
+                .unwrap();
             kept.push(opened.expect("below the ceiling").challenge);
         }
         assert!(
@@ -1439,7 +1441,10 @@ mod tests {
                 format!("https://{HOST}/page?x=1&{HANDOFF_RETRY_PARAM}=1"),
             );
             assert!(clears_the_nonce(&resp));
-            assert!(stored(&db, &cookie).await, "the browser session was dropped");
+            assert!(
+                stored(&db, &cookie).await,
+                "the browser session was dropped"
+            );
 
             // Spent: with its own nonce it is now an unknown token.
             let resp = cli
@@ -1452,9 +1457,15 @@ mod tests {
                 .send()
                 .await;
             resp.assert_status(StatusCode::SEE_OTHER);
-            resp.assert_header("location", format!("https://{HOST}/?{HANDOFF_RETRY_PARAM}=1"));
+            resp.assert_header(
+                "location",
+                format!("https://{HOST}/?{HANDOFF_RETRY_PARAM}=1"),
+            );
             assert!(!clears_the_nonce(&resp));
-            assert!(stored(&db, &cookie).await, "the browser session was dropped");
+            assert!(
+                stored(&db, &cookie).await,
+                "the browser session was dropped"
+            );
         }
 
         /// A browser already signed in here for this target, sent here with
@@ -1483,7 +1494,10 @@ mod tests {
                 .await;
             resp.assert_status(StatusCode::SEE_OTHER);
             resp.assert_header("location", format!("https://{HOST}/page?x=1"));
-            assert!(stored(&db, &cookie).await, "the browser session was dropped");
+            assert!(
+                stored(&db, &cookie).await,
+                "the browser session was dropped"
+            );
         }
 
         /// Mints a token for a handoff opened for `next`.
@@ -1949,8 +1963,7 @@ mod tests {
                 let node_b = TestClient::new(app(db.clone()).await);
                 let (control, _, _) = signed_in(&node_a, &db, first, user, 10).await;
                 let on_first = hand_off(&node_a, &db, &control, user, first, HOST).await;
-                let on_second =
-                    hand_off(&node_b, &db, &control, user, second, OTHER_HOST).await;
+                let on_second = hand_off(&node_b, &db, &control, user, second, OTHER_HOST).await;
                 assert_eq!(page_on(&node_a, HOST, &on_first).await, "auth");
                 assert_eq!(page_on(&node_b, OTHER_HOST, &on_second).await, "auth");
 
@@ -1964,7 +1977,10 @@ mod tests {
 
                 assert_eq!(page_on(&node_a, HOST, &on_first).await, "anon");
                 assert_eq!(page_on(&node_b, OTHER_HOST, &on_second).await, "anon");
-                assert!(!stored(&db, &on_first).await, "the first host's session is stored");
+                assert!(
+                    !stored(&db, &on_first).await,
+                    "the first host's session is stored"
+                );
                 assert!(
                     !stored(&db, &on_second).await,
                     "the second host's session is stored"
