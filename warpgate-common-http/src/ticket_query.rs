@@ -9,6 +9,22 @@ use url::form_urlencoded;
 /// protocol's handoff). Kept out of the same places as a ticket.
 pub const HANDOFF_QUERY_PARAM: &str = "warpgate-handoff";
 
+/// The control plane's handoff start, which takes the challenge in
+/// [`HANDOFF_CHALLENGE_QUERY_PARAM`].
+pub const HANDOFF_START_PATH: &str = "/@warpgate/handoff/start";
+/// The query parameter the handoff challenge travels in to
+/// [`HANDOFF_START_PATH`]. Elsewhere a parameter of that name is an
+/// application's own.
+pub const HANDOFF_CHALLENGE_QUERY_PARAM: &str = "challenge";
+
+/// Whether a decoded query key of a request to `path` carries a secret to
+/// keep out of logs: a credential ([`is_credential_query_key`]) anywhere,
+/// and the handoff challenge on [`HANDOFF_START_PATH`].
+pub fn is_secret_query_key(path: &str, key: &str) -> bool {
+    is_credential_query_key(key)
+        || (key == HANDOFF_CHALLENGE_QUERY_PARAM && path == HANDOFF_START_PATH)
+}
+
 /// Whether a decoded query key carries a credential that must not leave
 /// Warpgate: `warpgate-ticket` (the parameter `TicketMiddleware` reads a
 /// ticket from) or [`HANDOFF_QUERY_PARAM`].
