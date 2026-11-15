@@ -27,26 +27,48 @@
 //! no-referrer`, and the request log and the proxy never see the token
 //! ([`HANDOFF_TOKEN_PARAM`] is scrubbed like the ticket parameter).
 
+use std::sync::Arc;
 use std::time::Duration;
 
-use sea_orm::{ConnectionTrait, TransactionTrait};
+use http::StatusCode;
+use poem::error::NotFoundError;
+use poem::session::Session;
+use poem::web::Data;
+use poem::web::cookie::CookieJar;
+use poem::{FromRequest, Request, Response};
+use sea_orm::{ConnectionTrait, EntityTrait, TransactionTrait};
 use time::OffsetDateTime;
+use tokio::sync::Mutex;
 use uuid::Uuid;
-use warpgate_common::WarpgateError;
 use warpgate_common::helpers::hash::{generate_ticket_secret, hash_secret};
 use warpgate_common::same_binding_hostname;
+use warpgate_common::{UserSessionId, WarpgateError};
+use warpgate_common_http::auth::{
+    AuthenticatedRequestContext, RequestAuthorization, SessionAuthorization,
+    UnauthenticatedRequestContext,
+};
+use warpgate_common_http::ext::is_navigation_request;
+use warpgate_core::ConfigProvider;
+use warpgate_core::authorize_for_target;
+use warpgate_core::live_streams::host_binding;
 use warpgate_db_entities::HttpHandoff;
 
-pub use crate::common::HANDOFF_COOKIE_NAME;
+use crate::catchall::{bound_to_host, get_target_by_request_host};
+use crate::common::{
+    BoundSessionAuthorization, GatewayPages, HANDOFF_COOKIE_NAME, SessionExt, SessionRotation,
+    bound_host_return_url, gateway_pages_for, gateway_redirect,
+};
+use crate::middleware::target_bound_to_request_host;
+use crate::session::{SESSION_ID_SESSION_KEY, SessionStore};
 
 /// The control plane's mint route, under `/@warpgate`.
-pub const START_PATH: &str = "/api/handoff/start";
+pub const START_PATH: &str = "/handoff/start";
 /// The bound host's redeem route, under `/@warpgate`.
-pub const REDEEM_PATH: &str = "/api/handoff";
+pub const REDEEM_PATH: &str = "/handoff";
 /// The query parameter carrying the challenge to [`START_PATH`].
 pub const HANDOFF_CHALLENGE_PARAM: &str = "challenge";
 /// The query parameter carrying the token to [`REDEEM_PATH`].
-pub const HANDOFF_TOKEN_PARAM: &str = "warpgate-handoff";
+pub const HANDOFF_TOKEN_PARAM: &str = warpgate_common_http::ticket_query::HANDOFF_QUERY_PARAM;
 
 /// How long an opened handoff waits for the control plane. A sign-in there
 /// that takes longer leaves the browser on a refusal; opening the page again
@@ -189,6 +211,211 @@ pub async fn purge_expired<C: ConnectionTrait>(
     now: OffsetDateTime,
 ) -> Result<u64, WarpgateError> {
     HttpHandoff::purge_expired(db, now).await
+}
+
+/// The control plane's [`START_PATH`]: mints a token for the challenge in the
+/// query and sends the browser back to the bound host's [`REDEEM_PATH`].
+///
+/// Only a top-level navigation signed in by session (not a ticket or token)
+/// gets a token, and only for an opened handoff whose target is still bound
+/// to the handoff's hostname and which the user may use. A browser not
+/// signed in is sent to sign in, then back here.
+#[poem::handler]
+pub async fn start_endpoint(req: &Request, session: &Session) -> poem::Result<Response> {
+    let ctx = Data::<&UnauthenticatedRequestContext>::from_request_without_body(req).await?;
+    if !matches!(gateway_pages_for(req).await, GatewayPages::Here) {
+        return Err(NotFoundError.into());
+    }
+    if !is_navigation_request(req) {
+        return Ok(refusal(StatusCode::FORBIDDEN));
+    }
+    let Some(challenge) = query_value(req, HANDOFF_CHALLENGE_PARAM) else {
+        return Ok(refusal(StatusCode::BAD_REQUEST));
+    };
+    let signed_in = req
+        .data::<AuthenticatedRequestContext>()
+        .and_then(|actx| match &actx.auth {
+            RequestAuthorization::Session(SessionAuthorization::User { user_id, .. }) => {
+                actx.auth.as_full_user().map(|full| (*user_id, full))
+            }
+            _ => None,
+        });
+    let Some((user_id, full)) = signed_in else {
+        if req.data::<AuthenticatedRequestContext>().is_some() {
+            // A ticket, an API token or a cluster peer: never a handoff.
+            return Ok(refusal(StatusCode::FORBIDDEN));
+        }
+        return Ok(gateway_redirect(req));
+    };
+    let Some(user_session_id) = session.get_session_id() else {
+        return Ok(refusal(StatusCode::FORBIDDEN));
+    };
+    let services = ctx.services();
+    let now = OffsetDateTime::now_utc();
+    let Some(row) = opened(&services.db, &challenge, now).await? else {
+        return Ok(refusal(StatusCode::FORBIDDEN));
+    };
+    let target = get_target_by_request_host(services, &row.hostname)
+        .await?
+        .filter(|target| target.id == row.target_id && bound_to_host(target, &row.hostname));
+    let Some(target) = target else {
+        return Err(NotFoundError.into());
+    };
+    let identity = full.identity(crate::common::PROTOCOL_NAME);
+    if authorize_for_target(&*services.config_provider, &identity, target)
+        .await?
+        .is_none()
+    {
+        return Err(NotFoundError.into());
+    }
+    let Some(token) = mint(&services.db, &challenge, user_id, user_session_id.0, now).await? else {
+        return Ok(refusal(StatusCode::FORBIDDEN));
+    };
+    let mut redeem = url::form_urlencoded::Serializer::new(format!("/@warpgate{REDEEM_PATH}?"));
+    redeem.append_pair(HANDOFF_TOKEN_PARAM, &token);
+    let Some(location) = bound_host_return_url("https", &row.hostname, &redeem.finish()) else {
+        return Err(NotFoundError.into());
+    };
+    Ok(see_other(&location).finish())
+}
+
+/// The bound host's [`REDEEM_PATH`]: turns the token in the query into a
+/// session that counts on this host for its target only
+/// ([`crate::common::BoundSessionAuthorization`]), then sends the browser to
+/// the page it started from. The nonce cookie is cleared whatever happens;
+/// any refusal is a 403 with the browser session purged.
+#[poem::handler]
+pub async fn redeem_endpoint(req: &Request, session: &Session) -> poem::Result<Response> {
+    let ctx = Data::<&UnauthenticatedRequestContext>::from_request_without_body(req).await?;
+    let target = target_bound_to_request_host(&ctx, req).await?;
+    let Some((target, binding)) =
+        target.and_then(|target| host_binding(&target.options).map(|binding| (target, binding)))
+    else {
+        return Err(NotFoundError.into());
+    };
+    let nonce = <&CookieJar>::from_request_without_body(req)
+        .await?
+        .get(HANDOFF_COOKIE_NAME)
+        .map(|cookie| cookie.value_str().to_owned());
+    let redeemed = match query_value(req, HANDOFF_TOKEN_PARAM) {
+        Some(token) => {
+            let services = ctx.services();
+            redeem(
+                &services.db,
+                &token,
+                target.id,
+                &binding,
+                nonce.as_deref(),
+                OffsetDateTime::now_utc(),
+            )
+            .await?
+            .map_err(|refusal| format!("{refusal:?}"))
+        }
+        None => Err("NoToken".to_owned()),
+    };
+    let outcome = match redeemed {
+        Ok(redeemed) => complete_redeem(req, &ctx, session, &target, &binding, redeemed).await,
+        Err(refusal) => Err(refusal),
+    };
+    let mut response = match outcome {
+        Ok(response) => response,
+        Err(reason) => {
+            tracing::warn!(target = %target.name, %reason, "Refused a target-host handoff");
+            session.purge();
+            refusal(StatusCode::FORBIDDEN)
+        }
+    };
+    response.headers_mut().append(
+        http::header::SET_COOKIE,
+        http::HeaderValue::from_str(&format!(
+            "{HANDOFF_COOKIE_NAME}=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0"
+        ))
+        .map_err(poem::error::InternalServerError)?,
+    );
+    Ok(response)
+}
+
+/// The checks and the session change after [`redeem`] accepted a token.
+async fn complete_redeem(
+    req: &Request,
+    ctx: &UnauthenticatedRequestContext,
+    session: &Session,
+    target: &warpgate_common::Target,
+    binding: &str,
+    redeemed: Redeemed,
+) -> Result<Response, String> {
+    let services = ctx.services();
+    let user = warpgate_db_entities::User::Entity::find_by_id(redeemed.user_id)
+        .one(&services.db)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or("UnknownUser")?;
+    // A fresh browser session id, carrying nothing from before.
+    session.clear();
+    if let Some(rotation) = SessionRotation::for_request(req)
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        rotation
+            .apply(session)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    session.set(
+        SESSION_ID_SESSION_KEY,
+        UserSessionId(redeemed.user_session_id),
+    );
+    session.set_bound_auth(BoundSessionAuthorization {
+        user_id: user.id,
+        username: user.username,
+        target_id: target.id,
+        hostname: binding.to_owned(),
+    });
+    // The user session must still be open, an HTTP one, and this user's.
+    let store = Data::<&Arc<Mutex<SessionStore>>>::from_request_without_body(req)
+        .await
+        .map_err(|error| error.to_string())?;
+    store
+        .lock()
+        .await
+        .handle_for_request(req, ctx)
+        .await
+        .map_err(|_| "UserSessionGone")?;
+    if !services
+        .config_provider
+        .authorize_target_by_id(redeemed.user_id, target.id)
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        return Err("TargetAccess".to_owned());
+    }
+    let location = bound_host_return_url("https", binding, &redeemed.next).ok_or("BadNext")?;
+    Ok(see_other(&location).finish())
+}
+
+/// The first value of the query parameter `name`.
+fn query_value(req: &Request, name: &str) -> Option<String> {
+    url::form_urlencoded::parse(req.uri().query()?.as_bytes())
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value.into_owned())
+        .filter(|value| !value.is_empty())
+}
+
+/// A 303 to `location` that leaks neither the address it came from nor a
+/// cached copy of itself.
+fn see_other(location: &str) -> poem::ResponseBuilder {
+    Response::builder()
+        .status(StatusCode::SEE_OTHER)
+        .header(http::header::LOCATION, location)
+        .header(http::header::REFERRER_POLICY, "no-referrer")
+        .header(http::header::CACHE_CONTROL, "no-store")
+}
+
+fn refusal(status: StatusCode) -> Response {
+    Response::builder()
+        .status(status)
+        .header(http::header::CACHE_CONTROL, "no-store")
+        .finish()
 }
 
 #[cfg(test)]

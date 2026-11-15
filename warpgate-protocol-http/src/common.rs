@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use anyhow::Context;
-use http::StatusCode;
+use http::{Method, StatusCode};
 use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use poem::error::InternalServerError;
 use poem::session::{CookieConfig, Session};
@@ -54,6 +54,10 @@ pub const PROTOCOL_NAME: Protocol = Protocol::Http;
 static TARGET_SESSION_KEY: &str = "target_name";
 static AUTH_SESSION_KEY: &str = "auth";
 static AUTH_SSO_LOGIN_STATE: &str = "auth_sso_login_state";
+/// A target-host session's authorization ([`BoundSessionAuthorization`]).
+/// Kept apart from [`AUTH_SESSION_KEY`] so that no code reading that key,
+/// an older release's included, takes it for a sign-in that counts anywhere.
+static BOUND_AUTH_SESSION_KEY: &str = "cove_bound_auth";
 pub static SESSION_COOKIE_NAME: &str = "warpgate-http-session";
 /// The session cookie's name in the browser on a plain-HTTP loopback listener
 /// (`http.plain_http_on_loopback`); see `LoopbackSessionCookieMiddleware`.
@@ -308,7 +312,52 @@ impl SsoLoginState {
     }
 }
 
+/// A browser session on a host bound to an HTTP target, given by a handoff
+/// from the control plane (`crate::handoff`). It counts only for requests to
+/// that target on that host ([`BoundSessionAuthorization::counts_on`]), and it
+/// shares the user session of the control-plane sign-in it came from, so
+/// signing out there ends it too.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BoundSessionAuthorization {
+    pub user_id: Uuid,
+    pub username: String,
+    pub target_id: Uuid,
+    pub hostname: String,
+}
+
+impl BoundSessionAuthorization {
+    /// Whether this session counts for a request whose host is bound to
+    /// `bound` (`(target id, binding)`, `None` for a host that is not bound),
+    /// on `path`: a request proxied to its own target on its own host, or the
+    /// host-local sign-out. Never on Warpgate's other routes, and never on
+    /// another host.
+    pub fn counts_on(&self, bound: Option<(Uuid, &str)>, method: &Method, path: &str) -> bool {
+        let Some((target_id, binding)) = bound else {
+            return false;
+        };
+        if target_id != self.target_id
+            || !warpgate_common::same_binding_hostname(binding, &self.hostname)
+        {
+            return false;
+        }
+        match warpgate_surface_path(path) {
+            None => true,
+            Some(path) => path == "/api/auth/logout" && method == Method::POST,
+        }
+    }
+
+    pub fn as_session_authorization(&self) -> SessionAuthorization {
+        SessionAuthorization::User {
+            user_id: self.user_id,
+            username: self.username.clone(),
+        }
+    }
+}
+
 pub trait SessionExt {
+    /// The target-host session's authorization, if this is one.
+    fn get_bound_auth(&self) -> Option<BoundSessionAuthorization>;
+    fn set_bound_auth(&self, auth: BoundSessionAuthorization);
     fn get_target_name(&self) -> Option<String>;
     fn set_target_name(&self, target_name: String);
     fn get_auth(&self) -> Option<SessionAuthorization>;
@@ -323,6 +372,14 @@ pub trait SessionExt {
 }
 
 impl SessionExt for Session {
+    fn get_bound_auth(&self) -> Option<BoundSessionAuthorization> {
+        self.get(BOUND_AUTH_SESSION_KEY)
+    }
+
+    fn set_bound_auth(&self, auth: BoundSessionAuthorization) {
+        self.set(BOUND_AUTH_SESSION_KEY, auth);
+    }
+
     fn get_target_name(&self) -> Option<String> {
         self.get(TARGET_SESSION_KEY)
     }
@@ -562,6 +619,10 @@ async fn try_auto_sso_redirect(req: &Request) -> poem::Result<Option<Response>> 
     // Cheap gates first — avoid the DB read + config lock unless the request
     // could actually be redirected.
     if !is_navigation || has_password_bypass || is_management_path {
+        return Ok(None);
+    }
+    // A bound host signs no one in: its visitors get a handoff instead.
+    if !matches!(gateway_pages_for(req).await, GatewayPages::Here) {
         return Ok(None);
     }
 
@@ -825,25 +886,23 @@ pub fn gateway_redirect(req: &Request) -> Response {
 }
 
 /// Where an unauthenticated navigation goes to sign in. A host bound to an
-/// HTTP target serves no login page (`is_served_on_bound_host`), so there the
-/// browser is sent to the control-plane host's login page
-/// ([`bound_host_login_location`]); elsewhere it is [`gateway_redirect`]. If
-/// the host's binding cannot be resolved, or no control-plane host is
-/// configured, there is no login page to send it to and it gets a plain 401.
+/// HTTP target serves no login page (`is_served_on_bound_host`) and honours no
+/// control-plane session, so there the browser starts a handoff
+/// ([`handoff_redirect`]), which signs it in on the control-plane host if it
+/// is not already; elsewhere it is [`gateway_redirect`]. If the host's binding
+/// cannot be resolved, no control-plane host is configured, or the request
+/// is not an HTTPS navigation, it gets a plain 401.
 pub(crate) async fn login_redirect(req: &Request) -> Response {
     match gateway_pages_for(req).await {
         GatewayPages::Here => gateway_redirect(req),
         GatewayPages::ControlPlane {
             control_plane,
             binding,
-        } => {
-            let path = next_after_login(req).unwrap_or_default();
-            redirect_navigations(
-                req,
-                bound_host_login_location(&control_plane, &binding, &path),
-                StatusCode::UNAUTHORIZED,
-            )
-        }
+            target_id,
+        } => match handoff_redirect(req, &control_plane, target_id, &binding).await {
+            Some(response) => response,
+            None => StatusCode::UNAUTHORIZED.into_response(),
+        },
         GatewayPages::Unavailable => StatusCode::UNAUTHORIZED.into_response(),
     }
 }
@@ -859,6 +918,7 @@ pub(crate) enum GatewayPages {
     ControlPlane {
         control_plane: url::Url,
         binding: String,
+        target_id: Uuid,
     },
     /// The host is, or may be, bound, and there is nowhere to send the
     /// browser: the lookup failed or no control-plane host is configured.
@@ -885,6 +945,7 @@ pub(crate) async fn gateway_pages_for(req: &Request) -> GatewayPages {
         (Ok(control_plane), Some(binding)) => GatewayPages::ControlPlane {
             control_plane,
             binding,
+            target_id: target.id,
         },
         _ => {
             tracing::warn!(target = %target.name, "No control-plane host is configured to send a browser on a bound host to");
@@ -893,25 +954,53 @@ pub(crate) async fn gateway_pages_for(req: &Request) -> GatewayPages {
     }
 }
 
-/// The control-plane login page for a visitor to the host a target is bound
-/// to (`binding`, the target's stored `external_host`), with `next` the
-/// absolute address of `path` on that host ([`bound_host_return_url`]). Both
-/// origins come from configuration and the target row, never from the
-/// request's Host. A `path` that would not stay on the bound host is dropped.
-pub(crate) fn bound_host_login_location(
+/// Starts a handoff for an unauthenticated navigation on the host bound to
+/// `target_id` at `binding` (`crate::handoff`): records it, gives the browser
+/// the nonce cookie, and sends it to the control plane's handoff start. The
+/// page to return to is this request's path on this host. `None` for a
+/// request that is not a navigation, not over HTTPS (the nonce cookie is a
+/// `__Host-` cookie), or when the handoff cannot be recorded.
+async fn handoff_redirect(
+    req: &Request,
     control_plane: &url::Url,
+    target_id: Uuid,
     binding: &str,
-    path: &str,
-) -> String {
-    let mut location = format!(
-        "{}/@warpgate#/login",
-        control_plane.origin().ascii_serialization()
-    );
-    if let Some(next) = bound_host_return_url(control_plane.scheme(), binding, path) {
-        location.push_str("?next=");
-        location.extend(utf8_percent_encode(&next, NON_ALPHANUMERIC));
+) -> Option<Response> {
+    let ctx = req.data::<UnauthenticatedRequestContext>()?;
+    if !is_navigation_request(req) || ctx.trusted_proto(req) != http::uri::Scheme::HTTPS {
+        return None;
     }
+    let next = next_after_login(req).filter(|next| next.starts_with('/'))?;
+    let opened = crate::handoff::open(
+        &ctx.services().db,
+        target_id,
+        binding,
+        &next,
+        OffsetDateTime::now_utc(),
+    )
+    .await
+    .inspect_err(|error| tracing::error!(%error, "Could not record a target-host handoff"))
+    .ok()?;
+    let mut location = control_plane.clone();
+    location.set_path(&format!("/@warpgate{}", crate::handoff::START_PATH));
+    location.set_query(None);
     location
+        .query_pairs_mut()
+        .append_pair(crate::handoff::HANDOFF_CHALLENGE_PARAM, &opened.challenge);
+    let nonce_cookie = format!(
+        "{HANDOFF_COOKIE_NAME}={}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age={}",
+        opened.nonce,
+        crate::handoff::OPEN_LIFETIME.as_secs()
+    );
+    Some(
+        Response::builder()
+            .status(StatusCode::SEE_OTHER)
+            .header(http::header::LOCATION, location.as_str())
+            .header(http::header::SET_COOKIE, nonce_cookie)
+            .header(http::header::REFERRER_POLICY, "no-referrer")
+            .header(http::header::CACHE_CONTROL, "no-store")
+            .finish(),
+    )
 }
 
 /// `path` on the host a target is bound to, as an absolute URL with the
@@ -1205,6 +1294,37 @@ pub async fn inject_request_authorization<E: Endpoint + 'static>(
     let is_cluster_peer = is_cluster_peer_request(&req);
 
     let mut session_auth = session.get_auth();
+    // A control-plane sign-in never counts on a host bound to a target, and a
+    // target-host session counts only for its own target on its own host
+    // (`BoundSessionAuthorization::counts_on`). If the host cannot be
+    // resolved, neither counts.
+    let bound_auth = session.get_bound_auth();
+    let signed_in = matches!(session_auth, Some(SessionAuthorization::User { .. }));
+    let mut bound_session_counts = false;
+    if (signed_in || bound_auth.is_some()) && !is_cluster_peer {
+        let host_target = target_bound_to_request_host(&ctx, &req).await;
+        if let Err(error) = &host_target {
+            tracing::warn!(%error, "Could not resolve the request host to a target; ignoring the session");
+        }
+        if signed_in && !matches!(host_target, Ok(None)) {
+            tracing::debug!("Control-plane session ignored on a host bound to a target");
+            session_auth = None;
+        }
+        if let (None, Some(bound)) = (&session_auth, &bound_auth) {
+            let target = host_target.ok().flatten();
+            let binding = target.as_ref().and_then(|t| host_binding(&t.options));
+            let here = target
+                .as_ref()
+                .zip(binding.as_deref())
+                .map(|(t, b)| (t.id, b));
+            if bound.counts_on(here, req.method(), req.uri().path()) {
+                session_auth = Some(bound.as_session_authorization());
+                bound_session_counts = true;
+            } else {
+                tracing::debug!("Target-host session ignored outside its own target and host");
+            }
+        }
+    }
     // On a host bound to an HTTP target, outside the login flow, neither the
     // session nor a token counts (see `credentials_refused_on_bound_host`).
     // Looked up only for a request that carries either.
@@ -1213,7 +1333,7 @@ pub async fn inject_request_authorization<E: Endpoint + 'static>(
         && credentials_refused_on_bound_host(&ctx, &req).await;
     // A forwarded request's Host is the cluster SNI name by construction, so the
     // origin check below would reject - and clear - a session that is fine.
-    if session_auth.is_some() && !is_cluster_peer {
+    if session_auth.is_some() && !is_cluster_peer && !bound_session_counts {
         // Host binding only means something when `external_host` pins an
         // origin. Without it the external URL is derived from Host header
         let (base_host, control_plane_host, accepted) = {
@@ -1433,21 +1553,60 @@ mod tests {
         }
     }
 
+    /// A target-host session counts for its own target on its own host
+    /// (port, case and a trailing dot aside), on proxied paths and the
+    /// host-local sign-out only.
     #[test]
-    fn bound_host_login_location_is_on_the_control_plane() {
-        use super::bound_host_login_location;
+    fn bound_session_counts_only_on_its_own_target_and_host() {
+        use http::Method;
 
-        let control_plane = url::Url::parse("https://admin.example.test:8443").unwrap();
-        assert_eq!(
-            bound_host_login_location(&control_plane, "vm.example.test:8443", "/app?a=1"),
-            "https://admin.example.test:8443/@warpgate#/login?next=\
-             https%3A%2F%2Fvm%2Eexample%2Etest%3A8443%2Fapp%3Fa%3D1"
-        );
-        // No `next` rather than one off the bound host.
-        assert_eq!(
-            bound_host_login_location(&control_plane, "vm.example.test", ".evil.example/"),
-            "https://admin.example.test:8443/@warpgate#/login"
-        );
+        use super::BoundSessionAuthorization;
+
+        let target_id = uuid::Uuid::new_v4();
+        let auth = BoundSessionAuthorization {
+            user_id: uuid::Uuid::new_v4(),
+            username: "alice".into(),
+            target_id,
+            hostname: "vm.example.test:8443".into(),
+        };
+        let here = Some((target_id, "vm.example.test:8443"));
+        for (bound, method, path, expected) in [
+            (here, Method::GET, "/", true),
+            (here, Method::POST, "/app/form", true),
+            (here, Method::DELETE, "/api/things/1", true),
+            (
+                Some((target_id, "VM.example.test.")),
+                Method::GET,
+                "/",
+                true,
+            ),
+            (here, Method::POST, "/@warpgate/api/auth/logout", true),
+            (here, Method::POST, "/_warpgate/api/auth/logout", true),
+            (here, Method::GET, "/@warpgate/api/auth/logout", false),
+            (here, Method::GET, "/@warpgate/api/info", false),
+            (here, Method::GET, "/@warpgate", false),
+            (here, Method::GET, "/@warpgate/admin/api/users", false),
+            (here, Method::POST, "/@warpgate/api/sso/logout", false),
+            (None, Method::GET, "/", false),
+            (
+                Some((uuid::Uuid::new_v4(), "vm.example.test:8443")),
+                Method::GET,
+                "/",
+                false,
+            ),
+            (
+                Some((target_id, "vm2.example.test:8443")),
+                Method::GET,
+                "/",
+                false,
+            ),
+        ] {
+            assert_eq!(
+                auth.counts_on(bound, &method, path),
+                expected,
+                "{bound:?} {method} {path}"
+            );
+        }
     }
 
     /// A ticket in the address of a request sent to the login page is not

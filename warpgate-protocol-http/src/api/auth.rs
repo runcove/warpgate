@@ -232,6 +232,12 @@ impl Api {
         ctx: Data<&UnauthenticatedRequestContext>,
         session_middleware: Data<&Arc<Mutex<SessionStore>>>,
     ) -> poem::Result<LogoutResponse> {
+        // A target-host session ends only itself: the user session it shares
+        // with the control-plane sign-in stays (see `crate::handoff`).
+        if session.get_auth().is_none() && session.get_bound_auth().is_some() {
+            session.purge();
+            return Ok(LogoutResponse::Success);
+        }
         if local_logout_disabled(session, &*ctx.services().config.lock().await) {
             return Ok(LogoutResponse::LocalLogoutDisabled);
         }

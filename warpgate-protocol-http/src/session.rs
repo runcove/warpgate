@@ -96,7 +96,7 @@ fn request_auth_user_id(session: &Session) -> Option<Uuid> {
     match session.get_auth() {
         Some(SessionAuthorization::User { user_id, .. })
         | Some(SessionAuthorization::Ticket { user_id, .. }) => Some(user_id),
-        None => None,
+        None => session.get_bound_auth().map(|auth| auth.user_id),
     }
 }
 

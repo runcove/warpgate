@@ -258,6 +258,11 @@ impl ProtocolServer for HTTPProtocolServer {
                         }),
                 )
                 .at("/api/logo", poem::get(api::logo::api_get_logo))
+                // The target-host handoff (`handoff`): minted on the control
+                // plane, redeemed on the bound host. Outside `/api`, which is
+                // the API service's.
+                .at(handoff::START_PATH, poem::get(handoff::start_endpoint))
+                .at(handoff::REDEEM_PATH, poem::get(handoff::redeem_endpoint))
                 // Liveness, from memory only; see health.rs.
                 .at("/api/health", health::health_endpoint)
                 .at(
@@ -384,6 +389,7 @@ impl ProtocolServer for HTTPProtocolServer {
             )
             .boxed();
 
+        let handoff_db = self.services.db.clone();
         tokio::spawn(async move {
             loop {
                 let live = {
@@ -400,6 +406,11 @@ impl ProtocolServer for HTTPProtocolServer {
                     warn!(%error, "Failed to expire stored HTTP sessions");
                 }
                 sso_request_store.vacuum().await;
+                if let Err(error) =
+                    handoff::purge_expired(&handoff_db, time::OffsetDateTime::now_utc()).await
+                {
+                    warn!(%error, "Failed to purge expired target-host handoffs");
+                }
                 tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             }
         });
