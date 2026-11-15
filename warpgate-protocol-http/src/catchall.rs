@@ -415,7 +415,8 @@ async fn serve_unbound_http_targets(services: &Services) -> bool {
 /// request whose Host header is `request_host`: only when
 /// `http.serve_unbound_http_targets` is on, and never on a hostname a web
 /// target is bound to, at any port (a browser's cookies do not tell ports
-/// apart) and whether or not that binding is refused.
+/// apart) and whether or not that binding is refused, except a binding on
+/// the control-plane host, which binds nothing there.
 async fn unbound_targets_served_on_host(
     services: &Services,
     request_host: Option<&str>,
@@ -426,13 +427,28 @@ async fn unbound_targets_served_on_host(
     let Some(host) = request_host else {
         return Ok(true);
     };
+    let control_plane = services.config.lock().await.control_plane_host();
     let targets = services.config_provider.list_targets().await?;
-    Ok(!targets.iter().any(|target| {
-        target
-            .options
-            .external_host()
-            .is_some_and(|bound| !bound.is_empty() && same_binding_hostname(bound, host))
-    }))
+    // A binding on the control-plane host is refused, so it binds nothing
+    // there: unbound targets are served on Warpgate's own host as before.
+    let binding = targets.iter().find(|target| {
+        target.options.external_host().is_some_and(|bound| {
+            !bound.is_empty()
+                && same_binding_hostname(bound, host)
+                && !control_plane
+                    .as_deref()
+                    .is_some_and(|control_plane| same_binding_hostname(bound, control_plane))
+        })
+    });
+    if let Some(target) = binding {
+        debug!(
+            target = %target.name,
+            host,
+            "Not serving targets with no hostname on a host a target is bound to"
+        );
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 /// [`target_served_on_host`] for a ticket's target, which is resolved by id,
@@ -1887,5 +1903,187 @@ mod target_selection_tests {
             Some("c".into())
         );
         assert_eq!(select_target_name(None, None, None), None);
+    }
+}
+
+#[cfg(test)]
+mod request_target_tests {
+    //! `get_target_for_request` for a signed-in browser: the target named by
+    //! `?warpgate-target=` or held by the session, on the control-plane host,
+    //! a host bound to a target, and a host bound to none.
+
+    use poem::Request;
+    use poem::session::Session;
+    use sea_orm::ActiveValue::Set;
+    use sea_orm::{ActiveModelTrait, DatabaseConnection};
+    use time::OffsetDateTime;
+    use uuid::Uuid;
+    use warpgate_common_http::auth::UnauthenticatedRequestContext;
+    use warpgate_common_http::{RequestAuthorization, SessionAuthorization};
+    use warpgate_db_entities::Target::TargetKind;
+    use warpgate_db_entities::{Role, Target, TargetRoleAssignment, UserRoleAssignment};
+
+    use super::get_target_for_request;
+    use crate::common::SessionExt;
+    use crate::test_db::{insert_user, memory_db, services};
+
+    const CONTROL_PLANE: &str = "warp.example";
+    const BOUND_HOST: &str = "vm1.warp.example";
+
+    async fn target(db: &DatabaseConnection, role: Uuid, name: &str, host: Option<&str>) {
+        let id = Uuid::new_v4();
+        let mut http = serde_json::json!({"url": "http://h", "public": true});
+        if let Some(host) = host {
+            http["external_host"] = host.into();
+        }
+        Target::ActiveModel {
+            id: Set(id),
+            name: Set(name.into()),
+            description: Set(String::new()),
+            kind: Set(TargetKind::Http),
+            options: Set(serde_json::json!({ "http": http })),
+            rate_limit_bytes_per_second: Set(None),
+            group_id: Set(None),
+            ticket_max_duration_seconds: Set(None),
+            ticket_requests_disabled: Set(false),
+            ticket_require_approval: Set(false),
+            ticket_max_uses: Set(None),
+            require_approval: Set(false),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        TargetRoleAssignment::ActiveModel {
+            target_id: Set(id),
+            role_id: Set(role),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+    }
+
+    /// A user granted, by role, every target: `bound` (bound to
+    /// [`BOUND_HOST`]), `open` (no hostname) and, when `leftover` is given,
+    /// one bound to that host.
+    async fn setup(db: &DatabaseConnection, leftover: Option<&str>) -> Uuid {
+        let user_id = Uuid::new_v4();
+        insert_user(db, user_id, "user").await;
+        let role_id = Uuid::new_v4();
+        Role::ActiveModel {
+            id: Set(role_id),
+            name: Set("role".into()),
+            description: Set(String::new()),
+            is_default: Set(false),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        UserRoleAssignment::ActiveModel {
+            user_id: Set(user_id),
+            role_id: Set(role_id),
+            granted_at: Set(Some(OffsetDateTime::now_utc())),
+            expires_at: Set(None),
+            revoked_at: Set(None),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        target(db, role_id, "bound", Some(BOUND_HOST)).await;
+        target(db, role_id, "open", None).await;
+        if let Some(host) = leftover {
+            target(db, role_id, "leftover", Some(host)).await;
+        }
+        user_id
+    }
+
+    /// The target served to a signed-in browser asking for `path` on `host`
+    /// with the session holding `session_target`.
+    async fn served(
+        serve_unbound: bool,
+        leftover: Option<&str>,
+        host: &str,
+        path: &str,
+        session_target: Option<&str>,
+    ) -> Option<String> {
+        let db = memory_db().await;
+        let user_id = setup(&db, leftover).await;
+        let services = services(db).await;
+        {
+            let mut config = services.config.lock().await;
+            config.store.external_host = Some(CONTROL_PLANE.into());
+            config.store.http.serve_unbound_http_targets = serve_unbound;
+        }
+        let ctx = UnauthenticatedRequestContext::new(services)
+            .await
+            .to_authenticated(RequestAuthorization::Session(SessionAuthorization::User {
+                user_id,
+                username: "user".into(),
+            }));
+        let mut req = Request::builder()
+            .uri(path.parse().unwrap())
+            .header("host", host)
+            .finish();
+        let session = Session::default();
+        if let Some(name) = session_target {
+            session.set_target_name(name.into());
+        }
+        req.extensions_mut().insert(session);
+        get_target_for_request(&req, &ctx)
+            .await
+            .unwrap()
+            .map(|authorization| authorization.target().name.clone())
+    }
+
+    #[tokio::test]
+    async fn the_target_served_for_a_name_or_a_session() {
+        let open = Some("open");
+        let bound = Some("bound");
+        #[rustfmt::skip]
+        let cases: &[(bool, &str, &str, Option<&str>, Option<&str>)] = &[
+            // switch, host, path, session target, served
+            (true,  BOUND_HOST,    "/?warpgate-target=open",  None,  bound),
+            (true,  BOUND_HOST,    "/",                       open,  bound),
+            (true,  CONTROL_PLANE, "/?warpgate-target=open",  None,  open),
+            (true,  CONTROL_PLANE, "/",                       open,  open),
+            (false, CONTROL_PLANE, "/?warpgate-target=open",  None,  None),
+            (false, CONTROL_PLANE, "/",                       open,  None),
+            (true,  CONTROL_PLANE, "/?warpgate-target=bound", None,  None),
+            (true,  CONTROL_PLANE, "/",                       bound, None),
+            (true,  "other.example", "/?warpgate-target=open", None, open),
+            (true,  "vm1.warp.example:8443", "/?warpgate-target=open", None, None),
+        ];
+        for &(switch, host, path, session, expected) in cases {
+            assert_eq!(
+                served(switch, None, host, path, session).await.as_deref(),
+                expected,
+                "switch {switch}, {host}{path}, session {session:?}"
+            );
+        }
+    }
+
+    /// A leftover target bound to the control-plane host (refused, at any
+    /// port) does not stop unbound targets being served there; on another
+    /// host its binding still does.
+    #[tokio::test]
+    async fn a_target_bound_to_the_control_plane_host_does_not_turn_unbound_targets_off() {
+        let path = "/?warpgate-target=open";
+        let leftover = Some("warp.example:8443");
+        assert_eq!(
+            served(true, leftover, CONTROL_PLANE, path, None)
+                .await
+                .as_deref(),
+            Some("open")
+        );
+        assert_eq!(
+            served(
+                true,
+                Some("vm2.warp.example:8443"),
+                "vm2.warp.example",
+                path,
+                None
+            )
+            .await,
+            None
+        );
     }
 }
