@@ -357,15 +357,6 @@ impl RedeemRefusal {
         !matches!(self, Self::UnknownToken)
     }
 
-    /// Whether the refusal also ends this host's browser session. Not for a
-    /// token without its nonce: any site can send a browser here with a
-    /// token it minted for itself, so that refusal proves nothing about the
-    /// session the browser already holds here. The token is spent all the
-    /// same.
-    const fn ends_the_browser_session(&self) -> bool {
-        matches!(self, Self::WrongHost)
-    }
-
     /// The refusal's name for the log, without the page it carries.
     const fn reason(&self) -> &'static str {
         match self {
@@ -523,11 +514,11 @@ pub async fn start_endpoint(req: &Request, session: &Session) -> poem::Result<Re
 /// the page it started from.
 ///
 /// A refused token that spent a handoff (one found and deleted) clears the
-/// nonce cookie; one minted for another host or target also purges this
-/// host's browser session, but one refused only for its nonce does not
-/// ([`RedeemRefusal::ends_the_browser_session`]). One that spent nothing
-/// (never issued, already used, or no token at all: any site can send a
-/// browser here) changes nothing. Either way the browser is sent to
+/// nonce cookie and leaves this host's browser session as it is: any site
+/// can send a browser here with a token it minted for itself, for this host
+/// or another, so a refusal proves nothing about the session the browser
+/// already holds here. One that spent nothing (never issued, already used,
+/// or no token at all) changes nothing. Either way the browser is sent to
 /// the page the handoff was opened for when that is known, or this host's
 /// root, where a browser without a session opens a new handoff: so a tab
 /// whose nonce cookie another tab's handoff replaced simply tries again.
@@ -567,36 +558,31 @@ pub async fn redeem_endpoint(req: &Request, session: &Session) -> poem::Result<R
         }
         None => Err(RedeemRefusal::UnknownToken),
     };
-    let (outcome, spent, ends_session, next) = match redeemed {
+    let (outcome, spent, next) = match redeemed {
         Ok(redeemed) => {
             let next = redeemed.next.clone();
             let outcome = complete_redeem(req, &ctx, session, &target, &binding, redeemed).await;
-            (outcome, true, true, Some(next))
+            (outcome, true, Some(next))
         }
         Err(refusal) => {
             let spent = refusal.spent_a_handoff();
-            let ends_session = refusal.ends_the_browser_session();
             let next = match &refusal {
                 RedeemRefusal::WrongNonce { next } => Some(next.clone()),
                 _ => None,
             };
-            (Err(refusal.reason().to_owned()), spent, ends_session, next)
+            (Err(refusal.reason().to_owned()), spent, next)
         }
     };
     let mut response = match outcome {
         Ok(response) => response,
         Err(reason) => {
             tracing::warn!(target = %target.name, %reason, "Refused a target-host handoff");
-            if ends_session {
-                session.purge();
-            }
             let next = next.unwrap_or_else(|| "/".to_owned());
             // A browser that already holds a session for this target on this
             // host has nothing to retry: it goes back to the page unmarked.
-            let signed_in_here = !ends_session
-                && session.get_bound_auth().is_some_and(|bound| {
-                    bound.counts_on(Some((target.id, &binding)), &http::Method::GET, "/")
-                });
+            let signed_in_here = session.get_bound_auth().is_some_and(|bound| {
+                bound.counts_on(Some((target.id, &binding)), &http::Method::GET, "/")
+            });
             let retry = if signed_in_here {
                 bound_host_return_url("https", &binding, &without_retry_marker(&next))
             } else {
@@ -1497,6 +1483,62 @@ mod tests {
             assert!(
                 stored(&db, &cookie).await,
                 "the browser session was dropped"
+            );
+        }
+
+        /// A token minted for another host is refused and spent, and the
+        /// browser session here stays: any site can mint one for its own
+        /// target and send a browser here with it.
+        #[tokio::test]
+        async fn a_token_for_another_host_is_spent_and_keeps_the_browser_session() {
+            let db = memory_db().await;
+            let target = bound_target(&db).await;
+            let cli = TestClient::new(app(db.clone()).await);
+            let cookie = session_cookie(
+                &cli.get(format!("/seed-bound?target={target}"))
+                    .header("host", HOST)
+                    .send()
+                    .await,
+            );
+            let now = OffsetDateTime::now_utc();
+            let opened = open(&db, Uuid::new_v4(), "other.example.com", "/", now)
+                .await
+                .unwrap()
+                .unwrap();
+            let token = mint(
+                &db,
+                &opened.challenge,
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                None,
+                now,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let redeem = format!("/@warpgate{REDEEM_PATH}?{HANDOFF_TOKEN_PARAM}={token}");
+
+            let resp = cli
+                .get(&redeem)
+                .header("host", HOST)
+                .header(
+                    "cookie",
+                    format!("{cookie}; {HANDOFF_COOKIE_NAME}={}", opened.nonce),
+                )
+                .send()
+                .await;
+            resp.assert_status(StatusCode::SEE_OTHER);
+            assert!(clears_the_nonce(&resp), "the token was not spent");
+            assert!(
+                stored(&db, &cookie).await,
+                "the browser session was dropped"
+            );
+            assert_eq!(
+                HttpHandoff::take(&db, &hash_secret(&token), now)
+                    .await
+                    .unwrap(),
+                None,
+                "the token is still there"
             );
         }
 
