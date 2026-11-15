@@ -440,6 +440,10 @@ every node to see.
   browser starts a new handoff on that host, which carries the later sign-in.
 - Only those target-host sessions end: the control-plane sign-in, its user
   session and target-host sessions already handed the later sign-in go on.
+- A step-up Warpgate forces because the configured HTTP step-up interval
+  has passed is different: it ends the control-plane sign-in itself, with its
+  user session and every target-host session handed off from it, before the
+  browser signs in again. Nothing from the old sign-in acts again.
 - A sign-in that never used SSO records nothing and ends nothing this way.
 
 ## What a target's page can do on its own host
@@ -462,6 +466,20 @@ Every other route under `/@warpgate` and `/_warpgate` on that host answers
 404, and the session counts nowhere else: not on the control-plane host and
 not on another target's host. The target never receives a Warpgate cookie,
 and a cookie it sets under a Warpgate cookie name never reaches the browser.
+
+A target-host session never ends the control-plane sign-in it was handed off
+from. Signing out, a sign-in started on that host (as the same user or
+another, which gets a sign-in of its own) and its user being deleted or no
+longer admitted from the request's address end that host's browser session
+only. A ticket presented with it is ignored and keeps its uses, whoever it
+was issued to. A handoff token refused on that host, for whatever reason,
+leaves the session there as it is.
+
+On a plain-HTTP loopback listener (`http.plain_http_on_loopback`) a bound
+target cannot be reached by a signed-in session: the handoff needs HTTPS (its
+cookie is a `__Host-` cookie, which that listener neither reads nor sets), so
+the browser never gets a session on the target's host there. This fails
+closed: the target is not served as the signed-in user.
 
 ## Rolling back to the previous release
 
