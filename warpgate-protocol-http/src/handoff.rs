@@ -1039,6 +1039,229 @@ mod tests {
             resp.assert_text(COOKIES_NEEDED).await;
         }
 
+        mod step_up {
+            //! The start route on the control-plane host with step-up on, and
+            //! the stamp the redeemed session carries.
+            use std::sync::Arc;
+            use std::time::Duration;
+
+            use poem::{Endpoint, IntoResponse};
+            use warpgate_common::StepUpIntervalConfig;
+            use warpgate_db_entities::{Role, TargetRoleAssignment, UserRoleAssignment};
+
+            use super::*;
+            use warpgate_common_http::SessionAuthorization;
+
+            use crate::common::{SessionExt, session_id_for_login};
+            use crate::test_db::insert_user;
+
+            const CONTROL_PLANE: &str = "warp.example";
+
+            /// Signs the browser in on the control plane as `user`, with its
+            /// last sign-in at the unix time `stamp`.
+            #[handler]
+            async fn sign_in(req: &Request, session: &Session) -> poem::Result<()> {
+                let ctx =
+                    Data::<&UnauthenticatedRequestContext>::from_request_without_body(req).await?;
+                session_id_for_login(req, &ctx)
+                    .await
+                    .map_err(poem::error::InternalServerError)?;
+                let user_id: Uuid = query_value(req, "user").unwrap().parse().unwrap();
+                let stamp: i64 = query_value(req, "stamp").unwrap().parse().unwrap();
+                session.set_auth(SessionAuthorization::User {
+                    user_id,
+                    username: format!("user-{user_id}"),
+                });
+                session.set_last_sso_at(OffsetDateTime::from_unix_timestamp(stamp).unwrap());
+                Ok(())
+            }
+
+            /// The browser session's last sign-in, as a unix time.
+            #[handler]
+            fn stamp_page(session: &Session) -> String {
+                session
+                    .get_last_sso_at()
+                    .map(|at| at.unix_timestamp().to_string())
+                    .unwrap_or_default()
+            }
+
+            async fn app(db: DatabaseConnection) -> impl poem::Endpoint {
+                let services = services(db.clone()).await;
+                services.config.lock().await.store.step_up_interval = Some(StepUpIntervalConfig {
+                    http: Some(Duration::from_secs(60)),
+                    ..Default::default()
+                });
+                let ctx = UnauthenticatedRequestContext::new(services).await;
+                // The start route behind what the auth middleware gives a
+                // signed-in browser: the user in `x-test-user`.
+                let start = get(start_endpoint).around(|ep, mut req| async move {
+                    let user_id: Uuid = req.header("x-test-user").unwrap().parse().unwrap();
+                    let actx = req
+                        .data::<UnauthenticatedRequestContext>()
+                        .unwrap()
+                        .to_authenticated(RequestAuthorization::Session(
+                            SessionAuthorization::User {
+                                user_id,
+                                username: format!("user-{user_id}"),
+                            },
+                        ));
+                    req.extensions_mut().insert(actx);
+                    ep.call(req).await.map(IntoResponse::into_response)
+                });
+                Route::new()
+                    .at("/sign-in", get(sign_in))
+                    .at("/stamp", get(stamp_page))
+                    .at(format!("/@warpgate{START_PATH}"), start)
+                    .at(format!("/@warpgate{REDEEM_PATH}"), get(redeem_endpoint))
+                    .data(SessionStore::new())
+                    .data(SharedSessionStorage::new(db.clone()))
+                    .data(ctx)
+                    .with(ServerSession::new(
+                        session_cookie_config(),
+                        SharedSessionStorage::new(db),
+                    ))
+            }
+
+            /// A user with a role granting `target`.
+            async fn user_for(db: &DatabaseConnection, target: Uuid) -> Uuid {
+                let user_id = Uuid::new_v4();
+                insert_user(db, user_id, &format!("user-{user_id}")).await;
+                let role_id = Uuid::new_v4();
+                Role::ActiveModel {
+                    id: Set(role_id),
+                    name: Set(format!("role-{role_id}")),
+                    description: Set(String::new()),
+                    is_default: Set(false),
+                }
+                .insert(db)
+                .await
+                .unwrap();
+                UserRoleAssignment::ActiveModel {
+                    user_id: Set(user_id),
+                    role_id: Set(role_id),
+                    granted_at: Set(Some(OffsetDateTime::now_utc())),
+                    expires_at: Set(None),
+                    revoked_at: Set(None),
+                }
+                .insert(db)
+                .await
+                .unwrap();
+                TargetRoleAssignment::ActiveModel {
+                    target_id: Set(target),
+                    role_id: Set(role_id),
+                }
+                .insert(db)
+                .await
+                .unwrap();
+                user_id
+            }
+
+            /// Signs in on the control plane `ago` seconds back and opens a
+            /// handoff for `/page`: the control-plane cookie, the handoff and
+            /// the stamp.
+            async fn signed_in(
+                cli: &TestClient<impl poem::Endpoint>,
+                db: &DatabaseConnection,
+                target: Uuid,
+                user: Uuid,
+                ago: i64,
+            ) -> (String, Opened, i64) {
+                let stamp = OffsetDateTime::now_utc().unix_timestamp() - ago;
+                let resp = cli
+                    .get(format!("/sign-in?user={user}&stamp={stamp}"))
+                    .header("host", CONTROL_PLANE)
+                    .send()
+                    .await;
+                resp.assert_status_is_ok();
+                let cookie = session_cookie(&resp);
+                let opened = open(db, target, HOST, "/page", OffsetDateTime::now_utc())
+                    .await
+                    .unwrap();
+                (cookie, opened, stamp)
+            }
+
+            async fn start(
+                cli: &TestClient<impl poem::Endpoint>,
+                cookie: &str,
+                user: Uuid,
+                challenge: &str,
+            ) -> TestResponse {
+                cli.get(format!(
+                    "/@warpgate{START_PATH}?{HANDOFF_CHALLENGE_PARAM}={challenge}"
+                ))
+                .header("host", CONTROL_PLANE)
+                .header("accept", "text/html")
+                .header("cookie", cookie)
+                .header("x-test-user", user.to_string())
+                .send()
+                .await
+            }
+
+            /// A control-plane sign-in older than the step-up interval mints
+            /// nothing: the browser is sent to sign in again, and the handoff
+            /// can still be minted once.
+            #[tokio::test]
+            async fn a_stale_sign_in_is_sent_to_sign_in_and_mints_nothing() {
+                let db = memory_db().await;
+                let target = bound_target(&db).await;
+                let user = user_for(&db, target).await;
+                let cli = TestClient::new(app(db.clone()).await);
+                let (cookie, opened, _) = signed_in(&cli, &db, target, user, 3600).await;
+
+                let resp = start(&cli, &cookie, user, &opened.challenge).await;
+                let location = resp
+                    .0
+                    .headers()
+                    .get("location")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_owned();
+                assert!(location.starts_with("/@warpgate#/login"), "{location}");
+                assert!(!location.contains(HANDOFF_TOKEN_PARAM), "{location}");
+                let now = OffsetDateTime::now_utc();
+                let minted = mint(&db, &opened.challenge, user, Uuid::new_v4(), None, now)
+                    .await
+                    .unwrap();
+                assert!(minted.is_some(), "the stale start minted a token");
+            }
+
+            /// A fresh control-plane sign-in mints a token, and the session
+            /// the bound host redeems it into carries that sign-in's stamp.
+            #[tokio::test]
+            async fn a_fresh_sign_in_is_redeemed_with_its_stamp() {
+                let db = memory_db().await;
+                let target = bound_target(&db).await;
+                let user = user_for(&db, target).await;
+                let cli = TestClient::new(app(db.clone()).await);
+                let (cookie, opened, stamp) = signed_in(&cli, &db, target, user, 10).await;
+
+                let resp = start(&cli, &cookie, user, &opened.challenge).await;
+                resp.assert_status(StatusCode::SEE_OTHER);
+                let location = resp.0.headers()["location"].to_str().unwrap().to_owned();
+                let redeem = location
+                    .strip_prefix(&format!("https://{HOST}"))
+                    .expect("sent to the bound host")
+                    .to_owned();
+                let resp = cli
+                    .get(&redeem)
+                    .header("host", HOST)
+                    .header("cookie", format!("{HANDOFF_COOKIE_NAME}={}", opened.nonce))
+                    .send()
+                    .await;
+                resp.assert_status(StatusCode::SEE_OTHER);
+                resp.assert_header("location", format!("https://{HOST}/page"));
+                let bound = session_cookie(&resp);
+
+                let resp = cli
+                    .get("/stamp")
+                    .header("host", HOST)
+                    .header("cookie", &bound)
+                    .send()
+                    .await;
+                resp.assert_text(stamp.to_string()).await;
+            }
+        }
+
         #[test]
         fn the_retry_marker_is_added_found_and_removed_exactly() {
             assert_eq!(with_retry_marker("/"), format!("/?{HANDOFF_RETRY_PARAM}=1"));
