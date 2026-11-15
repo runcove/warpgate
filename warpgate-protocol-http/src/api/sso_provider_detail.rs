@@ -30,8 +30,8 @@ enum StartSsoResponse {
     Ok(Json<StartSsoResponseParams>),
     #[oai(status = 404)]
     NotFound,
-    /// The request originates from a domain that has no cookie domain relationship
-    /// with `external_host` while `return_url_domain` is `external_host`
+    /// `return_url_domain` is `external_host`, and the sign-in did not start on
+    /// the control-plane host: in that mode a sign-in must start there
     #[oai(status = 400)]
     IncompatibleSsoDomain,
 }
