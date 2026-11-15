@@ -157,12 +157,25 @@ pub async fn mark_ended_including_target_sessions(
 
 /// The definite way to close a session
 pub async fn revoke(db: &DatabaseConnection, id: UserSessionId) -> Result<(), WarpgateError> {
+    revoke_keeping(db, id, None).await
+}
+
+/// [`revoke`], except that the stored browser session `keep` (by its id),
+/// which the calling request goes on to write, is left to that request. Every
+/// other browser session of the login is deleted.
+pub async fn revoke_keeping(
+    db: &DatabaseConnection,
+    id: UserSessionId,
+    keep: Option<&str>,
+) -> Result<(), WarpgateError> {
     let transaction = db.begin().await?;
     let ended = mark_ended_in_transaction(&transaction, id).await?;
-    HttpSession::Entity::delete_many()
-        .filter(HttpSession::Column::UserSessionId.eq(id))
-        .exec(&transaction)
-        .await?;
+    let mut others =
+        HttpSession::Entity::delete_many().filter(HttpSession::Column::UserSessionId.eq(id));
+    if let Some(keep) = keep {
+        others = others.filter(HttpSession::Column::Id.ne(keep));
+    }
+    others.exec(&transaction).await?;
     transaction.commit().await?;
     ended.settle(db).await;
     Ok(())

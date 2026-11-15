@@ -61,7 +61,7 @@ pub async fn logout(
     session_middleware: &Mutex<SessionStore>,
     db: &DatabaseConnection,
 ) {
-    end_login(session, session_middleware, db).await;
+    end_login(session, None, session_middleware, db).await;
     session.purge();
     info!("Logout requested");
 }
@@ -69,20 +69,24 @@ pub async fn logout(
 /// Ends the browser session's login and detaches it from this node, leaving
 /// the browser session's own contents to the caller.
 ///
-/// The login is ended first, in its own transaction. Once it is ended, no
-/// node accepts a cookie that still carries its authorization
+/// The login is ended first, in its own transaction, which also deletes every
+/// stored browser session of that login but `keep`, the storage id of the
+/// caller's own browser session when the caller goes on to write it
+/// (`UserSession::revoke_keeping`): the target-host sessions handed off from
+/// it, on every node, end with it. Once
+/// it is ended, no node accepts a cookie that still carries its authorization
 /// (`SessionStore::handle_for_request`), and a request still in flight cannot
 /// write the authorization back (`SharedSessionStorage::update_session`).
 /// The store is locked only to detach the session, not while waiting for the
 /// database.
 pub async fn end_login(
     session: &Session,
+    keep: Option<&str>,
     session_middleware: &Mutex<SessionStore>,
     db: &DatabaseConnection,
 ) {
     if let Some(id) = session.get_session_id()
-        && let Err(error) =
-            entities::UserSession::mark_ended_including_target_sessions(db, id).await
+        && let Err(error) = entities::UserSession::revoke_keeping(db, id, keep).await
     {
         error!(%error, %id, "Could not end the user session at logout");
     }

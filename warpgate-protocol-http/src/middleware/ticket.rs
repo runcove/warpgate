@@ -332,7 +332,16 @@ impl<E: Endpoint> Endpoint for TicketMiddlewareEndpoint<E> {
                 // purged session ignores every later write in this request.
                 let session_store =
                     Data::<&Arc<Mutex<SessionStore>>>::from_request_without_body(&req).await?;
-                end_login(&session, session_store.0, &ctx.services().db).await;
+                let keep = crate::common::storage_session_id(
+                    <&poem::web::cookie::CookieJar>::from_request_without_body(&req).await?,
+                );
+                end_login(
+                    &session,
+                    keep.as_deref(),
+                    session_store.0,
+                    &ctx.services().db,
+                )
+                .await;
                 session.clear();
             }
         }

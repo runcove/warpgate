@@ -57,7 +57,7 @@ static AUTH_SSO_LOGIN_STATE: &str = "auth_sso_login_state";
 /// A target-host session's authorization ([`BoundSessionAuthorization`]).
 /// Kept apart from [`AUTH_SESSION_KEY`] so that no code reading that key,
 /// an older release's included, takes it for a sign-in that counts anywhere.
-static BOUND_AUTH_SESSION_KEY: &str = "cove_bound_auth";
+pub(crate) static BOUND_AUTH_SESSION_KEY: &str = "cove_bound_auth";
 pub static SESSION_COOKIE_NAME: &str = "warpgate-http-session";
 /// The session cookie's name in the browser on a plain-HTTP loopback listener
 /// (`http.plain_http_on_loopback`); see `LoopbackSessionCookieMiddleware`.
@@ -502,7 +502,14 @@ pub(crate) async fn force_step_up(req: &Request, session: &Session) -> poem::Res
     let ctx = Data::<&UnauthenticatedRequestContext>::from_request_without_body(req).await?;
     let session_middleware =
         Data::<&Arc<Mutex<SessionStore>>>::from_request_without_body(req).await?;
-    crate::api::common::end_login(session, session_middleware.0, &ctx.services().db).await;
+    let keep = storage_session_id(<&CookieJar>::from_request_without_body(req).await?);
+    crate::api::common::end_login(
+        session,
+        keep.as_deref(),
+        session_middleware.0,
+        &ctx.services().db,
+    )
+    .await;
     session.clear();
     info!("Logout requested");
     Ok(())

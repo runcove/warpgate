@@ -1062,12 +1062,30 @@ mod tests {
         }
 
         /// Gives the browser a target-host session for the target in the
-        /// query, on [`HOST`].
+        /// query, on [`HOST`], under an open user session.
         #[handler]
-        fn seed_bound(req: &Request, session: &Session) {
+        async fn seed_bound(req: &Request, session: &Session) {
+            let ctx = req.data::<UnauthenticatedRequestContext>().unwrap();
             let target_id = query_value(req, "target").unwrap().parse().unwrap();
+            let user_id = Uuid::new_v4();
+            let user_session_id = UserSessionId(Uuid::new_v4());
+            warpgate_db_entities::UserSession::ActiveModel {
+                id: Set(user_session_id),
+                username: Set(Some("user".into())),
+                user_id: Set(Some(user_id)),
+                remote_address: Set("127.0.0.1:443".into()),
+                started: Set(OffsetDateTime::now_utc()),
+                ended: Set(None),
+                protocol: Set("HTTP".into()),
+                node_id: Set(None),
+                auth_state_node_id: Set(None),
+            }
+            .insert(&ctx.services().db)
+            .await
+            .unwrap();
+            session.set(SESSION_ID_SESSION_KEY, user_session_id);
             session.set_bound_auth(BoundSessionAuthorization {
-                user_id: Uuid::new_v4(),
+                user_id,
                 username: "user".into(),
                 target_id,
                 hostname: HOST.into(),
@@ -1375,6 +1393,20 @@ mod tests {
                     .await
                     .map_err(poem::error::InternalServerError)?;
                 let user_id: Uuid = query_value(req, "user").unwrap().parse().unwrap();
+                // As a completed sign-in does, the user session is the user's
+                // in the store too, so another node can take it up.
+                let store =
+                    Data::<&Arc<Mutex<SessionStore>>>::from_request_without_body(req).await?;
+                let handle = store.lock().await.handle_for_login(req, &ctx).await?;
+                handle
+                    .lock()
+                    .await
+                    .set_user_info(warpgate_common::auth::AuthStateUserInfo {
+                        id: user_id,
+                        username: format!("user-{user_id}"),
+                    })
+                    .await
+                    .map_err(poem::error::InternalServerError)?;
                 let stamp: i64 = query_value(req, "stamp").unwrap().parse().unwrap();
                 session.set_auth(SessionAuthorization::User {
                     user_id,
@@ -1424,6 +1456,17 @@ mod tests {
                 )
             }
 
+            /// Signs the browser out, as the control plane's sign-out does.
+            #[handler]
+            async fn sign_out(req: &Request, session: &Session) -> poem::Result<()> {
+                let ctx =
+                    Data::<&UnauthenticatedRequestContext>::from_request_without_body(req).await?;
+                let store =
+                    Data::<&Arc<Mutex<SessionStore>>>::from_request_without_body(req).await?;
+                crate::api::common::logout(session, store.0, &ctx.services().db).await;
+                Ok(())
+            }
+
             /// The browser session's last sign-in, as a unix time.
             #[handler]
             fn stamp_page(session: &Session) -> String {
@@ -1459,6 +1502,7 @@ mod tests {
                 Route::new()
                     .at("/sign-in", get(sign_in))
                     .at("/stamp", get(stamp_page))
+                    .at("/sign-out", poem::post(sign_out))
                     .at(
                         "/page",
                         get(page).around(crate::common::inject_request_authorization),
@@ -1624,6 +1668,33 @@ mod tests {
                     .await;
                 resp.assert_text(stamp.to_string()).await;
             }
+            const OTHER_HOST: &str = "vm2.warp.example";
+
+            /// A second HTTP target, bound to [`OTHER_HOST`].
+            async fn other_bound_target(db: &DatabaseConnection) -> Uuid {
+                let id = Uuid::new_v4();
+                Target::ActiveModel {
+                    id: Set(id),
+                    name: Set(format!("target-{id}")),
+                    description: Set(String::new()),
+                    kind: Set(TargetKind::Http),
+                    options: Set(serde_json::json!({
+                        "http": {"url": "http://h2", "external_host": OTHER_HOST}
+                    })),
+                    rate_limit_bytes_per_second: Set(None),
+                    group_id: Set(None),
+                    ticket_max_duration_seconds: Set(None),
+                    ticket_requests_disabled: Set(false),
+                    ticket_require_approval: Set(false),
+                    ticket_max_uses: Set(None),
+                    require_approval: Set(false),
+                }
+                .insert(db)
+                .await
+                .unwrap();
+                id
+            }
+
             /// Hands the control-plane sign-in in `cookie` off to `host`,
             /// bound to `target`: the session cookie it gets there.
             async fn hand_off(
@@ -1692,37 +1763,78 @@ mod tests {
                 resp.assert_text(format!("user-{user}/user")).await;
             }
 
+            /// Handed off to two hosts, each served by a node of its own, a
+            /// sign-out on the control plane ends both target-host sessions
+            /// and deletes them from the store.
+            #[tokio::test]
+            async fn a_sign_out_ends_the_target_host_sessions_on_every_node() {
+                let db = memory_db().await;
+                let first = bound_target(&db).await;
+                let second = other_bound_target(&db).await;
+                let user = user_for_targets(&db, &[first, second]).await;
+                let node_a = TestClient::new(app(db.clone()).await);
+                let node_b = TestClient::new(app(db.clone()).await);
+                let (control, _, _) = signed_in(&node_a, &db, first, user, 10).await;
+                let on_first = hand_off(&node_a, &db, &control, user, first, HOST).await;
+                let on_second =
+                    hand_off(&node_b, &db, &control, user, second, OTHER_HOST).await;
+                assert_eq!(page_on(&node_a, HOST, &on_first).await, "auth");
+                assert_eq!(page_on(&node_b, OTHER_HOST, &on_second).await, "auth");
+
+                node_a
+                    .post("/sign-out")
+                    .header("host", CONTROL_PLANE)
+                    .header("cookie", &control)
+                    .send()
+                    .await
+                    .assert_status_is_ok();
+
+                assert_eq!(page_on(&node_a, HOST, &on_first).await, "anon");
+                assert_eq!(page_on(&node_b, OTHER_HOST, &on_second).await, "anon");
+                assert!(!stored(&db, &on_first).await, "the first host's session is stored");
+                assert!(
+                    !stored(&db, &on_second).await,
+                    "the second host's session is stored"
+                );
+            }
+
+            /// A target-host session whose sign-in has ended counts on no
+            /// node, even while its stored row is still there.
+            #[tokio::test]
+            async fn an_ended_sign_in_ends_its_target_host_session_while_still_stored() {
+                let db = memory_db().await;
+                let target = bound_target(&db).await;
+                let user = user_for(&db, target).await;
+                let node_a = TestClient::new(app(db.clone()).await);
+                let node_b = TestClient::new(app(db.clone()).await);
+                let (control, _, _) = signed_in(&node_a, &db, target, user, 10).await;
+                let bound = hand_off(&node_b, &db, &control, user, target, HOST).await;
+                assert_eq!(page_on(&node_b, HOST, &bound).await, "auth");
+
+                let (_, storage_id) = control.split_once('=').unwrap();
+                let user_session_id = HttpSession::Entity::find_by_id(storage_id.to_owned())
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .and_then(|row| row.user_session_id)
+                    .expect("the control-plane session names its user session");
+                warpgate_db_entities::UserSession::mark_ended_including_target_sessions(
+                    &db,
+                    user_session_id,
+                )
+                .await
+                .unwrap();
+                assert!(stored(&db, &bound).await);
+
+                for node in [&node_a, &node_b] {
+                    assert_eq!(page_on(node, HOST, &bound).await, "anon");
+                }
+            }
+
             mod step_up_ending {
                 //! A step-up on one bound host ends every other bound host's
                 //! session of the same sign-in on its next request.
                 use super::*;
-
-                const OTHER_HOST: &str = "vm2.warp.example";
-
-                /// A second HTTP target, bound to [`OTHER_HOST`].
-                async fn other_bound_target(db: &DatabaseConnection) -> Uuid {
-                    let id = Uuid::new_v4();
-                    Target::ActiveModel {
-                        id: Set(id),
-                        name: Set(format!("target-{id}")),
-                        description: Set(String::new()),
-                        kind: Set(TargetKind::Http),
-                        options: Set(serde_json::json!({
-                            "http": {"url": "http://h2", "external_host": OTHER_HOST}
-                        })),
-                        rate_limit_bytes_per_second: Set(None),
-                        group_id: Set(None),
-                        ticket_max_duration_seconds: Set(None),
-                        ticket_requests_disabled: Set(false),
-                        ticket_require_approval: Set(false),
-                        ticket_max_uses: Set(None),
-                        require_approval: Set(false),
-                    }
-                    .insert(db)
-                    .await
-                    .unwrap();
-                    id
-                }
 
                 /// Signs the control-plane browser in (again, with `cookie`) as
                 /// `user`, its SSO sign-in `ago` seconds back.
