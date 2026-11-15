@@ -453,4 +453,56 @@ mod tests {
         db.close().await.unwrap();
         std::fs::remove_file(path).unwrap();
     }
+
+    /// A rollback left one step done (m00097 reverted, a session written
+    /// before m00096) is finished by deleting the rows again and reverting
+    /// m00096 alone: m00096 refuses on its own while a row remains, keeping
+    /// its table and its `seaql_migrations` row.
+    #[tokio::test]
+    async fn rolling_back_m00096_alone_requires_no_http_sessions() {
+        use sea_orm::{ConnectionTrait, Statement};
+
+        set_config_migration_values(ConfigMigrationValues::default());
+        let path = std::env::temp_dir().join(format!(
+            "warpgate-migrations-m00096-{}.sqlite3",
+            std::process::id()
+        ));
+        let mut opt = ConnectOptions::new(format!("sqlite://{}?mode=rwc", path.display()));
+        opt.max_connections(100);
+        let db = Database::connect(opt).await.unwrap();
+        migrate_database(&db).await.unwrap();
+
+        migrate_database_down(&db, 1).await.unwrap();
+        assert!(!table_exists(&db, "cove_http_sso_stamps").await);
+        assert!(!applied(&db, "m00097_cove_http_sso_stamps").await);
+
+        let backend = db.get_database_backend();
+        db.execute(Statement::from_string(
+            backend,
+            "INSERT INTO http_sessions (id, expires, data, updated) \
+             VALUES ('s1', NULL, '{}', CURRENT_TIMESTAMP)",
+        ))
+        .await
+        .unwrap();
+
+        let error = migrate_database_down(&db, 1).await.unwrap_err().to_string();
+        assert!(
+            error.contains("refusing to roll back m00096_cove_http_handoffs"),
+            "{error}"
+        );
+        assert!(error.contains("DELETE FROM http_sessions;"), "{error}");
+        assert!(table_exists(&db, "cove_http_handoffs").await);
+        assert!(applied(&db, "m00096_cove_http_handoffs").await);
+
+        db.execute(Statement::from_string(backend, "DELETE FROM http_sessions"))
+            .await
+            .unwrap();
+        migrate_database_down(&db, 1).await.unwrap();
+        assert!(!table_exists(&db, "cove_http_handoffs").await);
+        assert!(!applied(&db, "m00096_cove_http_handoffs").await);
+        assert!(applied(&db, "m00095_cove_pending_user_closes").await);
+
+        db.close().await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
 }
