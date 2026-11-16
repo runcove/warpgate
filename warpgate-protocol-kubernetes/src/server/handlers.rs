@@ -1,5 +1,6 @@
+use std::any::Any;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, Weak};
 
 use anyhow::{Context, Result, bail};
 use futures::{StreamExt, TryStreamExt};
@@ -361,9 +362,14 @@ async fn _handle_normal_request_inner(
         .ok_or(WarpgateError::UserSessionEnded)?
         .context("reading request body")?;
 
+    let recording_session = ApiRecordingSession {
+        id: admitted.id(),
+        anchor: admitted.clone(),
+        required: services.recordings.refuses_unrecorded_sessions(),
+    };
     let recorder_opt = start_api_recording(
         &recording_owner(audit_subject),
-        &admitted.id(),
+        &recording_session,
         &services.recordings,
     )
     .await?;
@@ -506,6 +512,7 @@ async fn _handle_normal_request_inner(
     if let Some(recorder) = &recorder_opt {
         record_api_response(
             recorder,
+            &recording_session,
             method,
             full_url.as_ref(),
             redacted_headers,
@@ -539,12 +546,53 @@ fn copy_upstream_response_headers(src: &http::HeaderMap, dst: &mut poem::http::H
     }
 }
 
+/// The target session an API request belongs to, as its recording sees it.
+struct ApiRecordingSession {
+    id: TargetSessionId,
+    /// Shared by every request of the session, and dropped with it: see
+    /// [`FailedApiRecordings`].
+    anchor: Arc<dyn Any + Send + Sync>,
+    /// `--recordings-refuse-unrecorded-sessions`.
+    required: bool,
+}
+
+/// Target sessions whose API recording failed a write while unrecorded sessions
+/// are refused: every later request of such a session is refused before it is
+/// forwarded. Each request has its own recording, so without this a disk that
+/// accepts a new file but not its writes would let every request through. An
+/// entry lasts as long as its session's `anchor`.
+struct FailedApiRecordings(std::sync::Mutex<Vec<(TargetSessionId, Weak<dyn Any + Send + Sync>)>>);
+
+static FAILED_API_RECORDINGS: FailedApiRecordings =
+    FailedApiRecordings(std::sync::Mutex::new(Vec::new()));
+
+impl FailedApiRecordings {
+    fn mark(&self, session: &ApiRecordingSession) {
+        let mut entries = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        entries.retain(|(_, anchor)| anchor.strong_count() > 0);
+        if !entries.iter().any(|(id, _)| *id == session.id) {
+            entries.push((session.id, Arc::downgrade(&session.anchor)));
+        }
+    }
+
+    fn contains(&self, session: &TargetSessionId) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .any(|(id, anchor)| id == session && anchor.strong_count() > 0)
+    }
+}
+
 /// Records an API request and its response. A failure is logged and counted once,
 /// and the response still goes out, even when unrecorded sessions are refused: the
 /// request has already reached the cluster, and failing it would hide whether it was
-/// applied. The next request starts a fresh recording, and is refused if that fails.
+/// applied. When they are refused, the write is waited for, and a failure refuses
+/// every later request of the session (see [`FailedApiRecordings`]).
+#[allow(clippy::too_many_arguments)]
 async fn record_api_response(
     recorder: &KubernetesRecorder,
+    session: &ApiRecordingSession,
     method: &str,
     path: &str,
     headers: HashMap<String, String>,
@@ -552,11 +600,20 @@ async fn record_api_response(
     status: u16,
     response_body: &[u8],
 ) {
-    if let Err(e) = recorder
-        .record_response(method, path, headers, request_body, status, response_body)
-        .await
+    let recorded = async {
+        recorder
+            .record_response(method, path, headers, request_body, status, response_body)
+            .await?;
+        if session.required {
+            recorder.flush().await?;
+        }
+        Ok::<(), warpgate_core::recordings::Error>(())
+    }
+    .await;
+    if let Err(e) = recorded
+        && recorder.write_failed(&e)
     {
-        recorder.write_failed(&e);
+        FAILED_API_RECORDINGS.mark(session);
     }
 }
 
@@ -627,20 +684,44 @@ fn recording_owner(subject: &KubernetesAuditSubject) -> RecordingOwner {
 /// Start an API request's recording, before the request is forwarded. `Ok(None)` when
 /// recording is disabled. A failure to start is logged (by `start_for`); it is then
 /// [`WarpgateError::SessionNotRecorded`] when unrecorded sessions are refused, and
-/// `Ok(None)` otherwise (the default).
+/// `Ok(None)` otherwise (the default). When they are refused, a session whose
+/// recording already failed a write is refused with
+/// [`WarpgateError::SessionRecordingFailed`] before anything starts.
 async fn start_api_recording(
     owner: &RecordingOwner,
-    target_session_id: &TargetSessionId,
+    session: &ApiRecordingSession,
     recordings: &SessionRecordings,
 ) -> Result<Option<KubernetesRecorder>, WarpgateError> {
-    match start_recording_api(owner, target_session_id, recordings).await {
-        Ok(recorder) => Ok(recorder),
-        Err(_) => {
-            if recordings.refuses_unrecorded_sessions() {
-                return Err(WarpgateError::SessionNotRecorded);
+    if recordings.refuses_unrecorded_sessions() && FAILED_API_RECORDINGS.contains(&session.id) {
+        return Err(WarpgateError::SessionRecordingFailed);
+    }
+    checked_api_recording(
+        recordings,
+        start_recording_api(owner, &session.id, recordings).await,
+    )
+    .await
+}
+
+/// Maps a started API recording to what [`start_api_recording`] returns. When
+/// unrecorded sessions are refused, the recording's first write (an empty line) is
+/// waited for, so a file that cannot be written (a full disk) refuses the request
+/// before it is forwarded; that failure is logged and counted by the recorder.
+async fn checked_api_recording(
+    recordings: &SessionRecordings,
+    started: anyhow::Result<Option<KubernetesRecorder>>,
+) -> Result<Option<KubernetesRecorder>, WarpgateError> {
+    let required = recordings.refuses_unrecorded_sessions();
+    match started {
+        Ok(Some(recorder)) if required => match recorder.write_header().await {
+            Ok(()) => Ok(Some(recorder)),
+            Err(error) => {
+                recorder.write_failed(&error);
+                Err(WarpgateError::SessionNotRecorded)
             }
-            Ok(None)
-        }
+        },
+        Ok(recorder) => Ok(recorder),
+        Err(_) if required => Err(WarpgateError::SessionNotRecorded),
+        Err(_) => Ok(None),
     }
 }
 
@@ -1051,7 +1132,10 @@ mod tests {
         };
         use warpgate_db_migrations::migrate_database;
 
-        use super::super::{SessionRecordingMetadata, start_api_recording, start_stream_recording};
+        use super::super::{
+            ApiRecordingSession, SessionRecordingMetadata, start_api_recording,
+            start_stream_recording,
+        };
 
         struct Failing {
             recordings: SessionRecordings,
@@ -1110,11 +1194,19 @@ mod tests {
             }
         }
 
+        fn session(f: &Failing, required: bool) -> ApiRecordingSession {
+            ApiRecordingSession {
+                id: f.id,
+                anchor: std::sync::Arc::new(()),
+                required,
+            }
+        }
+
         #[tokio::test]
         async fn an_api_request_whose_recording_fails_is_refused_when_required() {
             let f = failing(true).await;
             assert!(matches!(
-                start_api_recording(&owner(), &f.id, &f.recordings).await,
+                start_api_recording(&owner(), &session(&f, true), &f.recordings).await,
                 Err(WarpgateError::SessionNotRecorded)
             ));
         }
@@ -1132,7 +1224,7 @@ mod tests {
         async fn with_refusal_off_api_and_exec_continue_unrecorded() {
             let f = failing(false).await;
             assert!(matches!(
-                start_api_recording(&owner(), &f.id, &f.recordings).await,
+                start_api_recording(&owner(), &session(&f, false), &f.recordings).await,
                 Ok(None)
             ));
             assert!(matches!(
@@ -1144,6 +1236,7 @@ mod tests {
 
     /// Recordings that start on a real disk root, then fail mid-session as a full
     /// disk would.
+    #[cfg(target_os = "linux")]
     mod failing_mid_session {
         use std::collections::HashMap;
         use std::path::PathBuf;
@@ -1154,7 +1247,7 @@ mod tests {
         use tokio::sync::mpsc;
         use tokio_util::sync::CancellationToken;
         use uuid::Uuid;
-        use warpgate_common::{GlobalParams, TargetSessionId, UserSessionId};
+        use warpgate_common::{GlobalParams, TargetSessionId, UserSessionId, WarpgateError};
         use warpgate_core::recordings::{RecordingOwner, SessionRecordings, test_support};
         use warpgate_db_entities::Parameters::{
             self, ConfigMigrationValues, RecordingsDiskConfig, RecordingsStorageConfig,
@@ -1163,9 +1256,11 @@ mod tests {
         use warpgate_db_migrations::migrate_database;
 
         use super::super::{
-            SessionRecordingMetadata, record_api_response, run_websocket_recording,
-            start_api_recording, start_stream_recording,
+            ApiRecordingSession, FAILED_API_RECORDINGS, SessionRecordingMetadata,
+            checked_api_recording, record_api_response, run_websocket_recording, start_api_recording,
+            start_stream_recording,
         };
+        use crate::recording::start_recording_api_named;
 
         struct Recording {
             recordings: SessionRecordings,
@@ -1216,6 +1311,15 @@ mod tests {
         }
 
         impl Recording {
+            /// The session every API request of this recording belongs to.
+            fn session(&self, required: bool) -> ApiRecordingSession {
+                ApiRecordingSession {
+                    id: self.id,
+                    anchor: std::sync::Arc::new(()),
+                    required,
+                }
+            }
+
             fn fail(&self) {
                 assert!(test_support::fail_open_recording_files(&self.root) >= 1);
             }
@@ -1294,7 +1398,8 @@ mod tests {
         async fn an_api_request_whose_recording_fails_is_logged_and_answered_either_way() {
             for required in [true, false] {
                 let r = recording(required).await;
-                let recorder = start_api_recording(&owner(), &r.id, &r.recordings)
+                let session = r.session(required);
+                let recorder = start_api_recording(&owner(), &session, &r.recordings)
                     .await
                     .unwrap()
                     .unwrap();
@@ -1302,6 +1407,7 @@ mod tests {
                 for _ in 0..1000 {
                     record_api_response(
                         &recorder,
+                        &session,
                         "GET",
                         "/api/v1/pods",
                         HashMap::new(),
@@ -1318,6 +1424,7 @@ mod tests {
                 for _ in 0..3 {
                     record_api_response(
                         &recorder,
+                        &session,
                         "GET",
                         "/api/v1/pods",
                         HashMap::new(),
@@ -1328,6 +1435,82 @@ mod tests {
                     .await;
                 }
                 r.assert_one_failure_line(required);
+            }
+        }
+
+        /// Required: once a write of a session's API recording fails, every later
+        /// request of that session is refused before it is forwarded, even though
+        /// each request records to a fresh file that could be created. Other
+        /// sessions are not affected. Not required: later requests go on.
+        #[tokio::test]
+        async fn after_a_failed_api_write_later_requests_follow_the_setting() {
+            for required in [true, false] {
+                let r = recording(required).await;
+                let session = r.session(required);
+                let recorder = start_api_recording(&owner(), &session, &r.recordings)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                r.fail();
+                for _ in 0..1000 {
+                    record_api_response(
+                        &recorder,
+                        &session,
+                        "GET",
+                        "/api/v1/pods",
+                        HashMap::new(),
+                        b"",
+                        200,
+                        b"{}",
+                    )
+                    .await;
+                    if r.recordings.failed_recordings() > 0 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                r.assert_one_failure_line(required);
+
+                let later = start_api_recording(&owner(), &session, &r.recordings).await;
+                if required {
+                    assert!(
+                        matches!(later, Err(WarpgateError::SessionRecordingFailed)),
+                        "the session's later request is refused"
+                    );
+                } else {
+                    assert!(matches!(later, Ok(Some(_))), "the session goes on");
+                }
+                assert!(
+                    !FAILED_API_RECORDINGS.contains(&TargetSessionId(Uuid::new_v4())),
+                    "another session is not affected"
+                );
+            }
+        }
+
+        /// Required: an API recording whose file is created but cannot be written
+        /// (a full disk) fails at its start, before the request is forwarded.
+        #[tokio::test]
+        async fn an_api_recording_that_cannot_be_written_is_refused_at_start_when_required() {
+            for required in [true, false] {
+                let r = recording(required).await;
+                let name = format!("api-full-{}", Uuid::new_v4());
+                let folder = r.root.join(r.id.to_string()).join(&name);
+                std::fs::create_dir_all(&folder).unwrap();
+                std::os::unix::fs::symlink("/dev/full", folder.join("data.ndjson")).unwrap();
+                let started = checked_api_recording(
+                    &r.recordings,
+                    start_recording_api_named(&owner(), &r.id, &r.recordings, name).await,
+                )
+                .await;
+                if required {
+                    assert!(
+                        matches!(started, Err(WarpgateError::SessionNotRecorded)),
+                        "refused at start"
+                    );
+                    r.assert_one_failure_line(true);
+                } else {
+                    assert!(matches!(started, Ok(Some(_))), "not checked when not required");
+                }
             }
         }
     }

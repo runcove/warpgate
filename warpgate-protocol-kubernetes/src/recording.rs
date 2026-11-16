@@ -38,6 +38,19 @@ impl KubernetesRecorder {
         self.writer.write_failed(cause)
     }
 
+    /// Writes an empty line (which readers skip) and waits for it to reach the
+    /// file, so a recording that cannot be written fails before its request is
+    /// forwarded rather than after.
+    pub async fn write_header(&self) -> Result<(), warpgate_core::recordings::Error> {
+        self.writer.write_empty_line().await?;
+        self.writer.flush().await
+    }
+
+    /// Waits for everything recorded so far to reach the file.
+    pub async fn flush(&self) -> Result<(), warpgate_core::recordings::Error> {
+        self.writer.flush().await
+    }
+
     pub async fn record_response(
         &self,
         method: &str,
@@ -117,11 +130,21 @@ pub async fn start_recording_api(
     recordings: &SessionRecordings,
 ) -> anyhow::Result<Option<KubernetesRecorder>> {
     let seq = API_RECORDING_SEQ.fetch_add(1, Ordering::Relaxed);
+    start_recording_api_named(owner, target_session_id, recordings, format!("api-{seq}")).await
+}
+
+/// As [`start_recording_api`], under a given recording name.
+pub(crate) async fn start_recording_api_named(
+    owner: &RecordingOwner,
+    target_session_id: &TargetSessionId,
+    recordings: &SessionRecordings,
+    name: String,
+) -> anyhow::Result<Option<KubernetesRecorder>> {
     recordings
         .start_for::<KubernetesRecorder, _>(
             owner,
             target_session_id,
-            Some(format!("api-{seq}")),
+            Some(name),
             SessionRecordingMetadata::Api,
         )
         .await
