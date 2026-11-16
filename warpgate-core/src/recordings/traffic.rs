@@ -57,6 +57,14 @@ pub struct ConnectionRecorder {
 }
 
 impl ConnectionRecorder {
+    /// Reports this recording's failure (`cause`, typically the error a write
+    /// returned) with the pinned [`crate::recordings::log_text::SESSION_RECORDING_FAILED`]
+    /// line, unless it was already reported. Returns whether the session must now be
+    /// closed (`--recordings-refuse-unrecorded-sessions`).
+    pub fn write_failed(&self, cause: &dyn std::fmt::Display) -> bool {
+        self.writer.write_failed(cause)
+    }
+
     fn new(
         params: TrafficConnectionParams,
         writer: RawRecordingWriter,

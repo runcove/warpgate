@@ -8,9 +8,11 @@ use anyhow::anyhow;
 use bytes::Bytes;
 use futures::stream::{FuturesOrdered, StreamExt};
 use tokio_util::sync::CancellationToken;
-use tracing::{Instrument, debug, info_span, warn};
+use tracing::{Instrument, debug, info_span};
 use warpgate_common::{TargetOptions, TargetSessionId, UserSessionId, WarpgateError};
-use warpgate_core::recordings::{DesktopRecorder, DesktopRecordingMetadata, SessionRecordings};
+use warpgate_core::recordings::{
+    DesktopRecorder, DesktopRecordingMetadata, RecordingOwner, SessionRecordings,
+};
 use warpgate_core::{
     AdmittedTarget, DesktopClientHandles, DesktopEvent, Services, TargetAuthorization,
 };
@@ -145,8 +147,16 @@ async fn connect(
     if !matches!(kind, TargetKind::Vnc | TargetKind::Rdp) {
         return Err(WarpgateError::InvalidTarget);
     }
-    let (handles, recorder) =
-        record_then_dial(&services.recordings, &target_session_id, || match kind {
+    let owner = RecordingOwner {
+        protocol: "web-desktop",
+        user: admitted.user_info().username.clone(),
+        target: admitted.target().name.clone(),
+    };
+    let (handles, recorder) = record_then_dial(
+        &services.recordings,
+        &owner,
+        &target_session_id,
+        || match kind {
             TargetKind::Vnc => {
                 warpgate_protocol_vnc::connect(admitted.narrow()?, services.secret_backends.clone())
             }
@@ -157,8 +167,9 @@ async fn connect(
                 size.unwrap_or(warpgate_protocol_rdp::DEFAULT_SIZE),
                 services.secret_backends.clone(),
             ),
-        })
-        .await?;
+        },
+    )
+    .await?;
 
     session.bind_backend(DesktopBackend {
         input_tx: handles.input_tx.clone(),
@@ -174,20 +185,22 @@ async fn connect(
 /// records framebuffer updates; the recording finalises when both drop.
 async fn record_then_dial(
     recordings: &SessionRecordings,
+    owner: &RecordingOwner,
     target_session_id: &TargetSessionId,
     dial: impl FnOnce() -> Result<DesktopClientHandles, WarpgateError>,
 ) -> Result<(DesktopClientHandles, Option<Arc<DesktopRecorder>>), WarpgateError> {
     let recorder = match recordings
-        .start::<DesktopRecorder, _>(target_session_id, None, DesktopRecordingMetadata::Desktop)
+        .start_for::<DesktopRecorder, _>(
+            owner,
+            target_session_id,
+            None,
+            DesktopRecordingMetadata::Desktop,
+        )
         .await
     {
         Ok(recorder) => recorder,
-        Err(error) => {
-            warn!(
-                %error,
-                "{}",
-                warpgate_core::recordings::log_text::FAILED_TO_START_DESKTOP_RECORDING
-            );
+        // Logged by `start_for`.
+        Err(_) => {
             if recordings.refuses_unrecorded_sessions() {
                 return Err(WarpgateError::SessionNotRecorded);
             }
@@ -206,7 +219,9 @@ async fn record_then_dial(
 /// re-encoded tile's original pixels, letting the recorder composite without a decode.
 ///
 /// A backend state change becomes a session phase; an error is remembered and returned so
-/// the session can end with it.
+/// the session can end with it. A failed recording write is reported once by the
+/// recorder; when unrecorded sessions are refused it is
+/// [`WarpgateError::SessionRecordingFailed`] and the event is not sent.
 async fn emit(
     session: &WebDesktopSession,
     recorder: Option<&DesktopRecorder>,
@@ -220,8 +235,10 @@ async fn emit(
             }
             _ => recorder.write_event(&event).await,
         };
-        if let Err(error) = result {
-            warn!(%error, "Failed to record desktop event");
+        if let Err(error) = result
+            && recorder.write_failed(&error)
+        {
+            return Err(WarpgateError::SessionRecordingFailed);
         }
     }
     match event {
@@ -323,8 +340,13 @@ async fn relay_events(
                     }
                     _ => {}
                 }
-                if let Err(err) = emit(session, recorder.as_deref(), event, raw.as_ref()).await {
-                    final_result = Err(err);
+                match emit(session, recorder.as_deref(), event, raw.as_ref()).await {
+                    // Ends the session: nothing more reaches the viewer unrecorded.
+                    Err(WarpgateError::SessionRecordingFailed) => {
+                        return Err(WarpgateError::SessionRecordingFailed);
+                    }
+                    Err(err) => final_result = Err(err),
+                    Ok(()) => (),
                 }
             }
             // Gated on an empty pipeline: a refinement snapshots the composited
@@ -336,7 +358,11 @@ async fn relay_events(
                     // `None`: the region left the surface (resize) or failed to encode.
                     if let Some(event) = session.refinement(rect).await {
                         debug!(?rect, "Refining settled region");
-                        let _ = emit(session, recorder.as_deref(), event, None).await;
+                        if let Err(WarpgateError::SessionRecordingFailed) =
+                            emit(session, recorder.as_deref(), event, None).await
+                        {
+                            return Err(WarpgateError::SessionRecordingFailed);
+                        }
                     } else {
                         debug!(?rect, "Settled region no longer refinable");
                     }
@@ -408,7 +434,12 @@ mod tests {
             let id = TargetSessionId(Uuid::new_v4());
             let recordings = failing_recordings(dir.path(), &id, refuse).await;
             let dialled = AtomicBool::new(false);
-            let result = record_then_dial(&recordings, &id, || {
+            let owner = RecordingOwner {
+                protocol: "web-desktop",
+                user: "alice".into(),
+                target: "desktop".into(),
+            };
+            let result = record_then_dial(&recordings, &owner, &id, || {
                 dialled.store(true, Ordering::SeqCst);
                 // The dial's own outcome does not matter here.
                 Err(WarpgateError::InvalidTarget)

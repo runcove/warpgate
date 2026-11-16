@@ -21,7 +21,9 @@ use warpgate_common_http::logging::{
     get_client_ip, log_request_error, log_request_result, span_for_request, upstream_uri_for_log,
 };
 use warpgate_core::logging::KubernetesAuditSubject;
-use warpgate_core::recordings::{SessionRecordings, TerminalRecorder, TerminalRecordingStreamId};
+use warpgate_core::recordings::{
+    RecordingOwner, SessionRecordings, TerminalRecorder, TerminalRecordingStreamId,
+};
 use warpgate_core::{Services, WarpgateServerHandle};
 
 use crate::audit::{StreamOperation, classify_mutating, classify_stream};
@@ -359,7 +361,12 @@ async fn _handle_normal_request_inner(
         .ok_or(WarpgateError::UserSessionEnded)?
         .context("reading request body")?;
 
-    let mut recorder_opt = start_api_recording(&admitted.id(), &services.recordings).await?;
+    let mut recorder_opt = start_api_recording(
+        &recording_owner(audit_subject),
+        &admitted.id(),
+        &services.recordings,
+    )
+    .await?;
 
     // Forward request to Kubernetes API
     let mut request_builder = client.request(
@@ -509,7 +516,11 @@ async fn _handle_normal_request_inner(
             )
             .await
     {
-        warn!("Failed to record Kubernetes response: {}", e);
+        // Logged and counted once; the response still goes out, even when
+        // unrecorded sessions are refused: the request has already reached the
+        // cluster, and failing it would hide whether it was applied. The next
+        // request starts a fresh recording, and is refused if that fails.
+        recorder.write_failed(&e);
     }
 
     let mut poem_response = Response::builder().status(status).body(response_body);
@@ -535,7 +546,14 @@ fn copy_upstream_response_headers(src: &http::HeaderMap, dst: &mut poem::http::H
     }
 }
 
-async fn run_websocket_recording(recorder: TerminalRecorder, mut rx: mpsc::Receiver<Vec<u8>>) {
+/// Records an exec / attach stream. On a failed write the recording is reported
+/// once and stops; when unrecorded sessions are refused, `recording_failed` is
+/// cancelled, which ends the stream.
+async fn run_websocket_recording(
+    recorder: TerminalRecorder,
+    mut rx: mpsc::Receiver<Vec<u8>>,
+    recording_failed: CancellationToken,
+) {
     while let Some(data) = rx.recv().await {
         if data.is_empty() {
             continue;
@@ -575,27 +593,35 @@ async fn run_websocket_recording(recorder: TerminalRecorder, mut rx: mpsc::Recei
             _ => continue,
         };
         if let Err(e) = result {
-            error!("Failed to write recording item: {}", e);
+            if recorder.write_failed(&e) {
+                recording_failed.cancel();
+            }
+            return;
         }
     }
 }
 
+/// The user and target named on a failed recording's log line.
+fn recording_owner(subject: &KubernetesAuditSubject) -> RecordingOwner {
+    RecordingOwner {
+        protocol: "kubernetes",
+        user: subject.username.clone(),
+        target: subject.target_name.clone(),
+    }
+}
+
 /// Start an API request's recording, before the request is forwarded. `Ok(None)` when
-/// recording is disabled. A failure to start is logged; it is then
+/// recording is disabled. A failure to start is logged (by `start_for`); it is then
 /// [`WarpgateError::SessionNotRecorded`] when unrecorded sessions are refused, and
 /// `Ok(None)` otherwise (the default).
 async fn start_api_recording(
+    owner: &RecordingOwner,
     target_session_id: &TargetSessionId,
     recordings: &SessionRecordings,
 ) -> Result<Option<KubernetesRecorder>, WarpgateError> {
-    match start_recording_api(target_session_id, recordings).await {
+    match start_recording_api(owner, target_session_id, recordings).await {
         Ok(recorder) => Ok(recorder),
-        Err(e) => {
-            warn!(
-                "{}: {}",
-                warpgate_core::recordings::log_text::FAILED_TO_START_RECORDING,
-                e
-            );
+        Err(_) => {
             if recordings.refuses_unrecorded_sessions() {
                 return Err(WarpgateError::SessionNotRecorded);
             }
@@ -607,18 +633,14 @@ async fn start_api_recording(
 /// Start an exec or attach stream's recording, before the stream opens. As
 /// [`start_api_recording`].
 async fn start_stream_recording(
+    owner: &RecordingOwner,
     target_session_id: &TargetSessionId,
     recordings: &SessionRecordings,
     metadata: SessionRecordingMetadata,
 ) -> Result<Option<TerminalRecorder>, WarpgateError> {
-    match start_recording_exec(target_session_id, recordings, metadata).await {
+    match start_recording_exec(owner, target_session_id, recordings, metadata).await {
         Ok(recorder) => Ok(recorder),
-        Err(e) => {
-            error!(
-                "{}: {}",
-                warpgate_core::recordings::log_text::FAILED_TO_START_RECORDING,
-                e
-            );
+        Err(_) => {
             if recordings.refuses_unrecorded_sessions() {
                 return Err(WarpgateError::SessionNotRecorded);
             }
@@ -656,13 +678,25 @@ async fn _handle_websocket_request_inner(
     let operation = classify_stream(api_path, req.uri().query());
 
     let (recorder_tx, recorder_rx) = mpsc::channel::<Vec<u8>>(1000);
+    // Cancelled when the recording fails and unrecorded sessions are refused: the
+    // stream then ends like a session close.
+    let recording_failed = closed.child_token();
     if let Some(metadata) = operation
         .as_ref()
         .and_then(StreamOperation::recording_metadata)
-        && let Some(recorder) =
-            start_stream_recording(&admitted.id(), &services.recordings, metadata).await?
+        && let Some(recorder) = start_stream_recording(
+            &recording_owner(audit_subject),
+            &admitted.id(),
+            &services.recordings,
+            metadata,
+        )
+        .await?
     {
-        tokio::spawn(run_websocket_recording(recorder, recorder_rx));
+        tokio::spawn(run_websocket_recording(
+            recorder,
+            recorder_rx,
+            recording_failed.clone(),
+        ));
     }
 
     let ws_protocol = req
@@ -726,13 +760,18 @@ async fn _handle_websocket_request_inner(
 
         let server_to_client = {
             let recorder_tx = recorder_tx.clone();
+            let recording_failed = recording_failed.clone();
             pump_websocket(
                 server_source,
                 client_sink,
                 move |msg| {
                     let recorder_tx = recorder_tx.clone();
+                    let recording_failed = recording_failed.clone();
                     async move {
                         tracing::debug!("Server: {:?}", msg);
+                        if recording_failed.is_cancelled() {
+                            return Err(WarpgateError::SessionRecordingFailed.into());
+                        }
                         if let tungstenite::Message::Binary(data) = &msg {
                             let _ = recorder_tx.send(data.to_vec()).await;
                         }
@@ -743,21 +782,28 @@ async fn _handle_websocket_request_inner(
             )
         };
 
-        let client_to_server = pump_websocket(
-            client_source,
-            server_sink,
-            move |msg| {
-                let recorder_tx = recorder_tx.clone();
-                async move {
-                    tracing::debug!("Client: {:?}", msg);
-                    if let tungstenite::Message::Binary(data) = &msg {
-                        let _ = recorder_tx.send(data.to_vec()).await;
+        let client_to_server = {
+            let recording_failed = recording_failed.clone();
+            pump_websocket(
+                client_source,
+                server_sink,
+                move |msg| {
+                    let recorder_tx = recorder_tx.clone();
+                    let recording_failed = recording_failed.clone();
+                    async move {
+                        tracing::debug!("Client: {:?}", msg);
+                        if recording_failed.is_cancelled() {
+                            return Err(WarpgateError::SessionRecordingFailed.into());
+                        }
+                        if let tungstenite::Message::Binary(data) = &msg {
+                            let _ = recorder_tx.send(data.to_vec()).await;
+                        }
+                        anyhow::Ok(msg)
                     }
-                    anyhow::Ok(msg)
-                }
-            },
-            "k8s_backend_to_browser",
-        );
+                },
+                "k8s_backend_to_browser",
+            )
+        };
 
         // Whichever direction ends first takes the stream down; the other is
         // dropped rather than left to fail writing into the closed socket. A
@@ -767,6 +813,10 @@ async fn _handle_websocket_request_inner(
         let result = tokio::select! {
             biased;
             () = closed.cancelled() => Ok(()),
+            () = recording_failed.cancelled() => {
+                warn!("Closing the Kubernetes stream: its recording failed");
+                Ok(())
+            }
             result = server_to_client => result,
             result = client_to_server => result,
         };
@@ -980,7 +1030,7 @@ mod tests {
         use sea_orm::{ActiveModelTrait, Database, IntoActiveModel};
         use uuid::Uuid;
         use warpgate_common::{GlobalParams, TargetSessionId, WarpgateError};
-        use warpgate_core::recordings::SessionRecordings;
+        use warpgate_core::recordings::{RecordingOwner, SessionRecordings};
         use warpgate_db_entities::Parameters::{
             self, ConfigMigrationValues, RecordingsDiskConfig, RecordingsStorageConfig,
             set_config_migration_values,
@@ -1029,6 +1079,14 @@ mod tests {
             }
         }
 
+        fn owner() -> RecordingOwner {
+            RecordingOwner {
+                protocol: "kubernetes",
+                user: "alice".into(),
+                target: "cluster".into(),
+            }
+        }
+
         fn exec() -> SessionRecordingMetadata {
             SessionRecordingMetadata::Exec {
                 namespace: "default".into(),
@@ -1042,7 +1100,7 @@ mod tests {
         async fn an_api_request_whose_recording_fails_is_refused_when_required() {
             let f = failing(true).await;
             assert!(matches!(
-                start_api_recording(&f.id, &f.recordings).await,
+                start_api_recording(&owner(), &f.id, &f.recordings).await,
                 Err(WarpgateError::SessionNotRecorded)
             ));
         }
@@ -1051,7 +1109,7 @@ mod tests {
         async fn an_exec_stream_whose_recording_fails_is_refused_when_required() {
             let f = failing(true).await;
             assert!(matches!(
-                start_stream_recording(&f.id, &f.recordings, exec()).await,
+                start_stream_recording(&owner(), &f.id, &f.recordings, exec()).await,
                 Err(WarpgateError::SessionNotRecorded)
             ));
         }
@@ -1060,11 +1118,11 @@ mod tests {
         async fn with_refusal_off_api_and_exec_continue_unrecorded() {
             let f = failing(false).await;
             assert!(matches!(
-                start_api_recording(&f.id, &f.recordings).await,
+                start_api_recording(&owner(), &f.id, &f.recordings).await,
                 Ok(None)
             ));
             assert!(matches!(
-                start_stream_recording(&f.id, &f.recordings, exec()).await,
+                start_stream_recording(&owner(), &f.id, &f.recordings, exec()).await,
                 Ok(None)
             ));
         }

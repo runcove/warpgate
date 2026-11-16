@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use warpgate_common::TargetSessionId;
 use warpgate_core::recordings::{
-    NDJsonRecordingWriter, Recorder, RecordingWriterOpener, SessionRecordings, TerminalRecorder,
+    NDJsonRecordingWriter, Recorder, RecordingOwner, RecordingWriterOpener, SessionRecordings,
+    TerminalRecorder,
 };
 use warpgate_db_entities::Recording::RecordingKind;
 
@@ -30,6 +31,13 @@ pub struct KubernetesRecorder {
 }
 
 impl KubernetesRecorder {
+    /// Reports this recording's failure once (see
+    /// [`NDJsonRecordingWriter::write_failed`]); returns whether unrecorded sessions
+    /// are refused.
+    pub fn write_failed(&self, cause: &dyn std::fmt::Display) -> bool {
+        self.writer.write_failed(cause)
+    }
+
     pub async fn record_response(
         &self,
         method: &str,
@@ -102,13 +110,16 @@ pub enum SessionRecordingMetadata {
 /// required to keep each request's recording separate.
 static API_RECORDING_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// A failure to start is logged and counted by [`SessionRecordings::start_for`].
 pub async fn start_recording_api(
+    owner: &RecordingOwner,
     target_session_id: &TargetSessionId,
     recordings: &SessionRecordings,
 ) -> anyhow::Result<Option<KubernetesRecorder>> {
     let seq = API_RECORDING_SEQ.fetch_add(1, Ordering::Relaxed);
     recordings
-        .start::<KubernetesRecorder, _>(
+        .start_for::<KubernetesRecorder, _>(
+            owner,
             target_session_id,
             Some(format!("api-{seq}")),
             SessionRecordingMetadata::Api,
@@ -117,13 +128,15 @@ pub async fn start_recording_api(
         .context("starting recording")
 }
 
+/// As [`start_recording_api`].
 pub async fn start_recording_exec(
+    owner: &RecordingOwner,
     target_session_id: &TargetSessionId,
     recordings: &SessionRecordings,
     metadata: SessionRecordingMetadata,
 ) -> anyhow::Result<Option<TerminalRecorder>> {
     recordings
-        .start::<TerminalRecorder, _>(target_session_id, None, metadata)
+        .start_for::<TerminalRecorder, _>(owner, target_session_id, None, metadata)
         .await
         .context("starting recording")
 }

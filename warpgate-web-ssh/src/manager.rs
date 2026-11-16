@@ -69,6 +69,7 @@ impl WebSshClientManager {
         let session = Arc::new(WebSshSession::new(
             session_id,
             user_id,
+            username.clone(),
             target_name.clone(),
             target_kind,
             server_handle,
@@ -154,10 +155,11 @@ async fn relay_events(
                 session.set_phase(LiveSessionPhase::Connected).await;
             }
             RCEvent::Output(channel_id, data) => {
-                session.on_output(channel_id, &data).await;
-                session
-                    .push(ServerMessage::Output { channel_id, data })
-                    .await;
+                if session.on_output(channel_id, &data).await {
+                    session
+                        .push(ServerMessage::Output { channel_id, data })
+                        .await;
+                }
             }
             RCEvent::Eof(channel_id) => {
                 session.push(ServerMessage::Eof { channel_id }).await;

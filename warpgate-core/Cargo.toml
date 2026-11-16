@@ -41,6 +41,8 @@ totp-rs = { version = "5.0", features = ["otpauth"], default-features = false }
 tracing.workspace = true
 tracing-core = { version = "0.1", default-features = false }
 tracing-subscriber = { version = "0.3", default-features = false }
+# Only the `test-util` helper `recordings::test_support` uses it.
+libc = "0.2"
 url.workspace = true
 uuid.workspace = true
 vt100 = "0.16"
@@ -58,6 +60,8 @@ webpki = { version = "0.22", default-features = false }
 zune-jpeg.workspace = true
 
 [features]
+# `recordings::test_support`, for other crates' tests.
+test-util = []
 postgres = ["sea-orm/sqlx-postgres"]
 mysql = ["sea-orm/sqlx-mysql"]
 sqlite = ["sea-orm/sqlx-sqlite", "dep:libsqlite3-sys"]

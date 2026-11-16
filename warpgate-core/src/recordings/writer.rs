@@ -16,7 +16,7 @@ use warpgate_common::try_block;
 use warpgate_db_entities::Recording;
 
 use super::storage::RecordingSink;
-use super::{Error, LiveMap, Result};
+use super::{Error, FailureReporter, LiveMap, Result};
 
 /// Capacity of both the disk-write queue and the live broadcast ring. They must
 /// stay equal: the live-stream lag heal relies on any item dropped from the
@@ -49,6 +49,8 @@ pub struct RawRecordingWriter {
     /// lock, and the counter can't diverge from disk order.
     offset: Arc<AtomicU64>,
     drop_signal: mpsc::Sender<()>,
+    /// Shared by every writer of this recording.
+    reporter: Arc<FailureReporter>,
 }
 
 impl RawRecordingWriter {
@@ -57,6 +59,7 @@ impl RawRecordingWriter {
         live: Option<LiveMap>,
         shutdown: WriterShutdown,
         ticket: WriterTicket,
+        reporter: Arc<FailureReporter>,
     ) -> Result<Self> {
         let recording_id = ticket.recording_id();
         let (sender, mut receiver) = mpsc::channel::<Bytes>(RECORDING_QUEUE_CAPACITY);
@@ -82,6 +85,7 @@ impl RawRecordingWriter {
             });
         }
 
+        let task_reporter = reporter.clone();
         tracker.spawn(async move {
             let mut written = true;
             try_block!(async {
@@ -110,7 +114,12 @@ impl RawRecordingWriter {
                 Ok::<(), anyhow::Error>(())
             } catch (error: anyhow::Error) {
                 written = false;
-                error!(%error, "Failed to write recording");
+                // Reported before the queue closes, so the line carries the real
+                // cause rather than a writer's later "Writer is closed".
+                task_reporter.write_failed(&format_args!("{error:#}"));
+                // Every later write then fails at once instead of filling the
+                // queue and blocking its session while the sink finalizes.
+                receiver.close();
             });
 
             // Crashed writer leaves the recording scratch as-is
@@ -122,6 +131,7 @@ impl RawRecordingWriter {
                 Ok::<(), Error>(())
             } catch (error: Error) {
                 error!(%error, "Failed to finalize recording");
+                task_reporter.write_failed(&error);
             });
         });
 
@@ -130,7 +140,15 @@ impl RawRecordingWriter {
             live_sender,
             offset: Arc::new(AtomicU64::new(0)),
             drop_signal,
+            reporter,
         })
+    }
+
+    /// Reports this recording's failure (`cause`, typically the error a write
+    /// returned) with the [`super::log_text::SESSION_RECORDING_FAILED`] line, unless
+    /// it was already reported. Returns whether the session must now be closed.
+    pub fn write_failed(&self, cause: &dyn std::fmt::Display) -> bool {
+        self.reporter.write_failed(cause)
     }
 
     pub async fn write(&self, data: &[u8]) -> Result<()> {
@@ -165,6 +183,11 @@ impl NDJsonRecordingWriter {
             inner,
             buf: RwLock::new(Vec::new()),
         }
+    }
+
+    /// As [`RawRecordingWriter::write_failed`].
+    pub fn write_failed(&self, cause: &dyn std::fmt::Display) -> bool {
+        self.inner.write_failed(cause)
     }
 
     pub async fn write_json_line<I: Serialize>(&self, value: I) -> Result<usize> {

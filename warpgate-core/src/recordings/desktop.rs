@@ -4,7 +4,6 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tokio::time::Instant;
-use tracing::error;
 use warpgate_db_entities::Parameters;
 use warpgate_db_entities::Recording::RecordingKind;
 
@@ -207,6 +206,14 @@ pub struct DesktopRecorder {
 }
 
 impl DesktopRecorder {
+    /// Reports this recording's failure (`cause`, typically the error a write
+    /// returned) with the pinned [`crate::recordings::log_text::SESSION_RECORDING_FAILED`]
+    /// line, unless it was already reported. Returns whether the session must now be
+    /// closed (`--recordings-refuse-unrecorded-sessions`).
+    pub fn write_failed(&self, cause: &dyn std::fmt::Display) -> bool {
+        self.data_writer.write_failed(cause)
+    }
+
     pub fn track_logon_state(&self, state: LogonState) {
         let _ = self.sign_in.set(state);
     }
@@ -610,7 +617,7 @@ impl Drop for DesktopRecorder {
                 time: state.duration,
             };
             if let Err(error) = index_writer.write_json_line(&entry).await {
-                error!(%error, "Failed to write the recording index footer");
+                index_writer.write_failed(&error);
             }
         });
     }

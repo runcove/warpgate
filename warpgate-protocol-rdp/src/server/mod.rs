@@ -464,10 +464,14 @@ async fn control_loop(
         let Some(backend) = &backend else {
             continue;
         };
+        // A failed write is reported once by the recorder; when unrecorded sessions
+        // are refused the session ends before the input reaches the target.
         if let Some(recorder) = &backend.recorder
             && let Err(error) = recorder.write_input(&input).await
+            && recorder.write_failed(&error)
         {
-            warn!(%error, "Failed to record RDP viewer input");
+            warn!("Closing the RDP session: its recording failed");
+            break;
         }
         if backend.input_tx.send(input).await.is_err() {
             break;

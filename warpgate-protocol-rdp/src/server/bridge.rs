@@ -4,6 +4,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use tokio::sync::Notify;
 use tokio::sync::mpsc::Sender;
 use tracing::{Instrument as _, info, warn};
 use warpgate_common::TargetRdpOptions;
@@ -23,18 +24,28 @@ use super::protocol::Input as ServerInput;
 /// delivery — `DesktopEvent` clones are cheap (`RawImage` holds ref-counted `Bytes`). The
 /// recorder is also shared with `control_loop` (viewer input); the recording finalises once
 /// every handle drops.
+///
+/// A failed recording write is reported once and recording stops; when unrecorded
+/// sessions are refused the viewer is shut down. A frame dropped under overload (below)
+/// is not a failure: the recording is best-effort under load by design.
 async fn frame_bridge(
     mut event_rx: tokio::sync::mpsc::Receiver<DesktopEvent>,
     server_in: Sender<ServerInput>,
     recorder: Option<Arc<DesktopRecorder>>,
 ) {
+    // Holds a permit once the recording failed and the session must close.
+    let recording_failed = Arc::new(Notify::new());
     let record_tx = recorder.map(|recorder| {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DesktopEvent>(256);
+        let recording_failed = recording_failed.clone();
         tokio::spawn(
             async move {
                 while let Some(event) = rx.recv().await {
                     if let Err(error) = recorder.write_event(&event).await {
-                        warn!(%error, "Failed to record RDP desktop event");
+                        if recorder.write_failed(&error) {
+                            recording_failed.notify_one();
+                        }
+                        return;
                     }
                 }
             }
@@ -43,7 +54,19 @@ async fn frame_bridge(
         tx
     });
 
-    while let Some(event) = event_rx.recv().await {
+    loop {
+        let event = tokio::select! {
+            biased;
+            () = recording_failed.notified() => {
+                warn!("Closing the RDP session: its recording failed");
+                let _ = server_in.send(ServerInput::Shutdown).await;
+                return;
+            }
+            event = event_rx.recv() => event,
+        };
+        let Some(event) = event else {
+            break;
+        };
         if let Some(record_tx) = &record_tx {
             // Best-effort: recording must never stall the live path, so drop under overload.
             let _ = record_tx.try_send(event.clone());
@@ -101,7 +124,8 @@ pub(super) async fn connect_backend(
 ) -> Result<BackendBridge> {
     info!(target=%admitted.target().name, "Authorized");
 
-    let recorder = warpgate_desktop_auth::start_recording(services, &admitted.id(), "rdp")
+    let owner = warpgate_desktop_auth::recording_owner("rdp", &admitted);
+    let recorder = warpgate_desktop_auth::start_recording(services, &admitted.id(), owner)
         .await?
         .map(Arc::new);
 

@@ -32,7 +32,9 @@ use warpgate_common_http::ext::construct_control_plane_url;
 use warpgate_core::approvals::{GatedConnection, admit_target_session};
 use warpgate_core::auth::submit_credential;
 use warpgate_core::login_protection::FailedAttemptInfo;
-use warpgate_core::recordings::{DesktopRecorder, DesktopRecordingMetadata, SessionRecordings};
+use warpgate_core::recordings::{
+    DesktopRecorder, DesktopRecordingMetadata, RecordingOwner, SessionRecordings,
+};
 use warpgate_core::{
     AdmittedTarget, AuthorizedIdentity, Services, TargetAuthorization, WarpgateServerHandle,
     authorize_and_spend_ticket, authorize_for_target_by_name,
@@ -302,37 +304,46 @@ async fn web_approval_url(services: &Services, state: &Arc<Mutex<AuthState>>) ->
     Some(url.to_string())
 }
 
+/// The user and target named on a native desktop session's failed-recording log line;
+/// `protocol` is `rdp` or `vnc`.
+pub fn recording_owner<O>(protocol: &'static str, admitted: &AdmittedTarget<O>) -> RecordingOwner {
+    RecordingOwner {
+        protocol,
+        user: admitted.user_info().username.clone(),
+        target: admitted.target().name.clone(),
+    }
+}
+
 /// Start a Desktop recording for a native desktop session (RDP / VNC). `Ok(None)` when
-/// recording is disabled. A failure to start is logged against `protocol_label`; it is
-/// then [`WarpgateError::SessionNotRecorded`] when unrecorded sessions are refused, and
+/// recording is disabled. A failure to start is logged (by `start_for`) against `owner`;
+/// it is then [`WarpgateError::SessionNotRecorded`] when unrecorded sessions are refused, and
 /// `Ok(None)` (the session continues unrecorded) otherwise, the default.
 ///
 /// Not an `async fn` wrapper, so the future callers hold is no deeper than before.
 pub fn start_recording<'a>(
     services: &'a Services,
     target_session_id: &'a TargetSessionId,
-    protocol_label: &'a str,
+    owner: RecordingOwner,
 ) -> impl Future<Output = Result<Option<DesktopRecorder>, WarpgateError>> + Send + 'a {
-    start_recording_in(&services.recordings, target_session_id, protocol_label)
+    start_recording_in(&services.recordings, target_session_id, owner)
 }
 
 async fn start_recording_in(
     recordings: &SessionRecordings,
     target_session_id: &TargetSessionId,
-    protocol_label: &str,
+    owner: RecordingOwner,
 ) -> Result<Option<DesktopRecorder>, WarpgateError> {
     match recordings
-        .start::<DesktopRecorder, _>(target_session_id, None, DesktopRecordingMetadata::Desktop)
+        .start_for::<DesktopRecorder, _>(
+            &owner,
+            target_session_id,
+            None,
+            DesktopRecordingMetadata::Desktop,
+        )
         .await
     {
         Ok(recorder) => Ok(recorder),
-        Err(error) => {
-            warn!(
-                %error,
-                protocol = protocol_label,
-                "{}",
-                warpgate_core::recordings::log_text::FAILED_TO_START_DESKTOP_SESSION_RECORDING
-            );
+        Err(_) => {
             if recordings.refuses_unrecorded_sessions() {
                 Err(WarpgateError::SessionNotRecorded)
             } else {
@@ -411,7 +422,12 @@ mod tests {
     async fn start(refuse: bool, enable: bool) -> Result<Option<DesktopRecorder>, WarpgateError> {
         let dir = tempfile::tempdir().unwrap();
         let recordings = failing_recordings(dir.path(), refuse, enable).await;
-        start_recording_in(&recordings, &TargetSessionId(Uuid::new_v4()), "rdp").await
+        let owner = RecordingOwner {
+            protocol: "rdp",
+            user: "user".into(),
+            target: "target".into(),
+        };
+        start_recording_in(&recordings, &TargetSessionId(Uuid::new_v4()), owner).await
     }
 
     #[tokio::test]

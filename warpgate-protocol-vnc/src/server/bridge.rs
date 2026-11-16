@@ -9,6 +9,7 @@ use anyhow::{Result, anyhow, bail};
 use tokio::io::AsyncWrite;
 use tokio::sync::mpsc;
 use tracing::warn;
+use warpgate_common::WarpgateError;
 use warpgate_core::recordings::DesktopRecorder;
 use warpgate_core::{DesktopEvent, DesktopInput, DesktopState};
 
@@ -18,24 +19,37 @@ use super::protocol::{
 };
 use super::{ProxySession, RenderState};
 
-/// Record an event, logging (but not failing on) recorder write errors. No-op when
-/// recording is disabled (`None`).
-async fn record_event(recorder: Option<&DesktopRecorder>, event: &DesktopEvent) {
+/// Record an event. No-op when recording is disabled (`None`). A failed write is
+/// reported once by the recorder; it is an error, which ends the session, only when
+/// unrecorded sessions are refused.
+async fn record_event(recorder: Option<&DesktopRecorder>, event: &DesktopEvent) -> Result<()> {
     if let Some(recorder) = recorder
         && let Err(error) = recorder.write_event(event).await
     {
-        warn!(%error, "Failed to record VNC desktop event");
+        return check_recording(recorder, &error);
     }
+    Ok(())
 }
 
-/// Record a viewer input, logging (but not failing on) recorder write errors. No-op when
-/// recording is disabled (`None`).
-async fn record_input(recorder: Option<&DesktopRecorder>, input: &DesktopInput) {
+/// Record a viewer input, before it is forwarded. As [`record_event`].
+async fn record_input(recorder: Option<&DesktopRecorder>, input: &DesktopInput) -> Result<()> {
     if let Some(recorder) = recorder
         && let Err(error) = recorder.write_input(input).await
     {
-        warn!(%error, "Failed to record VNC viewer input");
+        return check_recording(recorder, &error);
     }
+    Ok(())
+}
+
+fn check_recording(
+    recorder: &DesktopRecorder,
+    error: &warpgate_core::recordings::Error,
+) -> Result<()> {
+    if recorder.write_failed(error) {
+        warn!("Closing the VNC session: its recording failed");
+        return Err(WarpgateError::SessionRecordingFailed.into());
+    }
+    Ok(())
 }
 
 /// Drain backend events until the first [`DesktopEvent::Resize`] reveals the framebuffer
@@ -46,7 +60,7 @@ pub(super) async fn wait_for_backend_size(
     recorder: Option<&DesktopRecorder>,
 ) -> Result<(u16, u16)> {
     while let Some(event) = event_rx.recv().await {
-        record_event(recorder, &event).await;
+        record_event(recorder, &event).await?;
         match event {
             DesktopEvent::Resize { width, height } => return Ok((width, height)),
             DesktopEvent::Error(message) => bail!("backend error before first frame: {message}"),
@@ -159,21 +173,27 @@ pub(super) async fn run_proxy_session(session: ProxySession) -> Result<()> {
                             scancode: None,
                             down,
                         };
-                        record_input(recorder.as_ref(), &input).await;
+                        if let Err(error) = record_input(recorder.as_ref(), &input).await {
+                            break Err(error);
+                        }
                         if input_tx.send(input).await.is_err() {
                             break Ok(());
                         }
                     }
                     Some(ClientEvent::Pointer { x, y, buttons }) => {
                         let input = DesktopInput::Pointer { x, y, buttons };
-                        record_input(recorder.as_ref(), &input).await;
+                        if let Err(error) = record_input(recorder.as_ref(), &input).await {
+                            break Err(error);
+                        }
                         if input_tx.send(input).await.is_err() {
                             break Ok(());
                         }
                     }
                     Some(ClientEvent::Clipboard(text)) => {
                         let input = DesktopInput::Clipboard(text);
-                        record_input(recorder.as_ref(), &input).await;
+                        if let Err(error) = record_input(recorder.as_ref(), &input).await {
+                            break Err(error);
+                        }
                         let _ = input_tx.send(input).await;
                     }
                     None => break Ok(()), // viewer disconnected
@@ -185,7 +205,9 @@ pub(super) async fn run_proxy_session(session: ProxySession) -> Result<()> {
             event = event_rx.recv(), if queue.len() < QUEUE_CAP => {
                 match event {
                     Some(event) => {
-                        record_event(recorder.as_ref(), &event).await;
+                        if let Err(error) = record_event(recorder.as_ref(), &event).await {
+                            break Err(error);
+                        }
                         match event {
                             DesktopEvent::RawImage { .. }
                             | DesktopEvent::JpegImage { .. }

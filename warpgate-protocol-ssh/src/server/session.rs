@@ -42,7 +42,9 @@ use warpgate_core::auth::step_up::{
 };
 use warpgate_core::auth::submit_credential;
 use warpgate_core::login_protection::FailedAttemptInfo;
-use warpgate_core::recordings::{self, TerminalRecorder, TrafficConnectionParams, TrafficRecorder};
+use warpgate_core::recordings::{
+    RecordingOwner, TerminalRecorder, TrafficConnectionParams, TrafficRecorder,
+};
 use warpgate_core::{
     AdmittedTarget, ApprovedTarget, AuthorizedIdentity, ConfigProvider, Services,
     TargetAuthorization, TargetSessionStart, WarpgateServerHandle, authorize_and_spend_ticket,
@@ -338,6 +340,9 @@ pub struct ServerSession {
     /// Recording requests made while [`Self::target_session_id`] was still
     /// `None`, in arrival order. Drained on stamp.
     pending_recordings: Vec<(Uuid, SshRecordingMetadata)>,
+    /// The user and target named on a failed recording's log line; set with
+    /// [`Self::target_session_id`].
+    recording_owner: RecordingOwner,
     /// Set when the session was refused because a recording could not start
     /// (see [`Self::refuse_unrecorded_session`]). From then on
     /// [`Self::maybe_connect_remote`] never dials the target: a recording
@@ -406,6 +411,15 @@ pub struct ServerSession {
 
 fn session_debug_tag(id: &UserSessionId, remote_address: &SocketAddr) -> String {
     format!("[{id} - {remote_address}]")
+}
+
+/// The owner of an SSH session's recordings before its target is known.
+fn ssh_recording_owner() -> RecordingOwner {
+    RecordingOwner {
+        protocol: "ssh",
+        user: String::new(),
+        target: String::new(),
+    }
 }
 
 fn shell_recording_metadata(server_channel_id: ServerChannelId) -> SshRecordingMetadata {
@@ -2002,6 +2016,7 @@ mod tests {
                 target: TargetSelection::None,
                 target_session_id: None,
                 pending_recordings: vec![],
+                recording_owner: ssh_recording_owner(),
                 recording_refused: false,
                 traffic_recorders: HashMap::new(),
                 hub,
@@ -2773,6 +2788,7 @@ impl ServerSession {
             target: TargetSelection::None,
             target_session_id: None,
             pending_recordings: vec![],
+            recording_owner: ssh_recording_owner(),
             recording_refused: false,
             traffic_recorders: HashMap::new(),
             hub,
@@ -3640,6 +3656,11 @@ impl ServerSession {
 
     async fn stamp_approved_target(&mut self, admitted: AdmittedTarget<TargetSSHOptions>) {
         self.target_session_id = Some(admitted.id());
+        self.recording_owner = RecordingOwner {
+            user: admitted.user_info().username.clone(),
+            target: admitted.target().name.clone(),
+            ..ssh_recording_owner()
+        };
         self.target_env = admitted.options().env.clone();
         self.target = TargetSelection::Found(admitted);
         self.start_pending_recordings().await;
@@ -3777,7 +3798,10 @@ impl ServerSession {
                     .into());
                 };
                 channel_state.pty_size = Some(request.clone());
-                channel_state.audit.on_resize(&request).await;
+                if channel_state.audit.on_resize(&request).await.is_break() {
+                    self.close_on_recording_failure().await;
+                    return Ok(());
+                }
 
                 self.send_command_and_wait(RCCommand::Channel(
                     channel_id,
@@ -4026,15 +4050,21 @@ impl ServerSession {
                 self.disconnect_server().await;
             }
             RCEvent::Output(channel, data) => {
+                let mut recording_failed = false;
                 if let Some(channel_state) = self.channels.get_mut(&channel) {
-                    channel_state.audit.on_output(&data).await;
+                    recording_failed = channel_state.audit.on_output(&data).await.is_break();
 
                     if let Some(recorder) = channel_state.traffic_recorder.as_mut()
                         && let Err(error) = recorder.write_rx(&data).await
                     {
-                        error!(%channel, ?error, "Failed to record traffic data");
+                        recording_failed |= recorder.write_failed(&format_args!("{error:#}"));
                         channel_state.traffic_recorder = None;
                     }
+                }
+                // Closed before the unrecorded output reaches the client.
+                if recording_failed {
+                    self.close_on_recording_failure().await;
+                    return Ok(());
                 }
 
                 let slot = self.intake.take_slot();
@@ -4110,8 +4140,11 @@ impl ServerSession {
                 }
             }
             RCEvent::ExtendedData { channel, data, ext } => {
-                if let Some(channel_state) = self.channels.get_mut(&channel) {
-                    channel_state.audit.on_error_output(&data).await;
+                if let Some(channel_state) = self.channels.get_mut(&channel)
+                    && channel_state.audit.on_error_output(&data).await.is_break()
+                {
+                    self.close_on_recording_failure().await;
+                    return Ok(());
                 }
                 let slot = self.intake.take_slot();
                 if let Some((handle, id)) = self.client_channel(&channel)?
@@ -4164,7 +4197,8 @@ impl ServerSession {
                         src_addr: Ipv4Addr::from_str("1.1.1.1").unwrap(),
                         src_port: params.originator_port as u16,
                     };
-                    self.attach_traffic_recorder(id, &key, connection_params)
+                    let _ = self
+                        .attach_traffic_recorder(id, &key, connection_params)
                         .await;
                 }
             }
@@ -4191,7 +4225,8 @@ impl ServerSession {
                     let connection_params = TrafficConnectionParams::Socket {
                         socket_path: params.socket_path,
                     };
-                    self.attach_traffic_recorder(id, &key, connection_params)
+                    let _ = self
+                        .attach_traffic_recorder(id, &key, connection_params)
                         .await;
                 }
             }
@@ -4402,9 +4437,13 @@ impl ServerSession {
 
                 // The recorder is attached before the deferred output is
                 // replayed, so the target's first bytes are recorded too.
-                if let Some((key, connection_params)) = recording {
-                    self.attach_traffic_recorder(uuid, &key, connection_params)
-                        .await;
+                if let Some((key, connection_params)) = recording
+                    && self
+                        .attach_traffic_recorder(uuid, &key, connection_params)
+                        .await
+                        .is_break()
+                {
+                    return Ok(());
                 }
 
                 self.confirm_channel_open(uuid).await?;
@@ -4442,7 +4481,10 @@ impl ServerSession {
             .into());
         };
         channel_state.pty_size = Some(request.clone());
-        channel_state.audit.on_resize(&request).await;
+        if channel_state.audit.on_resize(&request).await.is_break() {
+            self.close_on_recording_failure().await;
+            return Ok(());
+        }
 
         if matches!(self.target, TargetSelection::Menu) {
             let (cols, rows) = request.screen_size();
@@ -4537,27 +4579,44 @@ impl ServerSession {
             self.pending_recordings.push((channel_id, metadata));
             return ControlFlow::Continue(());
         };
-        let recorder = async {
-            let Some(recorder) = self
-                .services
-                .recordings
-                .start::<TerminalRecorder, _>(&target_session_id, None, metadata)
-                .await?
-            else {
-                return Ok(None);
-            };
-            if let Some(request) = self
-                .channels
-                .get(&channel_id)
-                .and_then(|c| c.pty_size.as_ref())
-            {
-                recorder
-                    .write_pty_resize(request.col_width, request.row_height)
-                    .await?;
+        let recorder = match self
+            .services
+            .recordings
+            .start_for::<TerminalRecorder, _>(
+                &self.recording_owner,
+                &target_session_id,
+                None,
+                metadata,
+            )
+            .await
+        {
+            Ok(Some(recorder)) => {
+                let seeded = match self
+                    .channels
+                    .get(&channel_id)
+                    .and_then(|c| c.pty_size.as_ref())
+                {
+                    Some(request) => {
+                        recorder
+                            .write_pty_resize(request.col_width, request.row_height)
+                            .await
+                    }
+                    None => Ok(()),
+                };
+                match seeded {
+                    Ok(()) => Ok(Some(recorder)),
+                    // Started, then failed: reported once by the recorder.
+                    Err(error) => {
+                        if recorder.write_failed(&error) {
+                            self.close_on_recording_failure().await;
+                            return ControlFlow::Break(());
+                        }
+                        Ok(None)
+                    }
+                }
             }
-            Ok::<_, recordings::Error>(Some(recorder))
-        }
-        .await;
+            other => other,
+        };
         match recorder {
             Ok(Some(recorder)) => {
                 // Starting the recording awaits, so the channel can be gone by
@@ -4569,15 +4628,8 @@ impl ServerSession {
                 }
             }
             Ok(None) => (),
-            Err(error) => {
-                error!(
-                    channel=%channel_id,
-                    ?error,
-                    "{}",
-                    recordings::log_text::FAILED_TO_START_RECORDING
-                );
-                return self.refuse_unrecorded_session().await;
-            }
+            // Logged by `start_for`.
+            Err(_) => return self.refuse_unrecorded_session().await,
         }
         ControlFlow::Continue(())
     }
@@ -4597,6 +4649,19 @@ impl ServerSession {
         self.request_disconnect();
         self.disconnect_server().await;
         ControlFlow::Break(())
+    }
+
+    /// A recording failed mid-session (already logged by its recorder) and
+    /// unrecorded sessions are refused: tell the client and close the connection.
+    /// The caller returns without forwarding the data it could not record.
+    async fn close_on_recording_failure(&mut self) {
+        self.recording_refused = true;
+        let reason = WarpgateError::SessionRecordingFailed.to_string();
+        warn!(session = %self.id, "Closing the connection: its recording failed");
+        let _ = self.emit_pty_error(&reason);
+        self.disconnect_description = reason;
+        self.request_disconnect();
+        self.disconnect_server().await;
     }
 
     /// Starts the recordings parked while no target session existed yet — the
@@ -4733,22 +4798,15 @@ impl ServerSession {
         match self
             .services
             .recordings
-            .start(&target_session_id, None, metadata)
+            .start_for(&self.recording_owner, &target_session_id, None, metadata)
             .await
         {
             Ok(Some(recorder)) => {
                 self.traffic_recorders.insert(key.clone(), recorder);
             }
             Ok(None) => (),
-            Err(error) => {
-                error!(
-                    ?key,
-                    ?error,
-                    "{}",
-                    recordings::log_text::FAILED_TO_START_RECORDING
-                );
-                return self.refuse_unrecorded_session().await;
-            }
+            // Logged by `start_for`.
+            Err(_) => return self.refuse_unrecorded_session().await,
         }
         ControlFlow::Continue(())
     }
@@ -4768,17 +4826,22 @@ impl ServerSession {
         channel: Uuid,
         key: &TrafficRecorderKey,
         connection_params: TrafficConnectionParams,
-    ) {
+    ) -> ControlFlow<()> {
         let Some(recorder) = self.traffic_recorders.get_mut(key) else {
-            return;
+            return ControlFlow::Continue(());
         };
         let mut recorder = recorder.connection(connection_params);
         if let Err(error) = recorder.write_connection_setup().await {
-            error!(%channel, ?error, "Failed to record connection setup");
+            if recorder.write_failed(&format_args!("{error:#}")) {
+                self.close_on_recording_failure().await;
+                return ControlFlow::Break(());
+            }
+            return ControlFlow::Continue(());
         }
         if let Some(channel_state) = self.channels.get_mut(&channel) {
             channel_state.traffic_recorder = Some(recorder);
         }
+        ControlFlow::Continue(())
     }
 
     pub async fn _channel_subsystem_request(
@@ -4827,15 +4890,21 @@ impl ServerSession {
             return Ok(());
         }
 
+        let mut recording_failed = false;
         if let Some(channel_state) = self.channels.get_mut(&channel_id) {
-            channel_state.audit.on_input(&data).await;
+            recording_failed = channel_state.audit.on_input(&data).await.is_break();
 
             if let Some(recorder) = channel_state.traffic_recorder.as_mut()
                 && let Err(error) = recorder.write_tx(&data).await
             {
-                error!(channel=%channel_id, ?error, "Failed to record traffic data");
+                recording_failed |= recorder.write_failed(&format_args!("{error:#}"));
                 channel_state.traffic_recorder = None;
             }
+        }
+        // Closed before the unrecorded input reaches the target.
+        if recording_failed {
+            self.close_on_recording_failure().await;
+            return Ok(());
         }
 
         if has_pty {

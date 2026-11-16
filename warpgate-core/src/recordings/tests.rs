@@ -431,6 +431,7 @@ async fn a_failed_local_write_does_not_end() {
         RecordingCompletion::new(h.db.clone(), model.id)
             .register_writer()
             .await,
+        FailureReporter::for_test(&h.recordings, &h.session_id),
     )
     .await
     .unwrap();
@@ -1406,4 +1407,151 @@ fn tempfile_in_temp_dir() -> PathBuf {
     let probe = std::env::temp_dir().join(format!("wg-uid-probe-{}", Uuid::new_v4()));
     std::fs::write(&probe, b"").unwrap();
     probe
+}
+
+/// The failed-recording lines logged for one target session.
+fn failed_recording_lines(session: &TargetSessionId) -> Vec<HashMap<&'static str, String>> {
+    let session = session.to_string();
+    crate::approvals::tests::audit_events()
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|values| {
+            values.get("message").map(String::as_str) == Some(log_text::SESSION_RECORDING_FAILED)
+                && values.get("target_session") == Some(&session)
+        })
+        .cloned()
+        .collect()
+}
+
+fn test_owner() -> RecordingOwner {
+    RecordingOwner {
+        protocol: "ssh",
+        user: "alice".into(),
+        target: "db-host".into(),
+    }
+}
+
+/// A harness whose recordings refuse unrecorded sessions when `required`.
+async fn harness_requiring(required: bool) -> Harness {
+    let mut h = Harness::new(None).await;
+    let params = GlobalParams::new(h.root.join("warpgate.yaml"), false)
+        .unwrap()
+        .with_refuse_unrecorded_sessions(required);
+    h.recordings = SessionRecordings::new(h.db.clone(), &params);
+    h
+}
+
+/// Writes to `recorder` until a write fails, as a session would keep doing.
+async fn write_until_failure(recorder: &TerminalRecorder) -> Error {
+    for _ in 0..1000 {
+        if let Err(error) = recorder
+            .write(TerminalRecordingStreamId::Output, b"output")
+            .await
+        {
+            return error;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("the recording never failed");
+}
+
+/// A write failure after a good start (here, a full disk) is logged once per
+/// recording with the pinned line, `stage=write`, and counted; every later write
+/// fails at once, and `write_failed` returns the setting each time.
+#[tokio::test]
+async fn a_recording_failing_mid_session_is_reported_once_and_counted() {
+    for required in [false, true] {
+        crate::approvals::tests::audit_events();
+        let h = harness_requiring(required).await;
+        let recorder: TerminalRecorder = h
+            .recordings
+            .start_for(&test_owner(), &h.session_id, None, ())
+            .await
+            .unwrap()
+            .unwrap();
+        recorder
+            .write(TerminalRecordingStreamId::Output, b"before")
+            .await
+            .unwrap();
+        assert!(
+            test_support::fail_open_recording_files(&h.root) >= 2,
+            "the data and index files were broken"
+        );
+
+        let error = write_until_failure(&recorder).await;
+        assert!(matches!(error, Error::Closed), "{error}");
+        for _ in 0..3 {
+            assert_eq!(recorder.write_failed(&error), required);
+            assert!(
+                recorder
+                    .write(TerminalRecordingStreamId::Input, b"more")
+                    .await
+                    .is_err()
+            );
+        }
+        drop(recorder);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(h.recordings.failed_recordings(), 1);
+        let lines = failed_recording_lines(&h.session_id);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let line = &lines[0];
+        assert_eq!(line["protocol"], "ssh");
+        assert_eq!(line["user"], "alice");
+        assert_eq!(line["target"], "db-host");
+        assert_eq!(line["stage"], "write");
+        assert_eq!(line["required"], required.to_string());
+        assert_eq!(line["total"], "1");
+        assert!(
+            line["cause"].contains("No space left on device"),
+            "the real cause, not the closed queue: {line:?}"
+        );
+    }
+}
+
+/// A recording that cannot start is logged with the same pinned line,
+/// `stage=start`, and counted in the same total.
+#[tokio::test]
+async fn a_recording_failing_to_start_is_reported_with_the_same_line() {
+    crate::approvals::tests::audit_events();
+    let h = harness_requiring(true).await;
+    // The session's directory is a regular file, so the recording's cannot be made.
+    let session_dir = h
+        .root
+        .join("data/recordings")
+        .join(h.session_id.to_string());
+    std::fs::create_dir_all(session_dir.parent().unwrap()).unwrap();
+    std::fs::write(&session_dir, "not a directory").unwrap();
+
+    let result = h
+        .recordings
+        .start_for::<TerminalRecorder, _>(&test_owner(), &h.session_id, None, ())
+        .await;
+    assert!(result.is_err());
+    assert_eq!(h.recordings.failed_recordings(), 1);
+    let lines = failed_recording_lines(&h.session_id);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0]["stage"], "start");
+    assert_eq!(lines[0]["required"], "true");
+    assert_eq!(lines[0]["total"], "1");
+    assert_eq!(lines[0]["user"], "alice");
+}
+
+/// Writers closing because Warpgate shuts down is not a failed recording.
+#[tokio::test]
+async fn writers_closed_by_shutdown_are_not_reported() {
+    crate::approvals::tests::audit_events();
+    let h = harness_requiring(false).await;
+    let recorder: TerminalRecorder = h
+        .recordings
+        .start_for(&test_owner(), &h.session_id, None, ())
+        .await
+        .unwrap()
+        .unwrap();
+    h.recordings.shutdown().await;
+    let error = write_until_failure(&recorder).await;
+    assert!(!recorder.write_failed(&error));
+    assert_eq!(h.recordings.failed_recordings(), 0);
+    assert!(failed_recording_lines(&h.session_id).is_empty());
 }

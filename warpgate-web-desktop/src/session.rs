@@ -4,9 +4,8 @@ use bytes::Bytes;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
 use uuid::Uuid;
-use warpgate_common::UserSessionId;
+use warpgate_common::{UserSessionId, WarpgateError};
 use warpgate_core::recordings::DesktopRecorder;
 use warpgate_core::{DesktopEvent, DesktopInput, DesktopRect, Framebuffer, Rect};
 use warpgate_web_clients_common::{ManagedSession, Sheddable, WebSession};
@@ -138,10 +137,18 @@ impl WebDesktopSession {
             return;
         };
         // Record the viewer's input for audit before forwarding (like native RDP/VNC).
+        // A failed write is reported once by the recorder; when unrecorded sessions are
+        // refused the session ends before the input is forwarded.
         if let Some(recorder) = &backend.recorder
             && let Err(error) = recorder.write_input(&input).await
+            && recorder.write_failed(&error)
         {
-            warn!(%error, "Failed to record web-desktop viewer input");
+            self.push(ServerMessage::Error {
+                message: WarpgateError::SessionRecordingFailed.to_string(),
+            })
+            .await;
+            self.abort();
+            return;
         }
         // let inputs drop under backpressure
         let _ = backend.input_tx.try_send(input);

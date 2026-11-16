@@ -6,11 +6,11 @@ use bytes::Bytes;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{Mutex, oneshot};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::info;
 use uuid::Uuid;
 use warpgate_common::{TargetSSHOptions, TargetSessionId, UserSessionId, WarpgateError};
 use warpgate_core::WarpgateServerHandle;
-use warpgate_core::recordings::{SessionRecordings, TerminalRecorder};
+use warpgate_core::recordings::{RecordingOwner, SessionRecordings, TerminalRecorder};
 use warpgate_db_entities::Target::TargetKind;
 use warpgate_protocol_ssh::{
     ChannelAudit, ChannelOperation, PtyRequest, RCCommand, RCCommandReply, SshClientError,
@@ -40,6 +40,8 @@ pub struct WebSshSession {
     command_tx: UnboundedSender<(RCCommand, Option<RCCommandReply>)>,
 
     channel_counter: Arc<AtomicUsize>,
+    /// Named on a failed recording's log line.
+    username: String,
     /// Bound once the target is admitted; recordings need it, so no channel is opened before.
     target_session_id: OnceLock<TargetSessionId>,
     recordings: Arc<SessionRecordings>,
@@ -52,6 +54,7 @@ impl WebSshSession {
     pub fn new(
         id: UserSessionId,
         user_id: Uuid,
+        username: String,
         target_name: String,
         target_kind: TargetKind,
         server_handle: Arc<Mutex<WarpgateServerHandle>>,
@@ -59,7 +62,9 @@ impl WebSshSession {
         command_tx: UnboundedSender<(RCCommand, Option<RCCommandReply>)>,
         recordings: Arc<SessionRecordings>,
     ) -> Self {
+        let username_for_recordings = username;
         Self {
+            username: username_for_recordings,
             core: WebSession::new(
                 id,
                 user_id,
@@ -98,18 +103,16 @@ impl WebSshSession {
     async fn start_recording(
         &self,
         target_session_id: &TargetSessionId,
-        channel_id: Uuid,
     ) -> Result<Option<TerminalRecorder>, WarpgateError> {
         let channel_number = self
             .channel_counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        start_shell_recording(
-            &self.recordings,
-            target_session_id,
-            channel_id,
-            channel_number,
-        )
-        .await
+        let owner = RecordingOwner {
+            protocol: "web-ssh",
+            user: self.username.clone(),
+            target: self.core.target_name().to_owned(),
+        };
+        start_shell_recording(&self.recordings, &owner, target_session_id, channel_number).await
     }
 
     pub async fn end_channel(&self, channel_id: Uuid) {
@@ -136,7 +139,7 @@ impl WebSshSession {
         let mut audit = ChannelAudit::new(channel_id);
         let (cols, rows) = pty_request.screen_size();
         audit.start_command_detection(cols, rows);
-        match self.start_recording(target_session_id, channel_id).await {
+        match self.start_recording(target_session_id).await {
             Ok(Some(recorder)) => audit.set_recorder(recorder),
             Ok(None) => (),
             // Refused before the shell is opened on the target: tell the viewer, then end
@@ -151,7 +154,10 @@ impl WebSshSession {
             }
         }
         // seeds the recording with the initial screen size
-        audit.on_resize(&pty_request).await;
+        if audit.on_resize(&pty_request).await.is_break() {
+            self.close_on_recording_failure().await;
+            return None;
+        }
         self.channel_audits.lock().await.insert(channel_id, audit);
 
         self.command(RCCommand::Channel(channel_id, ChannelOperation::OpenShell));
@@ -167,27 +173,50 @@ impl WebSshSession {
     }
 
     pub async fn send_input(&self, channel_id: Uuid, data: Bytes) {
-        if let Some(audit) = self.channel_audits.lock().await.get_mut(&channel_id) {
-            audit.on_input(&data).await;
+        if let Some(audit) = self.channel_audits.lock().await.get_mut(&channel_id)
+            && audit.on_input(&data).await.is_break()
+        {
+            self.close_on_recording_failure().await;
+            return;
         }
         self.command(RCCommand::Channel(channel_id, ChannelOperation::Data(data)));
     }
 
-    pub async fn on_output(&self, channel_id: Uuid, data: &[u8]) {
-        if let Some(audit) = self.channel_audits.lock().await.get_mut(&channel_id) {
-            audit.on_output(data).await;
+    /// Records the target's output. `false` when the recording failed and the session
+    /// was closed: the output must then not reach the viewer.
+    #[must_use]
+    pub async fn on_output(&self, channel_id: Uuid, data: &[u8]) -> bool {
+        if let Some(audit) = self.channel_audits.lock().await.get_mut(&channel_id)
+            && audit.on_output(data).await.is_break()
+        {
+            self.close_on_recording_failure().await;
+            return false;
         }
+        true
     }
 
     pub async fn resize_channel(&self, channel_id: Uuid, cols: u32, rows: u32) {
         let pty_request = make_pty_request(cols, rows);
-        if let Some(audit) = self.channel_audits.lock().await.get_mut(&channel_id) {
-            audit.on_resize(&pty_request).await;
+        if let Some(audit) = self.channel_audits.lock().await.get_mut(&channel_id)
+            && audit.on_resize(&pty_request).await.is_break()
+        {
+            self.close_on_recording_failure().await;
+            return;
         }
         self.command(RCCommand::Channel(
             channel_id,
             ChannelOperation::ResizePty(pty_request),
         ));
+    }
+
+    /// A recording failed mid-session (logged by its recorder) and unrecorded
+    /// sessions are refused: tell the viewer, then end the session.
+    async fn close_on_recording_failure(&self) {
+        self.push(ServerMessage::Error {
+            message: WarpgateError::SessionRecordingFailed.to_string(),
+        })
+        .await;
+        self.abort();
     }
 
     pub fn close_channel(&self, channel_id: Uuid) {
@@ -228,16 +257,17 @@ pub fn make_pty_request(cols: u32, rows: u32) -> PtyRequest {
 }
 
 /// Start a web SSH shell's recording. `Ok(None)` when recording is disabled. A failure to
-/// start is logged; it is then [`WarpgateError::SessionNotRecorded`] when unrecorded
+/// start is logged (by `start_for`); it is then [`WarpgateError::SessionNotRecorded`] when unrecorded
 /// sessions are refused, and `Ok(None)` otherwise (the default).
 async fn start_shell_recording(
     recordings: &SessionRecordings,
+    owner: &RecordingOwner,
     target_session_id: &TargetSessionId,
-    channel_id: Uuid,
     channel_number: usize,
 ) -> Result<Option<TerminalRecorder>, WarpgateError> {
     match recordings
-        .start::<TerminalRecorder, _>(
+        .start_for::<TerminalRecorder, _>(
+            owner,
             target_session_id,
             None,
             SshRecordingMetadata::Shell {
@@ -247,13 +277,7 @@ async fn start_shell_recording(
         .await
     {
         Ok(recorder) => Ok(recorder),
-        Err(e) => {
-            error!(
-                %channel_id,
-                ?e,
-                "{}",
-                warpgate_core::recordings::log_text::FAILED_TO_START_TERMINAL_RECORDING
-            );
+        Err(_) => {
             if recordings.refuses_unrecorded_sessions() {
                 Err(WarpgateError::SessionNotRecorded)
             } else {
@@ -307,7 +331,12 @@ mod tests {
             .with_recordings_keep_group_read(true)
             .with_refuse_unrecorded_sessions(refuse);
         let recordings = SessionRecordings::new(db, &params);
-        start_shell_recording(&recordings, &id, Uuid::new_v4(), 0).await
+        let owner = RecordingOwner {
+            protocol: "web-ssh",
+            user: "alice".into(),
+            target: "host".into(),
+        };
+        start_shell_recording(&recordings, &owner, &id, 0).await
     }
 
     #[tokio::test]
