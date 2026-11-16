@@ -733,14 +733,32 @@ async fn start_stream_recording(
     recordings: &SessionRecordings,
     metadata: SessionRecordingMetadata,
 ) -> Result<Option<TerminalRecorder>, WarpgateError> {
-    match start_recording_exec(owner, target_session_id, recordings, metadata).await {
-        Ok(recorder) => Ok(recorder),
-        Err(_) => {
-            if recordings.refuses_unrecorded_sessions() {
-                return Err(WarpgateError::SessionNotRecorded);
+    checked_stream_recording(
+        recordings,
+        start_recording_exec(owner, target_session_id, recordings, metadata).await,
+    )
+    .await
+}
+
+/// As [`checked_api_recording`], for an exec or attach stream: when unrecorded
+/// sessions are refused, the recording's first write is waited for before the
+/// stream opens.
+async fn checked_stream_recording(
+    recordings: &SessionRecordings,
+    started: anyhow::Result<Option<TerminalRecorder>>,
+) -> Result<Option<TerminalRecorder>, WarpgateError> {
+    let required = recordings.refuses_unrecorded_sessions();
+    match started {
+        Ok(Some(recorder)) if required => match recorder.write_header().await {
+            Ok(()) => Ok(Some(recorder)),
+            Err(error) => {
+                recorder.write_failed(&error);
+                Err(WarpgateError::SessionNotRecorded)
             }
-            Ok(None)
-        }
+        },
+        Ok(recorder) => Ok(recorder),
+        Err(_) if required => Err(WarpgateError::SessionNotRecorded),
+        Err(_) => Ok(None),
     }
 }
 
@@ -1257,10 +1275,10 @@ mod tests {
 
         use super::super::{
             ApiRecordingSession, FAILED_API_RECORDINGS, SessionRecordingMetadata,
-            checked_api_recording, record_api_response, run_websocket_recording, start_api_recording,
-            start_stream_recording,
+            checked_api_recording, checked_stream_recording, record_api_response,
+            run_websocket_recording, start_api_recording, start_stream_recording,
         };
-        use crate::recording::start_recording_api_named;
+        use crate::recording::{start_recording_api_named, start_recording_exec};
 
         struct Recording {
             recordings: SessionRecordings,
@@ -1440,8 +1458,9 @@ mod tests {
 
         /// Required: once a write of a session's API recording fails, every later
         /// request of that session is refused before it is forwarded, even though
-        /// each request records to a fresh file that could be created. Other
-        /// sessions are not affected. Not required: later requests go on.
+        /// each request records to a fresh file that could be created. A single
+        /// response is enough: its write is waited for. Other sessions are not
+        /// affected. Not required: later requests go on.
         #[tokio::test]
         async fn after_a_failed_api_write_later_requests_follow_the_setting() {
             for required in [true, false] {
@@ -1452,31 +1471,25 @@ mod tests {
                     .unwrap()
                     .unwrap();
                 r.fail();
-                for _ in 0..1000 {
-                    record_api_response(
-                        &recorder,
-                        &session,
-                        "GET",
-                        "/api/v1/pods",
-                        HashMap::new(),
-                        b"",
-                        200,
-                        b"{}",
-                    )
-                    .await;
-                    if r.recordings.failed_recordings() > 0 {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-                r.assert_one_failure_line(required);
+                record_api_response(
+                    &recorder,
+                    &session,
+                    "GET",
+                    "/api/v1/pods",
+                    HashMap::new(),
+                    b"",
+                    200,
+                    b"{}",
+                )
+                .await;
 
                 let later = start_api_recording(&owner(), &session, &r.recordings).await;
                 if required {
                     assert!(
                         matches!(later, Err(WarpgateError::SessionRecordingFailed)),
-                        "the session's later request is refused"
+                        "the session's next request is refused"
                     );
+                    r.assert_one_failure_line(true);
                 } else {
                     assert!(matches!(later, Ok(Some(_))), "the session goes on");
                 }
@@ -1484,6 +1497,28 @@ mod tests {
                     !FAILED_API_RECORDINGS.contains(&TargetSessionId(Uuid::new_v4())),
                     "another session is not affected"
                 );
+            }
+        }
+
+        /// An exec stream whose recording file cannot be written (a full disk):
+        /// required, the stream is refused before it opens; otherwise it opens,
+        /// unchecked.
+        #[tokio::test]
+        async fn an_exec_stream_that_cannot_be_recorded_is_refused_at_start_when_required() {
+            for required in [true, false] {
+                let r = recording(required).await;
+                let started = start_recording_exec(&owner(), &r.id, &r.recordings, exec()).await;
+                r.fail();
+                let checked = checked_stream_recording(&r.recordings, started).await;
+                if required {
+                    assert!(
+                        matches!(checked, Err(WarpgateError::SessionNotRecorded)),
+                        "refused at start"
+                    );
+                    r.assert_one_failure_line(true);
+                } else {
+                    assert!(matches!(checked, Ok(Some(_))), "not checked when not required");
+                }
             }
         }
 
