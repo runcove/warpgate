@@ -121,12 +121,27 @@ pub(crate) struct FailureReporter {
 }
 
 impl FailureReporter {
-    /// Logs and counts the failure unless this recording's failure was already
-    /// reported, or Warpgate is shutting down (its writers are closing, not failing).
-    /// Returns whether the session must now be closed
+    /// A session-side write found the recording failed. Logs and counts the
+    /// failure unless this recording's failure was already reported, or Warpgate is
+    /// shutting down (its writers are then closing, not failing: the session sees
+    /// them closed). Returns whether the session must now be closed
     /// (`--recordings-refuse-unrecorded-sessions`).
     pub(crate) fn write_failed(&self, cause: &dyn std::fmt::Display) -> bool {
-        if !self.shutdown.is_cancelled() && !self.reported.swap(true, Ordering::SeqCst) {
+        if !self.shutdown.is_cancelled() {
+            self.report(cause);
+        }
+        self.required
+    }
+
+    /// The writer's own write, flush or finalize failed: a real failure even while
+    /// Warpgate shuts down (the shutdown drain still writes), so it is always
+    /// logged and counted, once per recording.
+    pub(crate) fn sink_failed(&self, cause: &dyn std::fmt::Display) {
+        self.report(cause);
+    }
+
+    fn report(&self, cause: &dyn std::fmt::Display) {
+        if !self.reported.swap(true, Ordering::SeqCst) {
             log_recording_failure(
                 &self.owner,
                 &self.target_session,
@@ -136,6 +151,10 @@ impl FailureReporter {
                 &self.failures,
             );
         }
+    }
+
+    /// `--recordings-refuse-unrecorded-sessions`, as this recording started.
+    pub(crate) const fn required(&self) -> bool {
         self.required
     }
 
@@ -219,6 +238,11 @@ pub enum Error {
 
     #[error("Storage backend: {0}")]
     Aws(#[from] warpgate_aws::AwsError),
+
+    /// The local scratch has the bytes, but streaming them to S3 failed, so the
+    /// off-host copy is now incomplete (its upload cannot be completed).
+    #[error("Streaming the recording to S3: {0}")]
+    S3Push(warpgate_aws::AwsError),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -546,7 +570,9 @@ mod tests;
 #[cfg(any(test, feature = "test-util"))]
 pub mod test_support {
     use std::collections::HashMap;
+    #[cfg(target_os = "linux")]
     use std::os::fd::AsRawFd;
+    #[cfg(target_os = "linux")]
     use std::path::Path;
     use std::sync::{Mutex, OnceLock};
 
@@ -602,6 +628,8 @@ pub mod test_support {
     /// Points every recording file this process has open under `root` at
     /// `/dev/full`, so the writers' next writes fail with "No space left on
     /// device" as they would on a full disk. Returns how many were broken.
+    /// Linux only: it finds the files through `/proc/self/fd`.
+    #[cfg(target_os = "linux")]
     #[allow(unsafe_code)]
     pub fn fail_open_recording_files(root: &Path) -> usize {
         #[allow(clippy::unwrap_used)]

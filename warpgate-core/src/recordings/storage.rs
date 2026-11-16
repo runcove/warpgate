@@ -49,6 +49,9 @@ impl RecordingSink {
         }
     }
 
+    /// Writes to the local file and, on S3, streams to the upload. A failed push is
+    /// [`super::Error::S3Push`]: the local file has the bytes, so the writer decides
+    /// whether to go on.
     pub async fn write_all(&mut self, bytes: &Bytes) -> Result<()> {
         self.file().write_all(bytes).await?;
 
@@ -57,6 +60,7 @@ impl RecordingSink {
             && let Err(error) = upload.push(bytes).await
         {
             error!(%error, path=%upload.key(), "Failed to stream recording to S3");
+            return Err(super::Error::S3Push(error));
         }
 
         Ok(())

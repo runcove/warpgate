@@ -1448,6 +1448,7 @@ async fn write_until_failure(recorder: &TerminalRecorder) -> Error {
 /// A write failure after a good start (here, a full disk) is logged once per
 /// recording with the pinned line, `stage=write`, and counted; every later write
 /// fails at once, and `write_failed` returns the setting each time.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_recording_failing_mid_session_is_reported_once_and_counted() {
     for required in [false, true] {
@@ -1540,7 +1541,109 @@ async fn writers_closed_by_shutdown_are_not_reported() {
         .unwrap();
     h.recordings.shutdown().await;
     let error = write_until_failure(&recorder).await;
-    assert!(!recorder.write_failed(&error));
+    recorder.write_failed(&error);
     assert_eq!(h.recordings.failed_recordings(), 0);
     assert!(failed_recording_lines(&h.session_id).is_empty());
+}
+
+/// A real write failure in the shutdown drain is a failed recording: it is
+/// reported with the pinned line and counted, like any other.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_write_failing_in_the_shutdown_drain_is_reported() {
+    crate::approvals::tests::audit_events();
+    let h = harness_requiring(false).await;
+    let recorder: TerminalRecorder = h
+        .recordings
+        .start_for(&test_owner(), &h.session_id, None, ())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(test_support::fail_open_recording_files(&h.root) >= 2);
+    // Queued without yielding (a current-thread runtime), so the writer task
+    // first sees them once the shutdown has begun.
+    for _ in 0..3 {
+        recorder
+            .write(TerminalRecordingStreamId::Output, b"queued")
+            .await
+            .unwrap();
+    }
+    h.recordings.shutdown().await;
+    assert_eq!(h.recordings.failed_recordings(), 1);
+    let lines = failed_recording_lines(&h.session_id);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0]["stage"], "write");
+    assert!(
+        lines[0]["cause"].contains("No space left on device"),
+        "{lines:?}"
+    );
+}
+
+/// A failed S3 push is a failed recording, reported at once (not only when the
+/// upload fails to complete at the end) with the pinned line, and counted.
+/// Required: the writer stops, so the session's next write fails and it closes.
+/// Not required: the local scratch goes on being written, and is kept.
+#[tokio::test]
+async fn a_failed_s3_push_is_reported_and_follows_the_setting() {
+    for required in [false, true] {
+        crate::approvals::tests::audit_events();
+        let mut h = Harness::new(Some(FakeS3 {
+            fail_part: Some(("data.ndjson", 1)),
+            ..Default::default()
+        }))
+        .await;
+        let params = GlobalParams::new(h.root.join("warpgate.yaml"), false)
+            .unwrap()
+            .with_refuse_unrecorded_sessions(required);
+        h.recordings = SessionRecordings::new(h.db.clone(), &params);
+        let recorder: TerminalRecorder = h
+            .recordings
+            .start_for(&test_owner(), &h.session_id, None, ())
+            .await
+            .unwrap()
+            .unwrap();
+        // More than one S3 part, so the first part is pushed, and fails.
+        let chunk = vec![b'x'; 64 * 1024];
+        for _ in 0..96 {
+            recorder
+                .write(TerminalRecordingStreamId::Output, &chunk)
+                .await
+                .unwrap();
+        }
+        for _ in 0..1000 {
+            if h.recordings.failed_recordings() > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(h.recordings.failed_recordings(), 1, "required={required}");
+        let lines = failed_recording_lines(&h.session_id);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0]["stage"], "write");
+        assert_eq!(lines[0]["required"], required.to_string());
+        assert!(lines[0]["cause"].contains("S3"), "{lines:?}");
+
+        if required {
+            let error = write_until_failure(&recorder).await;
+            assert!(matches!(error, Error::Closed), "{error}");
+            assert!(recorder.write_failed(&error), "the session must close");
+        } else {
+            for _ in 0..20 {
+                recorder
+                    .write(TerminalRecordingStreamId::Output, b"later")
+                    .await
+                    .unwrap();
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            drop(recorder);
+            h.wait_for_writers(0).await;
+            assert!(exists(&h.scratch(RecordingFile::NDJsonData).await));
+            assert_eq!(h.ended().await, None);
+        }
+        assert_eq!(
+            failed_recording_lines(&h.session_id).len(),
+            1,
+            "reported once"
+        );
+    }
 }

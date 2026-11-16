@@ -176,7 +176,8 @@ impl ManagedSession for WebDesktopSession {
     }
 }
 
-#[cfg(test)]
+// Every test here fails a recording through `/proc/self/fd`.
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use std::time::Duration;
 

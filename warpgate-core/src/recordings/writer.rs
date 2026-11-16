@@ -7,7 +7,7 @@ use bytes::Bytes;
 use sea_orm::{ActiveModelTrait, DatabaseConnection, DbErr, EntityTrait};
 use serde::Serialize;
 use time::OffsetDateTime;
-use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
+use tokio::sync::{Mutex, RwLock, broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::error;
@@ -38,9 +38,17 @@ pub struct LiveChunk {
     pub data: Bytes,
 }
 
+/// What a writer's queue carries to its task.
+enum Queued {
+    Data(Bytes),
+    /// Answered once everything queued before it is written and flushed; dropped
+    /// unanswered when the recording has failed.
+    Flush(oneshot::Sender<()>),
+}
+
 #[derive(Clone)]
 pub struct RawRecordingWriter {
-    sender: mpsc::Sender<Bytes>,
+    sender: mpsc::Sender<Queued>,
     live_sender: broadcast::Sender<LiveChunk>,
     /// Running byte offset to hand out. Live viewers rely on this matching the
     /// on-disk byte order, which holds because every write to a recording is
@@ -62,7 +70,7 @@ impl RawRecordingWriter {
         reporter: Arc<FailureReporter>,
     ) -> Result<Self> {
         let recording_id = ticket.recording_id();
-        let (sender, mut receiver) = mpsc::channel::<Bytes>(RECORDING_QUEUE_CAPACITY);
+        let (sender, mut receiver) = mpsc::channel::<Queued>(RECORDING_QUEUE_CAPACITY);
         let (drop_signal, mut drop_receiver) = mpsc::channel(1);
         let WriterShutdown { token, tracker } = shutdown;
 
@@ -96,9 +104,11 @@ impl RawRecordingWriter {
                         sink.flush().await?;
                     }
                     tokio::select! {
-                        data = receiver.recv() => match data {
-                            Some(bytes) => {
-                                sink.write_all(&bytes).await?;
+                        item = receiver.recv() => match item {
+                            Some(item) => {
+                                if write_queued(&mut sink, item, &task_reporter).await? {
+                                    last_flush = Instant::now();
+                                }
                             }
                             None => break,
                         },
@@ -108,18 +118,21 @@ impl RawRecordingWriter {
                 }
 
                 // Drain receiver in case writer was shut down
-                while let Ok(bytes) = receiver.try_recv() {
-                    sink.write_all(&bytes).await?;
+                while let Ok(item) = receiver.try_recv() {
+                    write_queued(&mut sink, item, &task_reporter).await?;
                 }
                 Ok::<(), anyhow::Error>(())
             } catch (error: anyhow::Error) {
                 written = false;
                 // Reported before the queue closes, so the line carries the real
-                // cause rather than a writer's later "Writer is closed".
-                task_reporter.write_failed(&format_args!("{error:#}"));
+                // cause rather than a writer's later "Writer is closed". Reported
+                // even during shutdown: the drain's writes are real ones.
+                task_reporter.sink_failed(&format_args!("{error:#}"));
                 // Every later write then fails at once instead of filling the
-                // queue and blocking its session while the sink finalizes.
+                // queue and blocking its session while the sink finalizes, and a
+                // waiting flush is answered (as failed) now.
                 receiver.close();
+                while receiver.try_recv().is_ok() {}
             });
 
             // Crashed writer leaves the recording scratch as-is
@@ -131,7 +144,7 @@ impl RawRecordingWriter {
                 Ok::<(), Error>(())
             } catch (error: Error) {
                 error!(%error, "Failed to finalize recording");
-                task_reporter.write_failed(&error);
+                task_reporter.sink_failed(&error);
             });
         });
 
@@ -154,7 +167,7 @@ impl RawRecordingWriter {
     pub async fn write(&self, data: &[u8]) -> Result<()> {
         let data = Bytes::from(data.to_vec());
         self.sender
-            .send(data.clone())
+            .send(Queued::Data(data.clone()))
             .await
             .map_err(|_| Error::Closed)?;
         // Tag with the end byte offset (bytes written through this item) after it
@@ -162,6 +175,49 @@ impl RawRecordingWriter {
         let offset = self.offset.fetch_add(data.len() as u64, Ordering::SeqCst) + data.len() as u64;
         let _ = self.live_sender.send(LiveChunk { offset, data });
         Ok(())
+    }
+}
+
+impl RawRecordingWriter {
+    /// Waits until everything written so far has reached the sink and been
+    /// flushed. [`Error::Closed`] when the recording has failed (its real cause is
+    /// already reported) or is closing.
+    pub async fn flush(&self) -> Result<()> {
+        let (ack, acked) = oneshot::channel();
+        self.sender
+            .send(Queued::Flush(ack))
+            .await
+            .map_err(|_| Error::Closed)?;
+        acked.await.map_err(|_| Error::Closed)
+    }
+}
+
+/// Writes one queued item. `true` when it was a flush.
+///
+/// A failed S3 push is a failed recording, reported at once. When unrecorded
+/// sessions are refused it ends the writer like any other failure (its session then
+/// closes at its next write); otherwise the local scratch goes on being written,
+/// and is kept, since the upload cannot be completed.
+async fn write_queued(
+    sink: &mut RecordingSink,
+    item: Queued,
+    reporter: &FailureReporter,
+) -> Result<bool> {
+    match item {
+        Queued::Data(bytes) => {
+            match sink.write_all(&bytes).await {
+                Err(error @ Error::S3Push(_)) if !reporter.required() => {
+                    reporter.sink_failed(&error);
+                }
+                result => result?,
+            }
+            Ok(false)
+        }
+        Queued::Flush(ack) => {
+            sink.flush().await?;
+            let _ = ack.send(());
+            Ok(true)
+        }
     }
 }
 
@@ -188,6 +244,18 @@ impl NDJsonRecordingWriter {
     /// As [`RawRecordingWriter::write_failed`].
     pub fn write_failed(&self, cause: &dyn std::fmt::Display) -> bool {
         self.inner.write_failed(cause)
+    }
+
+    /// As [`RawRecordingWriter::flush`].
+    pub async fn flush(&self) -> Result<()> {
+        self.inner.flush().await
+    }
+
+    /// Writes an empty line, which NDJSON readers skip: a recording's first write
+    /// when it must show at once that its file accepts writes.
+    pub async fn write_empty_line(&self) -> Result<()> {
+        let _order = self.buf.write().await;
+        self.inner.write(b"\n").await
     }
 
     pub async fn write_json_line<I: Serialize>(&self, value: I) -> Result<usize> {
