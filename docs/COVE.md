@@ -184,11 +184,23 @@ with these fields:
 - `total`: how many recordings have failed since Warpgate started
 
 A recording that fails mid-session is logged once, at its first failed write;
-it then stops. `total` is the same counter for both stages, so an alert can
+it then stops. With S3 storage, a part that cannot be pushed to S3 is such a
+failure, logged when the push fails: with the option below on, the recording
+stops and its session is closed; with it off, the local scratch copy goes on
+being written and is kept, since the upload can no longer be completed. `total` is the same counter for both stages, so an alert can
 match the message alone. The text is pinned by a test
 (`warpgate_core::recordings::log_text`); a change to it needs every alert that
 matches it changed too. Writers closing because Warpgate is shutting down are
-not failures and are not logged.
+not failures and are not logged; a write that really fails while Warpgate
+drains its recordings at shutdown is.
+
+This line replaces the texts earlier releases logged when a recording could
+not start or write (`Failed to start recording`, `Failed to start terminal
+recording`, `Failed to start desktop recording`, `Failed to start desktop
+session recording`, `Failed to write recording` and `Failed to write
+recording item`). None of them is logged any more: an alert keyed on an old
+text reads zero after the upgrade, whatever fails, until it is changed to
+match `Session recording failed`.
 
 With `--recordings-refuse-unrecorded-sessions true` (off by default, so a full
 disk cannot lock operators out of a host), a session whose recording cannot
@@ -202,7 +214,10 @@ start is refused rather than continuing unrecorded:
   an approval is pending) cannot be recorded, so with the option on its open
   is rejected; the client can open it again once the session is approved.
 - **Kubernetes:** the API request is answered with that error (HTTP 503) and
-  is not forwarded; an exec or attach stream fails before it is opened.
+  is not forwarded; an exec or attach stream fails before it is opened. An API
+  request's recording writes its first line and waits for it to reach the
+  file before the request is forwarded, so a disk that takes a new file but
+  not its writes refuses the request too.
 - **Web SSH client:** the shell is not opened on the target; the viewer gets
   the error and the session ends.
 - **Web desktop client:** the session ends with the error, before
@@ -212,10 +227,29 @@ start is refused rather than continuing unrecorded:
 With the option on, a recording that fails mid-session closes the session
 too: in SSH (the client is shown `session closed: its recording failed`), the
 web SSH client, Kubernetes exec and attach streams, native RDP and VNC, and
-the web desktop client. In SSH and the web clients, the data whose recording
-failed is not passed on. A Kubernetes API request that has already been sent to the cluster still gets
-its response, since failing it would hide whether it was applied; the next
-request starts a new recording and is refused if that cannot start.
+the web desktop client. In SSH and the web SSH client, nothing more passes
+once the session is closed for its recording. A Kubernetes API request that
+has already been sent to the cluster still gets its response, since failing
+it would hide whether it was applied; but its write is waited for, and once a
+write of a Kubernetes session's recording has failed, every later API request
+of that session is refused (HTTP 503, `session closed: its recording
+failed`) without being forwarded. In native RDP, with the option on, a
+recording that falls behind the session (its queue of 256 frames is full) is
+a failure too, and closes the session before that frame reaches the viewer.
+
+The close is not instant. Writes go through a queue of 1024 items per
+recording file, and the disk write happens behind it, so a session learns of
+a failure at its next write after the failure; what it sent or showed in
+between was passed on and may not be on disk. In native RDP, up to 16 frames
+already queued for the viewer still reach it, but the target connection is
+cut off at once, even if the viewer has stopped reading. In the desktop
+protocols, only what is written to the recording can show a failure: pixel
+updates are written at most 30 times a second, and the desktop's clipboard
+text and cursor shapes, and keyboard input that is not recorded (keyboard
+recording off, or the logon screen showing), are not written, so they pass
+until the next write fails. In SSH a forward's connection
+writes its first record before the forward opens, so a forward recorder that
+has already failed is caught before the forward reaches the target.
 
 With the option off (the default), nothing is closed or refused: the failure
 is still logged with the line above and counted, and the session continues
@@ -228,6 +262,16 @@ What the option does not cover:
   nothing. Nor does repointing the recordings root through the admin
   settings (ConfigEdit): a session whose recording starts under the new root
   is recorded there, and nothing is refused.
-- **What is never recorded**, so never refused for want of a recording: the
-  SSH SFTP subsystem, X11 and agent-forwarding channels, `scp` with
-  `record_scp` off, and MySQL, PostgreSQL and HTTP targets.
+- **What is never recorded**, so never refused for want of a recording: any
+  SSH subsystem (SFTP and every other), X11 and agent-forwarding channels,
+  `scp` with `record_scp` off, SSH extended data sent from the client to the
+  target, Kubernetes port-forward, Kubernetes exec and attach websocket frames
+  that are not binary, native RDP frames dropped from the recording when its
+  queue is full with the option off (no failure line is logged for them), and
+  MySQL, PostgreSQL and HTTP targets.
+- **Connecting before the recording starts.** With the option on, Warpgate
+  may connect and authenticate to the target before a recording exists: for
+  an SSH X11 request, a `tcpip-forward` or `streamlocal-forward` request and
+  a subsystem request, and for a web SSH client session, which connects when
+  the session is created. No shell, command, forward or data passes until a
+  recording starts.
