@@ -370,15 +370,21 @@ mod tests {
             // Not required: the target then ends, so the bridge returns.
             let event_tx = required.then_some(event_tx);
             let record = (record_tx, r.recorder.clone());
-            forward_frames(
-                event_rx,
-                &server_in,
-                &abort_tx,
-                Some(&record),
-                required,
-                &recording_failed,
+            // Required, a bridge that ignored the full queue would wait on the
+            // target forever: bounded, so that fails rather than hangs.
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                forward_frames(
+                    event_rx,
+                    &server_in,
+                    &abort_tx,
+                    Some(&record),
+                    required,
+                    &recording_failed,
+                ),
             )
-            .await;
+            .await
+            .expect("the bridge returned");
 
             let shown = std::iter::from_fn(|| viewer.try_recv().ok()).collect::<Vec<_>>();
             let lines = test_support::failed_recording_lines(&r.id);
