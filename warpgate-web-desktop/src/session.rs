@@ -175,3 +175,228 @@ impl ManagedSession for WebDesktopSession {
         self.core.abort();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use sea_orm::ActiveValue::Set;
+    use sea_orm::{ActiveModelTrait, Database, IntoActiveModel};
+    use tokio::sync::mpsc::Receiver;
+    use warpgate_common::{GlobalParams, TargetSessionId};
+    use warpgate_core::cluster::Cluster;
+    use warpgate_core::rate_limiting::RateLimiterRegistry;
+    use warpgate_core::recordings::{
+        DesktopRecordingMetadata, RecordingOwner, SessionRecordings, test_support,
+    };
+    use warpgate_core::{SessionHandle, State, UserSessionStateInit};
+    use warpgate_db_entities::Parameters::{
+        self, ConfigMigrationValues, RecordingsDiskConfig, RecordingsStorageConfig,
+        set_config_migration_values,
+    };
+    use warpgate_db_migrations::migrate_database;
+
+    use super::*;
+
+    struct NoopHandle;
+
+    impl SessionHandle for NoopHandle {
+        fn close(&mut self) {}
+    }
+
+    /// A web desktop session whose recording started on a real disk root, then
+    /// fails as a full disk would.
+    struct Harness {
+        session: WebDesktopSession,
+        forwarded: Receiver<DesktopInput>,
+        recordings: Arc<SessionRecordings>,
+        id: TargetSessionId,
+        required: bool,
+        _dir: tempfile::TempDir,
+    }
+
+    async fn desktop_failing_mid_session(refuse: bool) -> Harness {
+        test_support::log_events();
+        let dir = tempfile::tempdir().unwrap();
+        set_config_migration_values(ConfigMigrationValues::default());
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        migrate_database(&db).await.unwrap();
+        let mut parameters = Parameters::Entity::get(&db)
+            .await
+            .unwrap()
+            .into_active_model();
+        parameters.recordings_enable = Set(true);
+        parameters.recordings_storage = Set(serde_json::to_string(
+            &RecordingsStorageConfig::Disk(RecordingsDiskConfig {
+                path: "recordings".into(),
+            }),
+        )
+        .unwrap());
+        parameters.update(&db).await.unwrap();
+        let params = GlobalParams::new(dir.path().join("warpgate.yaml"), false)
+            .unwrap()
+            .with_refuse_unrecorded_sessions(refuse);
+        let recordings = Arc::new(SessionRecordings::new(db.clone(), &params));
+
+        let registry = Arc::new(Mutex::new(RateLimiterRegistry::new(db.clone())));
+        let cluster = Cluster::new(db.clone(), 0).await.unwrap();
+        let state = State::new(&db, &registry, cluster.node_id);
+        let server_handle = State::register_node_local_user_session(
+            &state,
+            warpgate_common::Protocol::Rdp,
+            UserSessionStateInit {
+                remote_address: None,
+                handle: Box::new(NoopHandle),
+            },
+        )
+        .await
+        .unwrap();
+        let user_session = server_handle.lock().await.user_session_id();
+        let id = TargetSessionId(Uuid::new_v4());
+        warpgate_db_entities::TargetSession::ActiveModel {
+            id: Set(id),
+            user_session_id: Set(user_session),
+            target_snapshot: Set("{}".into()),
+            target_id: Set(Uuid::new_v4()),
+            started: Set(time::OffsetDateTime::now_utc()),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        let owner = RecordingOwner {
+            protocol: "web-desktop",
+            user: "alice".into(),
+            target: "desktop".into(),
+        };
+        let recorder = recordings
+            .start_for::<DesktopRecorder, _>(&owner, &id, None, DesktopRecordingMetadata::Desktop)
+            .await
+            .unwrap()
+            .unwrap();
+        let session = WebDesktopSession::new(
+            user_session,
+            Uuid::new_v4(),
+            "desktop".into(),
+            warpgate_db_entities::Target::TargetKind::Rdp,
+            server_handle,
+            CancellationToken::new(),
+        );
+        let (input_tx, forwarded) = tokio::sync::mpsc::channel(10_000);
+        session.bind_backend(DesktopBackend {
+            input_tx,
+            recorder: Some(Arc::new(recorder)),
+        });
+        assert!(
+            test_support::fail_open_recording_files(&dir.path().join("recordings")) >= 2,
+            "the data and index files were broken"
+        );
+        Harness {
+            session,
+            forwarded,
+            recordings,
+            id,
+            required: refuse,
+            _dir: dir,
+        }
+    }
+
+    impl Harness {
+        fn aborted(&self) -> bool {
+            self.session.cancellation().is_cancelled()
+        }
+
+        fn forwarded(&mut self) -> usize {
+            let mut n = 0;
+            while self.forwarded.try_recv().is_ok() {
+                n += 1;
+            }
+            n
+        }
+
+        /// Sends viewer input until the failure is seen (writes are queued, so the
+        /// first ones after the break can still be accepted). Returns how many inputs
+        /// were sent and how many were forwarded to the desktop.
+        async fn input_until_failure(&mut self) -> (usize, usize) {
+            let (mut inputs, mut forwarded) = (0, 0);
+            for _ in 0..1000 {
+                self.session
+                    .send_input(DesktopInput::Pointer {
+                        x: 1,
+                        y: 1,
+                        buttons: 0,
+                    })
+                    .await;
+                inputs += 1;
+                forwarded += self.forwarded();
+                // The recorder's own task logs the failure as soon as it happens; the
+                // session sees it at its next write. So when required, wait for the
+                // end; otherwise for the log line.
+                let seen = if self.required {
+                    self.aborted()
+                } else {
+                    self.recordings.failed_recordings() > 0
+                };
+                if seen {
+                    return (inputs, forwarded);
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            panic!("the recording never failed");
+        }
+
+        fn assert_one_failure_line(&self, required: bool) {
+            assert_eq!(self.recordings.failed_recordings(), 1);
+            let lines = test_support::failed_recording_lines(&self.id);
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            assert_eq!(lines[0]["protocol"], "web-desktop");
+            assert_eq!(lines[0]["stage"], "write");
+            assert_eq!(lines[0]["required"], required.to_string());
+        }
+    }
+
+    /// Required: viewer input whose recording fails ends the session, tells the
+    /// viewer, and is not forwarded to the desktop.
+    #[tokio::test]
+    async fn input_whose_recording_fails_ends_the_session_when_required() {
+        let mut h = desktop_failing_mid_session(true).await;
+        let (inputs, forwarded) = h.input_until_failure().await;
+        assert!(h.aborted(), "the session is ended");
+        assert_eq!(
+            forwarded,
+            inputs - 1,
+            "the input whose recording failed was not forwarded"
+        );
+        let reason = WarpgateError::SessionRecordingFailed.to_string();
+        assert!(
+            h.session
+                .drain_buffer()
+                .await
+                .iter()
+                .any(|m| matches!(m, ServerMessage::Error { message } if *message == reason))
+        );
+        h.assert_one_failure_line(true);
+    }
+
+    /// Not required (the default): the session goes on unrecorded and every input is
+    /// forwarded; the failure is logged and counted once.
+    #[tokio::test]
+    async fn with_refusal_off_failing_input_recording_ends_nothing() {
+        let mut h = desktop_failing_mid_session(false).await;
+        let (inputs, forwarded) = h.input_until_failure().await;
+        assert_eq!(forwarded, inputs, "every input was forwarded");
+        for _ in 0..3 {
+            h.session
+                .send_input(DesktopInput::Pointer {
+                    x: 2,
+                    y: 2,
+                    buttons: 0,
+                })
+                .await;
+        }
+        assert_eq!(h.forwarded(), 3);
+        assert!(!h.aborted(), "the session goes on");
+        h.assert_one_failure_line(false);
+    }
+}

@@ -545,8 +545,59 @@ mod tests;
 /// recording mid-session the way a full disk does.
 #[cfg(any(test, feature = "test-util"))]
 pub mod test_support {
+    use std::collections::HashMap;
     use std::os::fd::AsRawFd;
     use std::path::Path;
+    use std::sync::{Mutex, OnceLock};
+
+    use warpgate_common::TargetSessionId;
+
+    use super::log_text;
+
+    /// Every event this test binary logs, as field values. Installed once and
+    /// globally: `tracing` caches a callsite first reached with no subscriber as
+    /// never-interested for the whole process, so a per-test subscriber would miss
+    /// events whenever another test thread got there first. The one global
+    /// subscriber a test binary can install, so this crate's audit tests share it.
+    pub fn log_events() -> &'static Mutex<Vec<HashMap<&'static str, String>>> {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        use crate::logging::layer::ValuesLogLayer;
+
+        static EVENTS: OnceLock<Mutex<Vec<HashMap<&'static str, String>>>> = OnceLock::new();
+        let events = EVENTS.get_or_init(|| Mutex::new(Vec::new()));
+        static INSTALLED: OnceLock<()> = OnceLock::new();
+        INSTALLED.get_or_init(|| {
+            let subscriber =
+                tracing_subscriber::registry().with(ValuesLogLayer::new(|values, _target| {
+                    if let Ok(mut events) = events.lock() {
+                        events.push(values.into_values());
+                    }
+                }));
+            let _ = tracing::subscriber::set_global_default(subscriber);
+        });
+        events
+    }
+
+    /// The [`log_text::SESSION_RECORDING_FAILED`] lines logged for one target
+    /// session since [`log_events`] was first called.
+    pub fn failed_recording_lines(session: &TargetSessionId) -> Vec<HashMap<&'static str, String>> {
+        let session = session.to_string();
+        log_events()
+            .lock()
+            .map(|events| {
+                events
+                    .iter()
+                    .filter(|values| {
+                        values.get("message").map(String::as_str)
+                            == Some(log_text::SESSION_RECORDING_FAILED)
+                            && values.get("target_session") == Some(&session)
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 
     /// Points every recording file this process has open under `root` at
     /// `/dev/full`, so the writers' next writes fail with "No space left on

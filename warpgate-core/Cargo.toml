@@ -42,7 +42,7 @@ tracing.workspace = true
 tracing-core = { version = "0.1", default-features = false }
 tracing-subscriber = { version = "0.3", default-features = false }
 # Only the `test-util` helper `recordings::test_support` uses it.
-libc = "0.2"
+libc = { version = "0.2", optional = true }
 url.workspace = true
 uuid.workspace = true
 vt100 = "0.16"
@@ -59,9 +59,13 @@ warpgate-tls = { path = "../warpgate-tls" }
 webpki = { version = "0.22", default-features = false }
 zune-jpeg.workspace = true
 
+[dev-dependencies]
+# `recordings::test_support` in this crate's own tests.
+libc = "0.2"
+
 [features]
 # `recordings::test_support`, for other crates' tests.
-test-util = []
+test-util = ["dep:libc"]
 postgres = ["sea-orm/sqlx-postgres"]
 mysql = ["sea-orm/sqlx-mysql"]
 sqlite = ["sea-orm/sqlx-sqlite", "dep:libsqlite3-sys"]

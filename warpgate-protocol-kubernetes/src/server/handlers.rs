@@ -361,7 +361,7 @@ async fn _handle_normal_request_inner(
         .ok_or(WarpgateError::UserSessionEnded)?
         .context("reading request body")?;
 
-    let mut recorder_opt = start_api_recording(
+    let recorder_opt = start_api_recording(
         &recording_owner(audit_subject),
         &admitted.id(),
         &services.recordings,
@@ -503,24 +503,17 @@ async fn _handle_normal_request_inner(
         }
     };
 
-    // Record the response
-    if let Some(ref mut recorder) = recorder_opt
-        && let Err(e) = recorder
-            .record_response(
-                method,
-                full_url.as_ref(),
-                redacted_headers,
-                &body_bytes,
-                status.as_u16(),
-                body_for_recording.unwrap_or_default().as_ref(),
-            )
-            .await
-    {
-        // Logged and counted once; the response still goes out, even when
-        // unrecorded sessions are refused: the request has already reached the
-        // cluster, and failing it would hide whether it was applied. The next
-        // request starts a fresh recording, and is refused if that fails.
-        recorder.write_failed(&e);
+    if let Some(recorder) = &recorder_opt {
+        record_api_response(
+            recorder,
+            method,
+            full_url.as_ref(),
+            redacted_headers,
+            &body_bytes,
+            status.as_u16(),
+            body_for_recording.unwrap_or_default().as_ref(),
+        )
+        .await;
     }
 
     let mut poem_response = Response::builder().status(status).body(response_body);
@@ -543,6 +536,27 @@ fn copy_upstream_response_headers(src: &http::HeaderMap, dst: &mut poem::http::H
         {
             dst.append(poem_name, poem_value);
         }
+    }
+}
+
+/// Records an API request and its response. A failure is logged and counted once,
+/// and the response still goes out, even when unrecorded sessions are refused: the
+/// request has already reached the cluster, and failing it would hide whether it was
+/// applied. The next request starts a fresh recording, and is refused if that fails.
+async fn record_api_response(
+    recorder: &KubernetesRecorder,
+    method: &str,
+    path: &str,
+    headers: HashMap<String, String>,
+    request_body: &[u8],
+    status: u16,
+    response_body: &[u8],
+) {
+    if let Err(e) = recorder
+        .record_response(method, path, headers, request_body, status, response_body)
+        .await
+    {
+        recorder.write_failed(&e);
     }
 }
 
@@ -1125,6 +1139,196 @@ mod tests {
                 start_stream_recording(&owner(), &f.id, &f.recordings, exec()).await,
                 Ok(None)
             ));
+        }
+    }
+
+    /// Recordings that start on a real disk root, then fail mid-session as a full
+    /// disk would.
+    mod failing_mid_session {
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+        use std::time::Duration;
+
+        use sea_orm::ActiveValue::Set;
+        use sea_orm::{ActiveModelTrait, Database, IntoActiveModel};
+        use tokio::sync::mpsc;
+        use tokio_util::sync::CancellationToken;
+        use uuid::Uuid;
+        use warpgate_common::{GlobalParams, TargetSessionId, UserSessionId};
+        use warpgate_core::recordings::{RecordingOwner, SessionRecordings, test_support};
+        use warpgate_db_entities::Parameters::{
+            self, ConfigMigrationValues, RecordingsDiskConfig, RecordingsStorageConfig,
+            set_config_migration_values,
+        };
+        use warpgate_db_migrations::migrate_database;
+
+        use super::super::{
+            SessionRecordingMetadata, record_api_response, run_websocket_recording,
+            start_api_recording, start_stream_recording,
+        };
+
+        struct Recording {
+            recordings: SessionRecordings,
+            id: TargetSessionId,
+            root: PathBuf,
+            _dir: tempfile::TempDir,
+        }
+
+        async fn recording(refuse: bool) -> Recording {
+            test_support::log_events();
+            let dir = tempfile::tempdir().unwrap();
+            set_config_migration_values(ConfigMigrationValues::default());
+            let db = Database::connect("sqlite::memory:").await.unwrap();
+            migrate_database(&db).await.unwrap();
+            let mut parameters = Parameters::Entity::get(&db)
+                .await
+                .unwrap()
+                .into_active_model();
+            parameters.recordings_enable = Set(true);
+            parameters.recordings_storage = Set(serde_json::to_string(
+                &RecordingsStorageConfig::Disk(RecordingsDiskConfig {
+                    path: "recordings".into(),
+                }),
+            )
+            .unwrap());
+            parameters.update(&db).await.unwrap();
+            let id = TargetSessionId(Uuid::new_v4());
+            warpgate_db_entities::TargetSession::ActiveModel {
+                id: Set(id),
+                user_session_id: Set(UserSessionId(Uuid::new_v4())),
+                target_snapshot: Set("{}".into()),
+                target_id: Set(Uuid::new_v4()),
+                started: Set(time::OffsetDateTime::now_utc()),
+                ..Default::default()
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+            let params = GlobalParams::new(dir.path().join("warpgate.yaml"), false)
+                .unwrap()
+                .with_refuse_unrecorded_sessions(refuse);
+            Recording {
+                recordings: SessionRecordings::new(db, &params),
+                id,
+                root: dir.path().join("recordings"),
+                _dir: dir,
+            }
+        }
+
+        impl Recording {
+            fn fail(&self) {
+                assert!(test_support::fail_open_recording_files(&self.root) >= 1);
+            }
+
+            fn assert_one_failure_line(&self, required: bool) {
+                assert_eq!(self.recordings.failed_recordings(), 1);
+                let lines = test_support::failed_recording_lines(&self.id);
+                assert_eq!(lines.len(), 1, "{lines:?}");
+                assert_eq!(lines[0]["protocol"], "kubernetes");
+                assert_eq!(lines[0]["user"], "alice");
+                assert_eq!(lines[0]["target"], "cluster");
+                assert_eq!(lines[0]["stage"], "write");
+                assert_eq!(lines[0]["required"], required.to_string());
+            }
+        }
+
+        fn owner() -> RecordingOwner {
+            RecordingOwner {
+                protocol: "kubernetes",
+                user: "alice".into(),
+                target: "cluster".into(),
+            }
+        }
+
+        fn exec() -> SessionRecordingMetadata {
+            SessionRecordingMetadata::Exec {
+                namespace: "default".into(),
+                pod: "pod".into(),
+                container: None,
+                command: vec!["sh".into()],
+            }
+        }
+
+        /// An exec stream whose recording fails: when required, the stream's
+        /// `recording_failed` token is cancelled, which ends the stream; otherwise it
+        /// goes on unrecorded. Either way the failure is logged and counted once.
+        #[tokio::test]
+        async fn an_exec_stream_whose_recording_fails_ends_only_when_required() {
+            for required in [true, false] {
+                let r = recording(required).await;
+                let recorder = start_stream_recording(&owner(), &r.id, &r.recordings, exec())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let closed = CancellationToken::new();
+                let recording_failed = closed.child_token();
+                let (tx, rx) = mpsc::channel(1000);
+                let task = tokio::spawn(run_websocket_recording(
+                    recorder,
+                    rx,
+                    recording_failed.clone(),
+                ));
+                tx.send(b"\x00ls\n".to_vec()).await.unwrap();
+                r.fail();
+                for _ in 0..1000 {
+                    if task.is_finished() {
+                        break;
+                    }
+                    let _ = tx.send(b"\x01output".to_vec()).await;
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                assert!(task.is_finished(), "the recording stopped at its failure");
+                assert_eq!(
+                    recording_failed.is_cancelled(),
+                    required,
+                    "the stream ends only when recording is required"
+                );
+                r.assert_one_failure_line(required);
+            }
+        }
+
+        /// An API request whose recording fails still gets its response, whether or
+        /// not recording is required: it has already reached the cluster. Logged and
+        /// counted once for the recording.
+        #[tokio::test]
+        async fn an_api_request_whose_recording_fails_is_logged_and_answered_either_way() {
+            for required in [true, false] {
+                let r = recording(required).await;
+                let recorder = start_api_recording(&owner(), &r.id, &r.recordings)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                r.fail();
+                for _ in 0..1000 {
+                    record_api_response(
+                        &recorder,
+                        "GET",
+                        "/api/v1/pods",
+                        HashMap::new(),
+                        b"",
+                        200,
+                        b"{}",
+                    )
+                    .await;
+                    if r.recordings.failed_recordings() > 0 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                for _ in 0..3 {
+                    record_api_response(
+                        &recorder,
+                        "GET",
+                        "/api/v1/pods",
+                        HashMap::new(),
+                        b"",
+                        200,
+                        b"{}",
+                    )
+                    .await;
+                }
+                r.assert_one_failure_line(required);
+            }
         }
     }
 }

@@ -1409,19 +1409,8 @@ fn tempfile_in_temp_dir() -> PathBuf {
     probe
 }
 
-/// The failed-recording lines logged for one target session.
 fn failed_recording_lines(session: &TargetSessionId) -> Vec<HashMap<&'static str, String>> {
-    let session = session.to_string();
-    crate::approvals::tests::audit_events()
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|values| {
-            values.get("message").map(String::as_str) == Some(log_text::SESSION_RECORDING_FAILED)
-                && values.get("target_session") == Some(&session)
-        })
-        .cloned()
-        .collect()
+    test_support::failed_recording_lines(session)
 }
 
 fn test_owner() -> RecordingOwner {

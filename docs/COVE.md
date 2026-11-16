@@ -163,24 +163,36 @@ its HTTP status only, never with the upstream's headers or body.
 - **Path segments are logged as written.** Warpgate's own routes carry only
   IDs there.
 
-## Sessions whose recording cannot start: `--recordings-refuse-unrecorded-sessions`
+## Sessions whose recording fails: `--recordings-refuse-unrecorded-sessions`
 
-When recording is enabled but a session's recording fails to start (for
-example, with `--recordings-keep-group-read`, a recording directory that
-cannot be secured), Warpgate first logs the failure with one of these texts,
-which alerts can match:
+A recording fails when it cannot start (for example, with
+`--recordings-keep-group-read`, a recording directory that cannot be secured)
+or when a write fails after a good start (for example, a full disk). Every
+failure, in every protocol, is logged at error level with one line whose
+message is exactly
 
-- `Failed to start recording` (SSH, Kubernetes)
-- `Failed to start terminal recording` (web SSH client)
-- `Failed to start desktop recording` (web desktop client)
-- `Failed to start desktop session recording` (native RDP and VNC)
+    Session recording failed
 
-The texts are pinned by a test (`warpgate_core::recordings::log_text`); a
-change to one needs every alert that matches it changed too.
+with these fields:
+
+- `protocol`: `ssh`, `kubernetes`, `web-ssh`, `web-desktop`, `rdp` or `vnc`
+- `user`, `target`: who the session belongs to and where it goes
+- `target_session`: the target session's id
+- `stage`: `start` (it could not start) or `write` (it failed mid-session)
+- `cause`: the underlying error
+- `required`: whether `--recordings-refuse-unrecorded-sessions` is on
+- `total`: how many recordings have failed since Warpgate started
+
+A recording that fails mid-session is logged once, at its first failed write;
+it then stops. `total` is the same counter for both stages, so an alert can
+match the message alone. The text is pinned by a test
+(`warpgate_core::recordings::log_text`); a change to it needs every alert that
+matches it changed too. Writers closing because Warpgate is shutting down are
+not failures and are not logged.
 
 With `--recordings-refuse-unrecorded-sessions true` (off by default, so a full
-disk cannot lock operators out of a host), the session is then refused rather
-than continuing unrecorded:
+disk cannot lock operators out of a host), a session whose recording cannot
+start is refused rather than continuing unrecorded:
 
 - **SSH:** the client is shown `session refused: its recording could not be
   started` and the connection is closed. This covers shell and exec channels
@@ -197,8 +209,17 @@ than continuing unrecorded:
   Warpgate connects to the desktop.
 - **Native RDP and VNC:** the connection is closed.
 
-With the option off (the default), the failure is logged and the session
-continues unrecorded. Whether a host turns it on is for the host's owner: it
+With the option on, a recording that fails mid-session closes the session
+too: in SSH (the client is shown `session closed: its recording failed`), the
+web SSH client, Kubernetes exec and attach streams, native RDP and VNC, and
+the web desktop client. In SSH and the web clients, the data whose recording
+failed is not passed on. A Kubernetes API request that has already been sent to the cluster still gets
+its response, since failing it would hide whether it was applied; the next
+request starts a new recording and is refused if that cannot start.
+
+With the option off (the default), nothing is closed or refused: the failure
+is still logged with the line above and counted, and the session continues
+unrecorded. Whether a host turns it on is for the host's owner: it
 trades access during an incident for the audit trail.
 
 What the option does not cover:

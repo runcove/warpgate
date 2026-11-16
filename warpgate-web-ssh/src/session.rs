@@ -62,9 +62,8 @@ impl WebSshSession {
         command_tx: UnboundedSender<(RCCommand, Option<RCCommandReply>)>,
         recordings: Arc<SessionRecordings>,
     ) -> Self {
-        let username_for_recordings = username;
         Self {
-            username: username_for_recordings,
+            username,
             core: WebSession::new(
                 id,
                 user_id,
@@ -350,5 +349,229 @@ mod tests {
     #[tokio::test]
     async fn with_refusal_off_a_web_shell_continues_unrecorded() {
         assert!(matches!(start_failing(false).await, Ok(None)));
+    }
+    /// A web shell whose recording started on a real disk root, and fails mid-session
+    /// as a full disk would.
+    mod failing_mid_session {
+        use std::time::Duration;
+
+        use tokio::sync::mpsc::UnboundedReceiver;
+        use warpgate_core::cluster::Cluster;
+        use warpgate_core::rate_limiting::RateLimiterRegistry;
+        use warpgate_core::recordings::test_support;
+        use warpgate_core::{SessionHandle, State, UserSessionStateInit};
+
+        use super::*;
+        use crate::protocol::ServerMessage;
+
+        struct NoopHandle;
+
+        impl SessionHandle for NoopHandle {
+            fn close(&mut self) {}
+        }
+
+        struct Harness {
+            session: WebSshSession,
+            sent: UnboundedReceiver<(RCCommand, Option<RCCommandReply>)>,
+            recordings: Arc<SessionRecordings>,
+            id: TargetSessionId,
+            channel: Uuid,
+            required: bool,
+            _dir: tempfile::TempDir,
+        }
+
+        async fn shell_failing_mid_session(refuse: bool) -> Harness {
+            test_support::log_events();
+            let dir = tempfile::tempdir().unwrap();
+            set_config_migration_values(ConfigMigrationValues::default());
+            let db = Database::connect("sqlite::memory:").await.unwrap();
+            migrate_database(&db).await.unwrap();
+            let mut parameters = Parameters::Entity::get(&db)
+                .await
+                .unwrap()
+                .into_active_model();
+            parameters.recordings_enable = Set(true);
+            parameters.recordings_storage = Set(serde_json::to_string(
+                &RecordingsStorageConfig::Disk(RecordingsDiskConfig {
+                    path: "recordings".into(),
+                }),
+            )
+            .unwrap());
+            parameters.update(&db).await.unwrap();
+            let params = GlobalParams::new(dir.path().join("warpgate.yaml"), false)
+                .unwrap()
+                .with_refuse_unrecorded_sessions(refuse);
+            let recordings = Arc::new(SessionRecordings::new(db.clone(), &params));
+
+            let registry = Arc::new(Mutex::new(RateLimiterRegistry::new(db.clone())));
+            let cluster = Cluster::new(db.clone(), 0).await.unwrap();
+            let state = State::new(&db, &registry, cluster.node_id);
+            let server_handle = State::register_node_local_user_session(
+                &state,
+                warpgate_protocol_ssh::PROTOCOL_NAME,
+                UserSessionStateInit {
+                    remote_address: None,
+                    handle: Box::new(NoopHandle),
+                },
+            )
+            .await
+            .unwrap();
+            let user_session = server_handle.lock().await.user_session_id();
+            let id = TargetSessionId(Uuid::new_v4());
+            warpgate_db_entities::TargetSession::ActiveModel {
+                id: Set(id),
+                user_session_id: Set(user_session),
+                target_snapshot: Set("{}".into()),
+                target_id: Set(Uuid::new_v4()),
+                started: Set(time::OffsetDateTime::now_utc()),
+                ..Default::default()
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+
+            let (command_tx, mut sent) = tokio::sync::mpsc::unbounded_channel();
+            let session = WebSshSession::new(
+                user_session,
+                Uuid::new_v4(),
+                "alice".into(),
+                "host".into(),
+                TargetKind::Ssh,
+                server_handle,
+                CancellationToken::new(),
+                command_tx,
+                recordings.clone(),
+            );
+            session.bind_target_session(id);
+            let channel = session.open_shell_channel(80, 24).await.unwrap();
+            while sent.try_recv().is_ok() {}
+            let root = dir.path().join("recordings");
+            assert!(
+                test_support::fail_open_recording_files(&root) >= 2,
+                "the data and index files were broken"
+            );
+            Harness {
+                session,
+                sent,
+                recordings,
+                id,
+                channel,
+                required: refuse,
+                _dir: dir,
+            }
+        }
+
+        impl Harness {
+            fn aborted(&self) -> bool {
+                self.session.cancellation().is_cancelled()
+            }
+
+            fn data_sent(&mut self) -> usize {
+                let mut n = 0;
+                while let Ok((command, _)) = self.sent.try_recv() {
+                    if matches!(command, RCCommand::Channel(_, ChannelOperation::Data(_))) {
+                        n += 1;
+                    }
+                }
+                n
+            }
+
+            /// Sends input until the failure is seen (writes are queued, so the first
+            /// ones after the break can still be accepted). Returns how many inputs
+            /// were sent and how many reached the target.
+            async fn input_until_failure(&mut self) -> (usize, usize) {
+                let (mut inputs, mut forwarded) = (0, 0);
+                for _ in 0..1000 {
+                    self.session
+                        .send_input(self.channel, Bytes::from_static(b"input"))
+                        .await;
+                    inputs += 1;
+                    forwarded += self.data_sent();
+                    // The recorder's own task logs the failure as soon as it happens;
+                    // the session sees it at its next write. So when required, wait
+                    // for the abort; otherwise for the log line.
+                    let seen = if self.required {
+                        self.aborted()
+                    } else {
+                        self.recordings.failed_recordings() > 0
+                    };
+                    if seen {
+                        return (inputs, forwarded);
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                panic!("the recording never failed");
+            }
+
+            async fn told_the_viewer(&self) -> bool {
+                let reason = WarpgateError::SessionRecordingFailed.to_string();
+                self.session
+                    .drain_buffer()
+                    .await
+                    .iter()
+                    .any(|m| matches!(m, ServerMessage::Error { message } if *message == reason))
+            }
+
+            fn assert_one_failure_line(&self, required: bool) {
+                assert_eq!(self.recordings.failed_recordings(), 1);
+                let lines = test_support::failed_recording_lines(&self.id);
+                assert_eq!(lines.len(), 1, "{lines:?}");
+                assert_eq!(lines[0]["protocol"], "web-ssh");
+                assert_eq!(lines[0]["user"], "alice");
+                assert_eq!(lines[0]["target"], "host");
+                assert_eq!(lines[0]["stage"], "write");
+                assert_eq!(lines[0]["required"], required.to_string());
+            }
+        }
+
+        /// Required: input whose recording fails ends the session and never reaches
+        /// the target.
+        #[tokio::test]
+        async fn input_whose_recording_fails_aborts_the_session_when_required() {
+            let mut h = shell_failing_mid_session(true).await;
+            let (inputs, forwarded) = h.input_until_failure().await;
+            assert!(h.aborted(), "the session is aborted");
+            assert_eq!(
+                forwarded,
+                inputs - 1,
+                "the input whose recording failed was not forwarded"
+            );
+            assert!(h.told_the_viewer().await);
+            h.assert_one_failure_line(true);
+        }
+
+        /// Required: output whose recording fails ends the session and is not shown.
+        #[tokio::test]
+        async fn output_whose_recording_fails_aborts_the_session_when_required() {
+            let h = shell_failing_mid_session(true).await;
+            let mut shown = true;
+            for _ in 0..1000 {
+                shown = h.session.on_output(h.channel, b"output").await;
+                if !shown {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert!(!shown, "the output whose recording failed is not shown");
+            assert!(h.aborted(), "the session is aborted");
+            assert!(h.told_the_viewer().await);
+            h.assert_one_failure_line(true);
+        }
+
+        /// Not required (the default): the session goes on unrecorded and every input
+        /// reaches the target; the failure is logged and counted once.
+        #[tokio::test]
+        async fn with_refusal_off_a_failing_recording_aborts_nothing() {
+            let mut h = shell_failing_mid_session(false).await;
+            let (inputs, forwarded) = h.input_until_failure().await;
+            assert_eq!(forwarded, inputs, "every input was forwarded");
+            assert!(h.session.on_output(h.channel, b"output").await);
+            h.session
+                .send_input(h.channel, Bytes::from_static(b"more"))
+                .await;
+            assert_eq!(h.data_sent(), 1);
+            assert!(!h.aborted(), "the session goes on");
+            h.assert_one_failure_line(false);
+        }
     }
 }

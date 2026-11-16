@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use sea_orm::ActiveValue::Set;
@@ -1267,23 +1267,7 @@ async fn session_teardown_gives_held_uses_back() {
 /// set afterwards sees nothing whenever another test thread got there
 /// first — which passes alone and fails in the suite.
 pub(crate) fn audit_events() -> &'static Mutex<Vec<HashMap<&'static str, String>>> {
-    use tracing_subscriber::layer::SubscriberExt;
-
-    use crate::logging::layer::ValuesLogLayer;
-
-    static EVENTS: OnceLock<Mutex<Vec<HashMap<&'static str, String>>>> = OnceLock::new();
-    let events = EVENTS.get_or_init(|| Mutex::new(Vec::new()));
-    static INSTALLED: OnceLock<()> = OnceLock::new();
-    INSTALLED.get_or_init(|| {
-        let subscriber =
-            tracing_subscriber::registry().with(ValuesLogLayer::new(|values, _target| {
-                if let Ok(mut events) = events.lock() {
-                    events.push(values.into_values());
-                }
-            }));
-        let _ = tracing::subscriber::set_global_default(subscriber);
-    });
-    events
+    crate::recordings::test_support::log_events()
 }
 
 /// The audit events of one `_type` recorded for one session.

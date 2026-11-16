@@ -29,6 +29,8 @@ warpgate-protocol-vnc = { path = "../warpgate-protocol-vnc" }
 warpgate-web-clients-common = { path = "../warpgate-web-clients-common" }
 
 [dev-dependencies]
+time.workspace = true
+warpgate-core = { path = "../warpgate-core", features = ["test-util"] }
 tempfile = "3"
 tokio = { workspace = true, features = ["rt", "macros"] }
 warpgate-db-migrations = { path = "../warpgate-db-migrations", features = ["sqlite"] }

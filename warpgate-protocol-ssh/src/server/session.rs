@@ -2689,6 +2689,235 @@ mod tests {
                 ));
                 assert!(closed(&s), "the connection is closed");
             }
+
+            /// A connected shell channel whose recording started, on a real disk
+            /// root that [`fail_open_recording_files`] can fail mid-session.
+            struct Recorded {
+                s: SignIn,
+                sent: Sent,
+                root: PathBuf,
+                id: TargetSessionId,
+                ch: ServerChannelId,
+                channel: Uuid,
+                required: bool,
+                _dir: tempfile::TempDir,
+            }
+
+            async fn recorded_shell(refuse: bool) -> Recorded {
+                warpgate_core::recordings::test_support::log_events();
+                let dir = tempfile::tempdir().unwrap();
+                let params = GlobalParams::new(dir.path().join("warpgate.yaml"), false)
+                    .unwrap()
+                    .with_refuse_unrecorded_sessions(refuse);
+                let mut s = sign_in_with(INSIDE, params).await;
+                enable_recordings(&s.db).await;
+                let id = TargetSessionId(Uuid::new_v4());
+                entities::TargetSession::ActiveModel {
+                    id: Set(id),
+                    user_session_id: Set(s.session.id),
+                    target_snapshot: Set("{}".into()),
+                    target_id: Set(Uuid::new_v4()),
+                    started: Set(time::OffsetDateTime::now_utc()),
+                    ..Default::default()
+                }
+                .insert(&s.db)
+                .await
+                .unwrap();
+                let (tx, sent) = tokio::sync::mpsc::unbounded_channel();
+                s.session.rc_tx = tx;
+                s.session.rc_state = RCState::Connected;
+                s.session.target = TargetSelection::Connected;
+                s.session.target_session_id = Some(id);
+                // Set when the target is selected.
+                s.session.recording_owner = RecordingOwner {
+                    user: "alice".into(),
+                    target: "box".into(),
+                    ..ssh_recording_owner()
+                };
+                let ch = open_session_channel(&mut s.session, 1);
+                let channel = s.session.map_channel(ch).unwrap();
+                assert!(
+                    s.session
+                        .start_terminal_recording(channel, SshRecordingMetadata::Shell { channel: 1 })
+                        .await
+                        .is_continue()
+                );
+                Recorded {
+                    s,
+                    sent,
+                    root: dir.path().join("recordings"),
+                    id,
+                    ch,
+                    channel,
+                    required: refuse,
+                    _dir: dir,
+                }
+            }
+
+            impl Recorded {
+                fn failures(&self) -> u64 {
+                    self.s.session.services.recordings.failed_recordings()
+                }
+
+                /// Fails the recording's open files, as a full disk would.
+                fn fail_recording(&self) {
+                    assert!(
+                        warpgate_core::recordings::test_support::fail_open_recording_files(
+                            &self.root
+                        ) >= 2,
+                        "the data and index files were broken"
+                    );
+                }
+
+                /// The recorder's own task logs the failure as soon as it happens;
+                /// the session sees it at its next write, which fails. So when
+                /// required, wait for the close; otherwise for the log line.
+                fn failure_seen(&self) -> bool {
+                    if self.required {
+                        closed(&self.s)
+                    } else {
+                        self.failures() > 0
+                    }
+                }
+
+                /// Sends input until the failure is seen (the writes are queued, so
+                /// the first ones after the break can still be accepted). Returns
+                /// how many inputs were sent and how many reached the target.
+                async fn input_until_failure(&mut self) -> (usize, usize) {
+                    let mut inputs = 0;
+                    let mut forwarded = 0;
+                    for _ in 0..1000 {
+                        self.s
+                            .session
+                            ._data(self.ch, Bytes::from_static(b"input"))
+                            .await
+                            .unwrap();
+                        inputs += 1;
+                        forwarded += data_sent(&drain(&mut self.sent));
+                        if self.failure_seen() {
+                            return (inputs, forwarded);
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    }
+                    panic!("the recording never failed");
+                }
+
+                /// Delivers target output until the failure is seen.
+                async fn output_until_failure(&mut self) {
+                    for _ in 0..1000 {
+                        let _ = self
+                            .s
+                            .session
+                            .handle_remote_event(RCEvent::Output(
+                                self.channel,
+                                Bytes::from_static(b"output"),
+                            ))
+                            .await;
+                        if self.failure_seen() {
+                            return;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    }
+                    panic!("the recording never failed");
+                }
+
+                fn assert_one_failure_line(&self, required: bool) {
+                    assert_eq!(self.failures(), 1);
+                    let lines =
+                        warpgate_core::recordings::test_support::failed_recording_lines(&self.id);
+                    assert_eq!(lines.len(), 1, "{lines:?}");
+                    assert_eq!(lines[0]["protocol"], "ssh");
+                    assert_eq!(lines[0]["user"], "alice");
+                    assert_eq!(lines[0]["target"], "box");
+                    assert_eq!(lines[0]["stage"], "write");
+                    assert_eq!(lines[0]["required"], required.to_string());
+                }
+
+                fn assert_closed_for_failure(&self) {
+                    assert!(closed(&self.s), "the connection is closed");
+                    assert!(self.s.session.recording_refused);
+                    assert_eq!(
+                        self.s.session.disconnect_description,
+                        WarpgateError::SessionRecordingFailed.to_string()
+                    );
+                }
+            }
+
+            fn data_sent(sent: &[RCCommand]) -> usize {
+                sent.iter()
+                    .filter(|c| matches!(c, RCCommand::Channel(_, ChannelOperation::Data(_))))
+                    .count()
+            }
+
+            /// Required recording failing on input: the connection closes and the
+            /// input that could not be recorded never reaches the target.
+            #[tokio::test]
+            async fn input_whose_recording_fails_closes_the_session_when_required() {
+                let mut r = recorded_shell(true).await;
+                r.s.session
+                    ._data(r.ch, Bytes::from_static(b"recorded"))
+                    .await
+                    .unwrap();
+                assert_eq!(data_sent(&drain(&mut r.sent)), 1);
+                r.fail_recording();
+
+                let (inputs, forwarded) = r.input_until_failure().await;
+                r.assert_closed_for_failure();
+                assert_eq!(
+                    forwarded,
+                    inputs - 1,
+                    "the input whose recording failed was not forwarded"
+                );
+                r.assert_one_failure_line(true);
+            }
+
+            /// Required recording failing on output: the connection closes.
+            #[tokio::test]
+            async fn output_whose_recording_fails_closes_the_session_when_required() {
+                let mut r = recorded_shell(true).await;
+                r.fail_recording();
+                r.output_until_failure().await;
+                r.assert_closed_for_failure();
+                r.assert_one_failure_line(true);
+            }
+
+            /// Not required (the default): the session goes on unrecorded, all
+            /// input reaches the target, and the failure is logged and counted once.
+            #[tokio::test]
+            async fn with_refusal_off_a_failing_recording_closes_nothing() {
+                let mut r = recorded_shell(false).await;
+                r.fail_recording();
+                let (inputs, forwarded) = r.input_until_failure().await;
+                assert_eq!(forwarded, inputs, "every input was forwarded");
+                for _ in 0..3 {
+                    r.s.session
+                        ._data(r.ch, Bytes::from_static(b"more"))
+                        .await
+                        .unwrap();
+                    let _ = r
+                        .s
+                        .session
+                        .handle_remote_event(RCEvent::Output(
+                            r.channel,
+                            Bytes::from_static(b"output"),
+                        ))
+                        .await;
+                }
+                assert_eq!(data_sent(&drain(&mut r.sent)), 3);
+                assert!(!closed(&r.s), "the connection stays open");
+                assert!(!r.s.session.recording_refused);
+                r.assert_one_failure_line(false);
+            }
+
+            /// Not required, failing on output: the connection stays open.
+            #[tokio::test]
+            async fn with_refusal_off_failing_output_closes_nothing() {
+                let mut r = recorded_shell(false).await;
+                r.fail_recording();
+                r.output_until_failure().await;
+                assert!(!closed(&r.s), "the connection stays open");
+                r.assert_one_failure_line(false);
+            }
         }
     }
 }
