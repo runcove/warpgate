@@ -9,8 +9,8 @@ use bytes::Bytes;
 use futures::stream::{FuturesOrdered, StreamExt};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, info_span, warn};
-use warpgate_common::{TargetOptions, UserSessionId, WarpgateError};
-use warpgate_core::recordings::{DesktopRecorder, DesktopRecordingMetadata};
+use warpgate_common::{TargetOptions, TargetSessionId, UserSessionId, WarpgateError};
+use warpgate_core::recordings::{DesktopRecorder, DesktopRecordingMetadata, SessionRecordings};
 use warpgate_core::{
     AdmittedTarget, DesktopClientHandles, DesktopEvent, Services, TargetAuthorization,
 };
@@ -133,7 +133,7 @@ fn encodes_jpeg(kind: TargetKind) -> bool {
     matches!(kind, TargetKind::Vnc | TargetKind::Rdp)
 }
 
-/// connect & start recording
+/// Start recording, then connect.
 async fn connect(
     session: &WebDesktopSession,
     services: &Services,
@@ -141,55 +141,64 @@ async fn connect(
     size: Option<(u16, u16)>,
 ) -> Result<(DesktopClientHandles, Option<Arc<DesktopRecorder>>, bool), WarpgateError> {
     let target_session_id = admitted.id();
-    let (handles, encode_jpeg) = match session.target_kind() {
-        TargetKind::Vnc => (
-            warpgate_protocol_vnc::connect(admitted.narrow()?, services.secret_backends.clone())?,
-            encodes_jpeg(TargetKind::Vnc),
-        ),
-        TargetKind::Rdp => {
+    let kind = *session.target_kind();
+    if !matches!(kind, TargetKind::Vnc | TargetKind::Rdp) {
+        return Err(WarpgateError::InvalidTarget);
+    }
+    let (handles, recorder) =
+        record_then_dial(&services.recordings, &target_session_id, || match kind {
+            TargetKind::Vnc => {
+                warpgate_protocol_vnc::connect(admitted.narrow()?, services.secret_backends.clone())
+            }
             // Connect at the viewer's measured size when known, so the desktop fits the
             // browser from the first frame; the DVC resize path handles later changes.
-            let handles = warpgate_protocol_rdp::connect(
+            _ => warpgate_protocol_rdp::connect(
                 admitted.narrow()?,
                 size.unwrap_or(warpgate_protocol_rdp::DEFAULT_SIZE),
                 services.secret_backends.clone(),
-            )?;
-            (handles, encodes_jpeg(TargetKind::Rdp))
-        }
-        _ => return Err(WarpgateError::InvalidTarget),
-    };
+            ),
+        })
+        .await?;
 
-    // Start a desktop recording (no-op if recording is disabled in config). Shared
-    // (Arc) between the session — which records viewer input — and the event loop,
-    // which records framebuffer updates; the recording finalises when both drop.
-    let recorder: Option<Arc<DesktopRecorder>> = match services
-        .recordings
-        .start::<DesktopRecorder, _>(&target_session_id, None, DesktopRecordingMetadata::Desktop)
+    session.bind_backend(DesktopBackend {
+        input_tx: handles.input_tx.clone(),
+        recorder: recorder.clone(),
+    });
+    Ok((handles, recorder, encodes_jpeg(kind)))
+}
+
+/// Start a desktop recording (no-op if recording is disabled in config), then `dial` the
+/// backend with its stored credentials. A recording that fails to start while unrecorded
+/// sessions are refused ends here, before the backend is dialled. The recorder is shared
+/// (Arc) between the session — which records viewer input — and the event loop, which
+/// records framebuffer updates; the recording finalises when both drop.
+async fn record_then_dial(
+    recordings: &SessionRecordings,
+    target_session_id: &TargetSessionId,
+    dial: impl FnOnce() -> Result<DesktopClientHandles, WarpgateError>,
+) -> Result<(DesktopClientHandles, Option<Arc<DesktopRecorder>>), WarpgateError> {
+    let recorder = match recordings
+        .start::<DesktopRecorder, _>(target_session_id, None, DesktopRecordingMetadata::Desktop)
         .await
     {
-        Ok(Some(recorder)) => {
-            recorder.track_logon_state(handles.logon_state.clone());
-            Some(Arc::new(recorder))
-        }
-        Ok(None) => None,
+        Ok(recorder) => recorder,
         Err(error) => {
             warn!(
                 %error,
                 "{}",
                 warpgate_core::recordings::log_text::FAILED_TO_START_DESKTOP_RECORDING
             );
-            if services.recordings.refuses_unrecorded_sessions() {
+            if recordings.refuses_unrecorded_sessions() {
                 return Err(WarpgateError::SessionNotRecorded);
             }
             None
         }
     };
-
-    session.bind_backend(DesktopBackend {
-        input_tx: handles.input_tx.clone(),
-        recorder: recorder.clone(),
-    });
-    Ok((handles, recorder, encode_jpeg))
+    let handles = dial()?;
+    if let Some(recorder) = &recorder {
+        recorder.track_logon_state(handles.logon_state.clone());
+    }
+    Ok((handles, recorder.map(Arc::new)))
 }
 
 /// Record an event, then send it. Both the live stream and refinements go out this way, so
@@ -343,6 +352,89 @@ async fn relay_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A recording whose start fails for real: recordings on, `--recordings-keep-group-read`
+    /// with files secured, and the session's directory under the recordings root a
+    /// symlink, which the start refuses to follow.
+    mod unrecorded {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use sea_orm::ActiveValue::Set;
+        use sea_orm::{ActiveModelTrait, Database, IntoActiveModel};
+        use uuid::Uuid;
+        use warpgate_common::GlobalParams;
+        use warpgate_db_entities::Parameters::{
+            self, ConfigMigrationValues, RecordingsDiskConfig, RecordingsStorageConfig,
+            set_config_migration_values,
+        };
+        use warpgate_db_migrations::migrate_database;
+
+        use super::*;
+
+        async fn failing_recordings(
+            dir: &std::path::Path,
+            id: &TargetSessionId,
+            refuse: bool,
+        ) -> SessionRecordings {
+            set_config_migration_values(ConfigMigrationValues::default());
+            let db = Database::connect("sqlite::memory:").await.unwrap();
+            migrate_database(&db).await.unwrap();
+            let root = dir.join("recordings");
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::create_dir_all(dir.join("elsewhere")).unwrap();
+            std::os::unix::fs::symlink(dir.join("elsewhere"), root.join(id.to_string())).unwrap();
+            let mut parameters = Parameters::Entity::get(&db)
+                .await
+                .unwrap()
+                .into_active_model();
+            parameters.recordings_enable = Set(true);
+            parameters.recordings_storage = Set(serde_json::to_string(
+                &RecordingsStorageConfig::Disk(RecordingsDiskConfig {
+                    path: "recordings".into(),
+                }),
+            )
+            .unwrap());
+            parameters.update(&db).await.unwrap();
+            let params = GlobalParams::new(dir.join("warpgate.yaml"), true)
+                .unwrap()
+                .with_recordings_keep_group_read(true)
+                .with_refuse_unrecorded_sessions(refuse);
+            SessionRecordings::new(db, &params)
+        }
+
+        /// Whether the backend was dialled, and the outcome.
+        async fn dial_with_failing_recording(refuse: bool) -> (bool, Result<(), WarpgateError>) {
+            let dir = tempfile::tempdir().unwrap();
+            let id = TargetSessionId(Uuid::new_v4());
+            let recordings = failing_recordings(dir.path(), &id, refuse).await;
+            let dialled = AtomicBool::new(false);
+            let result = record_then_dial(&recordings, &id, || {
+                dialled.store(true, Ordering::SeqCst);
+                // The dial's own outcome does not matter here.
+                Err(WarpgateError::InvalidTarget)
+            })
+            .await
+            .map(|_| ());
+            (dialled.load(Ordering::SeqCst), result)
+        }
+
+        #[tokio::test]
+        async fn a_refused_desktop_session_never_dials_the_backend() {
+            let (dialled, result) = dial_with_failing_recording(true).await;
+            assert!(
+                !dialled,
+                "the backend was dialled with its stored credentials"
+            );
+            assert!(matches!(result, Err(WarpgateError::SessionNotRecorded)));
+        }
+
+        #[tokio::test]
+        async fn with_refusal_off_the_desktop_session_dials_unrecorded() {
+            let (dialled, result) = dial_with_failing_recording(false).await;
+            assert!(dialled);
+            assert!(matches!(result, Err(WarpgateError::InvalidTarget)));
+        }
+    }
 
     #[test]
     fn vnc_tiles_are_jpeg_encoded_like_rdp() {

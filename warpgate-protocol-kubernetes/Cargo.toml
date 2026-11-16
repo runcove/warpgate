@@ -49,3 +49,6 @@ warpgate-tls = { path = "../warpgate-tls", default-features = false }
 
 [dev-dependencies]
 rcgen.workspace = true
+tempfile = "3"
+tokio = { workspace = true, features = ["rt", "macros"] }
+warpgate-db-migrations = { path = "../warpgate-db-migrations", features = ["sqlite"] }

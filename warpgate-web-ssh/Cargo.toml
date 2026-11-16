@@ -26,3 +26,8 @@ warpgate-core = { path = "../warpgate-core" }
 warpgate-db-entities = { path = "../warpgate-db-entities" }
 warpgate-protocol-ssh = { path = "../warpgate-protocol-ssh" }
 warpgate-web-clients-common = { path = "../warpgate-web-clients-common" }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["rt", "macros"] }
+warpgate-db-migrations = { path = "../warpgate-db-migrations", features = ["sqlite"] }

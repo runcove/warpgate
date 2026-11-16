@@ -184,12 +184,17 @@ than continuing unrecorded:
 
 - **SSH:** the client is shown `session refused: its recording could not be
   started` and the connection is closed. This covers shell and exec channels
-  and recorded port forwards.
+  and recorded port forwards. The recording is started before the shell,
+  command or forward reaches the target, so a refused session sends none of
+  them. A direct port forward opened before its target session exists (while
+  an approval is pending) cannot be recorded, so with the option on its open
+  is rejected; the client can open it again once the session is approved.
 - **Kubernetes:** the API request is answered with that error (HTTP 503) and
   is not forwarded; an exec or attach stream fails before it is opened.
 - **Web SSH client:** the shell is not opened on the target; the viewer gets
   the error and the session ends.
-- **Web desktop client:** the session ends with the error.
+- **Web desktop client:** the session ends with the error, before
+  Warpgate connects to the desktop.
 - **Native RDP and VNC:** the connection is closed.
 
 With the option off (the default), the failure is logged and the session

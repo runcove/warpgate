@@ -95,9 +95,6 @@ impl WebSshSession {
         let _ = self.command_tx.send((RCCommand::Connect(chain), None));
     }
 
-    /// `Ok(None)` when recording is disabled. A failure to start is logged; it is then
-    /// [`WarpgateError::SessionNotRecorded`] when unrecorded sessions are refused, and
-    /// `Ok(None)` otherwise (the default).
     async fn start_recording(
         &self,
         target_session_id: &TargetSessionId,
@@ -106,32 +103,13 @@ impl WebSshSession {
         let channel_number = self
             .channel_counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        match self
-            .recordings
-            .start::<TerminalRecorder, _>(
-                target_session_id,
-                None,
-                SshRecordingMetadata::Shell {
-                    channel: channel_number,
-                },
-            )
-            .await
-        {
-            Ok(recorder) => Ok(recorder),
-            Err(e) => {
-                error!(
-                    %channel_id,
-                    ?e,
-                    "{}",
-                    warpgate_core::recordings::log_text::FAILED_TO_START_TERMINAL_RECORDING
-                );
-                if self.recordings.refuses_unrecorded_sessions() {
-                    Err(WarpgateError::SessionNotRecorded)
-                } else {
-                    Ok(None)
-                }
-            }
-        }
+        start_shell_recording(
+            &self.recordings,
+            target_session_id,
+            channel_id,
+            channel_number,
+        )
+        .await
     }
 
     pub async fn end_channel(&self, channel_id: Uuid) {
@@ -246,5 +224,102 @@ pub fn make_pty_request(cols: u32, rows: u32) -> PtyRequest {
         pix_width: 0,
         pix_height: 0,
         modes: vec![],
+    }
+}
+
+/// Start a web SSH shell's recording. `Ok(None)` when recording is disabled. A failure to
+/// start is logged; it is then [`WarpgateError::SessionNotRecorded`] when unrecorded
+/// sessions are refused, and `Ok(None)` otherwise (the default).
+async fn start_shell_recording(
+    recordings: &SessionRecordings,
+    target_session_id: &TargetSessionId,
+    channel_id: Uuid,
+    channel_number: usize,
+) -> Result<Option<TerminalRecorder>, WarpgateError> {
+    match recordings
+        .start::<TerminalRecorder, _>(
+            target_session_id,
+            None,
+            SshRecordingMetadata::Shell {
+                channel: channel_number,
+            },
+        )
+        .await
+    {
+        Ok(recorder) => Ok(recorder),
+        Err(e) => {
+            error!(
+                %channel_id,
+                ?e,
+                "{}",
+                warpgate_core::recordings::log_text::FAILED_TO_START_TERMINAL_RECORDING
+            );
+            if recordings.refuses_unrecorded_sessions() {
+                Err(WarpgateError::SessionNotRecorded)
+            } else {
+                Ok(None)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sea_orm::ActiveValue::Set;
+    use sea_orm::{ActiveModelTrait, Database, IntoActiveModel};
+    use warpgate_common::GlobalParams;
+    use warpgate_db_entities::Parameters::{
+        self, ConfigMigrationValues, RecordingsDiskConfig, RecordingsStorageConfig,
+        set_config_migration_values,
+    };
+    use warpgate_db_migrations::migrate_database;
+
+    use super::*;
+
+    /// A recording whose start fails for real: recordings on, `--recordings-keep-group-read`
+    /// with files secured, and the session's directory under the recordings root a
+    /// symlink, which the start refuses to follow.
+    async fn start_failing(refuse: bool) -> Result<Option<TerminalRecorder>, WarpgateError> {
+        let dir = tempfile::tempdir().unwrap();
+        let id = TargetSessionId(Uuid::new_v4());
+        set_config_migration_values(ConfigMigrationValues::default());
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        migrate_database(&db).await.unwrap();
+        let root = dir.path().join("recordings");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(dir.path().join("elsewhere")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("elsewhere"), root.join(id.to_string()))
+            .unwrap();
+        let mut parameters = Parameters::Entity::get(&db)
+            .await
+            .unwrap()
+            .into_active_model();
+        parameters.recordings_enable = Set(true);
+        parameters.recordings_storage = Set(serde_json::to_string(&RecordingsStorageConfig::Disk(
+            RecordingsDiskConfig {
+                path: "recordings".into(),
+            },
+        ))
+        .unwrap());
+        parameters.update(&db).await.unwrap();
+        let params = GlobalParams::new(dir.path().join("warpgate.yaml"), true)
+            .unwrap()
+            .with_recordings_keep_group_read(true)
+            .with_refuse_unrecorded_sessions(refuse);
+        let recordings = SessionRecordings::new(db, &params);
+        start_shell_recording(&recordings, &id, Uuid::new_v4(), 0).await
+    }
+
+    #[tokio::test]
+    async fn a_web_shell_whose_recording_fails_is_refused_when_required() {
+        assert!(matches!(
+            start_failing(true).await,
+            Err(WarpgateError::SessionNotRecorded)
+        ));
+    }
+
+    #[tokio::test]
+    async fn with_refusal_off_a_web_shell_continues_unrecorded() {
+        assert!(matches!(start_failing(false).await, Ok(None)));
     }
 }

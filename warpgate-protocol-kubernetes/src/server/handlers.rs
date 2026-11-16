@@ -15,18 +15,20 @@ use tracing::{Instrument, debug, error, warn};
 use url::Url;
 use warpgate_common::helpers::websocket::pump_websocket;
 use warpgate_common::http_headers::ForwardFilter;
-use warpgate_common::{TargetKubernetesOptions, WarpgateError};
+use warpgate_common::{TargetKubernetesOptions, TargetSessionId, WarpgateError};
 use warpgate_common_http::auth::UnauthenticatedRequestContext;
 use warpgate_common_http::logging::{
     get_client_ip, log_request_error, log_request_result, span_for_request, upstream_uri_for_log,
 };
 use warpgate_core::logging::KubernetesAuditSubject;
-use warpgate_core::recordings::{TerminalRecorder, TerminalRecordingStreamId};
+use warpgate_core::recordings::{SessionRecordings, TerminalRecorder, TerminalRecordingStreamId};
 use warpgate_core::{Services, WarpgateServerHandle};
 
 use crate::audit::{StreamOperation, classify_mutating, classify_stream};
 use crate::correlator::{AdmittedSession, RequestCorrelator, correlated_authorization};
-use crate::recording::{start_recording_api, start_recording_exec};
+use crate::recording::{
+    KubernetesRecorder, SessionRecordingMetadata, start_recording_api, start_recording_exec,
+};
 use crate::server::UpstreamClientCache;
 use crate::server::auth::{
     KubernetesIdentity, authenticate_kubernetes_user, create_authenticated_client, unauthorized,
@@ -357,20 +359,7 @@ async fn _handle_normal_request_inner(
         .ok_or(WarpgateError::UserSessionEnded)?
         .context("reading request body")?;
 
-    let mut recorder_opt = match start_recording_api(&admitted.id(), &services.recordings).await {
-        Ok(recorder) => recorder,
-        Err(e) => {
-            warn!(
-                "{}: {}",
-                warpgate_core::recordings::log_text::FAILED_TO_START_RECORDING,
-                e
-            );
-            if services.recordings.refuses_unrecorded_sessions() {
-                return Err(WarpgateError::SessionNotRecorded);
-            }
-            None
-        }
-    };
+    let mut recorder_opt = start_api_recording(&admitted.id(), &services.recordings).await?;
 
     // Forward request to Kubernetes API
     let mut request_builder = client.request(
@@ -591,6 +580,53 @@ async fn run_websocket_recording(recorder: TerminalRecorder, mut rx: mpsc::Recei
     }
 }
 
+/// Start an API request's recording, before the request is forwarded. `Ok(None)` when
+/// recording is disabled. A failure to start is logged; it is then
+/// [`WarpgateError::SessionNotRecorded`] when unrecorded sessions are refused, and
+/// `Ok(None)` otherwise (the default).
+async fn start_api_recording(
+    target_session_id: &TargetSessionId,
+    recordings: &SessionRecordings,
+) -> Result<Option<KubernetesRecorder>, WarpgateError> {
+    match start_recording_api(target_session_id, recordings).await {
+        Ok(recorder) => Ok(recorder),
+        Err(e) => {
+            warn!(
+                "{}: {}",
+                warpgate_core::recordings::log_text::FAILED_TO_START_RECORDING,
+                e
+            );
+            if recordings.refuses_unrecorded_sessions() {
+                return Err(WarpgateError::SessionNotRecorded);
+            }
+            Ok(None)
+        }
+    }
+}
+
+/// Start an exec or attach stream's recording, before the stream opens. As
+/// [`start_api_recording`].
+async fn start_stream_recording(
+    target_session_id: &TargetSessionId,
+    recordings: &SessionRecordings,
+    metadata: SessionRecordingMetadata,
+) -> Result<Option<TerminalRecorder>, WarpgateError> {
+    match start_recording_exec(target_session_id, recordings, metadata).await {
+        Ok(recorder) => Ok(recorder),
+        Err(e) => {
+            error!(
+                "{}: {}",
+                warpgate_core::recordings::log_text::FAILED_TO_START_RECORDING,
+                e
+            );
+            if recordings.refuses_unrecorded_sessions() {
+                return Err(WarpgateError::SessionNotRecorded);
+            }
+            Ok(None)
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn _handle_websocket_request_inner(
     ws: WebSocket,
@@ -623,23 +659,10 @@ async fn _handle_websocket_request_inner(
     if let Some(metadata) = operation
         .as_ref()
         .and_then(StreamOperation::recording_metadata)
+        && let Some(recorder) =
+            start_stream_recording(&admitted.id(), &services.recordings, metadata).await?
     {
-        match start_recording_exec(&admitted.id(), &services.recordings, metadata).await {
-            Err(e) => {
-                error!(
-                    "{}: {}",
-                    warpgate_core::recordings::log_text::FAILED_TO_START_RECORDING,
-                    e
-                );
-                if services.recordings.refuses_unrecorded_sessions() {
-                    return Err(WarpgateError::SessionNotRecorded.into());
-                }
-            }
-            Ok(Some(recorder)) => {
-                tokio::spawn(run_websocket_recording(recorder, recorder_rx));
-            }
-            Ok(None) => {}
-        }
+        tokio::spawn(run_websocket_recording(recorder, recorder_rx));
     }
 
     let ws_protocol = req
@@ -947,5 +970,103 @@ mod tests {
         assert!(!redacted.contains_key("Authorization"));
         assert!(!redacted.contains_key("Cookie"));
         assert!(!redacted.keys().any(|k| is_impersonation_header(k)));
+    }
+
+    /// A recording whose start fails for real: recordings on,
+    /// `--recordings-keep-group-read` with files secured, and the session's directory
+    /// under the recordings root a symlink, which the start refuses to follow.
+    mod unrecorded {
+        use sea_orm::ActiveValue::Set;
+        use sea_orm::{ActiveModelTrait, Database, IntoActiveModel};
+        use uuid::Uuid;
+        use warpgate_common::{GlobalParams, TargetSessionId, WarpgateError};
+        use warpgate_core::recordings::SessionRecordings;
+        use warpgate_db_entities::Parameters::{
+            self, ConfigMigrationValues, RecordingsDiskConfig, RecordingsStorageConfig,
+            set_config_migration_values,
+        };
+        use warpgate_db_migrations::migrate_database;
+
+        use super::super::{SessionRecordingMetadata, start_api_recording, start_stream_recording};
+
+        struct Failing {
+            recordings: SessionRecordings,
+            id: TargetSessionId,
+            _dir: tempfile::TempDir,
+        }
+
+        async fn failing(refuse: bool) -> Failing {
+            let dir = tempfile::tempdir().unwrap();
+            let id = TargetSessionId(Uuid::new_v4());
+            set_config_migration_values(ConfigMigrationValues::default());
+            let db = Database::connect("sqlite::memory:").await.unwrap();
+            migrate_database(&db).await.unwrap();
+            let root = dir.path().join("recordings");
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::create_dir_all(dir.path().join("elsewhere")).unwrap();
+            std::os::unix::fs::symlink(dir.path().join("elsewhere"), root.join(id.to_string()))
+                .unwrap();
+            let mut parameters = Parameters::Entity::get(&db)
+                .await
+                .unwrap()
+                .into_active_model();
+            parameters.recordings_enable = Set(true);
+            parameters.recordings_storage = Set(serde_json::to_string(
+                &RecordingsStorageConfig::Disk(RecordingsDiskConfig {
+                    path: "recordings".into(),
+                }),
+            )
+            .unwrap());
+            parameters.update(&db).await.unwrap();
+            let params = GlobalParams::new(dir.path().join("warpgate.yaml"), true)
+                .unwrap()
+                .with_recordings_keep_group_read(true)
+                .with_refuse_unrecorded_sessions(refuse);
+            Failing {
+                recordings: SessionRecordings::new(db, &params),
+                id,
+                _dir: dir,
+            }
+        }
+
+        fn exec() -> SessionRecordingMetadata {
+            SessionRecordingMetadata::Exec {
+                namespace: "default".into(),
+                pod: "pod".into(),
+                container: None,
+                command: vec!["sh".into()],
+            }
+        }
+
+        #[tokio::test]
+        async fn an_api_request_whose_recording_fails_is_refused_when_required() {
+            let f = failing(true).await;
+            assert!(matches!(
+                start_api_recording(&f.id, &f.recordings).await,
+                Err(WarpgateError::SessionNotRecorded)
+            ));
+        }
+
+        #[tokio::test]
+        async fn an_exec_stream_whose_recording_fails_is_refused_when_required() {
+            let f = failing(true).await;
+            assert!(matches!(
+                start_stream_recording(&f.id, &f.recordings, exec()).await,
+                Err(WarpgateError::SessionNotRecorded)
+            ));
+        }
+
+        #[tokio::test]
+        async fn with_refusal_off_api_and_exec_continue_unrecorded() {
+            let f = failing(false).await;
+            assert!(matches!(
+                start_api_recording(&f.id, &f.recordings).await,
+                Ok(None)
+            ));
+            assert!(matches!(
+                start_stream_recording(&f.id, &f.recordings, exec()).await,
+                Ok(None)
+            ));
+        }
     }
 }
