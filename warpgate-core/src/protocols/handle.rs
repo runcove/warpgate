@@ -14,6 +14,7 @@ use warpgate_db_entities::TargetSession::TargetSessionOpenOutcome;
 use warpgate_db_entities::{TargetSession, UserSession};
 
 use crate::rate_limiting::{RateLimiterRegistry, stack_rate_limiters};
+use crate::revocation::target_shared_publicly;
 use crate::{
     ApprovedTarget, State, TargetAuthorization, UserSessionState, session_user_still_admitted,
 };
@@ -105,7 +106,7 @@ impl WarpgateServerHandle {
             // most calls are no-ops, and the lock must span the no-op check and the
             // commit to keep the DB and in-memory state consistent.
             let mut state = self.user_session_state.lock().await;
-            self.set_user_info_in(&mut state, user_info, remote_ip)
+            self.set_user_info_in(&mut state, user_info, remote_ip, false)
                 .await?;
         }
 
@@ -132,11 +133,18 @@ impl WarpgateServerHandle {
     /// A refused sign-in leaves the in-memory identity unset, so a retry is
     /// judged again, and the row attributed, so a close of the user's
     /// sessions still finds it; the caller ends or discards the session.
+    ///
+    /// `public_placeholder` is set only for the anonymous identity of the
+    /// public bypass (the nil user id, which no credential path produces) on
+    /// a target that is public now: it names no user, so there is no user
+    /// to read and it is attributed without the check. Set for any other
+    /// identity it is ignored and the check runs.
     async fn set_user_info_in(
         &self,
         state: &mut UserSessionState,
         user_info: AuthStateUserInfo,
         remote_ip: Option<IpAddr>,
+        public_placeholder: bool,
     ) -> Result<(), WarpgateError> {
         use sea_orm::ActiveValue::Set;
 
@@ -167,7 +175,8 @@ impl WarpgateServerHandle {
         }
 
         let remote_ip = remote_ip.or_else(|| state.remote_address.map(|addr| addr.ip()));
-        if !session_user_still_admitted(&self.db, user_info.id, remote_ip).await? {
+        let skip_check = public_placeholder && user_info.id.is_nil();
+        if !skip_check && !session_user_still_admitted(&self.db, user_info.id, remote_ip).await? {
             warn!(
                 session = %self.user_session_id,
                 user_id = %user_info.id,
@@ -221,8 +230,18 @@ impl WarpgateServerHandle {
         {
             let mut parent = self.user_session_state.lock().await;
             if parent.user_info.is_none() {
-                self.set_user_info_in(&mut parent, authorization.user_info().clone(), None)
-                    .await?;
+                // The public bypass serves an anonymous visitor under the nil
+                // user id. On a public target that identity has no user to
+                // re-read; on any other target it is refused by the check.
+                let public_placeholder = authorization.user_info().id.is_nil()
+                    && target_shared_publicly(authorization.target());
+                self.set_user_info_in(
+                    &mut parent,
+                    authorization.user_info().clone(),
+                    None,
+                    public_placeholder,
+                )
+                .await?;
             } else if parent.user_info.as_ref() != Some(authorization.user_info()) {
                 return Err(WarpgateError::InconsistentState(
                     "target authorization user does not match the user session".into(),
@@ -618,6 +637,120 @@ mod sign_in_completion_tests {
             ))
             .await;
 
+        assert!(
+            matches!(started, Err(WarpgateError::UserNoLongerAdmitted)),
+            "{}",
+            started.err().map(|e| e.to_string()).unwrap_or_default()
+        );
+    }
+
+    /// An HTTP target, `public` or not, requiring approval or not.
+    fn http_target(public: bool, require_approval: bool) -> Target {
+        Target {
+            id: Uuid::new_v4(),
+            name: "web".into(),
+            description: String::new(),
+            allow_roles: vec![],
+            options: warpgate_common::TargetOptions::Http(warpgate_common::TargetHTTPOptions {
+                url: "http://target".into(),
+                tls: warpgate_common::Tls::default(),
+                headers: Default::default(),
+                external_host: None,
+                public,
+                unix_socket: None,
+            }),
+            rate_limit_bytes_per_second: None,
+            group_id: None,
+            ticket_max_duration_seconds: None,
+            ticket_requests_disabled: false,
+            ticket_require_approval: false,
+            require_approval,
+            ticket_max_uses: None,
+        }
+    }
+
+    /// The identity the public bypass serves an anonymous visitor under.
+    fn public_placeholder() -> AuthStateUserInfo {
+        AuthStateUserInfo {
+            id: Uuid::nil(),
+            username: "<public>".into(),
+        }
+    }
+
+    async fn start(
+        handle: &Arc<Mutex<WarpgateServerHandle>>,
+        user: AuthStateUserInfo,
+        target: Target,
+    ) -> Result<crate::TargetSessionStart<warpgate_common::TargetOptions>, WarpgateError> {
+        handle
+            .lock()
+            .await
+            .start_target_session(crate::TargetAuthorization::for_test(
+                user,
+                target,
+                Protocol::Ssh,
+            ))
+            .await
+    }
+
+    /// An anonymous visitor of a public target names no user, so there is
+    /// none to re-read: the target session starts, under the nil id.
+    #[tokio::test]
+    async fn an_anonymous_visitor_of_a_public_target_is_admitted() {
+        let f = fixture().await;
+        let (handle, _) = f.sign_in_from(OUTSIDE).await;
+        let id = handle.lock().await.user_session_id();
+
+        let started = start(&handle, public_placeholder(), http_target(true, false)).await;
+
+        assert!(
+            matches!(started, Ok(crate::TargetSessionStart::Started(_))),
+            "{}",
+            started.err().map(|e| e.to_string()).unwrap_or_default()
+        );
+        assert_eq!(f.attributed_user(id).await, Some(Uuid::nil()));
+    }
+
+    /// The anonymous identity on a target that is not public, or that
+    /// requires approval, is judged as any other and refused: there is no
+    /// such user.
+    #[tokio::test]
+    async fn the_anonymous_identity_is_refused_on_a_target_that_is_not_public() {
+        for target in [http_target(false, false), http_target(true, true)] {
+            let f = fixture().await;
+            let (handle, _) = f.sign_in_from(INSIDE).await;
+
+            let started = start(&handle, public_placeholder(), target).await;
+
+            assert!(
+                matches!(started, Err(WarpgateError::UserNoLongerAdmitted)),
+                "{}",
+                started.err().map(|e| e.to_string()).unwrap_or_default()
+            );
+        }
+    }
+
+    /// A real user reaching a public target is still judged: a deleted user,
+    /// or one outside their ranges, is refused there too.
+    #[tokio::test]
+    async fn a_real_user_on_a_public_target_is_still_judged() {
+        let f = fixture().await;
+        let (handle, _) = f.sign_in_from(OUTSIDE).await;
+        f.set_ranges(serde_json::json!(["10.0.0.0/8"])).await;
+        let started = start(&handle, f.user.clone(), http_target(true, false)).await;
+        assert!(
+            matches!(started, Err(WarpgateError::UserNoLongerAdmitted)),
+            "{}",
+            started.err().map(|e| e.to_string()).unwrap_or_default()
+        );
+
+        let f = fixture().await;
+        let (handle, _) = f.sign_in_from(INSIDE).await;
+        User::Entity::delete_by_id(f.user.id)
+            .exec(&f.db)
+            .await
+            .unwrap();
+        let started = start(&handle, f.user.clone(), http_target(true, false)).await;
         assert!(
             matches!(started, Err(WarpgateError::UserNoLongerAdmitted)),
             "{}",

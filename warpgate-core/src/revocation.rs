@@ -9,7 +9,7 @@ use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect};
 use time::OffsetDateTime;
 use tracing::{info, warn};
 use uuid::Uuid;
-use warpgate_common::{Protocol, TargetOptions, UserSessionId, WarpgateError};
+use warpgate_common::{Protocol, Target, TargetOptions, UserSessionId, WarpgateError};
 use warpgate_db_entities::{
     PendingSessionClose, PendingUserClose, TargetSession, User, UserRoleAssignment, UserSession,
 };
@@ -19,6 +19,14 @@ use crate::cluster::ClusterNotification;
 use crate::live_streams::{LiveStreamKind, host_binding};
 use crate::services::TICKET_EXPIRY_SWEEP_INTERVAL;
 use crate::{ConfigProvider, Services, SessionsFilter, apply_sso_mappings, resolve_sso_username};
+
+/// Whether `target` is reachable through the public bypass: an HTTP target
+/// that is `public` and does not require approval. The rule that admits a
+/// request through the bypass (`catchall::decide_public_target_access`).
+pub(crate) fn target_shared_publicly(target: &Target) -> bool {
+    !target.require_approval
+        && matches!(&target.options, TargetOptions::Http(options) if options.public)
+}
 
 /// Waits up to [`LIVE_STREAM_LOOKUP_TIMEOUT`] for one access lookup of the
 /// live-request re-check. A lookup that does not answer in time is treated as
@@ -473,10 +481,7 @@ impl Services {
     /// errors counts as no longer shared.
     pub async fn public_target_still_shared(&self, target_id: Uuid) -> bool {
         match self.config_provider.get_target_by_id(target_id).await {
-            Ok(Some(target)) => {
-                !target.require_approval
-                    && matches!(&target.options, TargetOptions::Http(options) if options.public)
-            }
+            Ok(Some(target)) => target_shared_publicly(&target),
             Ok(None) => false,
             Err(error) => {
                 warn!(%error, %target_id, "Could not re-check that the target is public; treating it as unshared");
