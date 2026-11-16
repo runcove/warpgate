@@ -333,23 +333,37 @@ async fn start_recording_in(
     target_session_id: &TargetSessionId,
     owner: RecordingOwner,
 ) -> Result<Option<DesktopRecorder>, WarpgateError> {
-    match recordings
+    let started = recordings
         .start_for::<DesktopRecorder, _>(
             &owner,
             target_session_id,
             None,
             DesktopRecordingMetadata::Desktop,
         )
-        .await
-    {
-        Ok(recorder) => Ok(recorder),
-        Err(_) => {
-            if recordings.refuses_unrecorded_sessions() {
+        .await;
+    checked_recording(recordings, started).await
+}
+
+/// Maps a started desktop recording to what [`start_recording`] returns. When
+/// unrecorded sessions are refused, the recording's first write is waited for, so
+/// a recording that cannot be written (a full disk) refuses the session before the
+/// target is dialled; that failure is logged and counted by the recorder.
+pub async fn checked_recording(
+    recordings: &SessionRecordings,
+    started: warpgate_core::recordings::Result<Option<DesktopRecorder>>,
+) -> Result<Option<DesktopRecorder>, WarpgateError> {
+    let required = recordings.refuses_unrecorded_sessions();
+    match started {
+        Ok(Some(recorder)) if required => match recorder.write_header().await {
+            Ok(()) => Ok(Some(recorder)),
+            Err(error) => {
+                recorder.write_failed(&error);
                 Err(WarpgateError::SessionNotRecorded)
-            } else {
-                Ok(None)
             }
-        }
+        },
+        Ok(recorder) => Ok(recorder),
+        Err(_) if required => Err(WarpgateError::SessionNotRecorded),
+        Err(_) => Ok(None),
     }
 }
 

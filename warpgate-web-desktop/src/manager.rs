@@ -189,23 +189,38 @@ async fn record_then_dial(
     target_session_id: &TargetSessionId,
     dial: impl FnOnce() -> Result<DesktopClientHandles, WarpgateError>,
 ) -> Result<(DesktopClientHandles, Option<Arc<DesktopRecorder>>), WarpgateError> {
-    let recorder = match recordings
+    let started = recordings
         .start_for::<DesktopRecorder, _>(
             owner,
             target_session_id,
             None,
             DesktopRecordingMetadata::Desktop,
         )
-        .await
-    {
-        Ok(recorder) => recorder,
-        // Logged by `start_for`.
-        Err(_) => {
-            if recordings.refuses_unrecorded_sessions() {
+        .await;
+    dial_recorded(recordings, started, dial).await
+}
+
+/// [`record_then_dial`] once the recording has started (or failed to, logged by
+/// `start_for`). When unrecorded sessions are refused, the recording's first write
+/// is waited for, so a recording that cannot be written (a full disk) ends the
+/// session before the backend is dialled; that failure is logged by the recorder.
+async fn dial_recorded(
+    recordings: &SessionRecordings,
+    started: warpgate_core::recordings::Result<Option<DesktopRecorder>>,
+    dial: impl FnOnce() -> Result<DesktopClientHandles, WarpgateError>,
+) -> Result<(DesktopClientHandles, Option<Arc<DesktopRecorder>>), WarpgateError> {
+    let required = recordings.refuses_unrecorded_sessions();
+    let recorder = match started {
+        Ok(Some(recorder)) if required => {
+            if let Err(error) = recorder.write_header().await {
+                recorder.write_failed(&error);
                 return Err(WarpgateError::SessionNotRecorded);
             }
-            None
+            Some(recorder)
         }
+        Ok(recorder) => recorder,
+        Err(_) if required => return Err(WarpgateError::SessionNotRecorded),
+        Err(_) => None,
     };
     let handles = dial()?;
     if let Some(recorder) = &recorder {
@@ -464,6 +479,99 @@ mod tests {
             let (dialled, result) = dial_with_failing_recording(false).await;
             assert!(dialled);
             assert!(matches!(result, Err(WarpgateError::InvalidTarget)));
+        }
+    }
+
+    /// A recording whose files cannot be written (a full disk). Required: the
+    /// session is refused before the backend is dialled; otherwise it dials.
+    #[cfg(target_os = "linux")]
+    mod unwritable {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use sea_orm::ActiveValue::Set;
+        use sea_orm::{ActiveModelTrait, Database, IntoActiveModel};
+        use uuid::Uuid;
+        use warpgate_common::GlobalParams;
+        use warpgate_core::recordings::test_support;
+        use warpgate_db_entities::Parameters::{
+            self, ConfigMigrationValues, RecordingsDiskConfig, RecordingsStorageConfig,
+            set_config_migration_values,
+        };
+        use warpgate_db_migrations::migrate_database;
+
+        use super::*;
+
+        #[tokio::test]
+        async fn a_desktop_recording_that_cannot_be_written_follows_the_setting_at_start() {
+            for required in [true, false] {
+                test_support::log_events();
+                let dir = tempfile::tempdir().unwrap();
+                set_config_migration_values(ConfigMigrationValues::default());
+                let db = Database::connect("sqlite::memory:").await.unwrap();
+                migrate_database(&db).await.unwrap();
+                let mut parameters = Parameters::Entity::get(&db)
+                    .await
+                    .unwrap()
+                    .into_active_model();
+                parameters.recordings_enable = Set(true);
+                parameters.recordings_storage = Set(serde_json::to_string(
+                    &RecordingsStorageConfig::Disk(RecordingsDiskConfig {
+                        path: "recordings".into(),
+                    }),
+                )
+                .unwrap());
+                parameters.update(&db).await.unwrap();
+                let id = TargetSessionId(Uuid::new_v4());
+                warpgate_db_entities::TargetSession::ActiveModel {
+                    id: Set(id),
+                    user_session_id: Set(warpgate_common::UserSessionId(Uuid::new_v4())),
+                    target_snapshot: Set("{}".into()),
+                    target_id: Set(Uuid::new_v4()),
+                    started: Set(time::OffsetDateTime::now_utc()),
+                    ..Default::default()
+                }
+                .insert(&db)
+                .await
+                .unwrap();
+                let params = GlobalParams::new(dir.path().join("warpgate.yaml"), false)
+                    .unwrap()
+                    .with_refuse_unrecorded_sessions(required);
+                let recordings = SessionRecordings::new(db, &params);
+                let owner = RecordingOwner {
+                    protocol: "web-desktop",
+                    user: "alice".into(),
+                    target: "desktop".into(),
+                };
+                let started = recordings
+                    .start_for::<DesktopRecorder, _>(
+                        &owner,
+                        &id,
+                        None,
+                        DesktopRecordingMetadata::Desktop,
+                    )
+                    .await;
+                assert!(
+                    test_support::fail_open_recording_files(&dir.path().join("recordings")) >= 2
+                );
+                let dialled = AtomicBool::new(false);
+                let result = dial_recorded(&recordings, started, || {
+                    dialled.store(true, Ordering::SeqCst);
+                    Err(WarpgateError::InvalidTarget)
+                })
+                .await
+                .map(|_| ());
+                if required {
+                    assert!(!dialled.load(Ordering::SeqCst), "the backend was dialled");
+                    assert!(matches!(result, Err(WarpgateError::SessionNotRecorded)));
+                    let lines = test_support::failed_recording_lines(&id);
+                    assert_eq!(lines.len(), 1, "{lines:?}");
+                    assert_eq!(lines[0]["protocol"], "web-desktop");
+                    assert_eq!(lines[0]["stage"], "write");
+                } else {
+                    assert!(dialled.load(Ordering::SeqCst));
+                    assert!(matches!(result, Err(WarpgateError::InvalidTarget)));
+                }
+            }
         }
     }
 

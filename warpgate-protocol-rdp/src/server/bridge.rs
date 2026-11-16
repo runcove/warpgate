@@ -155,7 +155,9 @@ const RECORD_QUEUE_CAPACITY: usize = 256;
 /// queue is full, so the recording has fallen behind and the frame would reach the
 /// viewer unrecorded; that is reported as the recording's failure. With the setting
 /// off the frame is dropped from the recording. A closed queue is a recording that
-/// already failed, and was reported by the recording task.
+/// already failed, and was reported by the recording task: the session closes when
+/// unrecorded sessions are refused, even if the task's own close has not reached
+/// this loop yet.
 fn queue_for_recording(
     record_tx: &Sender<DesktopEvent>,
     recorder: &DesktopRecorder,
@@ -163,7 +165,8 @@ fn queue_for_recording(
     event: DesktopEvent,
 ) -> bool {
     match record_tx.try_send(event) {
-        Ok(()) | Err(TrySendError::Closed(_)) => true,
+        Ok(()) => true,
+        Err(TrySendError::Closed(_)) => !required,
         Err(TrySendError::Full(_)) if required => {
             recorder.write_failed(&"the recording fell behind the session (its queue is full)");
             false
@@ -241,7 +244,7 @@ mod tests {
     use tokio::sync::Mutex;
     use tokio::sync::mpsc::{UnboundedReceiver, channel, unbounded_channel};
     use uuid::Uuid;
-    use warpgate_common::{GlobalParams, TargetSessionId};
+    use warpgate_common::{GlobalParams, TargetSessionId, WarpgateError};
     use warpgate_core::cluster::Cluster;
     use warpgate_core::rate_limiting::RateLimiterRegistry;
     use warpgate_core::recordings::{
@@ -461,5 +464,85 @@ mod tests {
         // Its shutdown still waits for the viewer, which never reads.
         assert!(!bridge.is_finished());
         bridge.abort();
+    }
+
+    /// A recording task that has already failed (its queue is closed). Required:
+    /// the session closes before the frame reaches the viewer, even if the task's
+    /// own close has not reached the bridge. Not required: the frame reaches the
+    /// viewer.
+    #[tokio::test]
+    async fn a_closed_recording_queue_follows_the_setting() {
+        for required in [true, false] {
+            let r = recording(required).await;
+            let (record_tx, record_rx) = channel(1);
+            drop(record_rx);
+            let (event_tx, event_rx) = channel(16);
+            let (server_in, mut viewer) = channel(16);
+            let (abort_tx, mut abort_rx) = unbounded_channel();
+            let recording_failed = Notify::new();
+            event_tx.send(resize()).await.unwrap();
+            let event_tx = required.then_some(event_tx);
+            let record = (record_tx, r.recorder.clone());
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                forward_frames(
+                    event_rx,
+                    &server_in,
+                    &abort_tx,
+                    Some(&record),
+                    required,
+                    &recording_failed,
+                ),
+            )
+            .await
+            .expect("the bridge returned");
+
+            let shown = std::iter::from_fn(|| viewer.try_recv().ok()).collect::<Vec<_>>();
+            if required {
+                assert!(
+                    matches!(shown.as_slice(), [ServerInput::Shutdown]),
+                    "only the shutdown reached the viewer ({} items)", shown.len()
+                );
+                assert!(aborted(&mut abort_rx).await, "the target was cut off");
+                assert!(event_tx.is_some_and(|tx| tx.is_closed()));
+            } else {
+                assert!(
+                    matches!(shown.as_slice(), [ServerInput::Resize { .. }]),
+                    "the frame reached the viewer ({} items)", shown.len()
+                );
+                assert!(abort_rx.try_recv().is_err(), "the target stays connected");
+            }
+        }
+    }
+
+    /// A native desktop recording whose files cannot be written (a full disk), as
+    /// RDP and VNC start it: required, the session is refused before the target is
+    /// dialled; otherwise it goes on, unchecked.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_desktop_recording_that_cannot_be_written_is_refused_at_start_when_required() {
+        for required in [true, false] {
+            let Recording {
+                recorder,
+                recordings,
+                id,
+                _dir,
+            } = recording(required).await;
+            let recorder = Arc::try_unwrap(recorder).ok().unwrap();
+            assert!(test_support::fail_open_recording_files(&_dir.path().join("recordings")) >= 2);
+            let checked = warpgate_desktop_auth::checked_recording(&recordings, Ok(Some(recorder))).await;
+            if required {
+                assert!(
+                    matches!(checked, Err(WarpgateError::SessionNotRecorded)),
+                    "refused at start"
+                );
+                let lines = test_support::failed_recording_lines(&id);
+                assert_eq!(lines.len(), 1, "{lines:?}");
+                assert_eq!(lines[0]["protocol"], "rdp");
+                assert_eq!(lines[0]["stage"], "write");
+            } else {
+                assert!(matches!(checked, Ok(Some(_))), "not checked when not required");
+            }
+        }
     }
 }
