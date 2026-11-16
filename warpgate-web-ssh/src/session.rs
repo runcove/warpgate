@@ -137,6 +137,20 @@ impl WebSshSession {
             return None;
         }
         let target_session_id = self.target_session_id.get()?;
+        let started = self.start_recording(target_session_id).await;
+        self.open_recorded_shell_channel(cols, rows, started).await
+    }
+
+    /// [`Self::open_shell_channel`] once its recording has started (or failed to).
+    /// When unrecorded sessions are refused, the recording's first writes are waited
+    /// for, so a recording that cannot be written ends the session before the shell is
+    /// opened on the target.
+    async fn open_recorded_shell_channel(
+        &self,
+        cols: u32,
+        rows: u32,
+        started: Result<Option<TerminalRecorder>, WarpgateError>,
+    ) -> Option<Uuid> {
         let channel_id = Uuid::new_v4();
 
         info!(session=%self.id(), channel=%channel_id, "Opening session channel");
@@ -145,7 +159,7 @@ impl WebSshSession {
         let mut audit = ChannelAudit::new(channel_id);
         let (cols, rows) = pty_request.screen_size();
         audit.start_command_detection(cols, rows);
-        match self.start_recording(target_session_id).await {
+        match started {
             Ok(Some(recorder)) => audit.set_recorder(recorder),
             Ok(None) => (),
             // Refused before the shell is opened on the target: tell the viewer, then end
@@ -160,7 +174,10 @@ impl WebSshSession {
             }
         }
         // seeds the recording with the initial screen size
-        if audit.on_resize(&pty_request).await.is_break() {
+        if audit.on_resize(&pty_request).await.is_break()
+            || (self.recordings.refuses_unrecorded_sessions()
+                && audit.write_recording_header().await.is_break())
+        {
             self.close_on_recording_failure().await;
             return None;
         }
@@ -182,7 +199,12 @@ impl WebSshSession {
         if self.closed_for_recording_failure() {
             return;
         }
-        if let Some(audit) = self.channel_audits.lock().await.get_mut(&channel_id)
+        let mut audits = self.channel_audits.lock().await;
+        // A close that ran while the lock was awaited has removed nothing: check again.
+        if self.closed_for_recording_failure() {
+            return;
+        }
+        if let Some(audit) = audits.get_mut(&channel_id)
             && audit.on_input(&data).await.is_break()
         {
             self.close_on_recording_failure().await;
@@ -198,7 +220,11 @@ impl WebSshSession {
         if self.closed_for_recording_failure() {
             return false;
         }
-        if let Some(audit) = self.channel_audits.lock().await.get_mut(&channel_id)
+        let mut audits = self.channel_audits.lock().await;
+        if self.closed_for_recording_failure() {
+            return false;
+        }
+        if let Some(audit) = audits.get_mut(&channel_id)
             && audit.on_output(data).await.is_break()
         {
             self.close_on_recording_failure().await;
@@ -212,7 +238,11 @@ impl WebSshSession {
             return;
         }
         let pty_request = make_pty_request(cols, rows);
-        if let Some(audit) = self.channel_audits.lock().await.get_mut(&channel_id)
+        let mut audits = self.channel_audits.lock().await;
+        if self.closed_for_recording_failure() {
+            return;
+        }
+        if let Some(audit) = audits.get_mut(&channel_id)
             && audit.on_resize(&pty_request).await.is_break()
         {
             self.close_on_recording_failure().await;
@@ -413,7 +443,8 @@ mod tests {
             _dir: tempfile::TempDir,
         }
 
-        async fn shell_failing_mid_session(refuse: bool) -> Harness {
+        /// A web SSH session bound to its target session, no channel open yet.
+        async fn bound_shell(refuse: bool) -> Harness {
             test_support::log_events();
             let dir = tempfile::tempdir().unwrap();
             set_config_migration_values(ConfigMigrationValues::default());
@@ -463,7 +494,7 @@ mod tests {
             .await
             .unwrap();
 
-            let (command_tx, mut sent) = tokio::sync::mpsc::unbounded_channel();
+            let (command_tx, sent) = tokio::sync::mpsc::unbounded_channel();
             let session = WebSshSession::new(
                 user_session,
                 Uuid::new_v4(),
@@ -476,26 +507,46 @@ mod tests {
                 recordings.clone(),
             );
             session.bind_target_session(id);
-            let channel = session.open_shell_channel(80, 24).await.unwrap();
-            while sent.try_recv().is_ok() {}
-            let root = dir.path().join("recordings");
-            assert!(
-                test_support::fail_open_recording_files(&root) >= 2,
-                "the data and index files were broken"
-            );
             Harness {
                 session,
                 sent,
                 recordings,
                 id,
-                channel,
+                channel: Uuid::nil(),
                 required: refuse,
                 disconnects: 0,
                 _dir: dir,
             }
         }
 
+        /// A web shell whose recording started and works.
+        async fn recorded_shell(refuse: bool) -> Harness {
+            let mut h = bound_shell(refuse).await;
+            h.channel = h.session.open_shell_channel(80, 24).await.unwrap();
+            while h.sent.try_recv().is_ok() {}
+            h
+        }
+
+        async fn shell_failing_mid_session(refuse: bool) -> Harness {
+            let h = recorded_shell(refuse).await;
+            assert!(h.fail_recordings() >= 2, "the data and index files were broken");
+            h
+        }
+
         impl Harness {
+            /// Fails the open recording files, as a full disk would.
+            fn fail_recordings(&self) -> usize {
+                test_support::fail_open_recording_files(&self._dir.path().join("recordings"))
+            }
+
+            fn sent_commands(&mut self) -> Vec<RCCommand> {
+                let mut commands = Vec::new();
+                while let Ok((command, _)) = self.sent.try_recv() {
+                    commands.push(command);
+                }
+                commands
+            }
+
             fn aborted(&self) -> bool {
                 self.session.cancellation().is_cancelled()
             }
@@ -632,6 +683,85 @@ mod tests {
             assert_eq!(h.data_sent(), 1);
             assert!(!h.aborted(), "the session goes on");
             h.assert_one_failure_line(false);
+        }
+
+        /// A shell whose recording starts on files that cannot be written (a full
+        /// disk). Required: the session ends before the shell is opened on the
+        /// target. Otherwise the shell opens, its first writes not waited for.
+        #[tokio::test]
+        async fn a_web_shell_that_cannot_be_recorded_follows_the_setting_at_start() {
+            for required in [true, false] {
+                let mut h = bound_shell(required).await;
+                let started = h.session.start_recording(&h.id).await;
+                assert!(h.fail_recordings() >= 2);
+                let opened = h.session.open_recorded_shell_channel(80, 24, started).await;
+                let commands = h.sent_commands();
+                let shell_opened = commands
+                    .iter()
+                    .any(|c| matches!(c, RCCommand::Channel(_, ChannelOperation::OpenShell)));
+                if required {
+                    assert!(opened.is_none(), "refused at start");
+                    assert!(!shell_opened, "the shell was opened: {commands:?}");
+                    assert!(h.aborted(), "the session is aborted");
+                    assert!(h.told_the_viewer().await);
+                    h.assert_one_failure_line(true);
+                } else {
+                    assert!(opened.is_some());
+                    assert!(shell_opened, "{commands:?}");
+                    assert!(!h.aborted());
+                }
+            }
+        }
+
+        /// Once the session was closed for its recording, no new shell is opened.
+        #[tokio::test]
+        async fn once_closed_for_its_recording_no_new_shell_opens() {
+            let mut h = shell_failing_mid_session(true).await;
+            h.input_until_failure().await;
+            assert!(h.aborted());
+            h.sent_commands();
+            assert!(h.session.open_shell_channel(80, 24).await.is_none());
+            let commands = h.sent_commands();
+            assert!(commands.is_empty(), "sent to the target: {commands:?}");
+        }
+
+        /// A close that runs while input, output or a resize waits for the channel
+        /// lock: once that has the lock, it passes nothing.
+        #[tokio::test]
+        async fn a_close_while_waiting_for_the_channel_lock_passes_nothing() {
+            for op in ["input", "output", "resize"] {
+                let mut h = recorded_shell(true).await;
+                let (session, channel) = (&h.session, h.channel);
+                let guard = session.channel_audits.lock().await;
+                let passed = async {
+                    match op {
+                        "input" => {
+                            session
+                                .send_input(channel, Bytes::from_static(b"input"))
+                                .await;
+                            true
+                        }
+                        "output" => session.on_output(channel, b"output").await,
+                        _ => {
+                            session.resize_channel(channel, 100, 30).await;
+                            true
+                        }
+                    }
+                };
+                let close = async move {
+                    tokio::task::yield_now().await;
+                    session.close_on_recording_failure().await;
+                    drop(guard);
+                };
+                let (passed, ()) = tokio::join!(passed, close);
+                let forwarded: Vec<_> = h
+                    .sent_commands()
+                    .into_iter()
+                    .filter(|c| !matches!(c, RCCommand::Disconnect))
+                    .collect();
+                assert!(forwarded.is_empty(), "{op} reached the target: {forwarded:?}");
+                assert!(op != "output" || !passed, "the output was shown");
+            }
         }
     }
 }
