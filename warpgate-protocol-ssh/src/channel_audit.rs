@@ -74,6 +74,16 @@ impl ChannelAudit {
         self.check(result)
     }
 
+    /// Waits for the recording's first writes to reach its files (see
+    /// [`TerminalRecorder::write_header`]); `Break` as for the `on_*` calls.
+    pub async fn write_recording_header(&mut self) -> ControlFlow<()> {
+        let result = match self.recorder.as_ref() {
+            Some(recorder) => recorder.write_header().await,
+            None => Ok(()),
+        };
+        self.check(result)
+    }
+
     async fn record(&mut self, stream: TerminalRecordingStreamId, data: &[u8]) -> ControlFlow<()> {
         let result = match self.recorder.as_ref() {
             Some(recorder) => recorder.write(stream, data).await,

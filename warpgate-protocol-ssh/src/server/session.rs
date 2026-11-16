@@ -2711,8 +2711,9 @@ mod tests {
                 _dir: tempfile::TempDir,
             }
 
+            /// As [`recorded_shell`], before the channel's recording is started.
             #[cfg(target_os = "linux")]
-            async fn recorded_shell(refuse: bool) -> Recorded {
+            async fn connected_shell(refuse: bool) -> Recorded {
                 warpgate_core::recordings::test_support::log_events();
                 let dir = tempfile::tempdir().unwrap();
                 let params = GlobalParams::new(dir.path().join("warpgate.yaml"), false)
@@ -2745,12 +2746,6 @@ mod tests {
                 };
                 let ch = open_session_channel(&mut s.session, 1);
                 let channel = s.session.map_channel(ch).unwrap();
-                assert!(
-                    s.session
-                        .start_terminal_recording(channel, SshRecordingMetadata::Shell { channel: 1 })
-                        .await
-                        .is_continue()
-                );
                 Recorded {
                     s,
                     sent,
@@ -2761,6 +2756,18 @@ mod tests {
                     required: refuse,
                     _dir: dir,
                 }
+            }
+
+            #[cfg(target_os = "linux")]
+            async fn recorded_shell(refuse: bool) -> Recorded {
+                let mut r = connected_shell(refuse).await;
+                assert!(
+                    r.s.session
+                        .start_terminal_recording(r.channel, SshRecordingMetadata::Shell { channel: 1 })
+                        .await
+                        .is_continue()
+                );
+                r
             }
 
             #[cfg(target_os = "linux")]
@@ -3022,6 +3029,178 @@ mod tests {
                     {
                         assert!(!closed(&r.s), "the connection stays open");
                     }
+                }
+            }
+
+            /// A shell channel whose recording starts on files that cannot be written
+            /// (a full disk). Required: the session closes before anything of the
+            /// channel reaches the target. Otherwise the channel goes on, its first
+            /// writes not waited for.
+            #[cfg(target_os = "linux")]
+            #[tokio::test]
+            async fn a_shell_recording_that_cannot_be_written_follows_the_setting_at_start() {
+                for required in [true, false] {
+                    let mut r = connected_shell(required).await;
+                    let started = r
+                        .s
+                        .session
+                        .services
+                        .recordings
+                        .start_for::<TerminalRecorder, _>(
+                            &r.s.session.recording_owner,
+                            &r.id,
+                            None,
+                            SshRecordingMetadata::Shell { channel: 1 },
+                        )
+                        .await;
+                    r.fail_recording();
+                    let flow = r
+                        .s
+                        .session
+                        .attach_terminal_recording(r.channel, started)
+                        .await;
+                    let sent = drain(&mut r.sent);
+                    assert!(!sent.iter().any(reaches_target), "sent: {sent:?}");
+                    if required {
+                        assert!(flow.is_break(), "refused at start");
+                        r.assert_closed_for_failure();
+                        r.assert_one_failure_line(true);
+                    } else {
+                        assert!(flow.is_continue());
+                        assert!(!closed(&r.s), "the connection stays open");
+                    }
+                }
+            }
+
+            /// A forward's first connection on a traffic recording whose file
+            /// cannot be written (a full disk). Required: its setup record is waited
+            /// for, so the open is rejected and nothing reaches the target.
+            /// Otherwise the forward opens.
+            #[cfg(target_os = "linux")]
+            #[tokio::test]
+            async fn a_forward_whose_recording_cannot_be_written_follows_the_setting() {
+                for required in [true, false] {
+                    let mut r = recorded_shell(required).await;
+                    let params = direct_tcpip();
+                    let key = TrafficRecorderKey::Tcp(
+                        params.host_to_connect.clone(),
+                        params.port_to_connect,
+                    );
+                    assert!(
+                        r.s.session
+                            .prepare_traffic_recorder(
+                                &key,
+                                SshRecordingMetadata::DirectTcpIp {
+                                    host: params.host_to_connect.clone(),
+                                    port: params.port_to_connect as u16,
+                                },
+                            )
+                            .await
+                            .is_continue()
+                    );
+                    r.fail_recording();
+                    let open = FakeOpen::default();
+                    if required {
+                        r.s.session
+                            ._channel_open_direct_tcpip(
+                                server_channel(2),
+                                direct_tcpip(),
+                                open.clone(),
+                            )
+                            .await
+                            .unwrap();
+                        let sent = drain(&mut r.sent);
+                        assert!(
+                            !sent.iter().any(reaches_target),
+                            "sent to the target: {sent:?}"
+                        );
+                        assert_eq!(open.accepted(), Some(false), "the open is rejected");
+                        r.assert_closed_for_failure();
+                        continue;
+                    }
+                    let session = &mut r.s.session;
+                    let target = &mut r.sent;
+                    let opened = tokio::select! {
+                        () = async {
+                            session
+                                ._channel_open_direct_tcpip(
+                                    server_channel(2),
+                                    direct_tcpip(),
+                                    open.clone(),
+                                )
+                                .await
+                                .unwrap();
+                        } => false,
+                        Some((command, reply)) = target.recv() => {
+                            let _ = reply.map(|r| r.send(Ok(())));
+                            reaches_target(&command)
+                        }
+                    };
+                    assert!(opened, "the forward opens");
+                    assert!(!closed(&r.s), "the connection stays open");
+                }
+            }
+
+            /// A reverse forward from the target to an address an earlier one
+            /// already made a traffic recorder for, which has died since: the
+            /// failure is seen before the channel is opened to the client.
+            /// Required: the connection closes; otherwise the forward goes on.
+            #[cfg(target_os = "linux")]
+            #[tokio::test]
+            async fn a_reverse_forward_on_a_dead_traffic_recorder_follows_the_setting() {
+                for required in [true, false] {
+                    let mut r = recorded_shell(required).await;
+                    let params = crate::ForwardedTcpIpParams {
+                        connected_address: "127.0.0.1".into(),
+                        connected_port: 8080,
+                        originator_address: "10.0.0.2".into(),
+                        originator_port: 40000,
+                    };
+                    let key = TrafficRecorderKey::Tcp(
+                        params.originator_address.clone(),
+                        params.originator_port,
+                    );
+                    assert!(
+                        r.s.session
+                            .prepare_traffic_recorder(
+                                &key,
+                                SshRecordingMetadata::ForwardedTcpIp {
+                                    host: params.originator_address.clone(),
+                                    port: params.originator_port as u16,
+                                },
+                            )
+                            .await
+                            .is_continue()
+                    );
+                    r.fail_recording();
+                    let mut probe = r.s.session.traffic_recorders[&key].connection(
+                        TrafficConnectionParams::Socket {
+                            socket_path: "/probe".into(),
+                        },
+                    );
+                    let mut died = false;
+                    for _ in 0..1000 {
+                        if probe.write_connection_setup().await.is_err() {
+                            died = true;
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    }
+                    assert!(died, "the traffic recorder died");
+                    drop(probe);
+                    assert!(!closed(&r.s), "nothing has closed the connection yet");
+
+                    let _ = r
+                        .s
+                        .session
+                        .handle_remote_event(RCEvent::ForwardedTcpIp(Uuid::new_v4(), params))
+                        .await;
+                    if required {
+                        r.assert_closed_for_failure();
+                    } else {
+                        assert!(!closed(&r.s), "the connection stays open");
+                    }
+                    r.assert_one_failure_line(required);
                 }
             }
         }
@@ -4512,20 +4691,20 @@ impl ServerSession {
                 {
                     return Ok(());
                 }
+                #[allow(clippy::unwrap_used)]
+                let connection_params = TrafficConnectionParams::Tcp {
+                    dst_addr: Ipv4Addr::from_str("2.2.2.2").unwrap(),
+                    dst_port: params.connected_port as u16,
+                    src_addr: Ipv4Addr::from_str("1.1.1.1").unwrap(),
+                    src_port: params.originator_port as u16,
+                };
+                let ControlFlow::Continue(recorder) = self
+                    .connect_traffic_recorder(&key, connection_params)
+                    .await
+                else {
+                    return Ok(());
+                };
                 if let Some(session) = self.session_handle.clone() {
-                    #[allow(clippy::unwrap_used)]
-                    let connection_params = TrafficConnectionParams::Tcp {
-                        dst_addr: Ipv4Addr::from_str("2.2.2.2").unwrap(),
-                        dst_port: params.connected_port as u16,
-                        src_addr: Ipv4Addr::from_str("1.1.1.1").unwrap(),
-                        src_port: params.originator_port as u16,
-                    };
-                    let ControlFlow::Continue(recorder) = self
-                        .connect_traffic_recorder(&key, connection_params)
-                        .await
-                    else {
-                        return Ok(());
-                    };
                     let open_params = params.clone();
                     self.open_server_channel_in_background(id, async move {
                         session
@@ -4552,16 +4731,16 @@ impl ServerSession {
                 {
                     return Ok(());
                 }
+                let connection_params = TrafficConnectionParams::Socket {
+                    socket_path: params.socket_path.clone(),
+                };
+                let ControlFlow::Continue(recorder) = self
+                    .connect_traffic_recorder(&key, connection_params)
+                    .await
+                else {
+                    return Ok(());
+                };
                 if let Some(session) = self.session_handle.clone() {
-                    let connection_params = TrafficConnectionParams::Socket {
-                        socket_path: params.socket_path.clone(),
-                    };
-                    let ControlFlow::Continue(recorder) = self
-                        .connect_traffic_recorder(&key, connection_params)
-                        .await
-                    else {
-                        return Ok(());
-                    };
                     let socket_path = params.socket_path;
                     self.open_server_channel_in_background(id, async move {
                         session
@@ -4920,7 +5099,7 @@ impl ServerSession {
             self.pending_recordings.push((channel_id, metadata));
             return ControlFlow::Continue(());
         };
-        let recorder = match self
+        let started = self
             .services
             .recordings
             .start_for::<TerminalRecorder, _>(
@@ -4929,8 +5108,22 @@ impl ServerSession {
                 None,
                 metadata,
             )
-            .await
-        {
+            .await;
+        self.attach_terminal_recording(channel_id, started).await
+    }
+
+    /// [`Self::start_terminal_recording`] once the recording has started (or
+    /// failed to): seeds it with the channel's terminal size and, when unrecorded
+    /// sessions are refused, waits for its first writes to reach the files, so a
+    /// recording that cannot be written closes the session before anything of
+    /// the channel reaches the target.
+    async fn attach_terminal_recording(
+        &mut self,
+        channel_id: Uuid,
+        started: warpgate_core::recordings::Result<Option<TerminalRecorder>>,
+    ) -> ControlFlow<()> {
+        let required = self.services.recordings.refuses_unrecorded_sessions();
+        let recorder = match started {
             Ok(Some(recorder)) => {
                 let seeded = match self
                     .channels
@@ -4943,6 +5136,10 @@ impl ServerSession {
                             .await
                     }
                     None => Ok(()),
+                };
+                let seeded = match seeded {
+                    Ok(()) if required => recorder.write_header().await,
+                    seeded => seeded,
                 };
                 match seeded {
                     Ok(()) => Ok(Some(recorder)),
@@ -5176,7 +5373,14 @@ impl ServerSession {
             return ControlFlow::Continue(None);
         };
         let mut recorder = recorder.connection(connection_params);
-        if let Err(error) = recorder.write_connection_setup().await {
+        let required = self.services.recordings.refuses_unrecorded_sessions();
+        // When required, the setup record is waited for: queued writes would
+        // otherwise let the forward open before its file is seen to fail.
+        let written = match recorder.write_connection_setup().await {
+            Ok(()) if required => recorder.flush().await.map_err(anyhow::Error::from),
+            written => written,
+        };
+        if let Err(error) = written {
             if recorder.write_failed(&format_args!("{error:#}")) {
                 self.close_on_recording_failure().await;
                 return ControlFlow::Break(());
