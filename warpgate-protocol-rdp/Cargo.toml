@@ -54,7 +54,13 @@ warpgate-tls = { path = "../warpgate-tls" }
 x509-cert = { version = "0.2", default-features = false, features = ["std"] }
 
 [dev-dependencies]
+sea-orm.workspace = true
+serde_json.workspace = true
+tempfile = "3"
+time.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
+warpgate-core = { path = "../warpgate-core", features = ["test-util"] }
+warpgate-db-migrations = { path = "../warpgate-db-migrations", features = ["sqlite"] }
 
 [features]
 openssl-tls = [
