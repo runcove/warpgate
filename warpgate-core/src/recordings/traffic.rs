@@ -79,6 +79,11 @@ impl ConnectionRecorder {
         }
     }
 
+    /// Waits until everything written so far has reached the file.
+    pub async fn flush(&self) -> Result<()> {
+        self.writer.flush().await
+    }
+
     pub async fn write_connection_setup(&mut self) -> anyhow::Result<()> {
         self.writer
             .write(&[

@@ -95,6 +95,15 @@ impl TerminalRecorder {
         self.data_writer.write_failed(cause)
     }
 
+    /// Writes an empty line to the index (which readers skip) and waits for it, and
+    /// everything recorded before it, to reach the files: a recording that cannot be
+    /// written then fails before anything of its session reaches the target.
+    pub async fn write_header(&self) -> Result<()> {
+        self.index_writer.write_empty_line().await?;
+        self.index_writer.flush().await?;
+        self.data_writer.flush().await
+    }
+
     fn get_time(&self) -> f32 {
         self.started_at.elapsed().as_secs_f32()
     }

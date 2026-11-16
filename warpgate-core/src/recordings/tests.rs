@@ -1500,6 +1500,36 @@ async fn a_recording_failing_mid_session_is_reported_once_and_counted() {
     }
 }
 
+/// A recording whose files cannot be written (a full disk) fails its header,
+/// and the failure line names the flush's own error rather than the closed
+/// writer the session then sees. On a multi-threaded runtime, as in Warpgate,
+/// the session wakes as soon as its flush is answered.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_header_that_cannot_be_written_is_reported_with_its_real_cause() {
+    crate::approvals::tests::audit_events();
+    for _ in 0..20 {
+        let h = harness_requiring(true).await;
+        let recorder: TerminalRecorder = h
+            .recordings
+            .start_for(&test_owner(), &h.session_id, None, ())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(test_support::fail_open_recording_files(&h.root) >= 2);
+        let error = recorder.write_header().await.unwrap_err();
+        assert!(matches!(error, Error::Closed), "{error}");
+        assert!(recorder.write_failed(&error));
+        let lines = failed_recording_lines(&h.session_id);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0]["stage"], "write");
+        assert!(
+            lines[0]["cause"].contains("No space left on device"),
+            "the real cause, not the closed writer: {lines:?}"
+        );
+    }
+}
+
 /// A recording that cannot start is logged with the same pinned line,
 /// `stage=start`, and counted in the same total.
 #[tokio::test]

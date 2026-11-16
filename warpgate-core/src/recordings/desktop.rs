@@ -214,6 +214,13 @@ impl DesktopRecorder {
         self.data_writer.write_failed(cause)
     }
 
+    /// As [`super::TerminalRecorder::write_header`].
+    pub async fn write_header(&self) -> Result<()> {
+        self.index_writer.write_empty_line().await?;
+        self.index_writer.flush().await?;
+        self.data_writer.flush().await
+    }
+
     pub fn track_logon_state(&self, state: LogonState) {
         let _ = self.sign_in.set(state);
     }

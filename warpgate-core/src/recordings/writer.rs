@@ -214,7 +214,12 @@ async fn write_queued(
             Ok(false)
         }
         Queued::Flush(ack) => {
-            sink.flush().await?;
+            // Reported before `ack` drops: the waiting session then sees the
+            // writer closed, and its own report must not be the first.
+            if let Err(error) = sink.flush().await {
+                reporter.sink_failed(&error);
+                return Err(error);
+            }
             let _ = ack.send(());
             Ok(true)
         }
