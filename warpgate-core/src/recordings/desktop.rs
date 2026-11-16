@@ -595,19 +595,28 @@ impl Drop for DesktopRecorder {
             let mut rgba = std::mem::take(&mut state.rgba_scratch);
             if let Some(r) = take_dirty_region(&mut state, &mut rgba) {
                 let mut out = std::mem::take(&mut state.png_out);
-                if encode_png_rgba(r.width, r.height, &rgba, &mut out).is_ok() {
-                    let item = DesktopRecordingItem::PngImage {
-                        time,
-                        rect: RecordingRect {
-                            x: r.x as u16,
-                            y: r.y as u16,
-                            width: r.width as u16,
-                            height: r.height as u16,
-                        },
-                        keyframe: false,
-                        data: Bytes::copy_from_slice(&out),
-                    };
-                    let _ = data_writer.write_json_line(&item).await;
+                // Failures are reported as a live frame's are; the session is already
+                // ending, so there is nothing left to close.
+                match encode_png_rgba(r.width, r.height, &rgba, &mut out) {
+                    Ok(()) => {
+                        let item = DesktopRecordingItem::PngImage {
+                            time,
+                            rect: RecordingRect {
+                                x: r.x as u16,
+                                y: r.y as u16,
+                                width: r.width as u16,
+                                height: r.height as u16,
+                            },
+                            keyframe: false,
+                            data: Bytes::copy_from_slice(&out),
+                        };
+                        if let Err(error) = data_writer.write_json_line(&item).await {
+                            data_writer.write_failed(&error);
+                        }
+                    }
+                    Err(error) => {
+                        data_writer.write_failed(&Error::PngEncode(error));
+                    }
                 }
                 state.png_out = out;
             }
