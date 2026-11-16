@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use bytes::Bytes;
@@ -47,6 +47,9 @@ pub struct WebSshSession {
     recordings: Arc<SessionRecordings>,
     channel_audits: Arc<Mutex<HashMap<Uuid, ChannelAudit>>>,
     pending_host_key: Arc<Mutex<Option<PendingHostKey>>>,
+    /// Set once the session is closed because its recording failed: from then on
+    /// no input, output or resize passes, even before the close takes effect.
+    closed_for_recording_failure: AtomicBool,
 }
 
 impl WebSshSession {
@@ -80,6 +83,7 @@ impl WebSshSession {
             recordings,
             channel_audits: Arc::new(Mutex::new(HashMap::new())),
             pending_host_key: Arc::new(Mutex::new(None)),
+            closed_for_recording_failure: AtomicBool::new(false),
         }
     }
 
@@ -129,6 +133,9 @@ impl WebSshSession {
     }
 
     pub async fn open_shell_channel(&self, cols: u32, rows: u32) -> Option<Uuid> {
+        if self.closed_for_recording_failure() {
+            return None;
+        }
         let target_session_id = self.target_session_id.get()?;
         let channel_id = Uuid::new_v4();
 
@@ -172,6 +179,9 @@ impl WebSshSession {
     }
 
     pub async fn send_input(&self, channel_id: Uuid, data: Bytes) {
+        if self.closed_for_recording_failure() {
+            return;
+        }
         if let Some(audit) = self.channel_audits.lock().await.get_mut(&channel_id)
             && audit.on_input(&data).await.is_break()
         {
@@ -185,6 +195,9 @@ impl WebSshSession {
     /// was closed: the output must then not reach the viewer.
     #[must_use]
     pub async fn on_output(&self, channel_id: Uuid, data: &[u8]) -> bool {
+        if self.closed_for_recording_failure() {
+            return false;
+        }
         if let Some(audit) = self.channel_audits.lock().await.get_mut(&channel_id)
             && audit.on_output(data).await.is_break()
         {
@@ -195,6 +208,9 @@ impl WebSshSession {
     }
 
     pub async fn resize_channel(&self, channel_id: Uuid, cols: u32, rows: u32) {
+        if self.closed_for_recording_failure() {
+            return;
+        }
         let pty_request = make_pty_request(cols, rows);
         if let Some(audit) = self.channel_audits.lock().await.get_mut(&channel_id)
             && audit.on_resize(&pty_request).await.is_break()
@@ -209,13 +225,27 @@ impl WebSshSession {
     }
 
     /// A recording failed mid-session (logged by its recorder) and unrecorded
-    /// sessions are refused: tell the viewer, then end the session.
+    /// sessions are refused: tell the viewer, then end the session. Its failed
+    /// recorder is gone once this has run, so from here on nothing more is
+    /// forwarded either way, and the target connection is told to disconnect
+    /// before the abort is relayed.
     async fn close_on_recording_failure(&self) {
+        if self
+            .closed_for_recording_failure
+            .swap(true, Ordering::SeqCst)
+        {
+            return;
+        }
         self.push(ServerMessage::Error {
             message: WarpgateError::SessionRecordingFailed.to_string(),
         })
         .await;
+        let _ = self.command_tx.send((RCCommand::Disconnect, None));
         self.abort();
+    }
+
+    fn closed_for_recording_failure(&self) -> bool {
+        self.closed_for_recording_failure.load(Ordering::SeqCst)
     }
 
     pub fn close_channel(&self, channel_id: Uuid) {
@@ -352,6 +382,7 @@ mod tests {
     }
     /// A web shell whose recording started on a real disk root, and fails mid-session
     /// as a full disk would.
+    #[cfg(target_os = "linux")]
     mod failing_mid_session {
         use std::time::Duration;
 
@@ -377,6 +408,8 @@ mod tests {
             id: TargetSessionId,
             channel: Uuid,
             required: bool,
+            /// `RCCommand::Disconnect`s seen by [`Harness::data_sent`].
+            disconnects: usize,
             _dir: tempfile::TempDir,
         }
 
@@ -457,6 +490,7 @@ mod tests {
                 id,
                 channel,
                 required: refuse,
+                disconnects: 0,
                 _dir: dir,
             }
         }
@@ -469,8 +503,10 @@ mod tests {
             fn data_sent(&mut self) -> usize {
                 let mut n = 0;
                 while let Ok((command, _)) = self.sent.try_recv() {
-                    if matches!(command, RCCommand::Channel(_, ChannelOperation::Data(_))) {
-                        n += 1;
+                    match command {
+                        RCCommand::Channel(_, ChannelOperation::Data(_)) => n += 1,
+                        RCCommand::Disconnect => self.disconnects += 1,
+                        _ => (),
                     }
                 }
                 n
@@ -536,6 +572,22 @@ mod tests {
                 inputs - 1,
                 "the input whose recording failed was not forwarded"
             );
+            assert_eq!(h.disconnects, 1, "the target was told to disconnect");
+            // The failed recorder is gone now; later input, resize and output must
+            // still not pass while the close takes effect.
+            h.session
+                .send_input(h.channel, Bytes::from_static(b"after"))
+                .await;
+            h.session.resize_channel(h.channel, 100, 30).await;
+            assert!(!h.session.on_output(h.channel, b"after").await);
+            let mut after = Vec::new();
+            while let Ok((command, _)) = h.sent.try_recv() {
+                after.push(command);
+            }
+            assert!(
+                after.is_empty(),
+                "no input or resize was sent after the close: {after:?}"
+            );
             assert!(h.told_the_viewer().await);
             h.assert_one_failure_line(true);
         }
@@ -543,7 +595,7 @@ mod tests {
         /// Required: output whose recording fails ends the session and is not shown.
         #[tokio::test]
         async fn output_whose_recording_fails_aborts_the_session_when_required() {
-            let h = shell_failing_mid_session(true).await;
+            let mut h = shell_failing_mid_session(true).await;
             let mut shown = true;
             for _ in 0..1000 {
                 shown = h.session.on_output(h.channel, b"output").await;
@@ -554,6 +606,14 @@ mod tests {
             }
             assert!(!shown, "the output whose recording failed is not shown");
             assert!(h.aborted(), "the session is aborted");
+            assert!(
+                !h.session.on_output(h.channel, b"after").await,
+                "later output is not shown either"
+            );
+            h.session
+                .send_input(h.channel, Bytes::from_static(b"after"))
+                .await;
+            assert_eq!(h.data_sent(), 0, "no input after the failure was forwarded");
             assert!(h.told_the_viewer().await);
             h.assert_one_failure_line(true);
         }
