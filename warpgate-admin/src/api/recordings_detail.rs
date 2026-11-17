@@ -318,6 +318,11 @@ async fn serve_live_stream(
                     continue;
                 }
                 sent = offset;
+                // A blank line (the recording's first write at start), skipped
+                // as the replay from the file does.
+                if data.trim_ascii().is_empty() {
+                    continue;
+                }
                 LiveStreamMessage::Data {
                     data: serde_json::from_slice(&data)?,
                     offset,
