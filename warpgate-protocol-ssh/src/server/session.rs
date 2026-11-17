@@ -2973,8 +2973,8 @@ mod tests {
 
             /// Once the session is closed for its recording (by input or by
             /// output), later client data does not reach the target and later
-            /// target output (stdout or stderr) does not reach the client,
-            /// though the failed recorder is gone and the queued disconnect has
+            /// target output (stdout or stderr) does not reach the client, nor
+            /// does a forward the target opens, though the failed recorder is gone and the queued disconnect has
             /// not taken effect.
             /// The close also drops the client handle; it is put back here, so
             /// this checks the refusal on its own.
@@ -3013,6 +3013,28 @@ mod tests {
                         })
                         .await
                         .unwrap();
+                    let (tcp, socket) = (Uuid::new_v4(), Uuid::new_v4());
+                    r.s.session
+                        .handle_remote_event(RCEvent::ForwardedTcpIp(
+                            tcp,
+                            crate::ForwardedTcpIpParams {
+                                connected_address: "0.0.0.0".into(),
+                                connected_port: 8080,
+                                originator_address: "10.0.0.9".into(),
+                                originator_port: 50000,
+                            },
+                        ))
+                        .await
+                        .unwrap();
+                    r.s.session
+                        .handle_remote_event(RCEvent::ForwardedStreamlocal(
+                            socket,
+                            crate::ForwardedStreamlocalParams {
+                                socket_path: "/run/app.sock".into(),
+                            },
+                        ))
+                        .await
+                        .unwrap();
 
                     let sent = drain(&mut r.sent);
                     assert_eq!(data_sent(&sent), 0, "reached the target: {sent:?}");
@@ -3021,6 +3043,14 @@ mod tests {
                         to_client.len(),
                         written,
                         "reached the client: {to_client:?}"
+                    );
+                    assert!(
+                        r.s.session.channels.get(&tcp).is_none(),
+                        "a forward was opened to the client"
+                    );
+                    assert!(
+                        r.s.session.channels.get(&socket).is_none(),
+                        "a forward was opened to the client"
                     );
                 }
             }
@@ -5058,6 +5088,11 @@ impl ServerSession {
                 self.handle_unknown_host_key(key, reply).await?;
             }
             RCEvent::ForwardedTcpIp(id, params) => {
+                // Once closed for its recording, no forward queued ahead of the
+                // disconnect is opened to the client.
+                if self.recording_refused {
+                    return Ok(());
+                }
                 // The recorder exists before the channel is opened to the
                 // client, so a refused session never carries the forward.
                 let key = TrafficRecorderKey::Tcp(
@@ -5104,6 +5139,9 @@ impl ServerSession {
                 }
             }
             RCEvent::ForwardedStreamlocal(id, params) => {
+                if self.recording_refused {
+                    return Ok(());
+                }
                 let key = TrafficRecorderKey::Socket(params.socket_path.clone());
                 let metadata = SshRecordingMetadata::ForwardedSocket {
                     path: params.socket_path.clone(),
