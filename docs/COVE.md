@@ -134,3 +134,19 @@ primary group, not the root's.
   so every access beyond the owner comes from the ACL (where a default ACL
   applies, the kernel uses it in place of the umask), and the umask, which
   `warpgate run` checks, keeps everything else closed.
+
+## Upstream request errors in the log
+
+When the HTTP proxy, a WebSocket proxy (target or cluster peer) or the
+Kubernetes proxy logs a failed upstream request, the line carries no raw query
+string, no userinfo and no upstream client URL. Query values are redacted. A
+refused WebSocket upgrade is logged by its HTTP status only, never with the
+upstream's headers or body.
+
+### Limits
+
+- **A query key is logged as written** when it looks like a parameter name (1
+  to 40 letters, digits, `_`, `.`, `-`, `[` or `]`) and has a non-empty value.
+  A credential sent in the key position of such a pair appears in the log.
+- **Path segments are logged as written.** Warpgate's own routes carry only
+  IDs there.
