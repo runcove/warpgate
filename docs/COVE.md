@@ -146,12 +146,18 @@ its HTTP status only, never with the upstream's headers or body.
 ### Limits
 
 - **A query key is logged percent-decoded** when, decoded, it looks like a
-  parameter name (1 to 40 letters, digits, `_`, `.`, `-`, `[` or `]`) and its
-  value is neither empty nor starts with `=`. A credential sent in the key
-  position of such a pair appears in the log.
+  parameter name (1 to 40 ASCII letters, digits, `_`, `.`, `-`, `[` or `]`)
+  and its value, as sent, is neither empty nor starts with `=`. A credential
+  sent in the key position of such a pair appears in the log.
 - **A Kubernetes API server's refusal is logged with its body.** When the API
-  server refuses an exec, attach or port-forward WebSocket upgrade, the log
-  line carries its HTTP status and response body, and an admission webhook
-  can put any text in that body.
+  server refuses a WebSocket upgrade through the Kubernetes proxy (exec,
+  attach, port-forward or any other API path), the log line carries its HTTP
+  status and response body, and an admission webhook can put any text in
+  that body.
+- **Debug logging carries content.** At debug level, the WebSocket proxies
+  (target and Kubernetes) log every frame they pass, contents included (for
+  Kubernetes that includes exec and attach stdin and stdout), and the
+  Kubernetes proxy logs the upstream API server's response headers
+  unredacted. Everything above holds at info level and above.
 - **Path segments are logged as written.** Warpgate's own routes carry only
   IDs there.
