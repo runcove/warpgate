@@ -3043,6 +3043,99 @@ mod tests {
                 );
             }
 
+            /// X11 and agent forwarding have no recorder. Required: the client's
+            /// requests are refused without reaching the target (X11 with a channel
+            /// failure, agent forwarding with a `false` reply), and an X11 or agent
+            /// channel the target opens is closed before it reaches the client.
+            /// Otherwise both requests go to the target and its channels open to
+            /// the client, as before.
+            #[cfg(target_os = "linux")]
+            #[tokio::test]
+            async fn x11_and_agent_forwarding_are_refused_when_required() {
+                for required in [true, false] {
+                    let mut r = connected_shell(required).await;
+                    let _client = attach_client(&mut r.s.session).await;
+                    let session = &mut r.s.session;
+                    let target = &mut r.sent;
+                    let x11 = X11Request {
+                        single_conection: false,
+                        x11_auth_protocol: "MIT-MAGIC-COOKIE-1".into(),
+                        x11_auth_cookie: "00".into(),
+                        x11_screen_number: 0,
+                    };
+                    let (agent_reply, agent_replied) = oneshot::channel();
+                    let mut asked = vec![];
+                    tokio::join!(
+                        async {
+                            session
+                                .handle_server_handler_event(ServerHandlerEvent::X11Request(
+                                    r.ch,
+                                    x11,
+                                    oneshot::channel().0,
+                                ))
+                                .await
+                                .unwrap();
+                            session
+                                .handle_server_handler_event(ServerHandlerEvent::AgentForward(
+                                    r.ch,
+                                    agent_reply,
+                                ))
+                                .await
+                                .unwrap();
+                        },
+                        async {
+                            if !required {
+                                for _ in 0..2 {
+                                    let (command, reply) = target.recv().await.unwrap();
+                                    asked.push(command);
+                                    let _ = reply.map(|r| r.send(Ok(())));
+                                }
+                            }
+                        }
+                    );
+                    asked.extend(drain(&mut r.sent));
+                    let failures = r.s.session.channel_writer.channel_failures();
+                    if required {
+                        assert!(asked.is_empty(), "sent to the target: {asked:?}");
+                        assert_eq!(failures, 1, "the X11 request was answered");
+                        assert_eq!(agent_replied.await, Ok(false));
+                    } else {
+                        assert!(
+                            matches!(
+                                asked.as_slice(),
+                                [
+                                    RCCommand::Channel(_, ChannelOperation::RequestX11(_)),
+                                    RCCommand::Channel(_, ChannelOperation::AgentForward),
+                                ]
+                            ),
+                            "{asked:?}"
+                        );
+                        assert_eq!(failures, 0);
+                        assert_eq!(agent_replied.await, Ok(true));
+                    }
+
+                    let (x11_channel, agent_channel) = (Uuid::new_v4(), Uuid::new_v4());
+                    r.s.session
+                        .handle_remote_event(RCEvent::X11(x11_channel, "127.0.0.1".into(), 6010))
+                        .await
+                        .unwrap();
+                    r.s.session
+                        .handle_remote_event(RCEvent::ForwardedAgent(agent_channel))
+                        .await
+                        .unwrap();
+                    let sent = drain(&mut r.sent);
+                    for channel in [x11_channel, agent_channel] {
+                        let close_sent = sent.iter().any(|c| {
+                            matches!(c, RCCommand::Channel(id, ChannelOperation::Close) if *id == channel)
+                        });
+                        let opening = r.s.session.channels.get(&channel).is_some();
+                        assert_eq!(close_sent, required, "{sent:?}");
+                        assert_eq!(opening, !required, "opened to the client");
+                    }
+                    assert!(!closed(&r.s), "the session goes on");
+                }
+            }
+
             /// A forward to an address an earlier forward already made a traffic
             /// recorder for, which has died since: the failure is seen before the
             /// open goes to the target. Required: the open is rejected and the
@@ -4694,8 +4787,8 @@ impl ServerSession {
             }
 
             ServerHandlerEvent::AgentForward(channel, reply) => {
-                self._agent_forward(channel).await?;
-                let _ = reply.send(true);
+                let allowed = self._agent_forward(channel).await?;
+                let _ = reply.send(allowed);
             }
 
             ServerHandlerEvent::Disconnect => (),
@@ -4975,14 +5068,18 @@ impl ServerSession {
                 }
             }
             RCEvent::ForwardedAgent(id) => {
-                if let Some(session) = self.session_handle.clone() {
+                if self.refuses_unrecordable_forwarding("agent").await {
+                    let _ = self.send_command(RCCommand::Channel(id, ChannelOperation::Close));
+                } else if let Some(session) = self.session_handle.clone() {
                     self.open_server_channel_in_background(id, async move {
                         session.channel_open_agent().await
                     });
                 }
             }
             RCEvent::X11(id, originator_address, originator_port) => {
-                if let Some(session) = self.session_handle.clone() {
+                if self.refuses_unrecordable_forwarding("X11").await {
+                    let _ = self.send_command(RCCommand::Channel(id, ChannelOperation::Close));
+                } else if let Some(session) = self.session_handle.clone() {
                     self.open_server_channel_in_background(id, async move {
                         session
                             .channel_open_x11(originator_address, originator_port)
@@ -5470,6 +5567,14 @@ impl ServerSession {
     ) -> Result<()> {
         let channel_id = self.map_channel(server_channel_id)?;
         debug!(channel=%channel_id, "Requested X11");
+        if self.refuses_unrecordable_forwarding("X11").await {
+            // The target is never asked, so its reply is never relayed: answer
+            // the client here.
+            if let Some((handle, id)) = self.client_channel(&channel_id)? {
+                self.channel_writer.channel_failure(handle, id)?;
+            }
+            return Ok(());
+        }
         let _ = self.maybe_connect_remote().await;
         self.send_command_and_wait(RCCommand::Channel(
             channel_id,
@@ -5813,15 +5918,32 @@ impl ServerSession {
             .map_err(anyhow::Error::from)
     }
 
-    async fn _agent_forward(&mut self, server_channel_id: ServerChannelId) -> Result<()> {
+    /// `false` when the request is refused, without reaching the target.
+    async fn _agent_forward(&mut self, server_channel_id: ServerChannelId) -> Result<bool> {
         let channel_id = self.map_channel(server_channel_id)?;
         debug!(channel=%channel_id, "Requested Agent Forwarding");
+        if self.refuses_unrecordable_forwarding("agent").await {
+            return Ok(false);
+        }
         self.send_command_and_wait(RCCommand::Channel(
             channel_id,
             ChannelOperation::AgentForward,
         ))
         .await?;
-        Ok(())
+        Ok(true)
+    }
+
+    /// X11 and agent forwarding have no recorder, so with unrecorded sessions
+    /// refused (and recording on) they are refused: the request is not passed to
+    /// the target, and a channel the target opens for either is closed before it
+    /// reaches the client. OpenSSH's client goes on without the forwarding.
+    async fn refuses_unrecordable_forwarding(&self, kind: &str) -> bool {
+        let refused = self.services.recordings.refuses_unrecorded_sessions()
+            && self.recordings_enabled().await;
+        if refused {
+            debug!(%kind, "Refusing forwarding: it cannot be recorded");
+        }
+        refused
     }
 
     async fn _auth_publickey_offer(

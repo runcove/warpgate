@@ -50,6 +50,9 @@ pub struct ChannelWriter {
     /// Every chunk of data queued for the client, for tests to inspect.
     #[cfg(test)]
     written: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    /// How many channel failures were queued for the client, for tests.
+    #[cfg(test)]
+    channel_failures: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl ChannelWriter {
@@ -102,6 +105,8 @@ impl ChannelWriter {
             data_slots: Arc::new(Semaphore::new(OUTBOUND_DATA_SLOTS)),
             #[cfg(test)]
             written: Arc::default(),
+            #[cfg(test)]
+            channel_failures: Arc::default(),
         }
     }
 
@@ -134,6 +139,13 @@ impl ChannelWriter {
             written.push(data.clone());
         }
         self.enqueue(ChannelWriteOperation::Data(handle, channel, data, slot))
+    }
+
+    /// How many channel failures were queued for the client so far.
+    #[cfg(test)]
+    pub fn channel_failures(&self) -> usize {
+        self.channel_failures
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// The data queued for the client so far.
@@ -172,6 +184,9 @@ impl ChannelWriter {
     }
 
     pub fn channel_failure(&self, handle: Handle, channel: ChannelId) -> Result<()> {
+        #[cfg(test)]
+        self.channel_failures
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.enqueue(ChannelWriteOperation::Failure(handle, channel))
     }
 

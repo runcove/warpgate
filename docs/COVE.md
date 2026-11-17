@@ -257,6 +257,12 @@ some SSH servers hand such data to the command's stdin; OpenSSH's server
 discards it), and extended data the client sends on any channel, which is
 never recorded (OpenSSH's server discards that too).
 
+With the option on (and recording on), SSH refuses X11 forwarding and agent
+forwarding, which are never recorded: the client's request is not passed to
+the target and is answered with a failure (OpenSSH's client goes on without
+the forwarding), and an X11 or agent channel the target opens is closed
+before it reaches the client.
+
 With the option on, a recording that fails mid-session closes the session
 too: in SSH (the client is shown `session closed: its recording failed`), the
 web SSH client, Kubernetes exec and attach streams, native RDP and VNC, and
@@ -314,21 +320,23 @@ What the option does not cover:
   settings (ConfigEdit): a session whose recording starts under the new root
   is recorded there, and nothing is refused.
 - **What is never recorded**, so never refused for want of a recording: any
-  SSH subsystem (SFTP and every other), X11 and agent-forwarding channels,
-  `scp` with `record_scp` off, SSH extended data sent from the client to the
-  target, Kubernetes port-forward, Kubernetes exec and attach websocket frames
-  that are not binary, the bodies of streamed Kubernetes API responses to
-  reads (`watch`, `logs -f` and other chunked responses; the request and
-  its response are recorded, with an empty response body), native RDP frames
-  dropped from the recording when its queue is full with the option off (no
-  failure line is logged for them), and MySQL, PostgreSQL and HTTP targets.
+  SSH subsystem (SFTP and every other), `scp` with `record_scp` off, SSH
+  extended data sent from the client to the target, Kubernetes port-forward,
+  Kubernetes exec and attach websocket frames that are not binary, the
+  bodies of streamed Kubernetes API responses to reads (`watch`, `logs -f`
+  and other chunked responses; the request and its response are recorded,
+  with an empty response body), native RDP frames dropped from the recording
+  when its queue is full with the option off (no failure line is logged for
+  them), and MySQL, PostgreSQL and HTTP targets. SSH X11 and agent
+  forwarding are never recorded either; with the option on they are refused
+  (above), and with it off they pass unrecorded.
 - **Connecting before the recording starts.** With the option on, Warpgate
   may connect and authenticate to the target before a recording exists: for
-  an SSH X11 request, a `tcpip-forward` or `streamlocal-forward` request and
-  a subsystem request, and for a web SSH client session, which connects when
-  the session is created. No shell, command or forward reaches the target
-  before its recording has started. Input is a known limit: while an SSH
-  session waits for an approval gate, a shell or exec request on a session
-  channel has its recording started only once the gate is approved, and what
-  the client sends on that channel during the wait is held and passed to the
-  target after the approval, but is not in the recording.
+  a `tcpip-forward` or `streamlocal-forward` request and a subsystem
+  request, and for a web SSH client session, which connects when the session
+  is created. No shell, command or forward reaches the target before its
+  recording has started. Input is a known limit: while an SSH session waits
+  for an approval gate, a shell or exec request on a session channel has its
+  recording started only once the gate is approved, and what the client
+  sends on that channel during the wait is held and passed to the target
+  after the approval, but is not in the recording.
