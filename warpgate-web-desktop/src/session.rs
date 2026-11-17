@@ -136,6 +136,12 @@ impl WebDesktopSession {
         let Some(backend) = self.backend.get() else {
             return;
         };
+        // Once the session is ended (for its recording or otherwise), nothing more is
+        // forwarded, though the backend may not have stopped yet: input the recording
+        // never writes (the clipboard, unrecorded keys) would otherwise still pass.
+        if self.cancellation().is_cancelled() {
+            return;
+        }
         // Record the viewer's input for audit before forwarding (like native RDP/VNC).
         // A failed write is reported once by the recorder; when unrecorded sessions are
         // refused the session ends before the input is forwarded.
@@ -148,6 +154,10 @@ impl WebDesktopSession {
             })
             .await;
             self.abort();
+            return;
+        }
+        // The recording's write awaits: the session may have ended meanwhile.
+        if self.cancellation().is_cancelled() {
             return;
         }
         // let inputs drop under backpressure
@@ -378,6 +388,27 @@ mod tests {
                 .any(|m| matches!(m, ServerMessage::Error { message } if *message == reason))
         );
         h.assert_one_failure_line(true);
+    }
+
+    /// Once the session has ended for its recording, no later input reaches the
+    /// desktop, whether or not the recording would write it.
+    #[tokio::test]
+    async fn no_input_passes_once_the_session_ended_for_its_recording() {
+        let mut h = desktop_failing_mid_session(true).await;
+        h.input_until_failure().await;
+        assert!(h.aborted());
+        for input in [
+            DesktopInput::Pointer {
+                x: 3,
+                y: 3,
+                buttons: 1,
+            },
+            DesktopInput::Clipboard("text".into()),
+            DesktopInput::Refresh,
+        ] {
+            h.session.send_input(input).await;
+        }
+        assert_eq!(h.forwarded(), 0, "forwarded after the end");
     }
 
     /// Not required (the default): the session goes on unrecorded and every input is
