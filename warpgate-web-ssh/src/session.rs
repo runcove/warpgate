@@ -181,7 +181,15 @@ impl WebSshSession {
             self.close_on_recording_failure().await;
             return None;
         }
-        self.channel_audits.lock().await.insert(channel_id, audit);
+        let mut audits = self.channel_audits.lock().await;
+        // The session may have been closed for another channel's recording while this
+        // recording started, its first writes were awaited or the lock was: then no shell
+        // is opened. The lock is held until the shell is requested, so a close by
+        // input, output or a resize comes after it.
+        if self.closed_for_recording_failure() {
+            return None;
+        }
+        audits.insert(channel_id, audit);
 
         self.command(RCCommand::Channel(channel_id, ChannelOperation::OpenShell));
         self.command(RCCommand::Channel(
@@ -192,6 +200,7 @@ impl WebSshSession {
             channel_id,
             ChannelOperation::RequestShell,
         ));
+        drop(audits);
         Some(channel_id)
     }
 
@@ -723,6 +732,43 @@ mod tests {
             assert!(h.session.open_shell_channel(80, 24).await.is_none());
             let commands = h.sent_commands();
             assert!(commands.is_empty(), "sent to the target: {commands:?}");
+        }
+
+        /// A close for another channel's recording that runs while a new shell's
+        /// recording starts, or while the shell waits for the channel lock: no shell is
+        /// opened on the target.
+        #[tokio::test]
+        async fn a_close_while_a_shell_opens_opens_no_shell() {
+            for while_waiting_for_the_lock in [false, true] {
+                let mut h = bound_shell(true).await;
+                let session = &h.session;
+                let started = session.start_recording(&h.id).await;
+                assert!(matches!(started, Ok(Some(_))), "the recording started");
+                let opened = if while_waiting_for_the_lock {
+                    let guard = session.channel_audits.lock().await;
+                    let open = session.open_recorded_shell_channel(80, 24, started);
+                    let close = async move {
+                        // Time for the shell's first writes, so it waits on the lock when
+                        // the close runs. On a slower machine the close can land during
+                        // those writes instead: a weaker case, never a wrong failure.
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        session.close_on_recording_failure().await;
+                        drop(guard);
+                    };
+                    tokio::join!(open, close).0
+                } else {
+                    session.close_on_recording_failure().await;
+                    session.open_recorded_shell_channel(80, 24, started).await
+                };
+                assert!(opened.is_none(), "a shell was opened");
+                let forwarded: Vec<_> = h
+                    .sent_commands()
+                    .into_iter()
+                    .filter(|c| !matches!(c, RCCommand::Disconnect))
+                    .collect();
+                assert!(forwarded.is_empty(), "sent to the target: {forwarded:?}");
+                assert!(h.session.channel_audits.lock().await.is_empty());
+            }
         }
 
         /// A close that runs while input, output or a resize waits for the channel
