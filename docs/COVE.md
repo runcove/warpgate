@@ -140,13 +140,18 @@ primary group, not the root's.
 When the HTTP proxy, a WebSocket proxy (target or cluster peer) or the
 Kubernetes proxy logs a failed upstream request, the line carries no raw query
 string, no userinfo and no upstream client URL. Query values are redacted. A
-refused WebSocket upgrade is logged by its HTTP status only, never with the
-upstream's headers or body.
+WebSocket upgrade refused through a target or cluster-peer proxy is logged by
+its HTTP status only, never with the upstream's headers or body.
 
 ### Limits
 
-- **A query key is logged as written** when it looks like a parameter name (1
-  to 40 letters, digits, `_`, `.`, `-`, `[` or `]`) and has a non-empty value.
-  A credential sent in the key position of such a pair appears in the log.
+- **A query key is logged percent-decoded** when, decoded, it looks like a
+  parameter name (1 to 40 letters, digits, `_`, `.`, `-`, `[` or `]`) and its
+  value is neither empty nor starts with `=`. A credential sent in the key
+  position of such a pair appears in the log.
+- **A Kubernetes API server's refusal is logged with its body.** When the API
+  server refuses an exec, attach or port-forward WebSocket upgrade, the log
+  line carries its HTTP status and response body, and an admission webhook
+  can put any text in that body.
 - **Path segments are logged as written.** Warpgate's own routes carry only
   IDs there.
