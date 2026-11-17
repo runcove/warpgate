@@ -7,8 +7,10 @@ mod keepalive;
 pub mod logging;
 pub mod mtls_acceptor;
 mod request;
-#[cfg(test)]
-mod test_log;
+/// For tests in this and other crates (feature `test-util`).
+#[cfg(any(test, feature = "test-util"))]
+#[doc(hidden)]
+pub mod test_log;
 pub mod ticket_query;
 
 pub use auth::{AuthenticatedRequestContext, RequestAuthorization, SessionAuthorization};

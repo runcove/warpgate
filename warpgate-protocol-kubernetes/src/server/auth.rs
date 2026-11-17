@@ -571,11 +571,34 @@ fn upstream_client_builder(cluster_url: &str) -> reqwest::ClientBuilder {
 fn upstream_retry_policy(host: String) -> reqwest::retry::Builder {
     reqwest::retry::for_host(host).classify_fn(|req_rep| match req_rep.error() {
         Some(error) if is_safe_to_resend(error) => {
-            debug!(url = %upstream_uri_for_log(req_rep.uri()), %error, "Resending Kubernetes upstream request");
+            debug!(
+                url = %upstream_uri_for_log(req_rep.uri()),
+                error = %error_for_log(error),
+                "Resending Kubernetes upstream request"
+            );
             req_rep.retryable()
         }
         _ => req_rep.success(),
     })
+}
+
+/// `error` for logs. A reqwest error's own text names the URL it was for,
+/// whose query can hold a caller's values, so for one only its causes are
+/// shown.
+fn error_for_log(error: &(dyn std::error::Error + 'static)) -> String {
+    let text = error.to_string();
+    let Some(url) = error
+        .downcast_ref::<reqwest::Error>()
+        .and_then(reqwest::Error::url)
+    else {
+        return text;
+    };
+    let text = text.replace(&format!(" for url ({url})"), "");
+    if text.contains(url.as_str()) {
+        // reqwest no longer words the URL this way: show none of the text
+        return "request failed".to_owned();
+    }
+    text
 }
 
 fn is_safe_to_resend(error: &(dyn std::error::Error + 'static)) -> bool {
@@ -712,7 +735,29 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
-    use super::{upstream_client_builder, upstream_retry_policy, url_for_log};
+    use super::{error_for_log, upstream_client_builder, upstream_retry_policy, url_for_log};
+
+    /// A request error logged before a resend shows why it failed, and not
+    /// the URL it was for.
+    #[tokio::test]
+    async fn a_resent_request_error_is_logged_without_its_url() {
+        const SENTINEL: &str = "cmd-sentinel-90b3";
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let error = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{port}/exec?command={SENTINEL}"))
+            .send()
+            .await
+            .unwrap_err();
+        // The fixture carries the value, or the test would prove nothing.
+        assert!(error.to_string().contains(SENTINEL));
+        let logged = error_for_log(&error);
+        assert!(logged.starts_with("error sending request"), "{logged}");
+        assert!(!logged.contains(SENTINEL), "{logged}");
+    }
 
     /// A cluster or request address is logged without its userinfo and its
     /// query values; one that is not an address is withheld.

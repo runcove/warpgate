@@ -477,7 +477,9 @@ async fn _handle_normal_request_inner(
         // A write's response is always read in full, even if it is framed as
         // chunked, so a close can't cut off its answer.
         if !is_write && (transfer_encoding == "chunked" || is_streaming_response) {
-            let upstream = response.bytes_stream().map_err(std::io::Error::other);
+            let upstream = response
+                .bytes_stream()
+                .map_err(|error| std::io::Error::other(error.without_url()));
             (
                 Body::from_bytes_stream(end_on_close(upstream, closed, handle)),
                 None,
@@ -491,6 +493,7 @@ async fn _handle_normal_request_inner(
                     .await
                     .ok_or(WarpgateError::UserSessionEnded)?
             }
+            .map_err(reqwest::Error::without_url)
             .context("reading kubernetes response")?;
 
             (Body::from_bytes(bytes.clone()), Some(bytes.to_vec()))
@@ -647,6 +650,7 @@ async fn _handle_websocket_request_inner(
             )
             .await
             .context("Session closed while upgrading the Kubernetes websocket")?
+            .map_err(websocket_error_without_url)
             .context("sending websocket request to Kubernetes API")?;
 
         let status = client_response.status();
@@ -668,7 +672,8 @@ async fn _handle_websocket_request_inner(
             let body = closed
                 .run_until_cancelled(client_response.text())
                 .await
-                .context("Session closed while reading Kubernetes API rejection response")??;
+                .context("Session closed while reading Kubernetes API rejection response")?
+                .map_err(reqwest::Error::without_url)?;
             bail!("Unexpected websocket response status from Kubernetes API: {status}: {body}");
         }
 
@@ -676,6 +681,7 @@ async fn _handle_websocket_request_inner(
             .run_until_cancelled(client_response.into_websocket())
             .await
             .context("Session closed while negotiating the Kubernetes websocket")?
+            .map_err(websocket_error_without_url)
             .context("negotiating websocket connection with Kubernetes")?;
 
         let (client_sink, client_source) = client_socket.split();
@@ -758,6 +764,50 @@ async fn _handle_websocket_request_inner(
             .instrument(span)
         })
         .into_response())
+}
+
+/// A WebSocket error from the cluster, without the URL a reqwest error inside
+/// it would carry into the log: its query can hold a caller's values (an exec
+/// command, for one).
+fn websocket_error_without_url(error: reqwest_websocket::Error) -> reqwest_websocket::Error {
+    match error {
+        reqwest_websocket::Error::Reqwest(error) => {
+            reqwest_websocket::Error::Reqwest(error.without_url())
+        }
+        error => error,
+    }
+}
+
+#[cfg(test)]
+mod websocket_error_tests {
+    use super::websocket_error_without_url;
+
+    /// A failed WebSocket request to the cluster is logged as `{error:?}` of
+    /// an `anyhow` chain; no link of it names the URL, whose query carries
+    /// the exec command.
+    #[tokio::test]
+    async fn a_websocket_error_is_logged_without_its_url() {
+        const SENTINEL: &str = "cmd-sentinel-41fa";
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let error = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{port}/exec?command={SENTINEL}"))
+            .send()
+            .await
+            .unwrap_err();
+        // The fixture carries the value, or the test would prove nothing.
+        assert!(format!("{error:?}").contains(SENTINEL));
+        let error = websocket_error_without_url(reqwest_websocket::Error::from(error));
+        let logged = format!(
+            "{:?}",
+            anyhow::Error::from(error).context("sending websocket request")
+        );
+        assert!(logged.contains("reqwest error"), "{logged}");
+        assert!(!logged.contains(SENTINEL), "{logged}");
+    }
 }
 
 #[cfg(test)]

@@ -80,7 +80,8 @@ pub enum WarpgateError {
     #[error("rustls setup: {0}")]
     TlsSetup(#[from] RustlsSetupError),
     #[error("reqwest: {0}")]
-    Reqwest(#[from] reqwest::Error),
+    /// Built through `From`, which drops the URL: see there.
+    Reqwest(reqwest::Error),
     #[error("admin role required")]
     NoAdminAccess,
     #[error("admin permission required: {0:?}")]
@@ -237,6 +238,14 @@ impl ResponseError for WarpgateError {
     }
 }
 
+/// The URL is dropped: its query can carry a caller's values, and this error
+/// reaches the log.
+impl From<reqwest::Error> for WarpgateError {
+    fn from(err: reqwest::Error) -> Self {
+        Self::Reqwest(err.without_url())
+    }
+}
+
 impl From<Box<dyn Error + Send + Sync + 'static>> for WarpgateError {
     fn from(err: Box<dyn Error + Send + Sync + 'static>) -> Self {
         Self::Other(err)
@@ -269,6 +278,35 @@ mod tests {
         // stopped carrying the text and would prove nothing about the boundary.
         assert!(leaky.to_string().contains("SELECT"));
         assert_eq!(leaky.user_facing_reason(), "Internal Server Error");
+    }
+
+    /// A failed outbound request's error is kept without its URL, whose query
+    /// can carry a caller's values: neither the error's text nor its debug
+    /// form, which both reach the log, contains them.
+    #[tokio::test]
+    async fn a_reqwest_error_is_kept_without_its_url() {
+        const SENTINEL: &str = "q-sentinel-6d1f";
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let error = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{port}/x?access_token={SENTINEL}"))
+            .send()
+            .await
+            .unwrap_err();
+        // The fixture carries the value, or the test would prove nothing.
+        assert!(format!("{error:?}").contains(SENTINEL));
+        let error = WarpgateError::from(error);
+        for logged in [
+            error.to_string(),
+            format!("{error:?}"),
+            format!("{error:#}"),
+        ] {
+            assert!(!logged.contains(SENTINEL), "{logged}");
+        }
+        assert!(matches!(error, WarpgateError::Reqwest(_)));
     }
 
     /// A ticket that expired while the user waited for approval says so,

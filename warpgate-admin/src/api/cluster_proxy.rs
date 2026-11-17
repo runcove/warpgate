@@ -236,7 +236,10 @@ async fn forward_http_inner(
     if let Some(body) = body {
         request = request.body(body);
     }
-    let response = request.send().await.map_err(poem::error::BadGateway)?;
+    let response = request
+        .send()
+        .await
+        .map_err(|error| poem::error::BadGateway(error.without_url()))?;
 
     let mut builder = Response::builder().status(response.status());
     let filter = ForwardFilter::new(response.headers());
@@ -246,7 +249,9 @@ async fn forward_http_inner(
         }
     }
     Ok(builder.body(Body::from_bytes_stream(
-        response.bytes_stream().map_err(std::io::Error::other),
+        response
+            .bytes_stream()
+            .map_err(|error| std::io::Error::other(error.without_url())),
     )))
 }
 

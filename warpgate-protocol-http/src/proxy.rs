@@ -579,7 +579,7 @@ pub async fn proxy_normal_request(
     let client_request = client_request.build().context("Could not build request")?;
     let client_response = tokio::select! {
         result = client.execute(client_request) => {
-            result.map_err(poem::error::BadGateway)?
+            result.map_err(upstream_request_failed)?
         }
         _ = close_rx.recv() => {
             return Err(poem::Error::from_status(StatusCode::GONE));
@@ -637,6 +637,12 @@ fn embeds_session_ui(options: &TargetHTTPOptions) -> bool {
     options.external_host.as_deref().is_none_or(str::is_empty)
 }
 
+/// A request to the target that failed, as the gateway error it becomes. The
+/// URL is dropped: its query is the caller's, and this error reaches the log.
+fn upstream_request_failed(error: reqwest::Error) -> poem::Error {
+    poem::error::BadGateway(error.without_url())
+}
+
 async fn copy_client_body(
     client_response: reqwest::Response,
     response: &mut Response,
@@ -653,7 +659,7 @@ async fn copy_client_body(
     let body = Box::pin(
         client_response
             .bytes_stream()
-            .map_err(std::io::Error::other),
+            .map_err(|error| std::io::Error::other(error.without_url())),
     );
     let guarded = futures::stream::unfold(
         (body, close_rx, keepalive_guard),
@@ -674,7 +680,10 @@ async fn copy_client_body_and_embed(
     client_response: reqwest::Response,
     response: &mut Response,
 ) -> Result<()> {
-    let content = client_response.text().await?;
+    let content = client_response
+        .text()
+        .await
+        .map_err(reqwest::Error::without_url)?;
 
     let script_manifest = lookup_built_file("src/embed/index.ts")?;
 
@@ -734,11 +743,11 @@ pub async fn proxy_websocket_request(
     })
 }
 
-/// The line logged when the target accepts a WebSocket upgrade. The address
+/// Logs the target accepting a WebSocket upgrade. The address
 /// goes through [`upstream_uri_for_log`]: no query value and no userinfo of
 /// the target's URL reaches the log.
-fn websocket_upgrade_message(status: StatusCode, uri: &Uri) -> String {
-    format!("{:?} {:?} - WebSocket", status, upstream_uri_for_log(uri))
+fn log_websocket_upgrade(status: StatusCode, uri: &Uri) {
+    tracing::info!("{:?} {:?} - WebSocket", status, upstream_uri_for_log(uri));
 }
 
 /// A redirect's `Location` for logs, with its query values redacted, or
@@ -833,10 +842,7 @@ async fn proxy_ws_inner(
         }
     };
 
-    tracing::info!(
-        "{}",
-        websocket_upgrade_message(client_response.status(), &uri)
-    );
+    log_websocket_upgrade(client_response.status(), &uri);
 
     // poem drives the upgraded stream after this handler has returned, so the
     // request span is carried over explicitly; the database log layer keeps
@@ -878,7 +884,23 @@ pub(crate) async fn connect_target_websocket(
     let unix_socket = checked_unix_socket(req, options)?;
     connect_upstream_websocket(request, unix_socket, connector)
         .await
-        .map_err(poem::error::BadGateway)
+        .map_err(websocket_connect_failed)
+}
+
+/// An upstream WebSocket that could not be opened, as the gateway error it
+/// becomes. A refused upgrade keeps only its status: the headers and body of
+/// the target's answer (a `Set-Cookie`, a `Location`) would reach the log.
+fn websocket_connect_failed(error: tungstenite::Error) -> poem::Error {
+    match error {
+        tungstenite::Error::Http(response) => poem::Error::from_string(
+            format!(
+                "the target refused the WebSocket upgrade with status {}",
+                response.status()
+            ),
+            StatusCode::BAD_GATEWAY,
+        ),
+        error => poem::error::BadGateway(error),
+    }
 }
 
 /// Opens the upstream WebSocket for `request`: through `unix_socket` when the
@@ -1025,6 +1047,88 @@ where
 mod tests {
     use super::*;
 
+    /// A request to the target that never got an answer, to an address whose
+    /// query carries `sentinel`.
+    async fn failed_upstream_request(sentinel: &str) -> reqwest::Error {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let error = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{port}/x?access_token={sentinel}"))
+            .send()
+            .await
+            .unwrap_err();
+        // The fixture carries the value, or the tests would prove nothing.
+        assert!(format!("{error:?}").contains(sentinel));
+        error
+    }
+
+    /// A failed request to the target is logged without the query of the
+    /// address it was sent to, both by the request log and by the error
+    /// renderer.
+    #[tokio::test]
+    async fn a_failed_upstream_request_is_logged_without_its_query() {
+        use std::cell::RefCell;
+
+        use warpgate_common_http::errors::render_error;
+        use warpgate_common_http::logging::log_request_error;
+        use warpgate_common_http::test_log::logged;
+
+        const SENTINEL: &str = "q-sentinel-3b7e";
+        let request_uri: Uri = "/x".parse().unwrap();
+
+        let error = upstream_request_failed(failed_upstream_request(SENTINEL).await);
+        let line = logged(|| {
+            log_request_error(&http::Method::GET, &request_uri, None, &error);
+        });
+        assert!(line.contains("Request failed"), "{line}");
+        assert!(!line.contains(SENTINEL), "{line}");
+
+        // `logged` may run its closure more than once; each run renders one.
+        let mut errors = Vec::new();
+        for _ in 0..3 {
+            errors.push(upstream_request_failed(
+                failed_upstream_request(SENTINEL).await,
+            ));
+        }
+        let errors = RefCell::new(errors);
+        let line = logged(|| {
+            if let Some(error) = errors.borrow_mut().pop() {
+                render_error(error, &http::Method::GET, &request_uri, false);
+            }
+        });
+        assert!(line.contains("internal error"), "{line}");
+        assert!(!line.contains(SENTINEL), "{line}");
+    }
+
+    /// A target that refuses the WebSocket upgrade is reported, and logged, by
+    /// its status alone: the headers and body of its answer are not.
+    #[test]
+    fn a_refused_websocket_upgrade_is_logged_by_its_status() {
+        const COOKIE: &str = "sid-sentinel-8c2a";
+        const LOCATION: &str = "loc-sentinel-5e91";
+        let response = http::Response::builder()
+            .status(StatusCode::FOUND)
+            .header(http::header::SET_COOKIE, format!("sid={COOKIE}"))
+            .header(http::header::LOCATION, format!("/login?next={LOCATION}"))
+            .body(Some(b"body-sentinel-77d0".to_vec()))
+            .unwrap();
+        let error = websocket_connect_failed(tungstenite::Error::Http(Box::new(response)));
+        assert_eq!(error.status(), StatusCode::BAD_GATEWAY);
+        for logged in [
+            format!("{error:?}"),
+            format!("{error:#}"),
+            error.to_string(),
+        ] {
+            assert!(logged.contains("302"), "{logged}");
+            for secret in [COOKIE, LOCATION, "body-sentinel-77d0"] {
+                assert!(!logged.contains(secret), "{logged}");
+            }
+        }
+    }
+
     /// The line logged for a WebSocket upgrade shows the status, the path and
     /// the query keys, and never a query value or the target's credentials.
     #[test]
@@ -1032,10 +1136,14 @@ mod tests {
         let uri: Uri = "wss://user:pa55@app.example:8443/socket?access_token=s3cr3t&room=7"
             .parse()
             .unwrap();
-        let line = websocket_upgrade_message(StatusCode::SWITCHING_PROTOCOLS, &uri);
-        assert_eq!(
-            line,
-            r#"101 "wss://app.example:8443/socket?access_token=redacted&room=redacted" - WebSocket"#
+        let line = warpgate_common_http::test_log::logged(|| {
+            log_websocket_upgrade(StatusCode::SWITCHING_PROTOCOLS, &uri);
+        });
+        assert!(
+            line.contains(
+                r#"101 "wss://app.example:8443/socket?access_token=redacted&room=redacted" - WebSocket"#
+            ),
+            "{line}"
         );
         for secret in ["s3cr3t", "pa55", "=7"] {
             assert!(!line.contains(secret), "{line}");

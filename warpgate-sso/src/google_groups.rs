@@ -63,10 +63,9 @@ async fn parse_json_response<T: serde::de::DeserializeOwned>(
     response: reqwest::Response,
     context: &str,
 ) -> Result<T, SsoError> {
-    let body = response
-        .text()
-        .await
-        .map_err(|e| SsoError::GoogleDirectory(format!("{context} read failed: {e}")))?;
+    let body = response.text().await.map_err(|e| {
+        SsoError::GoogleDirectory(format!("{context} read failed: {}", e.without_url()))
+    })?;
     serde_json::from_str(&body)
         .map_err(|e| SsoError::GoogleDirectory(format!("{context} parse failed: {e}")))
 }
@@ -126,10 +125,9 @@ async fn fetch_user_groups(
             req = req.query(&[("pageToken", token.as_str())]);
         }
 
-        let response = req
-            .send()
-            .await
-            .map_err(|e| SsoError::GoogleDirectory(format!("group lookup failed: {e}")))?;
+        let response = req.send().await.map_err(|e| {
+            SsoError::GoogleDirectory(format!("group lookup failed: {}", e.without_url()))
+        })?;
 
         if response.status() != 200 {
             return Err(SsoError::GoogleDirectory(format!(
@@ -139,9 +137,9 @@ async fn fetch_user_groups(
             )));
         }
 
-        let response = response
-            .error_for_status()
-            .map_err(|e| SsoError::GoogleDirectory(format!("group lookup failed: {e}")))?;
+        let response = response.error_for_status().map_err(|e| {
+            SsoError::GoogleDirectory(format!("group lookup failed: {}", e.without_url()))
+        })?;
 
         let resp: DirectoryGroupsResponse = parse_json_response(response, "group response").await?;
 
