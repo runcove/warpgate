@@ -154,10 +154,11 @@ its HTTP status only, never with the upstream's headers or body.
   attach, port-forward or any other API path), the log line carries its HTTP
   status and response body, and an admission webhook can put any text in
   that body.
-- **Debug logging carries content.** At debug level, the WebSocket proxies
-  (target and Kubernetes) log every frame they pass, contents included (for
-  Kubernetes that includes exec and attach stdin and stdout), and the
-  Kubernetes proxy logs the upstream API server's response headers
-  unredacted. Everything above holds at info level and above.
+- **Debug logging carries content.** At debug level Warpgate logs more than
+  this section describes, including: every WebSocket frame the target and
+  Kubernetes proxies pass, contents included (for Kubernetes that includes
+  exec and attach stdin and stdout); the Kubernetes API server's response
+  headers, unredacted; and full redirect and SSO return URLs, query
+  included. Everything above holds at info level and above.
 - **Path segments are logged as written.** Warpgate's own routes carry only
   IDs there.
