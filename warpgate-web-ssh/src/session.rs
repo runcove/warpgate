@@ -47,8 +47,9 @@ pub struct WebSshSession {
     recordings: Arc<SessionRecordings>,
     channel_audits: Arc<Mutex<HashMap<Uuid, ChannelAudit>>>,
     pending_host_key: Arc<Mutex<Option<PendingHostKey>>>,
-    /// Set once the session is closed because its recording failed: from then on
-    /// no input, output or resize passes, even before the close takes effect.
+    /// Set once the session is closed because its recording failed or could not
+    /// start: from then on no input, output or resize passes, even before the close
+    /// takes effect.
     closed_for_recording_failure: AtomicBool,
 }
 
@@ -162,14 +163,10 @@ impl WebSshSession {
         match started {
             Ok(Some(recorder)) => audit.set_recorder(recorder),
             Ok(None) => (),
-            // Refused before the shell is opened on the target: tell the viewer, then end
-            // the session.
+            // Refused before the shell is opened on the target: closed as for a failure
+            // mid-session, with the refusal's own text.
             Err(error) => {
-                self.push(ServerMessage::Error {
-                    message: error.to_string(),
-                })
-                .await;
-                self.abort();
+                self.close_for_recording(error).await;
                 return None;
             }
         }
@@ -269,6 +266,14 @@ impl WebSshSession {
     /// forwarded either way, and the target connection is told to disconnect
     /// before the abort is relayed.
     async fn close_on_recording_failure(&self) {
+        self.close_for_recording(WarpgateError::SessionRecordingFailed)
+            .await;
+    }
+
+    /// Closes the session for its recording, once: from here no input, output or
+    /// resize passes, the viewer is told `reason`, the target connection is told to
+    /// disconnect, and the session is aborted.
+    async fn close_for_recording(&self, reason: WarpgateError) {
         if self
             .closed_for_recording_failure
             .swap(true, Ordering::SeqCst)
@@ -276,7 +281,7 @@ impl WebSshSession {
             return;
         }
         self.push(ServerMessage::Error {
-            message: WarpgateError::SessionRecordingFailed.to_string(),
+            message: reason.to_string(),
         })
         .await;
         let _ = self.command_tx.send((RCCommand::Disconnect, None));
@@ -720,6 +725,44 @@ mod tests {
                     assert!(!h.aborted());
                 }
             }
+        }
+
+        /// A shell whose recording could not start, when required: closed as for a
+        /// failure mid-session. No shell is opened, the viewer is told the refusal, the
+        /// target is told to disconnect, and nothing more passes.
+        #[tokio::test]
+        async fn a_web_shell_refused_at_start_closes_as_for_a_failure() {
+            let mut h = bound_shell(true).await;
+            let opened = h
+                .session
+                .open_recorded_shell_channel(80, 24, Err(WarpgateError::SessionNotRecorded))
+                .await;
+            assert!(opened.is_none());
+            assert!(h.aborted());
+            assert!(h.session.closed_for_recording_failure());
+            let commands = h.sent_commands();
+            assert!(
+                matches!(commands.as_slice(), [RCCommand::Disconnect]),
+                "{commands:?}"
+            );
+            let reason = WarpgateError::SessionNotRecorded.to_string();
+            assert!(
+                h.session
+                    .drain_buffer()
+                    .await
+                    .iter()
+                    .any(|m| matches!(m, ServerMessage::Error { message } if *message == reason))
+            );
+
+            let channel = Uuid::new_v4();
+            h.session
+                .send_input(channel, Bytes::from_static(b"input"))
+                .await;
+            h.session.resize_channel(channel, 100, 30).await;
+            assert!(!h.session.on_output(channel, b"output").await);
+            assert!(h.session.open_shell_channel(80, 24).await.is_none());
+            let commands = h.sent_commands();
+            assert!(commands.is_empty(), "sent to the target: {commands:?}");
         }
 
         /// Once the session was closed for its recording, no new shell is opened.
