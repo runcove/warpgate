@@ -210,11 +210,17 @@ impl WebSshSession {
         if self.closed_for_recording_failure() {
             return;
         }
-        if let Some(audit) = audits.get_mut(&channel_id)
-            && audit.on_input(&data).await.is_break()
-        {
-            self.close_on_recording_failure().await;
-            return;
+        match audits.get_mut(&channel_id) {
+            Some(audit) => {
+                if audit.on_input(&data).await.is_break() {
+                    self.close_on_recording_failure().await;
+                    return;
+                }
+            }
+            // A channel this session did not open has no audit, so its input would
+            // pass unrecorded: when unrecorded sessions are refused, it is dropped.
+            None if self.recordings.refuses_unrecorded_sessions() => return,
+            None => (),
         }
         self.command(RCCommand::Channel(channel_id, ChannelOperation::Data(data)));
     }
@@ -763,6 +769,25 @@ mod tests {
             assert!(h.session.open_shell_channel(80, 24).await.is_none());
             let commands = h.sent_commands();
             assert!(commands.is_empty(), "sent to the target: {commands:?}");
+        }
+
+        /// Input for a channel with no audit (one this session did not open) would pass
+        /// unrecorded. Required: it does not reach the target. Otherwise it is
+        /// forwarded, so the refusal is real.
+        #[tokio::test]
+        async fn input_for_a_channel_without_an_audit_follows_the_setting() {
+            for required in [true, false] {
+                let mut h = recorded_shell(required).await;
+                h.session
+                    .send_input(Uuid::new_v4(), Bytes::from_static(b"input"))
+                    .await;
+                assert_eq!(
+                    h.data_sent(),
+                    usize::from(!required),
+                    "required: {required}"
+                );
+                assert!(!h.aborted());
+            }
         }
 
         /// Once the session was closed for its recording, no new shell is opened.
