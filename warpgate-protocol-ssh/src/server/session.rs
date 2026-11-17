@@ -3514,6 +3514,59 @@ mod tests {
                     r.assert_one_failure_line(required);
                 }
             }
+
+            /// A reverse forward whose own connection setup record cannot be
+            /// written (a full disk), on a traffic recorder that was alive until
+            /// then. Required: the setup record is waited for, so the connection
+            /// closes and no channel is opened to the client. Otherwise the
+            /// forward opens to the client.
+            #[cfg(target_os = "linux")]
+            #[tokio::test]
+            async fn a_reverse_forward_whose_setup_record_cannot_be_written_follows_the_setting() {
+                for required in [true, false] {
+                    let mut r = recorded_shell(required).await;
+                    let _client = attach_client(&mut r.s.session).await;
+                    let params = crate::ForwardedTcpIpParams {
+                        connected_address: "127.0.0.1".into(),
+                        connected_port: 8080,
+                        originator_address: "10.0.0.2".into(),
+                        originator_port: 40000,
+                    };
+                    let key = TrafficRecorderKey::Tcp(
+                        params.originator_address.clone(),
+                        params.originator_port,
+                    );
+                    assert!(
+                        r.s.session
+                            .prepare_traffic_recorder(
+                                &key,
+                                SshRecordingMetadata::ForwardedTcpIp {
+                                    host: params.originator_address.clone(),
+                                    port: params.originator_port as u16,
+                                },
+                            )
+                            .await
+                            .is_continue()
+                    );
+                    r.fail_recording();
+                    assert_eq!(r.failures(), 0, "nothing has failed yet");
+
+                    let id = Uuid::new_v4();
+                    r.s.session
+                        .handle_remote_event(RCEvent::ForwardedTcpIp(id, params))
+                        .await
+                        .unwrap();
+                    let opening = r.s.session.channels.get(&id).is_some();
+                    if required {
+                        r.assert_closed_for_failure();
+                        assert!(!opening, "opened to the client");
+                        r.assert_one_failure_line(true);
+                    } else {
+                        assert!(!closed(&r.s), "the connection stays open");
+                        assert!(opening, "the forward opens to the client");
+                    }
+                }
+            }
         }
     }
 }
