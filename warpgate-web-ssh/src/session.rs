@@ -6,7 +6,7 @@ use bytes::Bytes;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{Mutex, oneshot};
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 use warpgate_common::{TargetSSHOptions, TargetSessionId, UserSessionId, WarpgateError};
 use warpgate_core::WarpgateServerHandle;
@@ -119,8 +119,16 @@ impl WebSshSession {
         start_shell_recording(&self.recordings, &owner, target_session_id, channel_number).await
     }
 
-    pub async fn end_channel(&self, channel_id: Uuid) {
+    /// The target closed a channel: its audit goes and the viewer is told.
+    pub async fn on_channel_closed(&self, channel_id: Uuid) {
         self.channel_audits.lock().await.remove(&channel_id);
+        self.push(ServerMessage::ChannelClosed { channel_id }).await;
+    }
+
+    /// The target refused a request on a channel (a pty or a shell, say). The channel
+    /// stays open, so its audit stays: its end comes as a close of its own.
+    pub fn on_channel_failure(&self, channel_id: Uuid) {
+        warn!(session=%self.id(), channel=%channel_id, "The target refused a channel request");
     }
 
     fn command(&self, cmd: RCCommand) -> Option<oneshot::Receiver<Result<(), SshClientError>>> {
@@ -809,6 +817,34 @@ mod tests {
                 );
                 assert!(!h.aborted());
             }
+        }
+
+        /// A request the target refuses on a channel (a pty, say) leaves the channel
+        /// open, so its audit stays: when required, its output is still recorded and
+        /// shown, and output for it never passes unrecorded. Its close ends it.
+        #[tokio::test]
+        async fn a_refused_channel_request_leaves_the_channel_and_its_audit() {
+            let mut h = recorded_shell(true).await;
+            h.session.on_channel_failure(h.channel);
+            assert!(h.session.channel_audits.lock().await.contains_key(&h.channel));
+            assert!(h.session.on_output(h.channel, b"output").await);
+            h.session
+                .send_input(h.channel, Bytes::from_static(b"input"))
+                .await;
+            assert_eq!(h.data_sent(), 1);
+            assert!(
+                !h.session
+                    .drain_buffer()
+                    .await
+                    .iter()
+                    .any(|m| matches!(m, ServerMessage::ChannelClosed { .. })),
+                "the viewer was told the channel closed"
+            );
+            assert!(!h.aborted());
+
+            h.session.on_channel_closed(h.channel).await;
+            assert!(!h.session.channel_audits.lock().await.contains_key(&h.channel));
+            assert!(!h.session.on_output(h.channel, b"after").await);
         }
 
         /// Once the session was closed for its recording, no new shell is opened.

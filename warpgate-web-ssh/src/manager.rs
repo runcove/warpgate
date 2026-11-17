@@ -169,12 +169,9 @@ async fn relay_events(
                     .push(ServerMessage::ExitStatus { channel_id, code })
                     .await;
             }
-            RCEvent::Close(channel_id) | RCEvent::ChannelFailure(channel_id) => {
-                session.end_channel(channel_id).await;
-                session
-                    .push(ServerMessage::ChannelClosed { channel_id })
-                    .await;
-            }
+            RCEvent::Close(channel_id) => session.on_channel_closed(channel_id).await,
+            // A refused request (a pty, say) does not end the channel.
+            RCEvent::ChannelFailure(channel_id) => session.on_channel_failure(channel_id),
             RCEvent::Error(e) => {
                 session
                     .push(ServerMessage::Error {
