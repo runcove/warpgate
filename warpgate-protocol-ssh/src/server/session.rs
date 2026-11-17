@@ -2973,8 +2973,9 @@ mod tests {
 
             /// Once the session is closed for its recording (by input or by
             /// output), later client data does not reach the target and later
-            /// target output does not reach the client, though the failed
-            /// recorder is gone and the queued disconnect has not taken effect.
+            /// target output (stdout or stderr) does not reach the client,
+            /// though the failed recorder is gone and the queued disconnect has
+            /// not taken effect.
             /// The close also drops the client handle; it is put back here, so
             /// this checks the refusal on its own.
             #[cfg(target_os = "linux")]
@@ -3002,6 +3003,14 @@ mod tests {
                             r.channel,
                             Bytes::from_static(b"after"),
                         ))
+                        .await
+                        .unwrap();
+                    r.s.session
+                        .handle_remote_event(RCEvent::ExtendedData {
+                            channel: r.channel,
+                            data: Bytes::from_static(b"after"),
+                            ext: 1,
+                        })
                         .await
                         .unwrap();
 
@@ -5024,6 +5033,11 @@ impl ServerSession {
                 }
             }
             RCEvent::ExtendedData { channel, data, ext } => {
+                // Once closed for its recording, nothing more reaches the
+                // client, whatever is still queued ahead of the disconnect.
+                if self.recording_refused {
+                    return Ok(());
+                }
                 if let Some(channel_state) = self.channels.get_mut(&channel)
                     && channel_state.audit.on_error_output(&data).await.is_break()
                 {

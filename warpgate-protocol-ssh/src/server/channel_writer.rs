@@ -162,12 +162,13 @@ impl ChannelWriter {
         data: D,
         slot: Option<OwnedSemaphorePermit>,
     ) -> Result<()> {
+        let data = data.into();
+        #[cfg(test)]
+        if let Ok(mut written) = self.written.lock() {
+            written.push(data.clone());
+        }
         self.enqueue(ChannelWriteOperation::ExtendedData(
-            handle,
-            channel,
-            ext,
-            data.into(),
-            slot,
+            handle, channel, ext, data, slot,
         ))
     }
 
