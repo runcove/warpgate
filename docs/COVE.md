@@ -250,6 +250,13 @@ The flush hands the write to the operating system; it does not wait for it to
 reach the disk (see the limits below). With S3 storage this write reaches
 the local scratch copy only; S3 itself is reached later (see below).
 
+With the option on, SSH also drops client data it has no recording for,
+rather than forward it: data on a session channel before the channel's shell,
+exec or subsystem request (the target's channel is already open by then, and
+some SSH servers hand such data to the command's stdin; OpenSSH's server
+discards it), and extended data the client sends on any channel, which is
+never recorded (OpenSSH's server discards that too).
+
 With the option on, a recording that fails mid-session closes the session
 too: in SSH (the client is shown `session closed: its recording failed`), the
 web SSH client, Kubernetes exec and attach streams, native RDP and VNC, and

@@ -48,6 +48,9 @@ pub struct Channel {
     pub audit: ChannelAudit,
     pub pty_size: Option<PtyRequest>,
     pub traffic_recorder: Option<ConnectionRecorder>,
+    /// A session channel that has had no shell, exec or subsystem request yet,
+    /// so nothing it carries can be recorded.
+    pub awaits_request: bool,
 }
 
 impl Channel {
@@ -58,6 +61,7 @@ impl Channel {
             audit: ChannelAudit::new(id),
             pty_size: None,
             traffic_recorder: None,
+            awaits_request: false,
         }
     }
 

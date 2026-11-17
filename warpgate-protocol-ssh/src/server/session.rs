@@ -3032,6 +3032,122 @@ mod tests {
                 }
             }
 
+            /// Data and extended data the client sends on a session channel before
+            /// its exec request have no recording to go to, yet the target's
+            /// session channel is open. Required: both are dropped, and the
+            /// command's own input, sent after the request, is recorded and
+            /// forwarded; client extended data stays dropped. Otherwise everything
+            /// is forwarded, as before.
+            #[cfg(target_os = "linux")]
+            #[tokio::test]
+            async fn data_before_a_session_channels_request_is_dropped_when_required() {
+                for required in [true, false] {
+                    let mut r = connected_shell(required).await;
+                    let ch = server_channel(2);
+                    let open = FakeOpen::default();
+                    let session = &mut r.s.session;
+                    let target = &mut r.sent;
+                    tokio::join!(
+                        async {
+                            session
+                                ._channel_open(ch, ChannelOperation::OpenShell, None, open.clone())
+                                .await
+                                .unwrap();
+                        },
+                        async {
+                            let (command, reply) = target.recv().await.unwrap();
+                            assert!(
+                                matches!(
+                                    command,
+                                    RCCommand::Channel(_, ChannelOperation::OpenShell)
+                                ),
+                                "{command:?}"
+                            );
+                            let _ = reply.map(|r| r.send(Ok(())));
+                        }
+                    );
+                    assert_eq!(open.accepted(), Some(true));
+                    drain(&mut r.sent);
+
+                    let early = [
+                        ServerHandlerEvent::Data(
+                            ch,
+                            Bytes::from_static(b"early"),
+                            oneshot::channel().0,
+                        ),
+                        ServerHandlerEvent::ExtendedData(
+                            ch,
+                            Bytes::from_static(b"early-ext"),
+                            1,
+                            oneshot::channel().0,
+                        ),
+                    ];
+                    for event in early {
+                        r.s.session
+                            .handle_server_handler_event(event)
+                            .await
+                            .unwrap();
+                    }
+                    let forwarded = |sent: &[RCCommand]| -> Vec<Vec<u8>> {
+                        sent.iter()
+                            .filter_map(|c| match c {
+                                RCCommand::Channel(
+                                    _,
+                                    ChannelOperation::Data(data)
+                                    | ChannelOperation::ExtendedData { data, .. },
+                                ) => Some(data.to_vec()),
+                                _ => None,
+                            })
+                            .collect()
+                    };
+                    let sent = drain(&mut r.sent);
+                    if required {
+                        assert!(forwarded(&sent).is_empty(), "forwarded: {sent:?}");
+                    } else {
+                        assert_eq!(
+                            forwarded(&sent),
+                            vec![b"early".to_vec(), b"early-ext".to_vec()]
+                        );
+                    }
+
+                    let (reply, replied) = oneshot::channel();
+                    r.s.session
+                        .handle_server_handler_event(ServerHandlerEvent::ExecRequest(
+                            ch,
+                            Bytes::from_static(b"cat"),
+                            reply,
+                        ))
+                        .await
+                        .unwrap();
+                    assert_eq!(replied.await, Ok(true));
+                    drain(&mut r.sent);
+                    r.s.session
+                        .handle_server_handler_event(ServerHandlerEvent::Data(
+                            ch,
+                            Bytes::from_static(b"input"),
+                            oneshot::channel().0,
+                        ))
+                        .await
+                        .unwrap();
+                    r.s.session
+                        .handle_server_handler_event(ServerHandlerEvent::ExtendedData(
+                            ch,
+                            Bytes::from_static(b"ext"),
+                            1,
+                            oneshot::channel().0,
+                        ))
+                        .await
+                        .unwrap();
+                    let sent = drain(&mut r.sent);
+                    if required {
+                        assert_eq!(forwarded(&sent), vec![b"input".to_vec()]);
+                    } else {
+                        assert_eq!(forwarded(&sent), vec![b"input".to_vec(), b"ext".to_vec()]);
+                    }
+                    assert!(!closed(&r.s), "the session goes on");
+                }
+            }
+
             /// A shell channel whose recording starts on files that cannot be written
             /// (a full disk). Required: the session closes before anything of the
             /// channel reaches the target. Otherwise the channel goes on, its first
@@ -4353,6 +4469,7 @@ impl ServerSession {
                     let _ = reply.send(false);
                     return Ok(());
                 }
+                self.end_request_wait(channel_id);
                 self.maybe_connect_remote().await?;
                 self.maybe_start_target_selection_menu(channel_id).await?;
 
@@ -4952,7 +5069,11 @@ impl ServerSession {
         recorder: Option<ConnectionRecorder>,
         open_handle: impl OpenReply,
     ) -> Result<()> {
+        let session = matches!(operation, ChannelOperation::OpenShell);
         let uuid = self.channels.begin_client_open(channel);
+        if let Some(channel_state) = self.channels.get_mut(&uuid) {
+            channel_state.awaits_request = session;
+        }
 
         match self
             .send_command_and_wait(RCCommand::Channel(uuid, operation))
@@ -5069,6 +5190,7 @@ impl ServerSession {
         {
             return Ok(false);
         }
+        self.end_request_wait(channel_id);
 
         let _ = self.maybe_connect_remote().await;
         self.maybe_start_target_selection_menu(channel_id).await?;
@@ -5406,6 +5528,7 @@ impl ServerSession {
     ) -> Result<(), SshClientError> {
         let channel_id = self.map_channel(server_channel_id)?;
         info!(channel=%channel_id, "Requesting subsystem {}", &name);
+        self.end_request_wait(channel_id);
         let _ = self.maybe_connect_remote().await;
         self.send_command_and_wait(RCCommand::Channel(
             channel_id,
@@ -5442,6 +5565,10 @@ impl ServerSession {
                 self.emit_service_message("Session closed")?;
                 self.disconnect_server().await;
             }
+            return Ok(());
+        }
+
+        if self.drops_unrecordable_input(channel_id) {
             return Ok(());
         }
 
@@ -5505,11 +5632,42 @@ impl ServerSession {
     ) -> Result<()> {
         let channel_id = self.map_channel(server_channel_id)?;
         debug!(channel=%server_channel_id.0, ?data, "Data");
+        // Extended data from the client is never recorded, at any point of the
+        // channel: with unrecorded sessions refused it is dropped. OpenSSH's
+        // server discards it on a session channel anyway.
+        if self.services.recordings.refuses_unrecorded_sessions() {
+            debug!(channel=%channel_id, "Dropping the client's extended data: it cannot be recorded");
+            return Ok(());
+        }
         let _ = self.send_command(RCCommand::Channel(
             channel_id,
             ChannelOperation::ExtendedData { ext: code, data },
         ));
         Ok(())
+    }
+
+    /// The channel's shell, exec or subsystem request has been accepted: from
+    /// here its data goes to the recording that request started, if any.
+    fn end_request_wait(&mut self, channel_id: Uuid) {
+        if let Some(channel_state) = self.channels.get_mut(&channel_id) {
+            channel_state.awaits_request = false;
+        }
+    }
+
+    /// Data on a session channel before its shell, exec or subsystem request
+    /// has no recording to go to, yet the target's session channel is already
+    /// open and some servers hand such data to the command's stdin. With
+    /// unrecorded sessions refused it is dropped, as OpenSSH's server does.
+    fn drops_unrecordable_input(&self, channel_id: Uuid) -> bool {
+        let drop = self.services.recordings.refuses_unrecorded_sessions()
+            && self
+                .channels
+                .get(&channel_id)
+                .is_some_and(|c| c.awaits_request);
+        if drop {
+            debug!(channel=%channel_id, "Dropping data sent before the channel's request: it cannot be recorded");
+        }
+        drop
     }
 
     async fn _tcpip_forward(&mut self, address: String, port: u32) -> Result<()> {
