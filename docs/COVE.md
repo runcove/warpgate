@@ -224,6 +224,16 @@ start is refused rather than continuing unrecorded:
   Warpgate connects to the desktop.
 - **Native RDP and VNC:** the connection is closed.
 
+With the option on, every session also waits for its recording's first write
+at start, before anything of it reaches the target: an empty line in the
+recording's index (readers skip it), or an SSH forward connection's setup
+record, is written and flushed, and the session is refused as above if that
+fails. This covers SSH channels and forwards, Kubernetes API requests and exec
+and attach streams, the web SSH and web desktop clients, and native RDP and
+VNC. So a disk that takes a new file but not its writes refuses the session at
+start too. With S3 storage this write reaches the local scratch copy only;
+S3 itself is reached later (see below).
+
 With the option on, a recording that fails mid-session closes the session
 too: in SSH (the client is shown `session closed: its recording failed`), the
 web SSH client, Kubernetes exec and attach streams, native RDP and VNC, and
@@ -238,18 +248,31 @@ recording that falls behind the session (its queue of 256 frames is full) is
 a failure too, and closes the session before that frame reaches the viewer.
 
 The close is not instant. Writes go through a queue of 1024 items per
-recording file, and the disk write happens behind it, so a session learns of
-a failure at its next write after the failure; what it sent or showed in
-between was passed on and may not be on disk. In native RDP, up to 16 frames
-already queued for the viewer still reach it, but the target connection is
-cut off at once, even if the viewer has stopped reading. In the desktop
+recording file, and the disk write happens behind it. At start this is
+checked: the first write is waited for, as above. After that, a failure
+mid-session is still found only at the session's next write after it; what
+the session sent or showed in between was passed on and may not be on disk.
+A Kubernetes exec or attach stream passes each frame on once it is in a queue
+of 1000 frames in front of its recorder, so the stream can be up to that many
+frames ahead of the recorder when a write fails. With S3 storage, the upload
+is pushed in 5 MiB parts and completed when the recording ends, so a push
+failure is only seen at a part push or at that final push. A failure at the
+final push comes after the recording's last write: it is logged and counted,
+but for the Kubernetes API, where each request has its own recording, it
+does not refuse the session's later requests (a known limit). In native RDP,
+frames already queued for the viewer still reach it: up to 16 in the queue
+into Warpgate's viewer-facing RDP server and up to 256 display updates in the
+queue behind it, inside that server. The target connection is cut off at
+once, even if the viewer has stopped reading. In the desktop
 protocols, only what is written to the recording can show a failure: pixel
 updates are written at most 30 times a second, and the desktop's clipboard
 text and cursor shapes, and keyboard input that is not recorded (keyboard
 recording off, or the logon screen showing), are not written, so they pass
-until the next write fails. In SSH a forward's connection
-writes its first record before the forward opens, so a forward recorder that
-has already failed is caught before the forward reaches the target.
+until the next write fails. In SSH a forward's connection writes its first
+record (its setup record) before the forward opens, so a forward recorder
+that has already failed is caught before the forward reaches the target; and
+since that record comes before the other side accepts the forward, a forward
+that is then refused still leaves a setup record.
 
 With the option off (the default), nothing is closed or refused: the failure
 is still logged with the line above and counted, and the session continues
@@ -266,9 +289,11 @@ What the option does not cover:
   SSH subsystem (SFTP and every other), X11 and agent-forwarding channels,
   `scp` with `record_scp` off, SSH extended data sent from the client to the
   target, Kubernetes port-forward, Kubernetes exec and attach websocket frames
-  that are not binary, native RDP frames dropped from the recording when its
-  queue is full with the option off (no failure line is logged for them), and
-  MySQL, PostgreSQL and HTTP targets.
+  that are not binary, the bodies of streamed Kubernetes API responses to
+  reads (`watch`, `logs -f` and other chunked responses; the request and
+  its response are recorded, with an empty response body), native RDP frames
+  dropped from the recording when its queue is full with the option off (no
+  failure line is logged for them), and MySQL, PostgreSQL and HTTP targets.
 - **Connecting before the recording starts.** With the option on, Warpgate
   may connect and authenticate to the target before a recording exists: for
   an SSH X11 request, a `tcpip-forward` or `streamlocal-forward` request and
