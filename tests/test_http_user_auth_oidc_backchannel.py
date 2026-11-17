@@ -134,3 +134,25 @@ class TestHTTPUserAuthOIDCBackchannelLogout:
         assert response.status_code == 200
         assert response.json()["url"].startswith(f"http://localhost:{oidc_port}/")
         assert _username(wg_url, session) is None
+
+    def test_get_sso_logout_is_not_a_logout(self, processes: ProcessManager):
+        wg_http_port = alloc_port()
+        oidc_port = processes.start_oidc_server(wg_http_port)
+        wg = _start_wg_with_oidc(processes, wg_http_port, oidc_port)
+        wg_url = f"https://127.0.0.1:{wg.http_port}"
+        user = _setup_sso_user(wg_url)
+
+        session, _ = _do_oidc_login(wg_url, oidc_port)
+        assert _username(wg_url, session) == user.username
+
+        # The deprecated GET, as a cross-site link would send it
+        response = session.get(
+            f"{wg_url}/@warpgate/api/sso/logout",
+            headers={"Sec-Fetch-Site": "cross-site"},
+            allow_redirects=False,
+        )
+        assert response.status_code == 405
+        assert response.headers["Allow"] == "POST"
+        assert _username(wg_url, session) == user.username
+        with admin_client(wg_url) as api:
+            assert api.get_sessions(active_only=True, username=user.username).items

@@ -91,6 +91,20 @@ enum StartSloResponse {
     NotFound,
 }
 
+/// `GET /sso/logout`, kept in the API only as a deprecated operation: SSO
+/// logout is `POST /sso/logout`, and a GET must never log anyone out (a
+/// cross-site link or image would otherwise do it).
+#[allow(clippy::large_enum_variant, dead_code)]
+#[derive(ApiResponse)]
+enum StartSloGetDeprecatedResponse {
+    /// Never sent. Declared only so the published schema keeps the success
+    /// response this operation had while it was the logout itself.
+    #[oai(status = 200)]
+    Ok(Json<StartSloResponseParams>),
+    #[oai(status = 405)]
+    MethodNotAllowed(#[oai(header = "Allow")] String),
+}
+
 #[derive(Object)]
 pub struct SsoKubernetesConfigDescription {
     pub name: String,
@@ -776,6 +790,18 @@ impl Api {
         })))
     }
 
+    /// Deprecated: use `POST /sso/logout`. Logs nobody out and reads or
+    /// writes no session state; it only answers 405 with `Allow: POST`.
+    #[oai(
+        path = "/sso/logout",
+        method = "get",
+        operation_id = "initiate_sso_logout_get_deprecated",
+        deprecated = true
+    )]
+    async fn api_start_slo_get_deprecated(&self) -> StartSloGetDeprecatedResponse {
+        StartSloGetDeprecatedResponse::MethodNotAllowed("POST".to_string())
+    }
+
     #[oai(
         path = "/sso/kubernetes-configs",
         method = "get",
@@ -829,6 +855,61 @@ mod tests {
         rejected_credential_failure,
     };
     use crate::test_db::{insert_user, memory_db, services};
+
+    /// `GET /sso/logout` is the deprecated operation: 405 with `Allow: POST`,
+    /// no cookie, and the caller's session is still logged in afterwards.
+    #[tokio::test]
+    async fn get_sso_logout_is_405_and_leaves_the_session_logged_in() {
+        use poem::handler;
+        use poem::session::{CookieConfig, MemoryStorage, ServerSession, Session};
+        use poem::test::TestClient;
+        use poem::{EndpointExt, Route, get};
+        use poem_openapi::OpenApiService;
+
+        #[handler]
+        fn login(session: &Session) {
+            session.set("user", "alice");
+        }
+
+        #[handler]
+        fn whoami(session: &Session) -> String {
+            session.get::<String>("user").unwrap_or_default()
+        }
+
+        let app = Route::new()
+            .at("/login", get(login))
+            .at("/whoami", get(whoami))
+            .nest("/api", OpenApiService::new(super::Api, "test", "0"))
+            .with(ServerSession::new(
+                CookieConfig::default(),
+                MemoryStorage::new(),
+            ));
+        let cli = TestClient::new(app);
+
+        let resp = cli.get("/login").send().await;
+        resp.assert_status_is_ok();
+        let cookie = resp
+            .0
+            .headers()
+            .get("set-cookie")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(';').next())
+            .map(ToOwned::to_owned)
+            .expect("the login sets a cookie");
+
+        let resp = cli
+            .get("/api/sso/logout")
+            .header("cookie", &cookie)
+            .send()
+            .await;
+        resp.assert_status(poem::http::StatusCode::METHOD_NOT_ALLOWED);
+        resp.assert_header("allow", "POST");
+        resp.assert_header_is_not_exist("set-cookie");
+
+        let resp = cli.get("/whoami").header("cookie", &cookie).send().await;
+        resp.assert_status_is_ok();
+        resp.assert_text("alice").await;
+    }
 
     #[test]
     fn error_redirect_is_site_relative_and_escaped() {

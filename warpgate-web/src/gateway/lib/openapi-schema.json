@@ -457,6 +457,35 @@
           }
         },
         "operationId": "initiate_sso_logout"
+      },
+      "get": {
+        "summary": "Deprecated: use `POST /sso/logout`. Logs nobody out and reads or\nwrites no session state; it only answers 405 with `Allow: POST`.",
+        "responses": {
+          "200": {
+            "description": "Never sent. Declared only so the published schema keeps the success\nresponse this operation had while it was the logout itself.",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/StartSloResponseParams"
+                }
+              }
+            }
+          },
+          "405": {
+            "description": "",
+            "headers": {
+              "ALLOW": {
+                "required": true,
+                "deprecated": false,
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "deprecated": true,
+        "operationId": "initiate_sso_logout_get_deprecated"
       }
     },
     "/sso/kubernetes-configs": {
