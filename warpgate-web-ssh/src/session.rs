@@ -226,7 +226,8 @@ impl WebSshSession {
     }
 
     /// Records the target's output. `false` when the recording failed and the session
-    /// was closed: the output must then not reach the viewer.
+    /// was closed, or the channel has no audit and unrecorded sessions are refused: the
+    /// output must then not reach the viewer.
     #[must_use]
     pub async fn on_output(&self, channel_id: Uuid, data: &[u8]) -> bool {
         if self.closed_for_recording_failure() {
@@ -236,13 +237,18 @@ impl WebSshSession {
         if self.closed_for_recording_failure() {
             return false;
         }
-        if let Some(audit) = audits.get_mut(&channel_id)
-            && audit.on_output(data).await.is_break()
-        {
-            self.close_on_recording_failure().await;
-            return false;
+        match audits.get_mut(&channel_id) {
+            Some(audit) => {
+                if audit.on_output(data).await.is_break() {
+                    self.close_on_recording_failure().await;
+                    return false;
+                }
+                true
+            }
+            // A channel with no audit would show its output unrecorded: when
+            // unrecorded sessions are refused, it is not shown.
+            None => !self.recordings.refuses_unrecorded_sessions(),
         }
-        true
     }
 
     pub async fn resize_channel(&self, channel_id: Uuid, cols: u32, rows: u32) {
@@ -784,6 +790,21 @@ mod tests {
                 assert_eq!(
                     h.data_sent(),
                     usize::from(!required),
+                    "required: {required}"
+                );
+                assert!(!h.aborted());
+            }
+        }
+
+        /// Output for a channel with no audit would be shown unrecorded. Required: it
+        /// is not shown. Otherwise it is, so the refusal is real.
+        #[tokio::test]
+        async fn output_for_a_channel_without_an_audit_follows_the_setting() {
+            for required in [true, false] {
+                let h = recorded_shell(required).await;
+                assert_eq!(
+                    h.session.on_output(Uuid::new_v4(), b"output").await,
+                    !required,
                     "required: {required}"
                 );
                 assert!(!h.aborted());
