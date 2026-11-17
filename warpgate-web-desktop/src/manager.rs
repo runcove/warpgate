@@ -575,6 +575,126 @@ mod tests {
         }
     }
 
+    /// A recording that fails mid-session, as a full disk would, on the event path to
+    /// the viewer.
+    #[cfg(target_os = "linux")]
+    mod failing_mid_session {
+        use std::sync::atomic::{AtomicU16, Ordering};
+        use std::time::Duration;
+
+        use warpgate_core::LogonState;
+
+        use super::*;
+        use crate::session::tests::desktop_failing_mid_session;
+
+        /// An event the recorder writes at once, told apart by its width.
+        const fn resize(n: u16) -> DesktopEvent {
+            DesktopEvent::Resize {
+                width: n,
+                height: 1,
+            }
+        }
+
+        /// The widths of the resizes the viewer was sent, in order.
+        async fn sent(session: &WebDesktopSession) -> Vec<u16> {
+            session
+                .drain_buffer()
+                .await
+                .into_iter()
+                .filter_map(|m| match m {
+                    ServerMessage::Resize { width, .. } => Some(width),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// Required: `emit` returns `SessionRecordingFailed` for the event whose write
+        /// failed, and that event is not sent to the viewer. Otherwise every event is
+        /// sent and the failure is only logged.
+        #[tokio::test]
+        async fn an_event_whose_recording_fails_follows_the_setting() {
+            for required in [true, false] {
+                let h = desktop_failing_mid_session(required).await;
+                let mut emitted = 0;
+                for n in 1..=1000 {
+                    let result = emit(&h.session, Some(&h.recorder), resize(n), None).await;
+                    match result {
+                        Ok(()) => emitted = n,
+                        Err(WarpgateError::SessionRecordingFailed) => {
+                            assert!(required, "failed with the setting off");
+                            break;
+                        }
+                        Err(error) => panic!("{error}"),
+                    }
+                    if !required && h.failures() > 0 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                assert!(h.failures() > 0, "the recording never failed");
+                assert_eq!(
+                    sent(&h.session).await,
+                    (1..=emitted).collect::<Vec<_>>(),
+                    "only the events before the failed write were sent"
+                );
+                if !required {
+                    for n in 2000..2003 {
+                        emit(&h.session, Some(&h.recorder), resize(n), None)
+                            .await
+                            .unwrap();
+                    }
+                    assert_eq!(sent(&h.session).await, vec![2000, 2001, 2002]);
+                }
+                h.assert_one_failure_line(required);
+            }
+        }
+
+        /// Required: the relay ends with `SessionRecordingFailed` while the backend is
+        /// still sending, and the viewer is sent nothing after the event whose write
+        /// failed.
+        #[tokio::test]
+        async fn the_relay_ends_with_the_session_recording_failed_when_required() {
+            let h = desktop_failing_mid_session(true).await;
+            let (event_tx, event_rx) = tokio::sync::mpsc::channel(1);
+            let (input_tx, _inputs) = tokio::sync::mpsc::channel(1);
+            let (abort_tx, _abort) = tokio::sync::mpsc::unbounded_channel();
+            let handles = DesktopClientHandles {
+                event_rx,
+                input_tx,
+                abort_tx,
+                logon_state: LogonState::logged_on(),
+            };
+            let fed = AtomicU16::new(0);
+            let feed = async {
+                for n in 1..=1000 {
+                    if event_tx.send(resize(n)).await.is_err() {
+                        return;
+                    }
+                    fed.store(n, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                std::future::pending::<()>().await;
+            };
+            let relay = relay_events(&h.session, handles, Some(h.recorder.clone()), false);
+            let result = tokio::select! {
+                result = relay => result,
+                () = feed => unreachable!(),
+            };
+            assert!(
+                matches!(result, Err(WarpgateError::SessionRecordingFailed)),
+                "{result:?}"
+            );
+            let sent = sent(&h.session).await;
+            let fed = fed.load(Ordering::SeqCst);
+            assert!(
+                sent.len() < usize::from(fed),
+                "every event fed was sent: {sent:?}"
+            );
+            assert_eq!(sent, (1..=sent.len() as u16).collect::<Vec<_>>());
+            h.assert_one_failure_line(true);
+        }
+    }
+
     #[test]
     fn vnc_tiles_are_jpeg_encoded_like_rdp() {
         // VNC once shipped its decoded rects raw: ~100 MB on the websocket for 4.9 MiB

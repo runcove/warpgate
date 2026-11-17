@@ -188,7 +188,7 @@ impl ManagedSession for WebDesktopSession {
 
 // Every test here fails a recording through `/proc/self/fd`.
 #[cfg(all(test, target_os = "linux"))]
-mod tests {
+pub(crate) mod tests {
     use std::time::Duration;
 
     use sea_orm::ActiveValue::Set;
@@ -217,16 +217,18 @@ mod tests {
 
     /// A web desktop session whose recording started on a real disk root, then
     /// fails as a full disk would.
-    struct Harness {
-        session: WebDesktopSession,
+    pub(crate) struct Harness {
+        pub(crate) session: WebDesktopSession,
         forwarded: Receiver<DesktopInput>,
+        /// The recorder bound to the session's backend.
+        pub(crate) recorder: Arc<DesktopRecorder>,
         recordings: Arc<SessionRecordings>,
         id: TargetSessionId,
         required: bool,
         _dir: tempfile::TempDir,
     }
 
-    async fn desktop_failing_mid_session(refuse: bool) -> Harness {
+    pub(crate) async fn desktop_failing_mid_session(refuse: bool) -> Harness {
         test_support::log_events();
         let dir = tempfile::tempdir().unwrap();
         set_config_migration_values(ConfigMigrationValues::default());
@@ -295,9 +297,10 @@ mod tests {
             CancellationToken::new(),
         );
         let (input_tx, forwarded) = tokio::sync::mpsc::channel(10_000);
+        let recorder = Arc::new(recorder);
         session.bind_backend(DesktopBackend {
             input_tx,
-            recorder: Some(Arc::new(recorder)),
+            recorder: Some(recorder.clone()),
         });
         assert!(
             test_support::fail_open_recording_files(&dir.path().join("recordings")) >= 2,
@@ -306,6 +309,7 @@ mod tests {
         Harness {
             session,
             forwarded,
+            recorder,
             recordings,
             id,
             required: refuse,
@@ -314,6 +318,10 @@ mod tests {
     }
 
     impl Harness {
+        pub(crate) fn failures(&self) -> u64 {
+            self.recordings.failed_recordings()
+        }
+
         fn aborted(&self) -> bool {
             self.session.cancellation().is_cancelled()
         }
@@ -357,7 +365,7 @@ mod tests {
             panic!("the recording never failed");
         }
 
-        fn assert_one_failure_line(&self, required: bool) {
+        pub(crate) fn assert_one_failure_line(&self, required: bool) {
             assert_eq!(self.recordings.failed_recordings(), 1);
             let lines = test_support::failed_recording_lines(&self.id);
             assert_eq!(lines.len(), 1, "{lines:?}");
