@@ -178,7 +178,10 @@ with these fields:
 - `protocol`: `ssh`, `kubernetes`, `web-ssh`, `web-desktop`, `rdp` or `vnc`
 - `user`, `target`: who the session belongs to and where it goes
 - `target_session`: the target session's id
-- `stage`: `start` (it could not start) or `write` (it failed mid-session)
+- `stage`: `start` (it could not be created) or `write` (a write failed:
+  mid-session, or the first write at start described below). A disk that
+  takes a new file but not its writes is logged as `write`, so an alert on
+  `stage=start` alone misses it
 - `cause`: the underlying error
 - `required`: whether `--recordings-refuse-unrecorded-sessions` is on
 - `total`: how many recordings have failed since Warpgate started
@@ -226,13 +229,26 @@ start is refused rather than continuing unrecorded:
 
 With the option on, every session also waits for its recording's first write
 at start, before anything of it reaches the target: an empty line in the
-recording's index (readers skip it), or an SSH forward connection's setup
-record, is written and flushed, and the session is refused as above if that
-fails. This covers SSH channels and forwards, Kubernetes API requests and exec
-and attach streams, the web SSH and web desktop clients, and native RDP and
-VNC. So a disk that takes a new file but not its writes refuses the session at
-start too. With S3 storage this write reaches the local scratch copy only;
-S3 itself is reached later (see below).
+recording's index (readers skip it), an SSH forward connection's setup
+record, or, for a Kubernetes API request, whose recording has no index, an
+empty line in its `data.ndjson`, is written and flushed. This covers SSH
+channels and forwards, Kubernetes API requests and exec and attach streams,
+the web SSH and web desktop clients, and native RDP and VNC. So a disk that
+takes a new file but not its writes stops the session at start too. That
+failure is a failed write: it is logged with `stage=write`, and what the
+client sees depends on the protocol:
+
+- **SSH and the web SSH client:** the session is closed as for a failure
+  mid-session (below): the client is shown `session closed: its recording
+  failed`, and nothing of the channel or forward reaches the target.
+- **Kubernetes, the web desktop client, native RDP and VNC:** the session is
+  refused exactly as when its recording cannot start (above): the error is
+  `session refused: its recording could not be started` (HTTP 503 for a
+  Kubernetes API request), and native RDP and VNC close the connection.
+
+The flush hands the write to the operating system; it does not wait for it to
+reach the disk (see the limits below). With S3 storage this write reaches
+the local scratch copy only; S3 itself is reached later (see below).
 
 With the option on, a recording that fails mid-session closes the session
 too: in SSH (the client is shown `session closed: its recording failed`), the
@@ -249,9 +265,14 @@ a failure too, and closes the session before that frame reaches the viewer.
 
 The close is not instant. Writes go through a queue of 1024 items per
 recording file, and the disk write happens behind it. At start this is
-checked: the first write is waited for, as above. After that, a failure
-mid-session is still found only at the session's next write after it; what
-the session sent or showed in between was passed on and may not be on disk.
+checked: the first write is waited for, as above, but only until the
+operating system has taken it, not until it is on disk. A filesystem that
+reports a lack of space only when it writes its cache back (some network
+filesystems, or a thin-provisioned volume) passes that
+check, and its failure surfaces at a later write, as a failure mid-session.
+After that, a failure mid-session is still found only at the session's next
+write after it; what the session sent or showed in between was passed on and
+may not be on disk.
 A Kubernetes exec or attach stream passes each frame on once it is in a queue
 of 1000 frames in front of its recorder, so the stream can be up to that many
 frames ahead of the recorder when a write fails. With S3 storage, the upload
