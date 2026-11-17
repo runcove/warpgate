@@ -23,7 +23,7 @@ use tokio_tungstenite::{
 };
 use tracing::{Instrument, debug, error, warn};
 use url::{Url, form_urlencoded};
-use warpgate_common::helpers::websocket::pump_websocket;
+use warpgate_common::helpers::websocket::{pump_websocket, websocket_connect_failed};
 use warpgate_common::http_headers::{
     ForwardFilter, X_FORWARDED_FOR, X_FORWARDED_HOST, X_FORWARDED_PROTO,
 };
@@ -885,22 +885,6 @@ pub(crate) async fn connect_target_websocket(
     connect_upstream_websocket(request, unix_socket, connector)
         .await
         .map_err(websocket_connect_failed)
-}
-
-/// An upstream WebSocket that could not be opened, as the gateway error it
-/// becomes. A refused upgrade keeps only its status: the headers and body of
-/// the target's answer (a `Set-Cookie`, a `Location`) would reach the log.
-fn websocket_connect_failed(error: tungstenite::Error) -> poem::Error {
-    match error {
-        tungstenite::Error::Http(response) => poem::Error::from_string(
-            format!(
-                "the target refused the WebSocket upgrade with status {}",
-                response.status()
-            ),
-            StatusCode::BAD_GATEWAY,
-        ),
-        error => poem::error::BadGateway(error),
-    }
 }
 
 /// Opens the upstream WebSocket for `request`: through `unix_socket` when the

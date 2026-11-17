@@ -258,6 +258,23 @@ where
     Ok(())
 }
 
+/// A WebSocket that could not be opened to an upstream (a target, or a peer
+/// node), as the gateway error it becomes. A refused upgrade keeps only its
+/// status: the headers and body of the upstream's answer (a `Set-Cookie`, a
+/// `Location`) would reach the log.
+pub fn websocket_connect_failed(error: tungstenite::Error) -> poem::Error {
+    match error {
+        tungstenite::Error::Http(response) => poem::Error::from_string(
+            format!(
+                "the upstream refused the WebSocket upgrade with status {}",
+                response.status()
+            ),
+            poem::http::StatusCode::BAD_GATEWAY,
+        ),
+        error => poem::error::BadGateway(error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;

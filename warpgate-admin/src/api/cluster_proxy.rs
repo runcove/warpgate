@@ -23,10 +23,13 @@ use poem::web::websocket::WebSocket;
 use poem::{Body, IntoResponse, Request, Response};
 use poem_openapi::types::ParseFromJSON;
 use serde::Serialize;
-use tokio_tungstenite::{Connector, client_async_tls_with_config, tungstenite};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio_tungstenite::{
+    Connector, MaybeTlsStream, WebSocketStream, client_async_tls_with_config, tungstenite,
+};
 use uuid::Uuid;
 use warpgate_ca::CLUSTER_TLS_SNI_NAME;
-use warpgate_common::helpers::websocket::pump_websocket;
+use warpgate_common::helpers::websocket::{pump_websocket, websocket_connect_failed};
 use warpgate_common::http_headers::ForwardFilter;
 use warpgate_common_http::auth::UnauthenticatedRequestContext;
 use warpgate_common_http::logging::get_client_ip;
@@ -287,14 +290,7 @@ pub async fn forward_websocket(
         poem::error::BadGateway(e.unwrap_or_else(|| std::io::Error::other("no peer address")))
     })?;
 
-    let (peer, _) = client_async_tls_with_config(
-        request,
-        stream,
-        None,
-        Some(Connector::Rustls(Arc::new(tls))),
-    )
-    .await
-    .map_err(poem::error::BadGateway)?;
+    let peer = upgrade_to_peer(request, stream, Connector::Rustls(Arc::new(tls))).await?;
 
     Ok(ws
         .on_upgrade(move |socket| async move {
@@ -319,6 +315,22 @@ pub async fn forward_websocket(
             }
         })
         .into_response())
+}
+
+/// Opens the WebSocket to the peer over `stream`. A refused upgrade is a 502
+/// that keeps only the peer's status ([`websocket_connect_failed`]).
+async fn upgrade_to_peer<S>(
+    request: poem::http::Request<()>,
+    stream: S,
+    connector: Connector,
+) -> poem::Result<WebSocketStream<MaybeTlsStream<S>>>
+where
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
+    let (peer, _) = client_async_tls_with_config(request, stream, None, Some(connector))
+        .await
+        .map_err(websocket_connect_failed)?;
+    Ok(peer)
 }
 
 fn path_and_query(req: &Request) -> String {
@@ -419,6 +431,69 @@ mod tests {
     #[test]
     fn should_forward_keeps_ordinary_headers() {
         assert!(should_forward(&HeaderName::from_static("accept")));
+    }
+
+    /// A peer that refuses the WebSocket upgrade is logged by its status
+    /// alone: the headers and body of its answer are not.
+    #[tokio::test]
+    async fn a_refused_peer_upgrade_is_logged_by_its_status() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio_tungstenite::Connector;
+        use warpgate_common_http::logging::log_request_error;
+        use warpgate_common_http::test_log::logged;
+
+        const COOKIE: &str = "sid-sentinel-4d17";
+        const LOCATION: &str = "loc-sentinel-a0c3";
+        const BODY: &str = "body-sentinel-e62b";
+
+        let (client, mut peer) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let mut request = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = peer.read(&mut buf).await.unwrap();
+                assert!(n > 0, "the request ended early");
+                request.extend_from_slice(buf.get(..n).unwrap());
+            }
+            let answer = format!(
+                "HTTP/1.1 302 Found\r\nSet-Cookie: sid={COOKIE}\r\n\
+                 Location: /login?next={LOCATION}\r\nContent-Length: {}\r\n\r\n{BODY}",
+                BODY.len()
+            );
+            peer.write_all(answer.as_bytes()).await.unwrap();
+            peer.flush().await.unwrap();
+        });
+        let request = poem::http::Request::builder()
+            .uri("ws://peer.invalid/x")
+            .header(poem::http::header::CONNECTION, "Upgrade")
+            .header(poem::http::header::UPGRADE, "websocket")
+            .header(poem::http::header::SEC_WEBSOCKET_VERSION, "13")
+            .header(
+                poem::http::header::SEC_WEBSOCKET_KEY,
+                tokio_tungstenite::tungstenite::handshake::client::generate_key(),
+            )
+            .header(poem::http::header::HOST, "peer.invalid")
+            .body(())
+            .unwrap();
+        // The refused upgrade is an error.
+        let error = super::upgrade_to_peer(request, client, Connector::Plain)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.status(), poem::http::StatusCode::BAD_GATEWAY);
+
+        let uri: poem::http::Uri = "/x".parse().unwrap();
+        let line = logged(|| {
+            log_request_error(&poem::http::Method::GET, &uri, None, &error);
+        });
+        assert!(line.contains("Request failed"), "{line}");
+        assert!(line.contains("302"), "{line}");
+        // A response's body is logged as its bytes, not as text.
+        let body_bytes = format!("{:?}", BODY.as_bytes());
+        let body_bytes = body_bytes.trim_matches(['[', ']']);
+        for secret in [COOKIE, LOCATION, BODY, body_bytes] {
+            assert!(!line.contains(secret), "{line}");
+        }
     }
 
     #[test]

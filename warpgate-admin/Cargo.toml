@@ -44,4 +44,5 @@ warpgate-tls = { path = "../warpgate-tls" }
 warpgate-version = { path = "../warpgate-version" }
 
 [dev-dependencies]
+warpgate-common-http = { path = "../warpgate-common-http", features = ["test-util"] }
 warpgate-db-migrations = { path = "../warpgate-db-migrations", features = ["sqlite"] }
