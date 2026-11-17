@@ -1471,17 +1471,26 @@ mod tests {
                     .unwrap()
                     .unwrap();
                 r.fail();
-                record_api_response(
-                    &recorder,
-                    &session,
-                    "GET",
-                    "/api/v1/pods",
-                    HashMap::new(),
-                    b"",
-                    200,
-                    b"{}",
-                )
-                .await;
+                // Required, the one response's write is waited for; not required,
+                // it is not, so responses go on until the writer has failed.
+                for _ in 0..if required { 1 } else { 1000 } {
+                    record_api_response(
+                        &recorder,
+                        &session,
+                        "GET",
+                        "/api/v1/pods",
+                        HashMap::new(),
+                        b"",
+                        200,
+                        b"{}",
+                    )
+                    .await;
+                    if r.recordings.failed_recordings() > 0 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                r.assert_one_failure_line(required);
 
                 let later = start_api_recording(&owner(), &session, &r.recordings).await;
                 if required {
@@ -1489,9 +1498,25 @@ mod tests {
                         matches!(later, Err(WarpgateError::SessionRecordingFailed)),
                         "the session's next request is refused"
                     );
-                    r.assert_one_failure_line(true);
                 } else {
-                    assert!(matches!(later, Ok(Some(_))), "the session goes on");
+                    assert!(
+                        !FAILED_API_RECORDINGS.contains(&session.id),
+                        "the session is not marked"
+                    );
+                    let later = later.unwrap().expect("the session's next request goes on");
+                    record_api_response(
+                        &later,
+                        &session,
+                        "GET",
+                        "/api/v1/pods",
+                        HashMap::new(),
+                        b"",
+                        200,
+                        b"{}",
+                    )
+                    .await;
+                    later.flush().await.unwrap();
+                    r.assert_one_failure_line(false);
                 }
                 assert!(
                     !FAILED_API_RECORDINGS.contains(&TargetSessionId(Uuid::new_v4())),
