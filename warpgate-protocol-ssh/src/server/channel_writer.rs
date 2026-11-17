@@ -47,6 +47,9 @@ enum ChannelWriteOperation {
 pub struct ChannelWriter {
     tx: mpsc::UnboundedSender<ChannelWriteOperation>,
     data_slots: Arc<Semaphore>,
+    /// Every chunk of data queued for the client, for tests to inspect.
+    #[cfg(test)]
+    written: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
 }
 
 impl ChannelWriter {
@@ -97,6 +100,8 @@ impl ChannelWriter {
         Self {
             tx,
             data_slots: Arc::new(Semaphore::new(OUTBOUND_DATA_SLOTS)),
+            #[cfg(test)]
+            written: Arc::default(),
         }
     }
 
@@ -123,12 +128,18 @@ impl ChannelWriter {
         data: D,
         slot: Option<OwnedSemaphorePermit>,
     ) -> Result<()> {
-        self.enqueue(ChannelWriteOperation::Data(
-            handle,
-            channel,
-            data.into(),
-            slot,
-        ))
+        let data = data.into();
+        #[cfg(test)]
+        if let Ok(mut written) = self.written.lock() {
+            written.push(data.clone());
+        }
+        self.enqueue(ChannelWriteOperation::Data(handle, channel, data, slot))
+    }
+
+    /// The data queued for the client so far.
+    #[cfg(test)]
+    pub fn written(&self) -> Vec<Vec<u8>> {
+        self.written.lock().map(|w| w.clone()).unwrap_or_default()
     }
 
     pub fn write_extended<D: Into<Vec<u8>>>(

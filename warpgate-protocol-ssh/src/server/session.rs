@@ -348,7 +348,9 @@ pub struct ServerSession {
     /// (see [`Self::refuse_unrecorded_session`]). From then on
     /// [`Self::maybe_connect_remote`] never dials the target: a recording
     /// parked for the menu or an approval gate is only started when the target
-    /// is stamped, and its callers go on to connect.
+    /// is stamped, and its callers go on to connect. It is also set when a
+    /// recording fails mid-session; either way, from then on no client data
+    /// reaches the target and no target output reaches the client.
     recording_refused: bool,
     traffic_recorders: HashMap<TrafficRecorderKey, TrafficRecorder>,
     hub: EventHub<Event>,
@@ -2941,6 +2943,106 @@ mod tests {
                 r.assert_one_failure_line(false);
             }
 
+            /// A client handle for the session to write to, so what it sends the
+            /// client shows in its channel writer. The returned stream is the
+            /// client's end; nothing reads it.
+            #[cfg(target_os = "linux")]
+            async fn attach_client(s: &mut ServerSession) -> tokio::io::DuplexStream {
+                use russh::keys::{Algorithm, PrivateKey};
+                use tokio::io::AsyncWriteExt;
+                use warpgate_common::helpers::rng::get_crypto_rng;
+
+                struct Client;
+                impl russh::server::Handler for Client {
+                    type Error = russh::Error;
+                }
+                let (server, mut client) = tokio::io::duplex(1 << 16);
+                client.write_all(b"SSH-2.0-test\r\n").await.unwrap();
+                let config = russh::server::Config {
+                    keys: vec![
+                        PrivateKey::random(&mut get_crypto_rng(), Algorithm::Ed25519).unwrap(),
+                    ],
+                    ..Default::default()
+                };
+                let running = russh::server::run_stream(Arc::new(config), server, Client)
+                    .await
+                    .unwrap();
+                s.session_handle = Some(running.handle());
+                client
+            }
+
+            /// Once the session is closed for its recording (by input or by
+            /// output), later client data does not reach the target and later
+            /// target output does not reach the client, though the failed
+            /// recorder is gone and the queued disconnect has not taken effect.
+            /// The close also drops the client handle; it is put back here, so
+            /// this checks the refusal on its own.
+            #[cfg(target_os = "linux")]
+            #[tokio::test]
+            async fn nothing_passes_once_closed_for_a_failed_recording() {
+                for by_input in [true, false] {
+                    let mut r = recorded_shell(true).await;
+                    r.fail_recording();
+                    if by_input {
+                        r.input_until_failure().await;
+                    } else {
+                        r.output_until_failure().await;
+                    }
+                    r.assert_closed_for_failure();
+                    drain(&mut r.sent);
+                    let _client = attach_client(&mut r.s.session).await;
+                    let written = r.s.session.channel_writer.written().len();
+
+                    r.s.session
+                        ._data(r.ch, Bytes::from_static(b"after"))
+                        .await
+                        .unwrap();
+                    r.s.session
+                        .handle_remote_event(RCEvent::Output(
+                            r.channel,
+                            Bytes::from_static(b"after"),
+                        ))
+                        .await
+                        .unwrap();
+
+                    let sent = drain(&mut r.sent);
+                    assert_eq!(data_sent(&sent), 0, "reached the target: {sent:?}");
+                    let to_client = r.s.session.channel_writer.written();
+                    assert_eq!(
+                        to_client.len(),
+                        written,
+                        "reached the client: {to_client:?}"
+                    );
+                }
+            }
+
+            /// Not required: the same session, its recording failed, goes on
+            /// passing data both ways, so the test above sees a real refusal.
+            #[cfg(target_os = "linux")]
+            #[tokio::test]
+            async fn with_refusal_off_data_passes_after_a_failed_recording() {
+                let mut r = recorded_shell(false).await;
+                r.fail_recording();
+                r.input_until_failure().await;
+                drain(&mut r.sent);
+                let _client = attach_client(&mut r.s.session).await;
+                let written = r.s.session.channel_writer.written().len();
+                r.s.session
+                    ._data(r.ch, Bytes::from_static(b"after"))
+                    .await
+                    .unwrap();
+                r.s.session
+                    .handle_remote_event(RCEvent::Output(r.channel, Bytes::from_static(b"after")))
+                    .await
+                    .unwrap();
+                assert_eq!(data_sent(&drain(&mut r.sent)), 1);
+                let to_client = r.s.session.channel_writer.written();
+                assert_eq!(
+                    to_client.iter().skip(written).collect::<Vec<_>>(),
+                    [b"after"]
+                );
+            }
+
             /// A forward to an address an earlier forward already made a traffic
             /// recorder for, which has died since: the failure is seen before the
             /// open goes to the target. Required: the open is rejected and the
@@ -4681,6 +4783,11 @@ impl ServerSession {
                 self.disconnect_server().await;
             }
             RCEvent::Output(channel, data) => {
+                // Once closed for its recording, nothing more reaches the
+                // client, whatever is still queued ahead of the disconnect.
+                if self.recording_refused {
+                    return Ok(());
+                }
                 let mut recording_failed = false;
                 if let Some(channel_state) = self.channels.get_mut(&channel) {
                     recording_failed = channel_state.audit.on_output(&data).await.is_break();
@@ -5541,6 +5648,12 @@ impl ServerSession {
     async fn _data(&mut self, server_channel_id: ServerChannelId, data: Bytes) -> Result<()> {
         let channel_id = self.map_channel(server_channel_id)?;
         debug!(channel=%server_channel_id.0, ?data, "Data");
+        // Once closed for its recording, nothing more reaches the target, whatever
+        // is still queued ahead of the disconnect: the failed recorder is gone, so
+        // this data would otherwise pass unrecorded.
+        if self.recording_refused {
+            return Ok(());
+        }
         let has_pty = self.channels.get(&channel_id).is_some_and(Channel::has_pty);
         // Only a terminal turns Ctrl-C into a 0x03 byte. On a forwarded
         // connection it's payload — RDP's first packet starts with 0x03, and
