@@ -16,7 +16,7 @@ use warpgate_common::{
     Protocol, Secret, TargetKubernetesOptions, User, UserSessionId, WarpgateError,
 };
 use warpgate_common_http::authorization_token;
-use warpgate_common_http::logging::get_client_ip_addr;
+use warpgate_common_http::logging::{get_client_ip_addr, upstream_uri_for_log};
 use warpgate_core::login_protection::FailedAttemptInfo;
 use warpgate_core::{
     AuthorizedIdentity, ConfigProvider, Services, TargetAuthorization, ValidatedTicket,
@@ -465,12 +465,21 @@ async fn user_for_username(services: &Services, username: &str) -> poem::Result<
     })
 }
 
+/// An address for logs: no userinfo, no query values. An address that is not
+/// a valid URI is withheld.
+pub fn url_for_log(url: &str) -> String {
+    url.parse::<http::Uri>().map_or_else(
+        |_| "<address withheld>".to_owned(),
+        |uri| upstream_uri_for_log(&uri),
+    )
+}
+
 pub async fn create_authenticated_client(
     k8s_options: &TargetKubernetesOptions,
     services: &Services,
 ) -> anyhow::Result<reqwest::ClientBuilder> {
     debug!(
-        server_url = ?k8s_options.cluster_url,
+        server_url = %url_for_log(&k8s_options.cluster_url),
         auth_kind = ?k8s_options.auth,
         tls_config = ?k8s_options.tls,
         "Creating authenticated Kubernetes client"
@@ -562,7 +571,7 @@ fn upstream_client_builder(cluster_url: &str) -> reqwest::ClientBuilder {
 fn upstream_retry_policy(host: String) -> reqwest::retry::Builder {
     reqwest::retry::for_host(host).classify_fn(|req_rep| match req_rep.error() {
         Some(error) if is_safe_to_resend(error) => {
-            debug!(url = %req_rep.uri(), %error, "Resending Kubernetes upstream request");
+            debug!(url = %upstream_uri_for_log(req_rep.uri()), %error, "Resending Kubernetes upstream request");
             req_rep.retryable()
         }
         _ => req_rep.success(),
@@ -703,7 +712,24 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
-    use super::{upstream_client_builder, upstream_retry_policy};
+    use super::{upstream_client_builder, upstream_retry_policy, url_for_log};
+
+    /// A cluster or request address is logged without its userinfo and its
+    /// query values; one that is not an address is withheld.
+    #[test]
+    fn a_logged_kubernetes_address_has_no_credentials() {
+        assert_eq!(
+            url_for_log(
+                "https://admin:pa55@cluster.example:6443/api/v1/pods?watch=true&token=s3cr3t"
+            ),
+            "https://cluster.example:6443/api/v1/pods?watch=redacted&token=redacted"
+        );
+        assert_eq!(
+            url_for_log("https://cluster.example:6443"),
+            "https://cluster.example:6443/"
+        );
+        assert_eq!(url_for_log("not an address"), "<address withheld>");
+    }
 
     fn client_builder() -> reqwest::ClientBuilder {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();

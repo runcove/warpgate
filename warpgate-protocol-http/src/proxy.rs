@@ -300,7 +300,10 @@ fn rewrite_response(
                 rewritten.push_str(fragment);
             }
             *value = rewritten.parse()?;
-            debug!("Rewrote a redirect from {:?} to {:?}", old_value, value);
+            match (redirect_for_log(&old_value), redirect_for_log(value)) {
+                (Some(old), Some(new)) => debug!("Rewrote a redirect from {old:?} to {new:?}"),
+                _ => debug!("Rewrote a redirect"),
+            }
         }
     }
 
@@ -731,6 +734,21 @@ pub async fn proxy_websocket_request(
     })
 }
 
+/// The line logged when the target accepts a WebSocket upgrade. The address
+/// goes through [`upstream_uri_for_log`]: no query value and no userinfo of
+/// the target's URL reaches the log.
+fn websocket_upgrade_message(status: StatusCode, uri: &Uri) -> String {
+    format!("{:?} {:?} - WebSocket", status, upstream_uri_for_log(uri))
+}
+
+/// A redirect's `Location` for logs, with its query values redacted, or
+/// `None` when it is not an address `http::Uri` accepts: such a value is not
+/// logged at all. A fragment is never logged.
+fn redirect_for_log(value: &HeaderValue) -> Option<String> {
+    let uri: Uri = value.to_str().ok()?.parse().ok()?;
+    Some(upstream_uri_for_log(&uri))
+}
+
 /// Remove the username/password from the URL before using it for the Host header
 fn extract_basic_auth(uri: Uri) -> anyhow::Result<(Option<HeaderValue>, Uri)> {
     let uri_authority = uri
@@ -815,7 +833,10 @@ async fn proxy_ws_inner(
         }
     };
 
-    tracing::info!("{:?} {:?} - WebSocket", client_response.status(), uri);
+    tracing::info!(
+        "{}",
+        websocket_upgrade_message(client_response.status(), &uri)
+    );
 
     // poem drives the upgraded stream after this handler has returned, so the
     // request span is carried over explicitly; the database log layer keeps
@@ -1003,6 +1024,42 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The line logged for a WebSocket upgrade shows the status, the path and
+    /// the query keys, and never a query value or the target's credentials.
+    #[test]
+    fn a_websocket_upgrade_is_logged_without_query_values() {
+        let uri: Uri = "wss://user:pa55@app.example:8443/socket?access_token=s3cr3t&room=7"
+            .parse()
+            .unwrap();
+        let line = websocket_upgrade_message(StatusCode::SWITCHING_PROTOCOLS, &uri);
+        assert_eq!(
+            line,
+            r#"101 "wss://app.example:8443/socket?access_token=redacted&room=redacted" - WebSocket"#
+        );
+        for secret in ["s3cr3t", "pa55", "=7"] {
+            assert!(!line.contains(secret), "{line}");
+        }
+    }
+
+    /// A rewritten redirect's `Location` is logged without query values; one
+    /// `http::Uri` does not accept is not logged.
+    #[test]
+    fn a_redirect_is_logged_without_query_values() {
+        let value = HeaderValue::from_static("/cb?code=s3cr3t&state=x");
+        assert_eq!(
+            redirect_for_log(&value).as_deref(),
+            Some("/cb?code=redacted&state=redacted")
+        );
+        let with_fragment = HeaderValue::from_static("/@warpgate#/login?next=s3cr3t");
+        assert!(
+            !redirect_for_log(&with_fragment)
+                .unwrap_or_default()
+                .contains("s3cr3t")
+        );
+        let not_an_address = HeaderValue::from_static("not an address?token=s3cr3t");
+        assert_eq!(redirect_for_log(&not_an_address), None);
+    }
 
     /// The header steps `proxy_normal_request` and `proxy_ws_inner` both run,
     /// in their order: the caller's headers, Warpgate's identity headers, the

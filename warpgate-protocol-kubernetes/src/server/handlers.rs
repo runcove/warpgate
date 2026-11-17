@@ -18,7 +18,7 @@ use warpgate_common::http_headers::ForwardFilter;
 use warpgate_common::{TargetKubernetesOptions, WarpgateError};
 use warpgate_common_http::auth::UnauthenticatedRequestContext;
 use warpgate_common_http::logging::{
-    get_client_ip, log_request_error, log_request_result, span_for_request,
+    get_client_ip, log_request_error, log_request_result, span_for_request, upstream_uri_for_log,
 };
 use warpgate_core::logging::KubernetesAuditSubject;
 use warpgate_core::recordings::{TerminalRecorder, TerminalRecordingStreamId};
@@ -30,6 +30,7 @@ use crate::recording::{start_recording_api, start_recording_exec};
 use crate::server::UpstreamClientCache;
 use crate::server::auth::{
     KubernetesIdentity, authenticate_kubernetes_user, create_authenticated_client, unauthorized,
+    url_for_log,
 };
 
 /// A client-supplied impersonation header (`Impersonate-User`,
@@ -117,7 +118,7 @@ pub async fn handle_api_request(
     ctx: Data<&UnauthenticatedRequestContext>,
 ) -> Result<Response, poem::Error> {
     debug!(
-        full_uri = %req.uri(),
+        full_uri = %upstream_uri_for_log(req.uri()),
         "Handling Kubernetes API request"
     );
 
@@ -304,7 +305,7 @@ async fn _handle_normal_request_inner(
 
     debug!(
         "Target Kubernetes options: cluster_url={}, auth={:?}",
-        k8s_options.cluster_url,
+        url_for_log(&k8s_options.cluster_url),
         match &k8s_options.auth {
             warpgate_common::KubernetesTargetAuth::Token(_) => "Token",
             warpgate_common::KubernetesTargetAuth::Certificate(_) => "Certificate",
@@ -405,7 +406,7 @@ async fn _handle_normal_request_inner(
     // Debug logging for upstream request
     debug!(
         method = method,
-        url = %full_url,
+        url = %url_for_log(full_url.as_str()),
         headers = ?redacted_headers,
         body_size = body_bytes.len(),
         "Sending request to upstream Kubernetes API"
@@ -447,7 +448,7 @@ async fn _handle_normal_request_inner(
 
     debug!(
         method = method,
-        url = %full_url,
+        url = %url_for_log(full_url.as_str()),
         status = %status,
         response_headers = ?response_headers,
         "Received response from upstream Kubernetes API"

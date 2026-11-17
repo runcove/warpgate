@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::net::{IpAddr, ToSocketAddrs};
 
 use poem::http::{Method, StatusCode, Uri};
@@ -66,28 +65,53 @@ pub async fn span_for_request(
     })
 }
 
-/// The request URI for logs: a `warpgate-ticket` query value is a credential.
-pub fn redacted_uri(uri: &Uri) -> String {
-    let Some(query) = uri.query() else {
-        return uri.to_string();
-    };
-    let is_ticket = |key: &str| key == "warpgate-ticket";
-    if !form_urlencoded::parse(query.as_bytes()).any(|(key, _)| is_ticket(&key)) {
-        return uri.to_string();
+/// What replaces a query value in a logged address.
+const REDACTED: &str = "redacted";
+
+/// A pair that is not `key=value`: no `=` at all, or only base64 padding after
+/// the name, so the "key" is the credential itself.
+fn is_bare_token(pair: &str) -> bool {
+    match pair.split_once('=') {
+        None => true,
+        Some((_, rest)) => !rest.is_empty() && rest.bytes().all(|b| b == b'='),
     }
-    let query = form_urlencoded::Serializer::new(String::new())
-        .extend_pairs(
-            form_urlencoded::parse(query.as_bytes()).map(|(key, value)| {
-                let value = if is_ticket(&key) {
-                    Cow::Borrowed("redacted")
-                } else {
-                    value
-                };
-                (key, value)
-            }),
-        )
-        .finish();
-    format!("{}?{query}", uri.path())
+}
+
+/// The request URI for logs. Query values are credentials as often as not (a
+/// ticket, an application's own access token), so every value is replaced by
+/// `redacted` and only the keys are kept: `/app?a=1&b=2` is logged as
+/// `/app?a=redacted&b=redacted`. A pair with no `=`, or with only base64
+/// padding after the name, is replaced whole: the query of some applications
+/// is a bare token. Scheme, host and path are
+/// logged as they came in, and a fragment is never logged.
+pub fn redacted_uri(uri: &Uri) -> String {
+    let full = uri.to_string();
+    let without_fragment = full.split('#').next().unwrap_or_default();
+    let Some(query) = uri.query().filter(|query| !query.is_empty()) else {
+        return without_fragment.to_owned();
+    };
+    let base = without_fragment
+        .split_once('?')
+        .map_or(without_fragment, |(base, _)| base);
+    let query = query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| {
+            if is_bare_token(pair) {
+                return REDACTED.to_owned();
+            }
+            form_urlencoded::parse(pair.as_bytes()).next().map_or_else(
+                || REDACTED.to_owned(),
+                |(key, _)| {
+                    form_urlencoded::Serializer::new(String::new())
+                        .append_pair(&key, REDACTED)
+                        .finish()
+                },
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("{base}?{query}")
 }
 
 #[cfg(test)]
@@ -99,16 +123,16 @@ mod tests {
         let uri: Uri = "/app/x?a=1&warpgate-ticket=s3cret&b=2".parse().unwrap();
         assert_eq!(
             redacted_uri(&uri),
-            "/app/x?a=1&warpgate-ticket=redacted&b=2"
+            "/app/x?a=redacted&warpgate-ticket=redacted&b=redacted"
         );
         let plain: Uri = "/app/x?a=1".parse().unwrap();
-        assert_eq!(redacted_uri(&plain), "/app/x?a=1");
+        assert_eq!(redacted_uri(&plain), "/app/x?a=redacted");
     }
 }
 
 /// An upstream address for logs. A target's URL can carry its credentials
-/// (`https://user:password@host/`), so the userinfo is left out, and a ticket
-/// in the query is redacted as in [`redacted_uri`].
+/// (`https://user:password@host/`), so the userinfo is left out, and the query
+/// values are redacted as in [`redacted_uri`].
 pub fn upstream_uri_for_log(uri: &Uri) -> String {
     let Some((_, host)) = uri.authority().and_then(|a| a.as_str().rsplit_once('@')) else {
         return redacted_uri(uri);
@@ -176,7 +200,10 @@ mod log_line_tests {
             }));
         }
         for line in lines {
-            assert!(line.contains("/app?a=1&warpgate-ticket=redacted"), "{line}");
+            assert!(
+                line.contains("/app?a=redacted&warpgate-ticket=redacted"),
+                "{line}"
+            );
             assert!(!line.contains(SECRET), "{line}");
         }
     }
@@ -203,18 +230,53 @@ mod log_line_tests {
         }
     }
 
-    /// An address without the parameter is logged exactly as it came in.
+    /// Every query value is a possible credential, not only a ticket's: the
+    /// keys are logged, the values never are.
     #[test]
-    fn a_uri_without_a_ticket_is_logged_unchanged() {
-        for uri in [
-            "/",
-            "/app?a=1&b=two%20words",
-            "/app?q=warpgate-ticket",
-            "/app?not-warpgate-ticket=1&warpgate-tickets=2",
-            "/app?warpgate-target=app",
+    fn a_logged_uri_has_no_query_value() {
+        for (uri, expected) in [
+            ("/app?a=1&b=two%20words", "/app?a=redacted&b=redacted"),
+            ("/ws?access_token=s3cr3t", "/ws?access_token=redacted"),
+            // a key with an empty value, and the same key repeated
+            ("/app?a=&b=", "/app?a=redacted&b=redacted"),
+            (
+                "/app?k=one&k=two&k=three",
+                "/app?k=redacted&k=redacted&k=redacted",
+            ),
+            // percent-encoded keys are logged decoded, values never
+            (
+                "/app?our%20key=v&a%2Db=w",
+                "/app?our+key=redacted&a-b=redacted",
+            ),
+            // a pair with no `=` may be a bare token: it is replaced whole
+            ("/app?eyJhIjoxfQ&flag", "/app?redacted&redacted"),
+            ("/app?eyJhIjoxfQ==&a=1", "/app?redacted&a=redacted"),
+            // scheme, host and path are kept
+            (
+                "https://app.example:8443/a/b?t=s3cr3t",
+                "https://app.example:8443/a/b?t=redacted",
+            ),
+            ("/a/b/", "/a/b/"),
         ] {
             let parsed: Uri = uri.parse().unwrap();
-            assert_eq!(redacted_uri(&parsed), uri);
+            assert_eq!(redacted_uri(&parsed), expected, "{uri}");
+        }
+    }
+
+    /// A fragment is never logged, whether `http::Uri` keeps it in the path
+    /// or in the query.
+    #[test]
+    fn a_logged_uri_has_no_fragment() {
+        for uri in [
+            "/app?a=1#frag=secret",
+            "/app#frag=secret",
+            "/app?#frag=secret",
+        ] {
+            let parsed: Uri = uri.parse().unwrap();
+            let logged = redacted_uri(&parsed);
+            assert!(!logged.contains("frag"), "{uri} logged as {logged}");
+            assert!(!logged.contains("secret"), "{uri} logged as {logged}");
+            assert!(!logged.contains('#'), "{uri} logged as {logged}");
         }
     }
 
@@ -226,7 +288,7 @@ mod log_line_tests {
         for (uri, expected) in [
             (
                 format!("https://user:{PASSWORD}@app.example:8443/x?a=1"),
-                "https://app.example:8443/x?a=1".to_owned(),
+                "https://app.example:8443/x?a=redacted".to_owned(),
             ),
             (
                 format!("http://{PASSWORD}@app.example/"),
