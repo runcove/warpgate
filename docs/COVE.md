@@ -292,8 +292,12 @@ frames ahead of the recorder when a write fails. With S3 storage, the upload
 is pushed in 5 MiB parts and completed when the recording ends, so a push
 failure is only seen at a part push or at that final push. A failure at the
 final push comes after the recording's last write: it is logged and counted,
-but for the Kubernetes API, where each request has its own recording, it
-does not refuse the session's later requests (a known limit). In native RDP,
+and the recording's local scratch copy is kept. The Kubernetes API is a known
+limit here: each API request has its own recording, usually far smaller than
+one part, so with S3 storage nothing of it reaches S3 until that final push,
+after the response, and an S3 failure is only seen then. It is logged and
+counted and the scratch copy is kept, but the session's later requests are
+not refused and go on. In native RDP,
 frames already queued for the viewer still reach it: up to 16 in the queue
 into Warpgate's viewer-facing RDP server and up to 256 display updates in the
 queue behind it, inside that server. The target connection is cut off at
