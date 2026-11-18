@@ -563,7 +563,10 @@ pub fn page_auth<E: Endpoint + 'static>(e: E) -> impl Endpoint {
                 // to the resolved public target. `_inner_auth`'s SSO step-up
                 // logic is gated on `Session(User { .. })` and so is also
                 // skipped.
-                let (req, auth) = onto_public_target_session(req, target_id);
+                let checked = req
+                    .data::<AuthenticatedRequestContext>()
+                    .map(|actx| actx.auth.clone());
+                let (req, auth) = onto_public_target_session(req, target_id, checked.as_ref());
                 let synthetic_ctx = ctx.to_authenticated(RequestAuthorization::Session(auth));
                 return Ok(ep.data(synthetic_ctx).call(req).await?.into_response());
             }
@@ -782,12 +785,18 @@ fn onto_throwaway_public_session(mut req: Request, target_id: Uuid) -> Request {
 /// Picks the session and the target-scoped authorization a public-target
 /// request is served under.
 ///
-/// A visitor whose cookie session is logged in as a user keeps that session:
-/// the proxied request carries their username, and the target session opens
-/// under their own user session. The authorization is a `Ticket` for the
-/// target in their name, so the catchall's Ticket arm skips the role check
-/// and the target session is stamped with the same user the session already
-/// holds. Nothing is written to their session.
+/// The visitor is named only by `checked`, the authorization
+/// [`inject_request_authorization`] accepted for this request on this host,
+/// never by what the cookie session holds: on a host bound to a target that
+/// is the target-host session handed off for this target and host
+/// ([`BoundSessionAuthorization::counts_on`]), and never a control-plane
+/// sign-in, which counts on no bound host.
+///
+/// A visitor accepted as a user keeps their session: the proxied request
+/// carries their username, and the target session opens under their own user
+/// session. The authorization is a `Ticket` for the target in their name, so
+/// the catchall's Ticket arm skips the role check and the target session is
+/// stamped with the same user. Nothing is written to their session.
 ///
 /// A visitor holding a ticket issued for this same target keeps its own
 /// session too, whether the ticket came in a header (a temporary session keyed
@@ -797,13 +806,33 @@ fn onto_throwaway_public_session(mut req: Request, target_id: Uuid) -> Request {
 /// id stays attached to it. A ticket is scoped to the one target it was
 /// issued for, so a ticket for any other target asserts no identity here.
 ///
-/// Anyone else (anonymous, or holding a ticket for a different target) is
-/// moved onto the throwaway `<public>` session.
-fn onto_public_target_session(req: Request, target_id: Uuid) -> (Request, SessionAuthorization) {
-    let visitor = req
-        .extensions()
-        .get::<Session>()
-        .and_then(SessionExt::get_auth);
+/// Anyone else (anonymous, a session not accepted here, a session that
+/// would name someone other than `checked` upstream, or a ticket for a
+/// different target) is moved onto the throwaway `<public>` session.
+fn onto_public_target_session(
+    req: Request,
+    target_id: Uuid,
+    checked: Option<&RequestAuthorization>,
+) -> (Request, SessionAuthorization) {
+    // The proxy names the user the request's session holds (its own
+    // authorization, else its target-host one), so a visitor is kept on
+    // that session only when it names the same user as `checked`.
+    let session_user = req.extensions().get::<Session>().and_then(|session| {
+        session
+            .get_auth()
+            .or_else(|| {
+                session
+                    .get_bound_auth()
+                    .map(|bound| bound.as_session_authorization())
+            })
+            .map(|auth| auth.user_id())
+    });
+    let visitor = match checked {
+        Some(RequestAuthorization::Session(auth)) if session_user == Some(auth.user_id()) => {
+            Some(auth.clone())
+        }
+        _ => None,
+    };
     match visitor {
         Some(SessionAuthorization::User { user_id, username }) => (
             req,
@@ -2006,9 +2035,69 @@ mod public_session_tests {
     use uuid::Uuid;
     use warpgate_common_http::SessionAuthorization;
 
-    use super::{SessionExt, onto_public_target_session, public_session_authorization};
+    use warpgate_common_http::RequestAuthorization;
+
+    use super::{SessionExt, public_session_authorization};
     use crate::middleware::ticket::{TemporaryTicketSession, ticket_session_key};
     use crate::proxy::upstream_headers_for_test;
+
+    /// [`super::onto_public_target_session`] with the authorization the
+    /// request's session holds, as `inject_request_authorization` accepts it
+    /// on a host where that session counts.
+    fn onto_public_target_session(
+        req: Request,
+        target_id: Uuid,
+    ) -> (Request, SessionAuthorization) {
+        let checked = req
+            .extensions()
+            .get::<Session>()
+            .and_then(SessionExt::get_auth)
+            .map(RequestAuthorization::Session);
+        super::onto_public_target_session(req, target_id, checked.as_ref())
+    }
+
+    /// The visitor is named by the authorization accepted for the request,
+    /// never by what its session holds: a session signed in as a user, or
+    /// holding a ticket for this target, that was not accepted here (as a
+    /// control-plane sign-in is not on a target's own host) is served as
+    /// `<public>` on the throwaway session, and its own session is left
+    /// alone.
+    #[tokio::test]
+    async fn a_session_not_accepted_here_names_no_one() {
+        for held in [
+            SessionAuthorization::User {
+                user_id: user_id_of("alice"),
+                username: "alice".into(),
+            },
+            SessionAuthorization::Ticket {
+                user_id: user_id_of("alice"),
+                username: "alice".into(),
+                target_id: TARGET,
+                ticket_id: Some(TICKET),
+            },
+        ] {
+            let session = Session::default();
+            session.set_auth(held.clone());
+
+            // Not accepted at all, or accepted as someone the session does
+            // not name upstream.
+            let bob = RequestAuthorization::Session(SessionAuthorization::User {
+                user_id: user_id_of("bob"),
+                username: "bob".into(),
+            });
+            for checked in [None, Some(&bob)] {
+                let mut req = Request::builder().finish();
+                req.extensions_mut().insert(session.clone());
+
+                let (req, auth) = super::onto_public_target_session(req, TARGET, checked);
+
+                assert!(auth.user_id().is_nil(), "{held:?} {checked:?}: {auth:?}");
+                assert_eq!(session_key(&req), Some((Uuid::nil(), TARGET, None)));
+                let upstream = upstream_headers_for_test(&req).await;
+                assert_eq!(warpgate_headers(&upstream), Vec::<String>::new());
+            }
+        }
+    }
 
     const TARGET: Uuid = Uuid::from_u128(7);
     const OTHER_TARGET: Uuid = Uuid::from_u128(8);

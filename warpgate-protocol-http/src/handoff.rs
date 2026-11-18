@@ -1654,6 +1654,8 @@ mod tests {
             use crate::test_db::insert_user;
 
             const CONTROL_PLANE: &str = "warp.example";
+            /// The user a ticket in these tests was issued to.
+            const TICKET_USER: Uuid = Uuid::from_u128(7);
 
             /// Signs the browser in on the control plane as `user`, with its
             /// last sign-in at the unix time `stamp`.
@@ -1782,6 +1784,35 @@ mod tests {
                     .at(
                         "/upstream",
                         get(upstream).around(crate::common::inject_request_authorization),
+                    )
+                    // A proxied page wrapped as the catchall is in production
+                    // (`lib.rs`): the public-target bypass, then the auth gate.
+                    .at(
+                        "/gated-upstream",
+                        crate::common::page_auth(upstream)
+                            .around(crate::common::inject_request_authorization),
+                    )
+                    // The same, for a browser holding a ticket in `x-test-ticket`
+                    // (the target id it was issued for), as `TicketMiddleware`
+                    // leaves a header ticket: on a temporary session of its own.
+                    .at(
+                        "/ticket-gated-upstream",
+                        crate::common::page_auth(upstream)
+                            .around(crate::common::inject_request_authorization)
+                            .around(|ep, mut req| async move {
+                                let target_id: Uuid =
+                                    req.header("x-test-ticket").unwrap().parse().unwrap();
+                                let session = Session::default();
+                                session.set_auth(SessionAuthorization::Ticket {
+                                    user_id: TICKET_USER,
+                                    username: "ticket-user".into(),
+                                    target_id,
+                                    ticket_id: Some(Uuid::new_v4()),
+                                });
+                                req.extensions_mut().insert(session);
+                                req.set_data(crate::middleware::ticket::TemporaryTicketSession);
+                                ep.call(req).await.map(IntoResponse::into_response)
+                            }),
                     )
                     .at(format!("/@warpgate{START_PATH}"), start)
                     .at(format!("/@warpgate{REDEEM_PATH}"), get(redeem_endpoint))
@@ -2193,6 +2224,144 @@ mod tests {
                     .await;
                 resp.assert_status_is_ok();
                 resp.assert_text(format!("user-{user}/user")).await;
+            }
+
+            /// [`bound_target`], but `public: true`: as cove's own web target
+            /// is, bound to a host of its own.
+            async fn public_bound_target(db: &DatabaseConnection) -> Uuid {
+                let id = Uuid::new_v4();
+                Target::ActiveModel {
+                    id: Set(id),
+                    name: Set(format!("target-{id}")),
+                    description: Set(String::new()),
+                    kind: Set(TargetKind::Http),
+                    options: Set(serde_json::json!({
+                        "http": {"url": "http://h", "external_host": HOST, "public": true}
+                    })),
+                    rate_limit_bytes_per_second: Set(None),
+                    group_id: Set(None),
+                    ticket_max_duration_seconds: Set(None),
+                    ticket_requests_disabled: Set(false),
+                    ticket_require_approval: Set(false),
+                    ticket_max_uses: Set(None),
+                    require_approval: Set(false),
+                }
+                .insert(db)
+                .await
+                .unwrap();
+                id
+            }
+
+            /// `/gated-upstream` on `host`: the status and the identity the
+            /// target was sent, `username/type`.
+            async fn gated_on(
+                cli: &TestClient<impl poem::Endpoint>,
+                host: &str,
+                cookie: Option<&str>,
+            ) -> (StatusCode, String) {
+                let mut req = cli
+                    .get("/gated-upstream")
+                    .header("host", host)
+                    .header("accept", "text/html")
+                    .header("sec-fetch-mode", "navigate");
+                if let Some(cookie) = cookie {
+                    req = req.header("cookie", cookie);
+                }
+                let resp = req.send().await;
+                let status = resp.0.status();
+                (status, resp.0.into_body().into_string().await.unwrap())
+            }
+
+            /// Control for the public case below: through the production
+            /// wrapping, a handed-off browser on a non-public bound host is
+            /// served as its user.
+            #[tokio::test]
+            async fn a_gated_bound_host_request_names_its_handed_off_user() {
+                let db = memory_db().await;
+                let target = bound_target(&db).await;
+                let user = user_for(&db, target).await;
+                let cli = TestClient::new(app(db.clone()).await);
+                let (control, _, _) = signed_in(&cli, &db, target, user, 10).await;
+                let bound = hand_off(&cli, &db, &control, user, target, HOST).await;
+
+                let (status, seen) = gated_on(&cli, HOST, Some(&bound)).await;
+                assert_eq!(status, StatusCode::OK, "{seen}");
+                assert_eq!(seen, format!("user-{user}/user"));
+            }
+
+            /// An anonymous navigation on a public target's own host is served
+            /// as `<public>` (no identity sent), not sent through a handoff:
+            /// a sign-in there starts only at the begin route.
+            #[tokio::test]
+            async fn an_anonymous_public_bound_host_navigation_is_served_as_public() {
+                let db = memory_db().await;
+                public_bound_target(&db).await;
+                let cli = TestClient::new(app(db.clone()).await);
+
+                let (status, seen) = gated_on(&cli, HOST, None).await;
+                assert_eq!(status, StatusCode::OK, "{seen}");
+                assert_eq!(seen, "-/-");
+            }
+
+            /// A browser handed off to a public target's own host is served
+            /// there as its user: the public-target bypass names the identity
+            /// `inject_request_authorization` accepted from the target-host
+            /// session (`common::onto_public_target_session`).
+            #[tokio::test]
+            async fn a_public_bound_host_request_names_its_handed_off_user() {
+                let db = memory_db().await;
+                let target = public_bound_target(&db).await;
+                let user = user_for(&db, target).await;
+                let cli = TestClient::new(app(db.clone()).await);
+                let (control, _, _) = signed_in(&cli, &db, target, user, 10).await;
+                let bound = hand_off(&cli, &db, &control, user, target, HOST).await;
+
+                let (status, seen) = gated_on(&cli, HOST, Some(&bound)).await;
+                assert_eq!(status, StatusCode::OK, "{seen}");
+                assert!(
+                    seen.starts_with(&format!("user-{user}/")),
+                    "a handed-off browser on a public bound host was served as {seen:?}"
+                );
+            }
+
+            /// The control-plane session, presented on a public target's own
+            /// host (no cookie gate in this app), names no one there:
+            /// `inject_request_authorization` drops it, and the public-target
+            /// bypass does not read it back from the raw session.
+            #[tokio::test]
+            async fn a_control_plane_session_names_no_one_on_a_public_bound_host() {
+                let db = memory_db().await;
+                let target = public_bound_target(&db).await;
+                let user = user_for(&db, target).await;
+                let cli = TestClient::new(app(db.clone()).await);
+                let (control, _, _) = signed_in(&cli, &db, target, user, 10).await;
+
+                let (status, seen) = gated_on(&cli, HOST, Some(&control)).await;
+                assert_eq!(status, StatusCode::OK, "{seen}");
+                assert_eq!(seen, "-/-", "the control-plane session named its user");
+            }
+
+            /// A ticket for a public target, on its own host, names its user
+            /// there (`ticket`); a ticket for another target names no one.
+            #[tokio::test]
+            async fn a_ticket_names_its_user_on_its_own_public_bound_host_only() {
+                let db = memory_db().await;
+                let target = public_bound_target(&db).await;
+                let cli = TestClient::new(app(db.clone()).await);
+                for (ticket_target, expected) in
+                    [(target, "ticket-user/ticket"), (Uuid::new_v4(), "-/-")]
+                {
+                    let resp = cli
+                        .get("/ticket-gated-upstream")
+                        .header("host", HOST)
+                        .header("accept", "text/html")
+                        .header("sec-fetch-mode", "navigate")
+                        .header("x-test-ticket", ticket_target.to_string())
+                        .send()
+                        .await;
+                    resp.assert_status_is_ok();
+                    resp.assert_text(expected).await;
+                }
             }
 
             /// Handed off to two hosts, each served by a node of its own, a
