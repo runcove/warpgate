@@ -499,6 +499,34 @@ mod tests {
         assert_eq!(cookie.max_age(), Some(cookie::time::Duration::seconds(60)));
     }
 
+    /// On HTTPS the session cookie leaves `SameSite=Lax` whatever attribute
+    /// or `Domain` it was minted with, on every host.
+    #[test]
+    fn unit_gate_https_session_cookie_is_always_lax() {
+        for set in [
+            "warpgate-http-session=S; Path=/",
+            "warpgate-http-session=S; Path=/; SameSite=None",
+            "warpgate-http-session=S; Path=/; SameSite=Strict",
+            "warpgate-http-session=S; Path=/; SameSite=Lax",
+            "warpgate-http-session=S; Domain=.warp.example; Path=/; SameSite=None",
+            "warpgate-http-session=S; Domain=localhost; Path=/",
+        ] {
+            let out = gate_set_cookie(set, HTTPS).unwrap().unwrap();
+            let cookie = Cookie::parse(out).unwrap();
+            assert_eq!(cookie.same_site(), Some(SameSite::Lax), "{set}");
+        }
+    }
+
+    /// The cookie as `ServerSession` mints it, before the gate: `Lax` on
+    /// every listener and host.
+    #[test]
+    fn unit_minted_session_cookie_is_lax() {
+        let jar = poem::web::cookie::CookieJar::default();
+        crate::common::session_cookie_config().set_cookie_value(&jar, "v");
+        let c = jar.get(SESSION_COOKIE_NAME).expect("session cookie set");
+        assert_eq!(c.same_site(), Some(SameSite::Lax));
+    }
+
     #[test]
     fn unit_gate_leaves_other_set_cookies_alone() {
         assert_eq!(gate_set_cookie("a=1; Path=/", HTTPS), None);
