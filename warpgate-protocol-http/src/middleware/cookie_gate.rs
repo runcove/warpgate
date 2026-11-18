@@ -160,10 +160,10 @@ fn gate_request_cookies<S: AsRef<[u8]>>(
             if pair.is_empty() {
                 continue;
             }
-            let (name, cookie_value) = match pair.iter().position(|byte| *byte == b'=') {
-                Some(at) => (&pair[..at], &pair[at + 1..]),
-                None => (pair, &[][..]),
-            };
+            // The name, and the value after the first `=` (none without one).
+            let mut parts = pair.splitn(2, |byte| *byte == b'=');
+            let name = parts.next().unwrap_or_default();
+            let cookie_value = parts.next().unwrap_or_default();
             let name = String::from_utf8_lossy(name);
             if !is_warpgate_cookie_name(&name) {
                 others.push(pair);
@@ -393,6 +393,19 @@ mod tests {
             Some("warpgate-http-session=S; a=1; b=2")
         );
         assert!(!g.legacy && g.duplicates.is_empty());
+    }
+
+    /// A pair splits at its first `=`: the rest, `=` included, is the
+    /// value, and a pair without one is a name with an empty value.
+    #[test]
+    fn unit_gate_splits_a_pair_at_its_first_equals_sign() {
+        let g = gated("a=1=2; __Host-warpgate-http-session=S=x; b", HTTPS);
+        assert_eq!(
+            joined(&g).as_deref(),
+            Some("warpgate-http-session=S=x; a=1=2; b")
+        );
+        let g = gated("__Host-warpgate-http-session; b=2", HTTPS);
+        assert_eq!(joined(&g).as_deref(), Some("warpgate-http-session=; b=2"));
     }
 
     #[test]
