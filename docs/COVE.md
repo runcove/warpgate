@@ -481,6 +481,19 @@ cookie is a `__Host-` cookie, which that listener neither reads nor sets), so
 the browser never gets a session on the target's host there. This fails
 closed: the target is not served as the signed-in user.
 
+## Sign-in handoff limits
+
+Each step of a handoff is rate-limited per client address, on each node.
+
+- Behind a reverse proxy or tunnel that connects to Warpgate from 127.0.0.1
+  (nginx, cloudflared), every client has that one address, so all of them
+  share one rate-limit bucket. On such a deployment set
+  `http.client_ip_header` to the header the proxy fills with the client's
+  address (for example `CF-Connecting-IP` behind cloudflared).
+- One target host's share of the handoff store is small: a handful of client
+  addresses (about 5 to 9) opening handoffs as fast as the rate limit allows
+  can block new sign-ins to that host until their entries expire.
+
 ## Rolling back to the previous release
 
 The way back from this release is to deploy the previous release,
