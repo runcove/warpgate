@@ -24,8 +24,10 @@
 //!
 //! Challenge and token travel in a URL's query: both are single-use and
 //! short-lived, the redirects that carry them say `Referrer-Policy:
-//! no-referrer`, and the request log and the proxy never see the token
-//! ([`HANDOFF_TOKEN_PARAM`] is scrubbed like the ticket parameter).
+//! no-referrer`. Log lines hold no query value
+//! (`warpgate_common_http::logging::redacted_uri`), so neither appears in
+//! the request log, and the proxy strips [`HANDOFF_TOKEN_PARAM`] as it
+//! strips the ticket parameter, so the target never sees the token.
 
 use std::net::IpAddr;
 use std::num::NonZeroU32;
@@ -80,8 +82,9 @@ pub const BEGIN_NEXT_PARAM: &str = "next";
 pub const START_PATH: &str = "/handoff/start";
 /// The bound host's redeem route, under `/@warpgate`.
 pub const REDEEM_PATH: &str = "/handoff";
-/// The query parameter carrying the challenge to [`START_PATH`] (redacted
-/// from logs there, as the token is everywhere).
+/// The query parameter carrying the challenge to [`START_PATH`]. Log lines
+/// never hold its value, as they hold no query value
+/// (`warpgate_common_http::logging::redacted_uri`).
 pub const HANDOFF_CHALLENGE_PARAM: &str =
     warpgate_common_http::ticket_query::HANDOFF_CHALLENGE_QUERY_PARAM;
 /// The query parameter carrying the token to [`REDEEM_PATH`].
