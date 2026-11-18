@@ -10,8 +10,14 @@ return (`/@warpgate/api/sso/return`) sends the browser back to that `next`
 instead of to the `/@warpgate` login page.
 
 Only a safe `next` qualifies: a site-relative path starting with a single `/`
-(not `//`, not `/\`, not an absolute URL). The redirect goes to the origin the
-SSO return URL named, so `next` can never carry the browser off-site.
+(not `//`, not `/\`, not an absolute URL), and still one once
+percent-decoded, however many times it was encoded. A `next` is refused if
+any layer of it holds a backslash, an encoded `/` or `\` (`%2f`, `%5c`, in
+either case), a control character or an `@`, the one `@` allowed being the
+leading one of Warpgate's own `/@warpgate` path. The redirect goes to the
+origin the SSO return URL named, so `next` can never carry the browser
+off-site. The same check applies to the `next` of the sign-in handoff's
+begin route (see "Starting a sign-in from a target's host").
 
 ### Parameters
 
@@ -50,6 +56,41 @@ Warpgate logs the real underlying reason server-side.
   SSO process) has no `next` to return to and takes the fallback.
 - An existing Warpgate session cookie may survive a failed retry. Treat a
   request that arrives with `login_error` as a failure whatever the session says.
+
+## SSO sign-in returns to the control-plane host
+
+An SSO provider whose `return_url_domain` is `external_host` (the default)
+sends the browser back to the control-plane host, not to the global
+`external_host`. The control-plane host is `http.external_host` when it is
+set, otherwise `external_host`.
+
+- **The redirect URI Warpgate sends to the identity provider** is
+  `https://<control-plane host>[:<port>]/@warpgate/api/sso/return`. The port
+  is the one written in `http.external_host`, else `http.external_port`, else
+  the HTTP listener's port, and is left out when it is 443. (With a
+  `return_url_prefix` other than the default `@`, the path is
+  `/<prefix>warpgate/api/sso/return`.)
+- **What operators do on upgrade:** where `http.external_host` names a host
+  other than `external_host` (for example `warpgate.<base>` beside
+  `<base>`), register that redirect URI, on the control-plane host, with the
+  identity provider *before* taking the release, and keep the old one
+  (`https://<external_host>[:<port>]/@warpgate/api/sso/return`) registered
+  until you no longer need to roll back. Until the new URI is registered,
+  every SSO sign-in fails at the provider. Where `http.external_host` is
+  unset, nothing changes.
+- **A sign-in starts on the control-plane host only.** On any other host,
+  `GET /@warpgate/api/sso/providers/<name>/start` answers 400, and
+  `GET /@warpgate/api/sso/auto-start` sends the browser to that host's login
+  page instead of the provider. On a host bound to a web target neither
+  route exists (404; see "What a target's page can do on its own host"); a
+  browser there starts its sign-in through the handoff's begin route (see
+  "Starting a sign-in from a target's host").
+- **Where the browser lands afterwards:** the post-login redirect, and the
+  `login_error` redirect of an SSO failure (see "SSO failure"), go to the
+  control-plane host's origin, never to the host the visitor came from. A
+  `next` of `/cove/login` lands on `https://<control-plane host>/cove/login`.
+- Providers with `return_url_domain: host_header` are unchanged: they
+  return to the host the sign-in started on.
 
 ## Recordings a separate reader can read: `--recordings-keep-group-read`
 
@@ -458,6 +499,9 @@ browser's session there. Through that session the page can:
 - Sign that host's browser session out (`POST /@warpgate/api/auth/logout`).
   That ends the session on this host only; the control-plane sign-in and the
   sessions on other target hosts go on.
+- Send the browser to the handoff's begin route
+  (`/@warpgate/handoff/begin?next=<path>`), which starts a sign-in (see
+  "Starting a sign-in from a target's host").
 - Send the browser to the handoff's redeem route (`/@warpgate/handoff`). It
   signs a browser in, on this host only, with a token handed off for this
   host's target to that same browser.
@@ -483,6 +527,61 @@ cookie is a `__Host-` cookie, which that listener neither reads nor sets), so
 the browser never gets a session on the target's host there. This fails
 closed: the target is not served as the signed-in user.
 
+## Starting a sign-in from a target's host
+
+A browser on a host bound to a web target signs in on the control-plane
+host and is handed back. On a target that is not public this starts by
+itself: a navigation without a session there is sent through the handoff.
+A public target's pages are served without a sign-in, so nothing starts
+one; a page that wants its visitor signed in sends the browser to
+
+    GET /@warpgate/handoff/begin?next=<path>
+
+on its own host, as a top-level navigation over HTTPS.
+
+- `next` is the page on this host to come back to. It is checked as the SSO
+  `next` is (see "SSO failure"): a site-relative path, still one after
+  decoding. Any other `next`, or none, answers 400.
+- The route starts the same handoff an unauthenticated navigation starts: it
+  records the handoff, sets the `__Host-warpgate-handoff` cookie on this host
+  (Secure, HttpOnly, SameSite=Lax) and sends the browser to the control
+  plane's handoff start. It changes nothing else: no session is written or
+  ended.
+- The host the browser returns to is the target's configured
+  `external_host`, never one taken from the request (`Host`,
+  `X-Forwarded-Host` or any other header). Off a bound host the route answers
+  404.
+- On the control plane a browser that is not signed in goes to the login
+  page and comes back through the same handoff once it is. A user without
+  access to the target is refused there and gets no session on the target's
+  host. The handoff completes only in the browser that began it (the cookie
+  holds a nonce the redeem checks); it is single-use and lasts 120 seconds.
+- A request that is not a navigation, or not over HTTPS, gets 403.
+
+## Public web targets (`public: true`)
+
+A web target with `public: true` (and `require_approval: false`) is served
+on its own hostname without a sign-in. Who the target is told it is serving:
+
+- **An anonymous visitor** is served as `<public>`: an identity with the nil
+  user id, which no credential produces. The target receives no
+  `X-Warpgate-Username` and no `X-Warpgate-Authentication-Type` header. The
+  visitor's browser session is not changed and no cookie is set.
+- **A visitor with a session on this host from a handoff** (see "Starting a
+  sign-in from a target's host") is served as that session's user.
+- **A visitor signed in only on the control-plane host** is served as
+  `<public>`: a control-plane session never names anyone on a target's host,
+  even if it reaches it.
+- **A visitor holding a ticket for this target** is served as the ticket's
+  user (`X-Warpgate-Authentication-Type: ticket`). A ticket for another
+  target names no one here.
+- **An API token or the admin token** gets 401: tokens do not open web
+  targets.
+
+The identity named to a public target is only ever the one Warpgate checked
+for this host: the handoff session made for this target on this host, or a
+ticket for this target. Anyone else is `<public>`.
+
 ## Sign-in handoff limits
 
 Each step of a handoff is rate-limited per client address, on each node.
@@ -499,7 +598,7 @@ Each step of a handoff is rate-limited per client address, on each node.
 ## Rolling back to the previous release
 
 The way back from this release is to deploy the previous release,
-v0.30.2-cove.24. That release refuses to start on a database this release
+v0.30.2-cove.27. That release refuses to start on a database this release
 has migrated (`Migration file of version 'm00097_cove_http_sso_stamps' is
 missing`), so the database goes back first:
 
