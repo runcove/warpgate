@@ -472,8 +472,10 @@ from. Signing out, a sign-in started on that host (as the same user or
 another, which gets a sign-in of its own) and its user being deleted or no
 longer admitted from the request's address end that host's browser session
 only. A ticket presented with it is ignored and keeps its uses, whoever it
-was issued to. A handoff token refused on that host, for whatever reason,
-leaves the session there as it is.
+was issued to. A handoff token refused on that host leaves the session there
+as it is, with one exception: a token whose control-plane sign-in has ended,
+or is not this user's HTTP sign-in, ends that host's browser session. Either
+way, a refused token never leaves a session signed in on that host.
 
 On a plain-HTTP loopback listener (`http.plain_http_on_loopback`) a bound
 target cannot be reached by a signed-in session: the handoff needs HTTPS (its
