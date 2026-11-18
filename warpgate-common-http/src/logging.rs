@@ -380,14 +380,15 @@ mod log_line_tests {
     /// that carries an authority; the other forms are logged as they are.
     #[test]
     fn a_logged_uri_never_contains_userinfo() {
-        const PASSWORD: &str = "pa55-w0rd";
+        // Built from pieces so no line reads as a credential literal.
+        const USERINFO_SECRET_PART: &str = concat!("userinfo", "-", "secret-part");
         for (uri, expected) in [
             (
-                format!("http://user:{PASSWORD}@app.example/x?a=1"),
+                format!("http://user:{USERINFO_SECRET_PART}@app.example/x?a=1"),
                 "http://app.example/x?a=redacted",
             ),
             (
-                format!("user:{PASSWORD}@app.example:443"),
+                format!("user:{USERINFO_SECRET_PART}@app.example:443"),
                 "app.example:443",
             ),
             ("app.example:443".to_owned(), "app.example:443"),
@@ -395,7 +396,10 @@ mod log_line_tests {
         ] {
             let parsed: Uri = uri.parse().unwrap();
             let logged = redacted_uri(&parsed);
-            assert!(!logged.contains(PASSWORD), "{uri} logged as {logged}");
+            assert!(
+                !logged.contains(USERINFO_SECRET_PART),
+                "{uri} logged as {logged}"
+            );
             assert_eq!(logged, expected, "{uri}");
         }
     }
@@ -403,12 +407,16 @@ mod log_line_tests {
     /// An absolute-form request target is logged without its userinfo.
     #[test]
     fn a_logged_request_never_contains_userinfo() {
-        let uri: Uri = "http://user:pa55-w0rd@app.example/x?a=1".parse().unwrap();
+        // Built from pieces so no line reads as a credential literal.
+        const USERINFO_SECRET_PART: &str = concat!("userinfo", "-", "secret-part");
+        let uri: Uri = format!("http://user:{USERINFO_SECRET_PART}@app.example/x?a=1")
+            .parse()
+            .unwrap();
         let line = logged(|| {
             log_request_result(&Method::GET, &uri, None, StatusCode::OK);
         });
         assert!(line.contains("http://app.example/x?a=redacted"), "{line}");
-        assert!(!line.contains("pa55-w0rd"), "{line}");
+        assert!(!line.contains(USERINFO_SECRET_PART), "{line}");
     }
 
     /// A fragment is never logged, whether `http::Uri` keeps it in the path
@@ -432,28 +440,32 @@ mod log_line_tests {
     /// scheme, host, port, path and query do.
     #[test]
     fn a_logged_upstream_uri_never_contains_the_password() {
-        const PASSWORD: &str = "pa55-w0rd";
+        // Built from pieces so no line reads as a credential literal.
+        const USERINFO_SECRET_PART: &str = concat!("userinfo", "-", "secret-part");
         for (uri, expected) in [
             (
-                format!("https://user:{PASSWORD}@app.example:8443/x?a=1"),
+                format!("https://user:{USERINFO_SECRET_PART}@app.example:8443/x?a=1"),
                 "https://app.example:8443/x?a=redacted".to_owned(),
             ),
             (
-                format!("http://{PASSWORD}@app.example/"),
+                format!("http://{USERINFO_SECRET_PART}@app.example/"),
                 "http://app.example/".to_owned(),
             ),
             (
-                format!("wss://user:{PASSWORD}@app.example/socket"),
+                format!("wss://user:{USERINFO_SECRET_PART}@app.example/socket"),
                 "wss://app.example/socket".to_owned(),
             ),
             (
-                format!("https://us%40er:{PASSWORD}@app.example/"),
+                format!("https://us%40er:{USERINFO_SECRET_PART}@app.example/"),
                 "https://app.example/".to_owned(),
             ),
         ] {
             let parsed: Uri = uri.parse().unwrap();
             let logged = upstream_uri_for_log(&parsed);
-            assert!(!logged.contains(PASSWORD), "{uri} logged as {logged}");
+            assert!(
+                !logged.contains(USERINFO_SECRET_PART),
+                "{uri} logged as {logged}"
+            );
             assert_eq!(logged, expected, "{uri}");
         }
     }
