@@ -2614,6 +2614,55 @@ mod tests {
                 }
             }
 
+            /// The begin route takes only a `next` that is site-relative once
+            /// decoded ([`is_safe_redirect_target`]): any other, or none, is
+            /// refused and opens nothing. Not a navigation, it is refused too.
+            #[tokio::test]
+            async fn begin_refuses_a_next_that_is_not_site_relative() {
+                let db = memory_db().await;
+                public_bound_target(&db).await;
+                let cli = TestClient::new(begin_app(db.clone(), false).await);
+                for next in [
+                    None,
+                    Some(""),
+                    Some("page"),
+                    Some("//evil.example/"),
+                    Some("/\\evil.example/"),
+                    Some("/a\\b"),
+                    Some("/%2f/evil.example/"),
+                    Some("/%2F/evil.example/"),
+                    Some("%2F%2Fevil.example/"),
+                    Some("/%5cevil.example/"),
+                    Some("/%5C/evil.example/"),
+                    Some("/%252f/evil.example/"),
+                    Some("/%255c/evil.example/"),
+                    Some("/@evil.example/"),
+                    Some("/x@evil.example/"),
+                    Some("/%40evil.example/"),
+                    Some("https://evil.example/"),
+                    Some("javascript:alert(1)"),
+                    Some("/a\nb"),
+                    Some("/a\tb"),
+                    Some("/%0a"),
+                    Some("/%250a"),
+                ] {
+                    let resp = begin(&cli, HOST, next, &[]).await;
+                    resp.assert_status(StatusCode::BAD_REQUEST);
+                    assert!(set_cookies(&resp).is_empty(), "{next:?}");
+                }
+
+                // A fetch, not a navigation.
+                let resp = cli
+                    .get(format!("/@warpgate{BEGIN_PATH}?{BEGIN_NEXT_PARAM}=%2Fpage"))
+                    .header("host", HOST)
+                    .send()
+                    .await;
+                resp.assert_status(StatusCode::FORBIDDEN);
+                assert_eq!(set_cookies(&resp), Vec::<String>::new());
+
+                assert_eq!(HttpHandoff::Entity::find().all(&db).await.unwrap(), vec![]);
+            }
+
             /// An anonymous visitor on a public target's own host begins a
             /// sign-in, is sent to sign in on the control plane, comes back
             /// through the same handoff, and is then served as its user. The

@@ -548,17 +548,61 @@ fn next_with_login_error(next: &str, code: SsoLoginError, retry_after: Option<u6
     url
 }
 
+/// How many times [`is_safe_redirect_target`] percent-decodes a `next`
+/// looking for a form that is not site-relative. One that still decodes to
+/// something new after this many is refused.
+const REDIRECT_TARGET_DECODE_LAYERS: usize = 4;
+
 /// Only site-relative paths are accepted as post-login redirect targets. An
 /// absolute URL names its own authority, so allowing one would let `?next=`
 /// carry the user to another site with a freshly authenticated session — the
-/// origin is decided by the SSO return URL, never by the caller.
+/// origin is decided by the SSO return URL, never by the caller. The one
+/// check for every `next` Warpgate redirects to: the SSO paths' and the
+/// target-host handoff's begin route's (`crate::handoff::begin_endpoint`).
+///
+/// `next` and each layer it percent-decodes to must be site-relative
+/// ([`is_site_relative_layer`]), so an encoded `//`, `/\` or scheme cannot
+/// become one in a component that decodes it again.
 pub(crate) fn is_safe_redirect_target(next: &str) -> bool {
-    let Some(rest) = next.strip_prefix('/') else {
+    let mut layer = std::borrow::Cow::Borrowed(next);
+    for _ in 0..=REDIRECT_TARGET_DECODE_LAYERS {
+        if !is_site_relative_layer(&layer) {
+            return false;
+        }
+        let Ok(decoded) = percent_encoding::percent_decode_str(&layer).decode_utf8() else {
+            return false;
+        };
+        if decoded == layer {
+            return true;
+        }
+        layer = std::borrow::Cow::Owned(decoded.into_owned());
+    }
+    false
+}
+
+/// One layer of [`is_safe_redirect_target`]: a path starting with a single
+/// `/` (so no scheme and no authority), with no backslash, no encoded `/` or
+/// `\` (`%2f`, `%5c`), no control character, and no `@` other than the
+/// leading one of Warpgate's own `/@warpgate` pages. Browsers read both
+/// `//host` and `/\host` as protocol-relative authorities, so a leading slash
+/// alone doesn't make a path site-relative; an `@` is where an authority's
+/// user part ends.
+fn is_site_relative_layer(layer: &str) -> bool {
+    let Some(rest) = layer.strip_prefix('/') else {
         return false;
     };
-    // Browsers read both `//host` and `/\host` as protocol-relative
-    // authorities, so a leading slash alone doesn't make a path site-relative.
-    !rest.starts_with(['/', '\\'])
+    if rest.starts_with('/') || layer.contains('\\') || layer.chars().any(char::is_control) {
+        return false;
+    }
+    let lower = layer.to_ascii_lowercase();
+    if lower.contains("%2f") || lower.contains("%5c") {
+        return false;
+    }
+    let after_gateway = rest
+        .strip_prefix("@warpgate")
+        .filter(|after| after.is_empty() || after.starts_with(['/', '?', '#']))
+        .unwrap_or(rest);
+    !after_gateway.contains('@')
 }
 
 /// Resolves the post-login redirect against the origin the identity provider
@@ -992,6 +1036,76 @@ mod tests {
         // return URL, never from the caller.
         assert!(!is_safe_redirect_target("https://evil.com/path"));
         assert!(!is_safe_redirect_target("http://evil.com"));
+    }
+
+    /// A `next` stays site-relative however it is decoded: every form that
+    /// could name an authority, in any layer of percent-encoding, is refused.
+    #[test]
+    fn rejects_a_next_that_is_not_site_relative_once_decoded() {
+        for next in [
+            // Not a single leading `/`.
+            "",
+            "evil.com",
+            "//evil.com",
+            "/\\evil.com",
+            "\\\\evil.com",
+            // A backslash anywhere.
+            "/a\\b",
+            "/a/\\evil.com",
+            // An encoded `/` or `\`, either case, decoded or double-encoded.
+            "/%2fevil.com",
+            "/%2Fevil.com",
+            "%2F%2Fevil.com",
+            "/a%2fb",
+            "/%5cevil.com",
+            "/%5Cevil.com",
+            "/%252fevil.com",
+            "/%252F%252Fevil.com",
+            "%252F%252Fevil.com",
+            "/%255cevil.com",
+            "/%25252fevil.com",
+            // A user part.
+            "/@evil.com",
+            "/a@evil.com",
+            "/%40evil.com",
+            "/%2540evil.com",
+            "/@warpgate@evil.com",
+            "/@warpgateevil.com",
+            // A scheme.
+            "javascript:alert(1)",
+            "https://evil.com",
+            "%68ttps://evil.com",
+            // Control characters, raw and encoded.
+            "/a\nb",
+            "/a\tb",
+            "/\u{7f}",
+            "/%0a/evil.com",
+            "/%09/evil.com",
+            "/%00",
+            "/%250a",
+            // Not UTF-8 once decoded.
+            "/%ff",
+        ] {
+            assert!(!is_safe_redirect_target(next), "{next:?} was accepted");
+        }
+    }
+
+    /// The `next` the login page carries back to the handoff's start on the
+    /// control plane (`common::gateway_redirect` for the start's request)
+    /// stays accepted, as do Warpgate's own pages and ordinary page paths.
+    #[test]
+    fn accepts_the_handoff_start_and_warpgate_pages() {
+        for next in [
+            "/@warpgate",
+            "/@warpgate/handoff/start?challenge=0123456789abcdef",
+            "/@warpgate#/login",
+            "/@warpgate?x=1",
+            "/",
+            "/page?x=1&y=%20z",
+            "/cove/login#top",
+        ] {
+            assert!(is_safe_redirect_target(next), "{next:?} was refused");
+        }
     }
 
     #[test]
