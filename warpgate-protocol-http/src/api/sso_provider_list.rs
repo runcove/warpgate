@@ -250,6 +250,204 @@ async fn finish_sso_return(
     Ok(Ok(admitted_redirect))
 }
 
+/// What the SSO return keeps of its [`SsoContext`] once the provider's
+/// code is verified (verifying it consumes the request half).
+///
+/// [`SsoContext`]: crate::api::sso_provider_detail::SsoContext
+struct VerifiedSso {
+    provider: String,
+    next_url: Option<String>,
+    supports_single_logout: bool,
+    return_origin: String,
+}
+
+/// The SSO return from the provider's verified response on: matches the
+/// user, submits the credential, signs the session in and stamps it
+/// ([`crate::step_up::stamp_sso`]), then applies the provider's roles and
+/// groups ([`finish_sso_return`]).
+async fn complete_sso_return(
+    req: &Request,
+    session: &Session,
+    ctx: &UnauthenticatedRequestContext,
+    client_ip: Option<std::net::IpAddr>,
+    sso: &VerifiedSso,
+    response: SsoLoginResponse,
+    return_to: &Option<(String, String)>,
+) -> Result<Result<String, SsoFailure>, WarpgateError> {
+    let services = ctx.services();
+
+    if !response.email_verified.unwrap_or(true) {
+        error!(
+            "SSO login attempt with an unverified email: {:?}",
+            response.email
+        );
+        error!(
+            "The SSO provider did provide an email_verified claim, and it is false. Since the provider provides this claim, Warpgate requires the email to be verified."
+        );
+        return Ok(Err(SsoFailure::at(
+            return_to,
+            SsoLoginError::SsoFailed,
+            "The SSO account's e-mail is not verified",
+        )));
+    }
+
+    let Some(ref email) = response.email else {
+        return Ok(Err(SsoFailure::at(
+            return_to,
+            SsoLoginError::SsoFailed,
+            "No e-mail information in the SSO response",
+        )));
+    };
+
+    info!("SSO login as {email}");
+
+    let providers_config = ctx
+        .services()
+        .config
+        .lock()
+        .await
+        .store
+        .sso_providers
+        .clone();
+    let mut iter = providers_config.iter();
+    let Some(provider_config) = iter.find(|x| x.name == sso.provider) else {
+        return Ok(Err(SsoFailure::at(
+            return_to,
+            SsoLoginError::SsoFailed,
+            format!("No provider matching {}", sso.provider),
+        )));
+    };
+
+    let cred = AuthCredential::Sso {
+        provider: sso.provider.clone(),
+        email: email.clone(),
+    };
+
+    let username = services
+        .config_provider
+        .username_for_sso_credential(
+            &cred,
+            response.preferred_username.clone(),
+            provider_config.clone(),
+        )
+        .await?;
+    let Some(username) = username else {
+        let session_id = session_id_for_login(req, ctx).await?;
+        emit_unknown_authentication_failed_event(
+            session_id,
+            client_ip,
+            email,
+            &cred.readable_description(),
+            "unknown user",
+        );
+        return Ok(Err(SsoFailure::at(
+            return_to,
+            SsoLoginError::NoMatchingUser,
+            format!("No user matching {email}"),
+        )));
+    };
+
+    let state_arc = match get_or_create_auth_state_for_request(req, &username, ctx, None).await {
+        Ok(state) => state,
+        Err(e) => {
+            if matches!(e, WarpgateError::IpAddrNotAllowed(..)) {
+                let session_id = session_id_for_login(req, ctx).await?;
+                emit_unknown_authentication_failed_event(
+                    session_id,
+                    client_ip,
+                    &username,
+                    &cred.readable_description(),
+                    "IP address not allowed",
+                );
+                return Ok(Err(SsoFailure::at(
+                    return_to,
+                    SsoLoginError::AccessDenied,
+                    "Login denied: your IP address is not in the allowed range for this user",
+                )));
+            }
+            return Err(e);
+        }
+    };
+
+    if let Some(failure) = blocked_address_failure(services, client_ip, return_to).await? {
+        return Ok(Err(failure));
+    }
+
+    let mut state = state_arc.lock().await;
+
+    let outcome = submit_credential(
+        &mut state,
+        cred,
+        ctx.services().config_provider.as_ref(),
+        &ctx.services().login_protection,
+    )
+    .await?;
+
+    if !outcome.is_valid() {
+        return Ok(Err(rejected_credential_failure(
+            services, client_ip, &username, return_to,
+        )
+        .await));
+    }
+
+    // Stored before any remaining factor so back-channel logout and SLO
+    // can find the session even when TOTP or an approval is still pending.
+    let login_state = || SsoLoginState {
+        provider: sso.provider.clone(),
+        token: response.id_token.clone(),
+        supports_single_logout: sso.supports_single_logout,
+        subject: Some(response.subject.clone()),
+        sid: response.sid.clone(),
+    };
+    session.set_sso_login_state(login_state());
+
+    // Set when the sign-in is refused where it completes: the user was
+    // removed, or their allowed ranges changed to leave this address out,
+    // while it was in progress.
+    let mut refused = false;
+    if let Ok(user_info) = outcome.into_accepted() {
+        match authorize_session(req, ctx, user_info).await {
+            Ok(()) => {
+                // Stamp the HTTP per-session step-up clock, after
+                // `authorize_session` (which can clear the session). Only
+                // the SSO return path stamps: password / OTP logins are not
+                // SSO handshakes and must not refresh the clock, else a
+                // user who only ever logs in via password would never
+                // re-SSO and the step-up gate would silently become a
+                // no-op.
+                //
+                // It also raises the user session's shared stamp, which
+                // ends every target-host session still carrying an
+                // earlier one (`step_up::is_superseded`).
+                crate::step_up::stamp_sso(session, &services.db, OffsetDateTime::now_utc()).await?;
+                state.emit_authenticated_event_once();
+                if let Some(ip) = client_ip {
+                    let _ = services
+                        .login_protection
+                        .clear_failed_attempts(&ip, &username)
+                        .await;
+                }
+                // `authorize_session` can clear the session, so store it
+                // again.
+                session.set_sso_login_state(login_state());
+            }
+            Err(WarpgateError::UserNoLongerAdmitted) => refused = true,
+            Err(error) => return Err(error),
+        }
+    }
+    drop(state);
+
+    finish_sso_return(
+        services,
+        provider_config,
+        &response,
+        refused,
+        return_to,
+        post_login_redirect(sso.next_url.as_deref(), &sso.return_origin),
+    )
+    .await
+}
+
 /// The failure for a credential login protection rejected. The block check
 /// and the recorded failure use the same client address, the one the rest of
 /// the login code resolves.
@@ -572,178 +770,13 @@ impl Api {
             }
         };
 
-        if !response.email_verified.unwrap_or(true) {
-            error!(
-                "SSO login attempt with an unverified email: {:?}",
-                response.email
-            );
-            error!(
-                "The SSO provider did provide an email_verified claim, and it is false. Since the provider provides this claim, Warpgate requires the email to be verified."
-            );
-            return Ok(Err(SsoFailure::at(
-                &return_to,
-                SsoLoginError::SsoFailed,
-                "The SSO account's e-mail is not verified",
-            )));
-        }
-
-        let Some(ref email) = response.email else {
-            return Ok(Err(SsoFailure::at(
-                &return_to,
-                SsoLoginError::SsoFailed,
-                "No e-mail information in the SSO response",
-            )));
-        };
-
-        info!("SSO login as {email}");
-
-        let providers_config = ctx
-            .services()
-            .config
-            .lock()
-            .await
-            .store
-            .sso_providers
-            .clone();
-        let mut iter = providers_config.iter();
-        let Some(provider_config) = iter.find(|x| x.name == context.provider) else {
-            return Ok(Err(SsoFailure::at(
-                &return_to,
-                SsoLoginError::SsoFailed,
-                format!("No provider matching {}", context.provider),
-            )));
-        };
-
-        let cred = AuthCredential::Sso {
-            provider: context.provider.clone(),
-            email: email.clone(),
-        };
-
-        let username = services
-            .config_provider
-            .username_for_sso_credential(
-                &cred,
-                response.preferred_username.clone(),
-                provider_config.clone(),
-            )
-            .await?;
-        let Some(username) = username else {
-            let session_id = session_id_for_login(req, &ctx).await?;
-            emit_unknown_authentication_failed_event(
-                session_id,
-                client_ip,
-                email,
-                &cred.readable_description(),
-                "unknown user",
-            );
-            return Ok(Err(SsoFailure::at(
-                &return_to,
-                SsoLoginError::NoMatchingUser,
-                format!("No user matching {email}"),
-            )));
-        };
-
-        let state_arc = match get_or_create_auth_state_for_request(req, &username, &ctx, None).await
-        {
-            Ok(state) => state,
-            Err(e) => {
-                if matches!(e, WarpgateError::IpAddrNotAllowed(..)) {
-                    let session_id = session_id_for_login(req, &ctx).await?;
-                    emit_unknown_authentication_failed_event(
-                        session_id,
-                        client_ip,
-                        &username,
-                        &cred.readable_description(),
-                        "IP address not allowed",
-                    );
-                    return Ok(Err(SsoFailure::at(
-                        &return_to,
-                        SsoLoginError::AccessDenied,
-                        "Login denied: your IP address is not in the allowed range for this user",
-                    )));
-                }
-                return Err(e);
-            }
-        };
-
-        if let Some(failure) = blocked_address_failure(services, client_ip, &return_to).await? {
-            return Ok(Err(failure));
-        }
-
-        let mut state = state_arc.lock().await;
-
-        let outcome = submit_credential(
-            &mut state,
-            cred,
-            ctx.services().config_provider.as_ref(),
-            &ctx.services().login_protection,
-        )
-        .await?;
-
-        if !outcome.is_valid() {
-            return Ok(Err(rejected_credential_failure(
-                services, client_ip, &username, &return_to,
-            )
-            .await));
-        }
-
-        // Stored before any remaining factor so back-channel logout and SLO
-        // can find the session even when TOTP or an approval is still pending.
-        let login_state = || SsoLoginState {
-            provider: context.provider.clone(),
-            token: response.id_token.clone(),
+        let sso = VerifiedSso {
+            provider: context.provider,
+            next_url: context.next_url,
             supports_single_logout: context.supports_single_logout,
-            subject: Some(response.subject.clone()),
-            sid: response.sid.clone(),
+            return_origin: context.return_origin,
         };
-        session.set_sso_login_state(login_state());
-
-        // Set when the sign-in is refused where it completes: the user was
-        // removed, or their allowed ranges changed to leave this address out,
-        // while it was in progress.
-        let mut refused = false;
-        if let Ok(user_info) = outcome.into_accepted() {
-            match authorize_session(req, &ctx, user_info).await {
-                Ok(()) => {
-                    // Stamp the HTTP per-session step-up clock, after
-                    // `authorize_session` (which can clear the session). Only
-                    // the SSO return path stamps: password / OTP logins are not
-                    // SSO handshakes and must not refresh the clock, else a
-                    // user who only ever logs in via password would never
-                    // re-SSO and the step-up gate would silently become a
-                    // no-op.
-                    //
-                    // It also raises the user session's shared stamp, which
-                    // ends every target-host session still carrying an
-                    // earlier one (`step_up::is_superseded`).
-                    crate::step_up::stamp_sso(session, &services.db, OffsetDateTime::now_utc())
-                        .await?;
-                    state.emit_authenticated_event_once();
-                    if let Some(ip) = client_ip {
-                        let _ = services
-                            .login_protection
-                            .clear_failed_attempts(&ip, &username)
-                            .await;
-                    }
-                    // `authorize_session` can clear the session, so store it
-                    // again.
-                    session.set_sso_login_state(login_state());
-                }
-                Err(WarpgateError::UserNoLongerAdmitted) => refused = true,
-                Err(error) => return Err(error),
-            }
-        }
-        drop(state);
-
-        finish_sso_return(
-            services,
-            provider_config,
-            &response,
-            refused,
-            &return_to,
-            post_login_redirect(context.next_url.as_deref(), &context.return_origin),
-        )
-        .await
+        complete_sso_return(req, session, &ctx, client_ip, &sso, response, &return_to).await
     }
 
     #[oai(
@@ -1358,5 +1391,149 @@ mod tests {
             format!("{ORIGIN}/cove/login?login_error=access_denied")
         );
         assert!(holds_role(&services, user_id, role_id).await);
+    }
+
+    mod return_stamp {
+        //! The SSO return, from the provider's verified response on, behind
+        //! the session middleware production uses: each sign-in stamps the
+        //! browser session and raises its user session's shared stamp.
+        use std::time::Duration;
+
+        use poem::session::{ServerSession, Session};
+        use poem::test::{TestClient, TestResponse};
+        use poem::web::Data;
+        use poem::{EndpointExt, FromRequest, Request, Route, get, handler};
+        use time::OffsetDateTime;
+        use warpgate_common::UserSessionId;
+        use warpgate_common_http::auth::UnauthenticatedRequestContext;
+        use warpgate_db_entities::HttpSsoStamp;
+
+        use super::super::{VerifiedSso, complete_sso_return};
+        use super::*;
+        use crate::common::{SESSION_COOKIE_NAME, SessionExt, session_cookie_config};
+        use crate::session::{SESSION_ID_SESSION_KEY, SessionStore};
+        use crate::session_storage::SharedSessionStorage;
+        use crate::step_up::{StepUpSessionExt, is_superseded};
+
+        /// The provider returns `alice@example.com`, verified.
+        #[handler]
+        async fn sso_return(req: &Request, session: &Session) -> poem::Result<String> {
+            let ctx =
+                Data::<&UnauthenticatedRequestContext>::from_request_without_body(req).await?;
+            let sso = VerifiedSso {
+                provider: "idp".into(),
+                next_url: Some("/cove/home".into()),
+                supports_single_logout: false,
+                return_origin: ORIGIN.into(),
+            };
+            let outcome =
+                complete_sso_return(req, session, &ctx, None, &sso, sso_response(&[]), &None)
+                    .await?;
+            Ok(outcome.unwrap_or_else(|failure| panic!("refused: {}", failure.reason)))
+        }
+
+        /// The browser session's user session and last sign-in stamp.
+        #[handler]
+        fn state(session: &Session) -> String {
+            format!(
+                "{} {}",
+                session
+                    .get_session_id()
+                    .map(|id| id.0.to_string())
+                    .unwrap_or_default(),
+                session
+                    .get_last_sso_at()
+                    .map(|at| at.unix_timestamp().to_string())
+                    .unwrap_or_default()
+            )
+        }
+
+        fn session_cookie(resp: &TestResponse) -> Option<String> {
+            resp.0
+                .headers()
+                .get_all("set-cookie")
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .filter_map(|value| value.split(';').next())
+                .find(|pair| pair.starts_with(&format!("{SESSION_COOKIE_NAME}=")))
+                .map(ToOwned::to_owned)
+        }
+
+        /// Runs the SSO return on the browser holding `cookie`: the cookie
+        /// it holds afterwards, its user session and its stamp.
+        async fn sign_in(
+            cli: &TestClient<impl poem::Endpoint>,
+            cookie: Option<String>,
+        ) -> (String, Uuid, OffsetDateTime) {
+            let mut req = cli.get("/sso-return").header("host", "gate.example");
+            if let Some(cookie) = &cookie {
+                req = req.header("cookie", cookie);
+            }
+            let resp = req.send().await;
+            resp.assert_status_is_ok();
+            let cookie = session_cookie(&resp).or(cookie).expect("a session cookie");
+            resp.assert_text(format!("{ORIGIN}/cove/home")).await;
+            let resp = cli
+                .get("/state")
+                .header("host", "gate.example")
+                .header("cookie", &cookie)
+                .send()
+                .await;
+            resp.assert_status_is_ok();
+            let text = resp.0.into_body().into_string().await.unwrap();
+            let (id, stamp) = text.split_once(' ').unwrap();
+            (
+                cookie,
+                id.parse().expect("the session names its user session"),
+                OffsetDateTime::from_unix_timestamp(stamp.parse().expect("a stamp")).unwrap(),
+            )
+        }
+
+        /// Two SSO sign-ins on one browser session, a second apart (stamps
+        /// are whole seconds): each stamps the session and its user
+        /// session's shared stamp, and the second stamp is the later one.
+        #[tokio::test]
+        async fn each_sso_return_raises_the_shared_stamp() {
+            let (services, _, _) = alice_without_ops().await;
+            services.config.lock().await.store.sso_providers = vec![provider_config()];
+            let db = services.db.clone();
+            let ctx = UnauthenticatedRequestContext::new(services).await;
+            let cli = TestClient::new(
+                Route::new()
+                    .at("/sso-return", get(sso_return))
+                    .at("/state", get(state))
+                    .data(SessionStore::new())
+                    .data(SharedSessionStorage::new(db.clone()))
+                    .data(ctx)
+                    .with(ServerSession::new(
+                        session_cookie_config(),
+                        SharedSessionStorage::new(db.clone()),
+                    )),
+            );
+
+            let (cookie, first_session, first) = sign_in(&cli, None).await;
+            assert_eq!(
+                HttpSsoStamp::latest(&db, first_session).await.unwrap(),
+                Some(first)
+            );
+
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+            let (_, second_session, second) = sign_in(&cli, Some(cookie)).await;
+            assert!(second > first, "{second} is not after {first}");
+            assert_eq!(
+                HttpSsoStamp::latest(&db, second_session).await.unwrap(),
+                Some(second)
+            );
+            assert_eq!(second_session, first_session, "the user session changed");
+
+            // A target-host session handed off with the first stamp is now
+            // superseded; one with the second is not.
+            let bound = Session::default();
+            bound.set(SESSION_ID_SESSION_KEY, UserSessionId(first_session));
+            bound.set_last_sso_at(first);
+            assert!(is_superseded(&bound, &db).await.unwrap());
+            bound.set_last_sso_at(second);
+            assert!(!is_superseded(&bound, &db).await.unwrap());
+        }
     }
 }
