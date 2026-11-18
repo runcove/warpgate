@@ -513,15 +513,23 @@ pub async fn start_endpoint(req: &Request, session: &Session) -> poem::Result<Re
 /// ([`crate::common::BoundSessionAuthorization`]), then sends the browser to
 /// the page it started from.
 ///
-/// A refused token that spent a handoff (one found and deleted) clears the
-/// nonce cookie and leaves this host's browser session as it is: any site
-/// can send a browser here with a token it minted for itself, for this host
-/// or another, so a refusal proves nothing about the session the browser
-/// already holds here. One that spent nothing (never issued, already used,
-/// or no token at all) changes nothing. Either way the browser is sent to
-/// the page the handoff was opened for when that is known, or this host's
-/// root, where a browser without a session opens a new handoff: so a tab
-/// whose nonce cookie another tab's handoff replaced simply tries again.
+/// A token refused by [`redeem`] that spent a handoff (one found and
+/// deleted) clears the nonce cookie and leaves this host's browser session
+/// as it is: any site can send a browser here with a token it minted for
+/// itself, for this host or another, so that refusal proves nothing about
+/// the session the browser already holds here. One that spent nothing
+/// (never issued, already used, or no token at all) changes nothing. A
+/// token [`redeem`] accepted, this browser's own handoff, is still refused
+/// if its user, the user's access to the target or its user session is gone
+/// by now, and that refusal never leaves a session stored for it: one for
+/// a gone user or target access is refused before the browser session is
+/// touched, and one for a gone user session, checked once the new session
+/// is written, purges this host's browser session ([`complete_redeem`]).
+/// Either refusal clears the nonce cookie. In every case the browser is
+/// sent to the page the handoff was opened for when that is known, or this
+/// host's root, where a browser without a session opens a new handoff: so
+/// a tab whose nonce cookie another tab's handoff replaced simply tries
+/// again.
 /// That retry is marked ([`HANDOFF_RETRY_PARAM`]); a refusal of a handoff
 /// opened for a marked page gets a 403 saying sign-in needs cookies. A
 /// browser that spent nothing and already holds a session for this target on
@@ -610,6 +618,12 @@ pub async fn redeem_endpoint(req: &Request, session: &Session) -> poem::Result<R
 }
 
 /// The checks and the session change after [`redeem`] accepted a token.
+///
+/// The user and the target access are checked before the session is
+/// touched. The user session can only be checked on the session the token
+/// names, so it is checked after that is written; if it, or anything after
+/// the first write, fails, the browser session is purged, so a refusal
+/// never leaves a stored session carrying the bound authorization.
 async fn complete_redeem(
     req: &Request,
     ctx: &UnauthenticatedRequestContext,
@@ -624,6 +638,32 @@ async fn complete_redeem(
         .await
         .map_err(|error| error.to_string())?
         .ok_or("UnknownUser")?;
+    if !services
+        .config_provider
+        .authorize_target_by_id(redeemed.user_id, target.id)
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        return Err("TargetAccess".to_owned());
+    }
+    let outcome = bind_session(req, ctx, session, target, binding, redeemed, user).await;
+    if outcome.is_err() {
+        session.purge();
+    }
+    outcome
+}
+
+/// The session change of [`complete_redeem`], and the user-session check
+/// that needs it.
+async fn bind_session(
+    req: &Request,
+    ctx: &UnauthenticatedRequestContext,
+    session: &Session,
+    target: &warpgate_common::Target,
+    binding: &str,
+    redeemed: Redeemed,
+    user: warpgate_db_entities::User::Model,
+) -> Result<Response, String> {
     // A fresh browser session id, carrying nothing from before.
     session.clear();
     if let Some(rotation) = SessionRotation::for_request(req)
@@ -658,14 +698,6 @@ async fn complete_redeem(
         .handle_for_request(req, ctx)
         .await
         .map_err(|_| "UserSessionGone")?;
-    if !services
-        .config_provider
-        .authorize_target_by_id(redeemed.user_id, target.id)
-        .await
-        .map_err(|error| error.to_string())?
-    {
-        return Err("TargetAccess".to_owned());
-    }
     let location = bound_host_return_url("https", binding, &without_retry_marker(&redeemed.next))
         .ok_or("BadNext")?;
     Ok(see_other(&location).finish())
@@ -1897,6 +1929,142 @@ mod tests {
                     .await;
                 resp.assert_text(stamp.to_string()).await;
             }
+            /// Signs in, opens a handoff and mints its token: the path of the
+            /// redeem the browser is sent to, and the handoff's nonce.
+            async fn minted_redeem(
+                cli: &TestClient<impl poem::Endpoint>,
+                db: &DatabaseConnection,
+                target: Uuid,
+                user: Uuid,
+            ) -> (String, String, String) {
+                let (cookie, opened, _) = signed_in(cli, db, target, user, 10).await;
+                let resp = start(cli, &cookie, user, &opened.challenge).await;
+                resp.assert_status(StatusCode::SEE_OTHER);
+                let location = resp.0.headers()["location"].to_str().unwrap().to_owned();
+                let redeem = location
+                    .strip_prefix(&format!("https://{HOST}"))
+                    .expect("sent to the bound host")
+                    .to_owned();
+                (cookie, redeem, opened.nonce)
+            }
+
+            /// Redeems `redeem` on [`HOST`] with its nonce and asserts the
+            /// refusal stored no target-host session: no stored browser
+            /// session holds a bound authorization, and the response gives
+            /// the browser no session cookie.
+            async fn assert_refused_and_nothing_stored(
+                cli: &TestClient<impl poem::Endpoint>,
+                db: &DatabaseConnection,
+                redeem: &str,
+                nonce: &str,
+            ) {
+                let resp = cli
+                    .get(redeem)
+                    .header("host", HOST)
+                    .header("cookie", format!("{HANDOFF_COOKIE_NAME}={nonce}"))
+                    .send()
+                    .await;
+                let session_value = resp
+                    .0
+                    .headers()
+                    .get_all("set-cookie")
+                    .iter()
+                    .filter_map(|value| value.to_str().ok())
+                    .filter_map(|value| value.split(';').next())
+                    .find_map(|pair| pair.strip_prefix(&format!("{SESSION_COOKIE_NAME}=")))
+                    .map(ToOwned::to_owned);
+                assert!(
+                    session_value.as_deref().is_none_or(str::is_empty),
+                    "the refusal gave the browser a session: {session_value:?}"
+                );
+                let rows = HttpSession::Entity::find().all(db).await.unwrap();
+                assert!(
+                    rows.iter()
+                        .all(|row| !row.data.contains(crate::common::BOUND_AUTH_SESSION_KEY)),
+                    "a bound authorization is stored after the refusal"
+                );
+                resp.assert_status(StatusCode::SEE_OTHER);
+                resp.assert_header(
+                    "location",
+                    format!("https://{HOST}/page?{HANDOFF_RETRY_PARAM}=1"),
+                );
+            }
+
+            /// A user who loses the target between mint and redeem gets no
+            /// session on its host: the refusal stores nothing.
+            #[tokio::test]
+            async fn a_redeem_refused_for_target_access_stores_no_session() {
+                let db = memory_db().await;
+                let target = bound_target(&db).await;
+                let user = user_for(&db, target).await;
+                let cli = TestClient::new(app(db.clone()).await);
+                let (_, redeem, nonce) = minted_redeem(&cli, &db, target, user).await;
+
+                TargetRoleAssignment::Entity::delete_many()
+                    .exec(&db)
+                    .await
+                    .unwrap();
+
+                assert_refused_and_nothing_stored(&cli, &db, &redeem, &nonce).await;
+            }
+
+            /// A user who signs out on the control plane between mint and
+            /// redeem gets no session on the target's host: the refusal
+            /// stores nothing. (The session store's own purge of a cookie
+            /// naming an ended session covers this case too.)
+            #[tokio::test]
+            async fn a_redeem_refused_for_an_ended_user_session_stores_no_session() {
+                let db = memory_db().await;
+                let target = bound_target(&db).await;
+                let user = user_for(&db, target).await;
+                let cli = TestClient::new(app(db.clone()).await);
+                let (control, redeem, nonce) = minted_redeem(&cli, &db, target, user).await;
+
+                cli.post("/sign-out")
+                    .header("host", CONTROL_PLANE)
+                    .header("cookie", &control)
+                    .send()
+                    .await
+                    .assert_status_is_ok();
+
+                assert_refused_and_nothing_stored(&cli, &db, &redeem, &nonce).await;
+            }
+
+            /// A user session that is now another user's, checked on a node
+            /// that has not seen it, is refused without the purge the session
+            /// store does for an ended one: the redeem's own purge is what
+            /// leaves nothing stored.
+            #[tokio::test]
+            async fn a_redeem_refused_for_another_user_s_session_stores_no_session() {
+                use sea_orm::IntoActiveModel;
+
+                let db = memory_db().await;
+                let target = bound_target(&db).await;
+                let user = user_for(&db, target).await;
+                let node_a = TestClient::new(app(db.clone()).await);
+                let node_b = TestClient::new(app(db.clone()).await);
+                let (control, redeem, nonce) = minted_redeem(&node_a, &db, target, user).await;
+
+                let (_, storage_id) = control.split_once('=').unwrap();
+                let user_session_id = HttpSession::Entity::find_by_id(storage_id.to_owned())
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .and_then(|row| row.user_session_id)
+                    .expect("the control-plane session names its user session");
+                let mut row =
+                    warpgate_db_entities::UserSession::Entity::find_by_id(user_session_id)
+                        .one(&db)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .into_active_model();
+                row.user_id = Set(Some(Uuid::new_v4()));
+                row.update(&db).await.unwrap();
+
+                assert_refused_and_nothing_stored(&node_b, &db, &redeem, &nonce).await;
+            }
+
             const OTHER_HOST: &str = "vm2.warp.example";
 
             /// A second HTTP target, bound to [`OTHER_HOST`].
