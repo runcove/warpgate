@@ -23,10 +23,10 @@ warpgate-core = { path = "../warpgate-core" }
 warpgate-db-entities = { path = "../warpgate-db-entities" }
 warpgate-tls = { path = "../warpgate-tls" }
 
-[features]
-# Exposes `test_log` to other crates' tests.
-test-util = []
-
 [dev-dependencies]
 rcgen.workspace = true
 thiserror.workspace = true
+
+[features]
+# Exposes `test_log` to other crates' tests.
+test-util = []

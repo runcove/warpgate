@@ -48,8 +48,8 @@ warpgate-sso = { path = "../warpgate-sso", default-features = false }
 warpgate-tls = { path = "../warpgate-tls", default-features = false }
 
 [dev-dependencies]
-warpgate-core = { path = "../warpgate-core", default-features = false, features = ["test-util"] }
 rcgen.workspace = true
 tempfile = "3"
 tokio = { workspace = true, features = ["rt", "macros"] }
+warpgate-core = { path = "../warpgate-core", default-features = false, features = ["test-util"] }
 warpgate-db-migrations = { path = "../warpgate-db-migrations", features = ["sqlite"] }

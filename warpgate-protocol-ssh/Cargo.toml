@@ -43,8 +43,8 @@ warpgate-tls = { path = "../warpgate-tls" }
 zeroize = { version = "^1.5", default-features = false }
 
 [dev-dependencies]
-warpgate-core = { path = "../warpgate-core", default-features = false, features = ["test-util"] }
 serde_json.workspace = true
 tempfile = "3"
 tokio = { workspace = true, features = ["test-util"] }
+warpgate-core = { path = "../warpgate-core", default-features = false, features = ["test-util"] }
 warpgate-db-migrations = { path = "../warpgate-db-migrations", features = ["sqlite"] }

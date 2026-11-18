@@ -77,6 +77,8 @@ ignore = [
     "RUSTSEC-2026-0387", # crypto-bigint timing: 0.7 copy is on fixed 0.7.6; only 0.5.5 (elliptic-curve 0.13 via openidconnect, SSO ID-token signature checks on public data) is left and has no fix; drop when one ships
     "RUSTSEC-2026-0441", # pin-utils 0.1.0 is unmaintained (archived, no fix): only via async-dnssd 0.5.1 <- sspi 0.21.3 <- ironrdp-connector (RDP); unmaintained, not a vulnerability; drop when sspi moves off async-dnssd
     "RUSTSEC-2026-0459", # SQLite page-cache disclosure needs a db opened with an attacker-written sibling -wal; Warpgate opens only its own database in a directory only it writes; drop when sqlx moves to libsqlite3-sys >=0.39
+    "RUSTSEC-2026-0543", # chrono is unmaintained (no fix): via oauth2/openidconnect (warpgate-sso), poem, pg_interval and x509-certificate (pgwire); unmaintained, not a vulnerability; drop when the deps move to jiff/time
+    "RUSTSEC-2026-0542", # humantime is unmaintained because it wraps chrono (no fix): via humantime-serde (warpgate-common), warpgate and warpgate-protocol-postgres; unmaintained, not a vulnerability; drop with 0543
 ]
 # If this is true, then cargo deny will use the git executable to fetch advisory database.
 # If this is false, then it uses a built-in git library.

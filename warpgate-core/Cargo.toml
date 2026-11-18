@@ -18,6 +18,7 @@ governor.workspace = true
 humantime-serde = { version = "1.1", default-features = false }
 ipnet.workspace = true
 ldap3.workspace = true
+libc = { version = "0.2", optional = true }
 libsqlite3-sys = { version = "0.30", default-features = false, optional = true }
 packet = { version = "0.1", default-features = false }
 password-hash.workspace = true
@@ -41,8 +42,6 @@ totp-rs = { version = "5.0", features = ["otpauth"], default-features = false }
 tracing.workspace = true
 tracing-core = { version = "0.1", default-features = false }
 tracing-subscriber = { version = "0.3", default-features = false }
-# Only the `test-util` helper `recordings::test_support` uses it.
-libc = { version = "0.2", optional = true }
 url.workspace = true
 uuid.workspace = true
 vt100 = "0.16"
