@@ -1037,11 +1037,36 @@ async fn handoff_redirect(
     target_id: Uuid,
     binding: &str,
 ) -> Option<Response> {
-    let ctx = req.data::<UnauthenticatedRequestContext>()?;
-    if !is_navigation_request(req) || ctx.trusted_proto(req) != http::uri::Scheme::HTTPS {
+    if !is_https_navigation(req) {
         return None;
     }
     let next = next_after_login(req).filter(|next| next.starts_with('/'))?;
+    open_handoff(req, control_plane, target_id, binding, &next).await
+}
+
+/// Whether `req` is a top-level navigation over HTTPS, as a handoff needs:
+/// its nonce cookie is a `__Host-` cookie.
+pub fn is_https_navigation(req: &Request) -> bool {
+    req.data::<UnauthenticatedRequestContext>()
+        .is_some_and(|ctx| ctx.trusted_proto(req) == http::uri::Scheme::HTTPS)
+        && is_navigation_request(req)
+}
+
+/// Opens a handoff for the host bound to `target_id` at `binding`, to come
+/// back to `next` (a path on that host), and answers with the nonce cookie
+/// and the redirect to the control plane's handoff start. Shared by
+/// [`handoff_redirect`] and the handoff's begin route
+/// (`crate::handoff::begin_endpoint`); it changes no session. `None` when
+/// the handoff cannot be recorded; a source address past its rate limit, or
+/// a full handoff store, gets a plain refusal and records nothing.
+pub async fn open_handoff(
+    req: &Request,
+    control_plane: &url::Url,
+    target_id: Uuid,
+    binding: &str,
+    next: &str,
+) -> Option<Response> {
+    let ctx = req.data::<UnauthenticatedRequestContext>()?;
     if !crate::handoff::within_rate_limit(req, ctx.services(), crate::handoff::Step::Open).await {
         return Some(crate::handoff::rate_limited());
     }
@@ -1049,7 +1074,7 @@ async fn handoff_redirect(
         &ctx.services().db,
         target_id,
         binding,
-        &next,
+        next,
         OffsetDateTime::now_utc(),
     )
     .await

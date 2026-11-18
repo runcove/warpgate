@@ -53,21 +53,29 @@ use warpgate_common_http::auth::{
 };
 use warpgate_common_http::ext::is_navigation_request;
 use warpgate_common_http::logging::get_client_ip_addr;
+use warpgate_common_http::ticket_query::without_ticket_query_param;
 use warpgate_core::ConfigProvider;
 use warpgate_core::authorize_for_target;
 use warpgate_core::live_streams::host_binding;
 use warpgate_db_entities::HttpHandoff;
 
+use crate::api::sso_provider_list::is_safe_redirect_target;
 use crate::catchall::{bound_to_host, get_target_by_request_host};
 use crate::common::{
     BoundSessionAuthorization, GatewayPages, HANDOFF_COOKIE_NAME, SessionExt, SessionRotation,
     bound_host_return_url, force_step_up, gateway_pages_for, gateway_redirect,
-    http_step_up_interval,
+    http_step_up_interval, is_https_navigation, open_handoff,
 };
 use crate::middleware::target_bound_to_request_host;
 use crate::session::{SESSION_ID_SESSION_KEY, SessionStore};
 use crate::step_up::{StepUpSessionExt, is_session_step_up_stale};
 
+/// The bound host's begin route, under `/@warpgate`: starts a handoff for
+/// a page on that host named in [`BEGIN_NEXT_PARAM`] ([`begin_endpoint`]).
+pub const BEGIN_PATH: &str = "/handoff/begin";
+/// The query parameter naming the page on the bound host to return to after
+/// [`BEGIN_PATH`]'s handoff.
+pub const BEGIN_NEXT_PARAM: &str = "next";
 /// The control plane's mint route, under `/@warpgate`.
 pub const START_PATH: &str = "/handoff/start";
 /// The bound host's redeem route, under `/@warpgate`.
@@ -411,6 +419,45 @@ pub async fn purge_expired<C: ConnectionTrait>(
     now: OffsetDateTime,
 ) -> Result<u64, WarpgateError> {
     HttpHandoff::purge_expired(db, now).await
+}
+
+/// The bound host's [`BEGIN_PATH`]: starts a sign-in from a host bound to a
+/// target, which no navigation there starts by itself when the target is
+/// public. It opens the same handoff an unauthenticated navigation on that
+/// host opens ([`crate::common::open_handoff`]), to return to the page in
+/// [`BEGIN_NEXT_PARAM`], and changes nothing else: no session is written or
+/// ended.
+///
+/// The host the handoff returns to is the target's configured binding
+/// (`host_binding`), never one taken from the request: the request's host
+/// only picks the target, as on every route. `next` must be a site-relative
+/// path by the one check the SSO paths use
+/// ([`crate::api::sso_provider_list::is_safe_redirect_target`]), and loses
+/// any ticket in its query. Off a bound host this route is not found; a
+/// request that is not a top-level HTTPS navigation is refused (403), as is
+/// a missing or unsafe `next` (400).
+#[poem::handler]
+pub async fn begin_endpoint(req: &Request) -> poem::Result<Response> {
+    let GatewayPages::ControlPlane {
+        control_plane,
+        binding,
+        target_id,
+    } = gateway_pages_for(req).await
+    else {
+        return Err(NotFoundError.into());
+    };
+    if !is_https_navigation(req) {
+        return Ok(refusal(StatusCode::FORBIDDEN));
+    }
+    let next = query_value(req, BEGIN_NEXT_PARAM)
+        .filter(|next| is_safe_redirect_target(next))
+        .map(|next| without_ticket_query_param(&next));
+    let Some(next) = next else {
+        return Ok(refusal(StatusCode::BAD_REQUEST));
+    };
+    open_handoff(req, &control_plane, target_id, &binding, &next)
+        .await
+        .ok_or_else(|| poem::Error::from_status(StatusCode::INTERNAL_SERVER_ERROR))
 }
 
 /// The control plane's [`START_PATH`]: mints a token for the challenge in the
@@ -1751,26 +1798,54 @@ mod tests {
             }
 
             async fn app(db: DatabaseConnection) -> impl poem::Endpoint {
+                app_with(db, |_| {}).await
+            }
+
+            /// [`app`] with the control plane at [`CONTROL_PLANE`]
+            /// (`external_host`), as the begin route needs, trusting
+            /// `X-Forwarded-*` headers if `trust_forwarded`.
+            async fn begin_app(
+                db: DatabaseConnection,
+                trust_forwarded: bool,
+            ) -> impl poem::Endpoint {
+                app_with(db, move |store| {
+                    store.external_host = Some(CONTROL_PLANE.into());
+                    store.http.trust_x_forwarded_headers = trust_forwarded;
+                })
+                .await
+            }
+
+            async fn app_with(
+                db: DatabaseConnection,
+                configure: impl FnOnce(&mut warpgate_common::WarpgateConfigStore),
+            ) -> impl poem::Endpoint {
                 let services = services(db.clone()).await;
-                services.config.lock().await.store.step_up_interval = Some(StepUpIntervalConfig {
-                    http: Some(Duration::from_secs(60)),
-                    ..Default::default()
-                });
+                {
+                    let mut config = services.config.lock().await;
+                    config.store.step_up_interval = Some(StepUpIntervalConfig {
+                        http: Some(Duration::from_secs(60)),
+                        ..Default::default()
+                    });
+                    configure(&mut config.store);
+                }
                 let ctx = UnauthenticatedRequestContext::new(services).await;
                 // The start route behind what the auth middleware gives a
-                // signed-in browser: the user in `x-test-user`.
+                // signed-in browser: the user in `x-test-user`, and none
+                // without it.
                 let start = get(start_endpoint).around(|ep, mut req| async move {
-                    let user_id: Uuid = req.header("x-test-user").unwrap().parse().unwrap();
-                    let actx = req
-                        .data::<UnauthenticatedRequestContext>()
-                        .unwrap()
-                        .to_authenticated(RequestAuthorization::Session(
-                            SessionAuthorization::User {
-                                user_id,
-                                username: format!("user-{user_id}"),
-                            },
-                        ));
-                    req.extensions_mut().insert(actx);
+                    if let Some(user_id) = req.header("x-test-user") {
+                        let user_id: Uuid = user_id.parse().unwrap();
+                        let actx = req
+                            .data::<UnauthenticatedRequestContext>()
+                            .unwrap()
+                            .to_authenticated(RequestAuthorization::Session(
+                                SessionAuthorization::User {
+                                    user_id,
+                                    username: format!("user-{user_id}"),
+                                },
+                            ));
+                        req.extensions_mut().insert(actx);
+                    }
                     ep.call(req).await.map(IntoResponse::into_response)
                 });
                 Route::new()
@@ -1814,6 +1889,7 @@ mod tests {
                                 ep.call(req).await.map(IntoResponse::into_response)
                             }),
                     )
+                    .at(format!("/@warpgate{BEGIN_PATH}"), get(begin_endpoint))
                     .at(format!("/@warpgate{START_PATH}"), start)
                     .at(format!("/@warpgate{REDEEM_PATH}"), get(redeem_endpoint))
                     .data(SessionStore::new())
@@ -1823,6 +1899,32 @@ mod tests {
                         session_cookie_config(),
                         SharedSessionStorage::new(db),
                     ))
+                    // `TestClient` leaves `original_uri` at `/`; a served
+                    // request carries its own, which the login redirect's
+                    // `next` is built from. Scheme and addresses stay the
+                    // `TestClient` defaults.
+                    .around(|ep, req| async move {
+                        let (parts, body) = req.into_parts();
+                        let mut served = poem::http::Request::builder()
+                            .method(parts.method)
+                            .uri(parts.uri)
+                            .version(parts.version)
+                            .body(())
+                            .unwrap();
+                        *served.headers_mut() = parts.headers;
+                        *served.extensions_mut() = parts.extensions;
+                        let (served, ()) = served.into_parts();
+                        let req = Request::from_parts(
+                            poem::RequestParts::from((
+                                served,
+                                poem::web::LocalAddr::default(),
+                                poem::web::RemoteAddr::default(),
+                                poem::http::uri::Scheme::HTTP,
+                            )),
+                            body,
+                        );
+                        ep.call(req).await.map(IntoResponse::into_response)
+                    })
             }
 
             /// A user with a role granting `target`.
@@ -2362,6 +2464,377 @@ mod tests {
                     resp.assert_status_is_ok();
                     resp.assert_text(expected).await;
                 }
+            }
+
+            /// Every `Set-Cookie` of `resp`, as `name=value` pairs.
+            fn set_cookies(resp: &TestResponse) -> Vec<String> {
+                resp.0
+                    .headers()
+                    .get_all("set-cookie")
+                    .iter()
+                    .filter_map(|value| value.to_str().ok())
+                    .filter_map(|value| value.split(';').next())
+                    .map(ToOwned::to_owned)
+                    .collect()
+            }
+
+            /// The value of the nonce cookie `resp` sets.
+            fn nonce_set_by(resp: &TestResponse) -> String {
+                set_cookies(resp)
+                    .iter()
+                    .find_map(|pair| pair.strip_prefix(&format!("{HANDOFF_COOKIE_NAME}=")))
+                    .unwrap()
+                    .to_owned()
+            }
+
+            /// `GET` the begin route on `host` for `next` (sent encoded as
+            /// given), as a top-level navigation, with `headers`.
+            async fn begin(
+                cli: &TestClient<impl poem::Endpoint>,
+                host: &str,
+                next: Option<&str>,
+                headers: &[(&str, &str)],
+            ) -> TestResponse {
+                let mut path = format!("/@warpgate{BEGIN_PATH}");
+                if let Some(next) = next {
+                    let query = url::form_urlencoded::Serializer::new(String::new())
+                        .append_pair(BEGIN_NEXT_PARAM, next)
+                        .finish();
+                    path = format!("{path}?{query}");
+                }
+                let mut req = cli
+                    .get(path)
+                    .header("host", host)
+                    .header("accept", "text/html")
+                    .header("sec-fetch-mode", "navigate");
+                for (name, value) in headers {
+                    req = req.header(*name, *value);
+                }
+                req.send().await
+            }
+
+            /// The challenge in the control-plane start address `location`,
+            /// which must be on the control-plane host.
+            fn challenge_in(location: &str) -> String {
+                let url = url::Url::parse(location).unwrap();
+                assert_eq!(url.scheme(), "https", "{location}");
+                assert_eq!(url.host_str(), Some(CONTROL_PLANE), "{location}");
+                assert_eq!(url.path(), format!("/@warpgate{START_PATH}"), "{location}");
+                url.query_pairs()
+                    .find(|(key, _)| key == HANDOFF_CHALLENGE_PARAM)
+                    .map(|(_, value)| value.into_owned())
+                    .unwrap()
+            }
+
+            /// Begins on [`HOST`] for `next`: the challenge and the nonce.
+            async fn begun(cli: &TestClient<impl poem::Endpoint>, next: &str) -> (String, String) {
+                let resp = begin(cli, HOST, Some(next), &[]).await;
+                resp.assert_status(StatusCode::SEE_OTHER);
+                let location = resp.0.headers()["location"].to_str().unwrap().to_owned();
+                (challenge_in(&location), nonce_set_by(&resp))
+            }
+
+            /// Mints the token for `challenge` signed in as `user`: the path
+            /// of the redeem on [`HOST`].
+            async fn redeem_for(
+                cli: &TestClient<impl poem::Endpoint>,
+                control: &str,
+                user: Uuid,
+                challenge: &str,
+            ) -> String {
+                let resp = start(cli, control, user, challenge).await;
+                resp.assert_status(StatusCode::SEE_OTHER);
+                let location = resp.0.headers()["location"].to_str().unwrap().to_owned();
+                location
+                    .strip_prefix(&format!("https://{HOST}"))
+                    .unwrap()
+                    .to_owned()
+            }
+
+            /// The begin route opens a handoff back to the target's configured
+            /// host, whatever `Host` or `X-Forwarded-Host` the request
+            /// carries: a forged header either still names the bound host,
+            /// and the handoff returns to the configured one, or names
+            /// another host, and nothing is begun.
+            #[tokio::test]
+            async fn begin_returns_to_the_configured_host_whatever_the_headers() {
+                for trust_forwarded in [false, true] {
+                    let db = memory_db().await;
+                    let target = public_bound_target(&db).await;
+                    let cli = TestClient::new(begin_app(db.clone(), trust_forwarded).await);
+
+                    let cases: Vec<(&str, Vec<(&str, &str)>)> = if trust_forwarded {
+                        // A trusted X-Forwarded-Host picks the bound host; the
+                        // request's Host never reaches the handoff.
+                        vec![("evil.example", vec![("x-forwarded-host", HOST)])]
+                    } else {
+                        vec![
+                            (HOST, vec![("x-forwarded-host", "evil.example")]),
+                            (
+                                HOST,
+                                vec![("x-forwarded-host", "vm1.warp.example.evil.example")],
+                            ),
+                        ]
+                    };
+                    for (host, headers) in cases {
+                        let resp = begin(&cli, host, Some("/page?x=1"), &headers).await;
+                        resp.assert_status(StatusCode::SEE_OTHER);
+                        let location = resp.0.headers()["location"].to_str().unwrap().to_owned();
+                        assert!(!location.contains("evil"), "{location}");
+                        let challenge = challenge_in(&location);
+                        let row = opened(&db, &challenge, OffsetDateTime::now_utc())
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        assert_eq!(row.hostname, HOST);
+                        assert_eq!(row.target_id, target);
+                        assert_eq!(row.next, "/page?x=1");
+                    }
+
+                    // A Host (or trusted X-Forwarded-Host) naming no bound
+                    // host begins nothing.
+                    let forged: &[(&str, &[(&str, &str)])] = if trust_forwarded {
+                        &[(HOST, &[("x-forwarded-host", "evil.example")])]
+                    } else {
+                        &[
+                            ("evil.example", &[("x-forwarded-host", HOST)]),
+                            (CONTROL_PLANE, &[]),
+                        ]
+                    };
+                    for (host, headers) in forged {
+                        let resp = begin(&cli, host, Some("/page"), headers).await;
+                        resp.assert_status(StatusCode::NOT_FOUND);
+                        assert!(set_cookies(&resp).is_empty(), "{host} {headers:?}");
+                    }
+                    assert_eq!(
+                        HttpHandoff::Entity::find().all(&db).await.unwrap().len(),
+                        if trust_forwarded { 1 } else { 2 },
+                        "trust_forwarded: {trust_forwarded}"
+                    );
+                }
+            }
+
+            /// An anonymous visitor on a public target's own host begins a
+            /// sign-in, is sent to sign in on the control plane, comes back
+            /// through the same handoff, and is then served as its user. The
+            /// begin sets the nonce cookie and nothing else.
+            #[tokio::test]
+            async fn an_anonymous_visitor_begins_signs_in_and_comes_back_named() {
+                let db = memory_db().await;
+                let target = public_bound_target(&db).await;
+                let user = user_for(&db, target).await;
+                let cli = TestClient::new(begin_app(db.clone(), false).await);
+
+                let resp = begin(&cli, HOST, Some("/gated-upstream?x=1"), &[]).await;
+                resp.assert_status(StatusCode::SEE_OTHER);
+                let cookies = set_cookies(&resp);
+                assert_eq!(cookies.len(), 1, "{cookies:?}");
+                let nonce = nonce_set_by(&resp);
+                let set_cookie = resp.0.headers()["set-cookie"].to_str().unwrap().to_owned();
+                for attribute in ["Path=/", "Secure", "HttpOnly", "SameSite=Lax"] {
+                    assert!(set_cookie.contains(attribute), "{set_cookie}");
+                }
+                assert!(!set_cookie.contains("Domain"), "{set_cookie}");
+                let location = resp.0.headers()["location"].to_str().unwrap().to_owned();
+                let challenge = challenge_in(&location);
+
+                // Not signed in on the control plane: sent to sign in, to
+                // come back to this same start.
+                let resp = cli
+                    .get(format!(
+                        "/@warpgate{START_PATH}?{HANDOFF_CHALLENGE_PARAM}={challenge}"
+                    ))
+                    .header("host", CONTROL_PLANE)
+                    .header("accept", "text/html")
+                    .header("sec-fetch-mode", "navigate")
+                    .send()
+                    .await;
+                let location = resp.0.headers()["location"].to_str().unwrap().to_owned();
+                let next = location.strip_prefix("/@warpgate#/login?next=").unwrap();
+                let next = percent_encoding::percent_decode_str(next)
+                    .decode_utf8()
+                    .unwrap()
+                    .into_owned();
+                assert_eq!(
+                    next,
+                    format!("/@warpgate{START_PATH}?{HANDOFF_CHALLENGE_PARAM}={challenge}")
+                );
+                assert!(
+                    crate::api::sso_provider_list::is_safe_redirect_target(&next),
+                    "the sign-in's next is refused: {next}"
+                );
+
+                // Signed in, back at the same start: handed off.
+                let stamp = OffsetDateTime::now_utc().unix_timestamp();
+                let resp = cli
+                    .get(format!("/sign-in?user={user}&stamp={stamp}"))
+                    .header("host", CONTROL_PLANE)
+                    .send()
+                    .await;
+                resp.assert_status_is_ok();
+                let control = session_cookie(&resp);
+                let redeem = redeem_for(&cli, &control, user, &challenge).await;
+                let resp = cli
+                    .get(&redeem)
+                    .header("host", HOST)
+                    .header("cookie", format!("{HANDOFF_COOKIE_NAME}={nonce}"))
+                    .send()
+                    .await;
+                resp.assert_status(StatusCode::SEE_OTHER);
+                resp.assert_header("location", format!("https://{HOST}/gated-upstream?x=1"));
+                let bound = session_cookie(&resp);
+
+                let (status, seen) = gated_on(&cli, HOST, Some(&bound)).await;
+                assert_eq!(status, StatusCode::OK, "{seen}");
+                assert_eq!(seen, format!("user-{user}/user"));
+            }
+
+            /// Begin changes no session: a browser already handed off keeps
+            /// its target-host session and is given only the nonce cookie,
+            /// and the control-plane sign-in is untouched.
+            #[tokio::test]
+            async fn begin_changes_no_session() {
+                let db = memory_db().await;
+                let target = public_bound_target(&db).await;
+                let user = user_for(&db, target).await;
+                let cli = TestClient::new(begin_app(db.clone(), false).await);
+                let (control, _, stamp) = signed_in(&cli, &db, target, user, 10).await;
+                let bound = hand_off(&cli, &db, &control, user, target, HOST).await;
+                let sessions_before = HttpSession::Entity::find().all(&db).await.unwrap();
+
+                let resp = begin(&cli, HOST, Some("/page"), &[("cookie", bound.as_str())]).await;
+                resp.assert_status(StatusCode::SEE_OTHER);
+                let cookies = set_cookies(&resp);
+                assert_eq!(cookies.len(), 1, "{cookies:?}");
+                assert!(
+                    cookies
+                        .first()
+                        .unwrap()
+                        .starts_with(&format!("{HANDOFF_COOKIE_NAME}="))
+                );
+
+                let sessions_after = HttpSession::Entity::find().all(&db).await.unwrap();
+                assert_eq!(sessions_before.len(), sessions_after.len());
+                for (before, after) in sessions_before.iter().zip(&sessions_after) {
+                    assert_eq!(before.id, after.id);
+                    assert_eq!(before.data, after.data);
+                }
+                let (status, seen) = gated_on(&cli, HOST, Some(&bound)).await;
+                assert_eq!(status, StatusCode::OK, "{seen}");
+                assert_eq!(seen, format!("user-{user}/user"));
+                let resp = cli
+                    .get("/stamp")
+                    .header("host", CONTROL_PLANE)
+                    .header("cookie", &control)
+                    .send()
+                    .await;
+                resp.assert_text(stamp.to_string()).await;
+            }
+
+            /// A begun handoff completes only in the browser that began it,
+            /// and once: a token redeemed with another browser's nonce, or
+            /// with none, is refused and spent, and a redeemed token
+            /// replayed with the right nonce is refused.
+            #[tokio::test]
+            async fn a_begun_handoff_redeems_only_with_its_nonce_and_once() {
+                let db = memory_db().await;
+                let target = public_bound_target(&db).await;
+                let user = user_for(&db, target).await;
+                let cli = TestClient::new(begin_app(db.clone(), false).await);
+                let (control, _, _) = signed_in(&cli, &db, target, user, 10).await;
+                let refused_to = format!("https://{HOST}/page?{HANDOFF_RETRY_PARAM}=1");
+
+                // Another browser's nonce, then none at all.
+                let (other_challenge, other_nonce) = begun(&cli, "/elsewhere").await;
+                for nonce in [Some(other_nonce.as_str()), None] {
+                    let (challenge, own_nonce) = begun(&cli, "/page").await;
+                    assert_ne!(challenge, other_challenge);
+                    let redeem = redeem_for(&cli, &control, user, &challenge).await;
+                    let mut req = cli.get(&redeem).header("host", HOST);
+                    if let Some(nonce) = nonce {
+                        req = req.header("cookie", format!("{HANDOFF_COOKIE_NAME}={nonce}"));
+                    }
+                    let resp = req.send().await;
+                    resp.assert_status(StatusCode::SEE_OTHER);
+                    resp.assert_header("location", &refused_to);
+                    assert!(
+                        !set_cookies(&resp)
+                            .iter()
+                            .any(|pair| pair.starts_with(&format!("{SESSION_COOKIE_NAME}="))
+                                && pair.len() > SESSION_COOKIE_NAME.len() + 1),
+                        "nonce {nonce:?}: a session was given"
+                    );
+                    // Spent: its own nonce no longer completes it.
+                    let resp = cli
+                        .get(&redeem)
+                        .header("host", HOST)
+                        .header("cookie", format!("{HANDOFF_COOKIE_NAME}={own_nonce}"))
+                        .send()
+                        .await;
+                    resp.assert_status(StatusCode::SEE_OTHER);
+                    resp.assert_header(
+                        "location",
+                        format!("https://{HOST}/?{HANDOFF_RETRY_PARAM}=1"),
+                    );
+                }
+
+                // Its own nonce completes it, once.
+                let (challenge, nonce) = begun(&cli, "/page").await;
+                let redeem = redeem_for(&cli, &control, user, &challenge).await;
+                let resp = cli
+                    .get(&redeem)
+                    .header("host", HOST)
+                    .header("cookie", format!("{HANDOFF_COOKIE_NAME}={nonce}"))
+                    .send()
+                    .await;
+                resp.assert_status(StatusCode::SEE_OTHER);
+                resp.assert_header("location", format!("https://{HOST}/page"));
+                session_cookie(&resp);
+                let resp = cli
+                    .get(&redeem)
+                    .header("host", HOST)
+                    .header("cookie", format!("{HANDOFF_COOKIE_NAME}={nonce}"))
+                    .send()
+                    .await;
+                resp.assert_status(StatusCode::SEE_OTHER);
+                resp.assert_header(
+                    "location",
+                    format!("https://{HOST}/?{HANDOFF_RETRY_PARAM}=1"),
+                );
+                assert!(
+                    !set_cookies(&resp)
+                        .iter()
+                        .any(|pair| pair.starts_with(&format!("{SESSION_COOKIE_NAME}="))),
+                    "the replay was given a session"
+                );
+            }
+
+            /// A user without access to the target is refused when its
+            /// begun handoff reaches the control plane's start (404, no
+            /// token), and a user who loses access between start and redeem
+            /// is refused at the redeem with no session stored.
+            #[tokio::test]
+            async fn a_begun_handoff_without_target_access_is_refused_at_start_and_redeem() {
+                let db = memory_db().await;
+                let target = public_bound_target(&db).await;
+                let cli = TestClient::new(begin_app(db.clone(), false).await);
+
+                let outsider = user_for_targets(&db, &[]).await;
+                let (control, _, _) = signed_in(&cli, &db, target, outsider, 10).await;
+                let (challenge, _) = begun(&cli, "/page").await;
+                let resp = start(&cli, &control, outsider, &challenge).await;
+                resp.assert_status(StatusCode::NOT_FOUND);
+                assert!(resp.0.headers().get("location").is_none());
+
+                let user = user_for(&db, target).await;
+                let (control, _, _) = signed_in(&cli, &db, target, user, 10).await;
+                let (challenge, nonce) = begun(&cli, "/page").await;
+                let redeem = redeem_for(&cli, &control, user, &challenge).await;
+                TargetRoleAssignment::Entity::delete_many()
+                    .exec(&db)
+                    .await
+                    .unwrap();
+                assert_refused_and_nothing_stored(&cli, &db, &redeem, &nonce).await;
             }
 
             /// Handed off to two hosts, each served by a node of its own, a

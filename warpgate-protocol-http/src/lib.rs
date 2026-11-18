@@ -258,9 +258,10 @@ impl ProtocolServer for HTTPProtocolServer {
                         }),
                 )
                 .at("/api/logo", poem::get(api::logo::api_get_logo))
-                // The target-host handoff (`handoff`): minted on the control
-                // plane, redeemed on the bound host. Outside `/api`, which is
-                // the API service's.
+                // The target-host handoff (`handoff`): begun on the bound
+                // host, minted on the control plane, redeemed on the bound
+                // host. Outside `/api`, which is the API service's.
+                .at(handoff::BEGIN_PATH, poem::get(handoff::begin_endpoint))
                 .at(handoff::START_PATH, poem::get(handoff::start_endpoint))
                 .at(handoff::REDEEM_PATH, poem::get(handoff::redeem_endpoint))
                 // Liveness, from memory only; see health.rs.

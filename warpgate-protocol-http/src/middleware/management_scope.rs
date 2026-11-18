@@ -74,17 +74,24 @@ pub fn is_origin_checked_route(method: &Method, path: &str) -> bool {
 /// Warpgate's own and honours a session or token on it
 /// ([`credentials_refused_on_bound_host`]). That host serves the target's
 /// own pages, which share its origin, so it serves only what neither reads
-/// nor changes the sign-in: the gateway's assets (GET); the handoff's redeem
-/// route (`crate::handoff::REDEEM_PATH`), which is how a browser gets a
-/// session on this host; and sign-out, which there ends only this host's
-/// session. Everything else (the login page, the login steps, `info`, the
-/// SSO return, the user API and the admin API) is only usable on other
-/// hosts; a visitor without a session is sent through a handoff
-/// (`common::login_redirect`). No sign-in starts on a bound host, so an
-/// identity provider never returns a browser to one: there the SSO return
-/// answers as any unknown route does.
+/// nor changes the sign-in: the gateway's assets (GET); the handoff's begin
+/// route (`crate::handoff::BEGIN_PATH`), which starts a handoff and changes
+/// no session, and its redeem route (`crate::handoff::REDEEM_PATH`), which
+/// is how a browser gets a session on this host (both GET); and sign-out,
+/// which there ends only this host's session. Everything else (the login
+/// page, the login steps, `info`, the SSO return, the user API and the admin
+/// API) is only usable on other hosts; a visitor without a session is sent
+/// through a handoff (`common::login_redirect`, or the begin route on a
+/// public target's host). The sign-in itself happens on the control-plane
+/// host, so an identity provider never returns a browser to a bound host:
+/// there the SSO return answers as any unknown route does.
 pub fn is_served_on_bound_host(method: &Method, path: &str) -> bool {
-    if method == Method::GET && warpgate_surface_path(path) == Some(crate::handoff::REDEEM_PATH) {
+    if method == Method::GET
+        && matches!(
+            warpgate_surface_path(path),
+            Some(crate::handoff::BEGIN_PATH | crate::handoff::REDEEM_PATH)
+        )
+    {
         return true;
     }
     is_login_flow_route(method, path)
@@ -313,14 +320,18 @@ mod tests {
         assert!(!is_login_flow_route(&Method::GET, "/api/info"));
     }
 
-    /// A bound host serves the gateway's assets, the handoff's redeem route
-    /// and host-local sign-out, and nothing that reads or changes the
-    /// sign-in; not the SSO return either.
+    /// A bound host serves the gateway's assets, the handoff's begin and
+    /// redeem routes and host-local sign-out, and nothing that reads or
+    /// changes the sign-in; not the SSO return either.
     #[test]
     fn bound_host_serves_only_assets_handoff_and_logout() {
         for prefix in ["/@warpgate", "/_warpgate"] {
             for (method, path, served) in [
-                // The handoff's redeem route, GET only; never its start
+                // The handoff's begin and redeem routes, GET only; never
+                // its start
+                (Method::GET, "/handoff/begin", true),
+                (Method::POST, "/handoff/begin", false),
+                (Method::GET, "/handoff/begin/", false),
                 (Method::GET, "/handoff", true),
                 (Method::POST, "/handoff", false),
                 (Method::GET, "/handoff/", false),
@@ -367,6 +378,7 @@ mod tests {
         assert!(!is_served_on_bound_host(&Method::GET, "/assets/app.js"));
         assert!(!is_served_on_bound_host(&Method::GET, "/api/sso/return"));
         assert!(!is_served_on_bound_host(&Method::GET, "/handoff"));
+        assert!(!is_served_on_bound_host(&Method::GET, "/handoff/begin"));
     }
 
     /// Both sign-out routes are origin-checked, only as POST (a GET can be
@@ -459,7 +471,8 @@ mod tests {
     ];
 
     /// What a bound host serves.
-    const BOUND_HOST_SERVED: [(Method, &str); 5] = [
+    const BOUND_HOST_SERVED: [(Method, &str); 6] = [
+        (Method::GET, "/@warpgate/handoff/begin"),
         (Method::GET, "/@warpgate/handoff"),
         (Method::GET, "/_warpgate/handoff"),
         (Method::POST, "/@warpgate/api/auth/logout"),
