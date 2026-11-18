@@ -205,7 +205,9 @@ LICENCE_FILE = re.compile(r"(LICEN[CS]E|COPYING|UNLICENSE)([-._][A-Za-z0-9._-]*)
 # aws-lc-rs and aws-lc-sys moved to v0.30.0's versions (20 Oct 2026): the same
 # licence files, byte for byte, and the same kind of package. They and
 # libz-sys (1.1.31) moved to v0.30.2-cove.5's versions (30 Oct 2026): the same
-# licence files, byte for byte, and the same package layout.
+# licence files, byte for byte, and the same package layout. libz-sys 1.1.33
+# added beside 1.1.31 (18 Nov 2026, RUSTSEC-2026-0544): the same licence
+# files, byte for byte, and the same package layout.
 # The four macOS-only -sys crates (21 Oct 2026, the first darwin notices run,
 # 22625): bindings to Apple's system frameworks, checked against the fork
 # lockfile's checksums at v0.30.0 -- no C, C++ or assembly in any of them.
@@ -229,7 +231,8 @@ NATIVE_CODE = {
     "libloading": (("0.8.9", (), "the DLLs under tests/ are test fixtures, never linked"),),
     "libsqlite3-sys": (("0.30.1", (), "the bundled SQLite amalgamation, compiled by its build script, is in the "
                                      "public domain and carries no licence file"),),
-    "libz-sys": (("1.1.31", ("src/zlib/LICENSE",), "the zlib C library, compiled by its build script"),),
+    "libz-sys": (("1.1.31", ("src/zlib/LICENSE",), "the zlib C library, compiled by its build script"),
+                 ("1.1.33", ("src/zlib/LICENSE",), "the zlib C library, compiled by its build script")),
     "linux-raw-sys": (("0.12.1", (), "a -sys name only: Rust bindings generated from Linux's headers"),),
     "nix": (("0.29.0", (), "the C under test/ is a test kernel module, never compiled in"),
             ("0.30.1", (), "the C under test/ is a test kernel module, never compiled in"),
