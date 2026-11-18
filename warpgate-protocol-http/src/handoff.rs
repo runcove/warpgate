@@ -86,7 +86,8 @@ pub const HANDOFF_TOKEN_PARAM: &str = warpgate_common_http::ticket_query::HANDOF
 pub const HANDOFF_RETRY_PARAM: &str = "warpgate-handoff-retry";
 
 /// How long an opened handoff waits for the control plane. A sign-in there
-/// that takes longer leaves the browser on a refusal; opening the page again
+/// that takes longer leaves the browser on a refusal saying so
+/// ([`start_endpoint`]); opening the page again
 /// starts a new handoff, which then completes without a second sign-in. The
 /// nonce cookie lives as long.
 pub const OPEN_LIFETIME: Duration = Duration::from_secs(120);
@@ -455,7 +456,7 @@ pub async fn start_endpoint(req: &Request, session: &Session) -> poem::Result<Re
     let services = ctx.services();
     let now = OffsetDateTime::now_utc();
     let Some(row) = opened(&services.db, &challenge, now).await? else {
-        return Ok(refusal(StatusCode::FORBIDDEN));
+        return Ok(sign_in_too_slow());
     };
     // A stale control-plane sign-in mints nothing: the browser signs in
     // again, as on any control-plane page, and comes back here.
@@ -498,7 +499,7 @@ pub async fn start_endpoint(req: &Request, session: &Session) -> poem::Result<Re
     )
     .await?
     else {
-        return Ok(refusal(StatusCode::FORBIDDEN));
+        return Ok(sign_in_too_slow());
     };
     let mut redeem = url::form_urlencoded::Serializer::new(format!("/@warpgate{REDEEM_PATH}?"));
     redeem.append_pair(HANDOFF_TOKEN_PARAM, &token);
@@ -751,6 +752,16 @@ fn cookies_needed() -> Response {
 
 const COOKIES_NEEDED: &str =
     "Signing in to this site needs cookies. Allow cookies for this host, then reload the page.\n";
+
+/// The refusal of a handoff that is gone by the time the control plane would
+/// mint it: most often a sign-in that took longer than [`OPEN_LIFETIME`].
+/// Opening the page again starts a new handoff.
+fn sign_in_too_slow() -> Response {
+    plain(StatusCode::FORBIDDEN, SIGN_IN_TOO_SLOW)
+}
+
+const SIGN_IN_TOO_SLOW: &str =
+    "Signing in took too long. Open the page you were going to again to continue.\n";
 
 /// The first value of the query parameter `name`.
 fn query_value(req: &Request, name: &str) -> Option<String> {
@@ -1929,6 +1940,30 @@ mod tests {
                     .await;
                 resp.assert_text(stamp.to_string()).await;
             }
+            /// A handoff that expired while the browser signed in is refused
+            /// with a body telling the user to open the page again, and
+            /// nothing is minted.
+            #[tokio::test]
+            async fn a_sign_in_slower_than_the_handoff_is_told_to_reopen_the_page() {
+                let db = memory_db().await;
+                let target = bound_target(&db).await;
+                let user = user_for(&db, target).await;
+                let cli = TestClient::new(app(db.clone()).await);
+                let (cookie, _, _) = signed_in(&cli, &db, target, user, 10).await;
+                let long_ago =
+                    OffsetDateTime::now_utc() - OPEN_LIFETIME - time::Duration::seconds(1);
+                let opened = open(&db, target, HOST, "/page", long_ago)
+                    .await
+                    .unwrap()
+                    .unwrap();
+
+                let resp = start(&cli, &cookie, user, &opened.challenge).await;
+                resp.assert_status(StatusCode::FORBIDDEN);
+                resp.assert_header("cache-control", "no-store");
+                resp.assert_content_type("text/plain; charset=utf-8");
+                resp.assert_text(SIGN_IN_TOO_SLOW).await;
+            }
+
             /// Signs in, opens a handoff and mints its token: the path of the
             /// redeem the browser is sent to, and the handoff's nonce.
             async fn minted_redeem(
