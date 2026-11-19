@@ -770,6 +770,55 @@ async fn run_websocket_recording(
     }
 }
 
+/// The subprotocols whose frames [`run_websocket_recording`] can read: a channel
+/// byte, then that channel's data.
+const RECORDABLE_SUBPROTOCOLS: [&str; 5] = [
+    "channel.k8s.io",
+    "v2.channel.k8s.io",
+    "v3.channel.k8s.io",
+    "v4.channel.k8s.io",
+    "v5.channel.k8s.io",
+];
+
+/// Whether an exec / attach stream on the subprotocol the cluster agreed to can be
+/// recorded. The client names the subprotocols it offers and the cluster picks
+/// one, so it can be one this proxy does not offer: in the base64 ones the channel
+/// byte is a digit and the data is encoded, and the recorder would skip every
+/// frame. A stream with no agreed subprotocol is not known to be recordable.
+fn is_recordable_subprotocol(negotiated: Option<&str>) -> bool {
+    negotiated.is_some_and(|protocol| RECORDABLE_SUBPROTOCOLS.contains(&protocol))
+}
+
+/// Hands a frame of an exec / attach stream to its recorder, before the frame is
+/// passed on; both directions of the stream go through here. Binary frames are
+/// what the recorder reads on a recordable subprotocol (see
+/// [`is_recordable_subprotocol`]), and are queued for it. A text frame is not
+/// what those subprotocols send, so it cannot be recorded faithfully. With
+/// `recording_required` (the stream has a recording, and unrecorded sessions are
+/// refused) a text frame is an error, which ends the stream before the frame is
+/// passed on; otherwise it passes unrecorded. Ping, pong and close frames carry
+/// no stream data and pass.
+async fn record_stream_frame(
+    recorder_tx: &mpsc::Sender<Vec<u8>>,
+    recording_failed: &CancellationToken,
+    recording_required: bool,
+    msg: &tungstenite::Message,
+) -> anyhow::Result<()> {
+    if recording_failed.is_cancelled() {
+        return Err(WarpgateError::SessionRecordingFailed.into());
+    }
+    match msg {
+        tungstenite::Message::Binary(data) => {
+            let _ = recorder_tx.send(data.to_vec()).await;
+        }
+        tungstenite::Message::Text(_) if recording_required => {
+            bail!("Closing the Kubernetes stream: a text frame cannot be recorded");
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// The user and target named on a failed recording's log line.
 fn recording_owner(subject: &KubernetesAuditSubject) -> RecordingOwner {
     RecordingOwner {
@@ -892,6 +941,8 @@ async fn _handle_websocket_request_inner(
     // Cancelled when the recording fails and unrecorded sessions are refused: the
     // stream then ends like a session close.
     let recording_failed = closed.child_token();
+    // Whether this stream has a recording it may not go on without.
+    let mut recording_required = false;
     if let Some(metadata) = operation
         .as_ref()
         .and_then(StreamOperation::recording_metadata)
@@ -903,6 +954,7 @@ async fn _handle_websocket_request_inner(
         )
         .await?
     {
+        recording_required = services.recordings.refuses_unrecorded_sessions();
         tokio::spawn(run_websocket_recording(
             recorder,
             recorder_rx,
@@ -961,6 +1013,10 @@ async fn _handle_websocket_request_inner(
             .map_err(websocket_error_without_url)
             .context("negotiating websocket connection with Kubernetes")?;
 
+        if recording_required && !is_recordable_subprotocol(client_socket.protocol()) {
+            bail!("Closing the Kubernetes stream: its subprotocol cannot be recorded");
+        }
+
         let (client_sink, client_source) = client_socket.split();
         let (server_sink, server_source) = socket.split();
 
@@ -975,12 +1031,13 @@ async fn _handle_websocket_request_inner(
                     let recording_failed = recording_failed.clone();
                     async move {
                         tracing::debug!("Server: {:?}", msg);
-                        if recording_failed.is_cancelled() {
-                            return Err(WarpgateError::SessionRecordingFailed.into());
-                        }
-                        if let tungstenite::Message::Binary(data) = &msg {
-                            let _ = recorder_tx.send(data.to_vec()).await;
-                        }
+                        record_stream_frame(
+                            &recorder_tx,
+                            &recording_failed,
+                            recording_required,
+                            &msg,
+                        )
+                        .await?;
                         anyhow::Ok(msg)
                     }
                 },
@@ -998,12 +1055,13 @@ async fn _handle_websocket_request_inner(
                     let recording_failed = recording_failed.clone();
                     async move {
                         tracing::debug!("Client: {:?}", msg);
-                        if recording_failed.is_cancelled() {
-                            return Err(WarpgateError::SessionRecordingFailed.into());
-                        }
-                        if let tungstenite::Message::Binary(data) = &msg {
-                            let _ = recorder_tx.send(data.to_vec()).await;
-                        }
+                        record_stream_frame(
+                            &recorder_tx,
+                            &recording_failed,
+                            recording_required,
+                            &msg,
+                        )
+                        .await?;
                         anyhow::Ok(msg)
                     }
                 },
@@ -1413,11 +1471,14 @@ mod tests {
         use std::path::PathBuf;
         use std::time::Duration;
 
+        use futures::StreamExt;
         use sea_orm::ActiveValue::Set;
         use sea_orm::{ActiveModelTrait, Database, IntoActiveModel};
         use tokio::sync::mpsc;
+        use tokio_tungstenite::tungstenite;
         use tokio_util::sync::CancellationToken;
         use uuid::Uuid;
+        use warpgate_common::helpers::websocket::pump_websocket;
         use warpgate_common::{GlobalParams, TargetSessionId, UserSessionId, WarpgateError};
         use warpgate_core::recordings::{RecordingOwner, SessionRecordings, test_support};
         use warpgate_db_entities::Parameters::{
@@ -1428,8 +1489,9 @@ mod tests {
 
         use super::super::{
             ApiRecordingSession, ApiRequestRecord, FAILED_API_RECORDINGS, SessionRecordingMetadata,
-            checked_api_recording, checked_stream_recording, record_api_response,
-            run_websocket_recording, send_recorded, start_api_recording, start_stream_recording,
+            checked_api_recording, checked_stream_recording, is_recordable_subprotocol,
+            record_api_response, record_stream_frame, run_websocket_recording, send_recorded,
+            start_api_recording, start_stream_recording,
         };
         use crate::recording::{start_recording_api_named, start_recording_exec};
 
@@ -1559,6 +1621,136 @@ mod tests {
                     "the stream ends only when recording is required"
                 );
                 r.assert_one_failure_line(required);
+            }
+        }
+
+        /// One direction of a stream, as the handler pumps it: `frames` go through
+        /// [`record_stream_frame`] and on. Returns the pump's result, the frames
+        /// passed on, and the frames handed to the recorder.
+        async fn pump(
+            frames: Vec<tungstenite::Message>,
+            recording_required: bool,
+        ) -> (anyhow::Result<()>, Vec<tungstenite::Message>, Vec<Vec<u8>>) {
+            let (recorder_tx, mut recorder_rx) = mpsc::channel(1000);
+            let (sink, passed_on) = futures::channel::mpsc::unbounded::<tungstenite::Message>();
+            let recording_failed = CancellationToken::new();
+            let result = pump_websocket(
+                futures::stream::iter(frames.into_iter().map(Ok::<_, std::io::Error>)),
+                sink,
+                move |msg| {
+                    let recorder_tx = recorder_tx.clone();
+                    let recording_failed = recording_failed.clone();
+                    async move {
+                        record_stream_frame(
+                            &recorder_tx,
+                            &recording_failed,
+                            recording_required,
+                            &msg,
+                        )
+                        .await?;
+                        anyhow::Ok(msg)
+                    }
+                },
+                "test",
+            )
+            .await;
+            let passed_on = passed_on.collect().await;
+            let mut recorded = Vec::new();
+            while let Ok(frame) = recorder_rx.try_recv() {
+                recorded.push(frame);
+            }
+            (result, passed_on, recorded)
+        }
+
+        /// A text frame on a stream whose recording is required ends the stream
+        /// before the frame is passed on: the recorder reads binary frames only.
+        /// Not required, it passes, unrecorded. Binary frames are handed to the
+        /// recorder and passed on either way.
+        #[tokio::test]
+        async fn a_text_frame_ends_a_stream_whose_recording_is_required() {
+            let stdin = tungstenite::Message::Binary(b"\x00ls\n".to_vec().into());
+            let stdout = tungstenite::Message::Binary(b"\x01file\n".to_vec().into());
+            for text in [
+                // As the binary subprotocols frame stdin, and as the base64 ones do.
+                tungstenite::Message::Text("\x00id\n".into()),
+                tungstenite::Message::Text("0aWQK".into()),
+            ] {
+                let frames = vec![stdin.clone(), text.clone(), stdout.clone()];
+
+                let (result, passed_on, recorded) = pump(frames.clone(), true).await;
+                let error = format!("{:#}", result.expect_err("the stream ends"));
+                assert!(
+                    error
+                        .contains("Closing the Kubernetes stream: a text frame cannot be recorded"),
+                    "{error}"
+                );
+                // The pump may end before it has passed on what came earlier.
+                assert!(
+                    !passed_on.contains(&text) && !passed_on.contains(&stdout),
+                    "neither the text frame nor anything after it is passed on: {passed_on:?}"
+                );
+                assert_eq!(recorded, [b"\x00ls\n".to_vec()]);
+
+                let (result, passed_on, recorded) = pump(frames.clone(), false).await;
+                result.unwrap();
+                assert_eq!(passed_on, frames);
+                assert_eq!(recorded, [b"\x00ls\n".to_vec(), b"\x01file\n".to_vec()]);
+            }
+        }
+
+        /// A stream whose recording is required goes on only on a subprotocol the
+        /// recorder can read. A binary frame is passed on whatever it holds (see
+        /// the test below), so one framed as the base64 subprotocols frame stdin
+        /// would be passed on and skipped by the recorder.
+        #[test]
+        fn only_the_binary_channel_subprotocols_are_recordable() {
+            for protocol in [
+                "channel.k8s.io",
+                "v2.channel.k8s.io",
+                "v3.channel.k8s.io",
+                "v4.channel.k8s.io",
+                "v5.channel.k8s.io",
+            ] {
+                assert!(is_recordable_subprotocol(Some(protocol)), "{protocol}");
+            }
+            for protocol in [
+                "base64.channel.k8s.io",
+                "v4.base64.channel.k8s.io",
+                "V4.CHANNEL.K8S.IO",
+                "v4.channel.k8s.io, base64.channel.k8s.io",
+                "SPDY/3.1+portforward.k8s.io",
+                "",
+            ] {
+                assert!(!is_recordable_subprotocol(Some(protocol)), "{protocol}");
+            }
+            assert!(!is_recordable_subprotocol(None));
+        }
+
+        /// Binary frames, and the frames that carry no stream data, pass whether
+        /// or not the recording is required. That includes a binary frame holding
+        /// what a base64 subprotocol would send as stdin, which is why such a
+        /// subprotocol is refused when the stream opens.
+        #[tokio::test]
+        async fn binary_and_control_frames_pass_when_recording_is_required() {
+            let frames = vec![
+                tungstenite::Message::Binary(b"\x00ls\n".to_vec().into()),
+                tungstenite::Message::Ping(Vec::new().into()),
+                tungstenite::Message::Pong(Vec::new().into()),
+                tungstenite::Message::Binary(b"\x01file\n".to_vec().into()),
+                tungstenite::Message::Binary(b"0aWQK".to_vec().into()),
+            ];
+            for required in [true, false] {
+                let (result, passed_on, recorded) = pump(frames.clone(), required).await;
+                result.unwrap();
+                assert_eq!(passed_on, frames);
+                assert_eq!(
+                    recorded,
+                    [
+                        b"\x00ls\n".to_vec(),
+                        b"\x01file\n".to_vec(),
+                        b"0aWQK".to_vec()
+                    ]
+                );
             }
         }
 

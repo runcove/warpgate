@@ -279,6 +279,22 @@ the request is refused when it is made, not kept for after the approval. The
 session itself stays open. `scp` in its SFTP mode (OpenSSH 9.0 and later by
 default) is such a request; `scp -O` is an exec and is recorded as one.
 
+With the option on, a Kubernetes exec or attach stream that has a recording
+goes on only in a form the recording can hold, which is binary websocket
+frames on one of the `channel.k8s.io` subprotocols Warpgate offers
+(`channel.k8s.io` and `v2.` to `v5.channel.k8s.io`). The client names the
+subprotocols it asks the cluster for, so the cluster can agree to another
+(in the base64 ones the same stdin and stdout travel encoded): the stream is
+then closed as soon as the cluster has agreed, as is one with no agreed
+subprotocol, before any frame passes, and the proxy logs `Closing the
+Kubernetes stream: its subprotocol cannot be recorded`. The cluster has
+accepted the stream by then, so an exec's command (which is in the
+recording's metadata and the audit event) may have started, with no input.
+On a subprotocol that can be recorded, the stream is closed at the first
+text frame from either side, before that frame is passed on, and the proxy
+logs `Closing the Kubernetes stream: a text frame cannot be recorded`. Ping,
+pong and close frames carry no stream data and pass.
+
 With the option on, a recording that fails mid-session closes the session
 too: in SSH (the client is shown `session closed: its recording failed`), the
 web SSH client, Kubernetes exec and attach streams, native RDP and VNC, and
@@ -287,7 +303,8 @@ once the session is closed for its recording. A Kubernetes API request is
 recorded twice in its `data.ndjson`: a line with the request and no response
 (`response_status` and `response_body` are `null`) before the request is
 sent, and a line with the request and its response afterwards; a request
-that fails after it was sent has the first line only. With the option on,
+with the first line only was not answered, and may not have reached the
+cluster. With the option on,
 the first line is waited for before the request is sent, and if that write
 fails the request is refused (HTTP 503, `session closed: its recording
 failed`) and never reaches the cluster. A Kubernetes API request that
@@ -353,8 +370,10 @@ What the option does not cover:
   the option overrides `record_scp`: the `scp` exec is recorded like any
   other exec, and Warpgate logs one warning saying so), SSH
   extended data sent from the client to the target, Kubernetes port-forward,
-  Kubernetes exec and attach websocket frames that are not binary, the
-  bodies of streamed Kubernetes API responses to reads (`watch`, `logs -f`
+  Kubernetes exec and attach websocket text frames, and every frame of an
+  exec or attach stream on a subprotocol other than the `channel.k8s.io`
+  ones above, with the option off (with it on they close the stream, above),
+  the bodies of streamed Kubernetes API responses to reads (`watch`, `logs -f`
   and other chunked responses; the request and its response are recorded,
   with an empty response body), native RDP frames dropped from the recording
   when its queue is full with the option off (no failure line is logged for
