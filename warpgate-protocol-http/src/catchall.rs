@@ -2068,6 +2068,112 @@ mod request_target_tests {
         }
     }
 
+    /// As shipped (`http.serve_unbound_http_targets` never set), a target
+    /// with no hostname is served nowhere: not on Warpgate's own host,
+    /// where its user API and admin API answer, nor on any other, whether
+    /// it is asked for by name, held by the session or opened with a ticket,
+    /// and whether or not Warpgate's own host is configured. With the
+    /// setting on, the same requests are served on Warpgate's own host.
+    #[tokio::test]
+    async fn a_target_with_no_hostname_is_served_nowhere_as_shipped() {
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+        for control_plane in [Some(CONTROL_PLANE), None] {
+            let db = memory_db().await;
+            let user_id = setup(&db, None).await;
+            let open_id = Target::Entity::find()
+                .filter(Target::Column::Name.eq("open"))
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap()
+                .id;
+            let services = services(db).await;
+            {
+                let mut config = services.config.lock().await;
+                config.store.external_host = control_plane.map(Into::into);
+                assert!(!config.store.http.serve_unbound_http_targets);
+            }
+            let unauthenticated = UnauthenticatedRequestContext::new(services.clone()).await;
+            let user = SessionAuthorization::User {
+                user_id,
+                username: "user".into(),
+            };
+            let ticket = SessionAuthorization::Ticket {
+                user_id,
+                username: "user".into(),
+                target_id: open_id,
+                ticket_id: Some(Uuid::new_v4()),
+            };
+            let served = async |auth: &SessionAuthorization,
+                                host: Option<&str>,
+                                path: &str,
+                                session_target: Option<&str>| {
+                let ctx =
+                    unauthenticated.to_authenticated(RequestAuthorization::Session(auth.clone()));
+                let mut req = Request::builder().uri(path.parse().unwrap());
+                if let Some(host) = host {
+                    req = req.header("host", host);
+                }
+                let mut req = req.finish();
+                let session = Session::default();
+                if let Some(name) = session_target {
+                    session.set_target_name(name.into());
+                }
+                req.extensions_mut().insert(session);
+                get_target_for_request(&req, &ctx)
+                    .await
+                    .unwrap()
+                    .map(|authorization| authorization.target().name.clone())
+            };
+            let hosts = [
+                Some(CONTROL_PLANE),
+                Some("warp.example:8443"),
+                Some("WARP.example"),
+                Some("other.example"),
+                Some("127.0.0.1:8888"),
+                None,
+            ];
+            let asks = [
+                ("/?warpgate-target=open", None),
+                ("/", Some("open")),
+                ("/?warpgate-target=open", Some("open")),
+            ];
+            for host in hosts {
+                for (path, session_target) in asks {
+                    for auth in [&user, &ticket] {
+                        assert_eq!(
+                            served(auth, host, path, session_target).await,
+                            None,
+                            "control plane {control_plane:?}, {host:?}{path}, session {session_target:?}, {auth:?}"
+                        );
+                    }
+                }
+            }
+
+            // The same requests find the target once the setting is on, so
+            // the refusals above are the setting's.
+            services
+                .config
+                .lock()
+                .await
+                .store
+                .http
+                .serve_unbound_http_targets = true;
+            for (path, session_target) in asks {
+                for auth in [&user, &ticket] {
+                    assert_eq!(
+                        served(auth, Some(CONTROL_PLANE), path, session_target)
+                            .await
+                            .as_deref(),
+                        Some("open"),
+                        "{path}, session {session_target:?}, {auth:?}"
+                    );
+                }
+            }
+        }
+    }
+
     /// A leftover target bound to the control-plane host (refused, at any
     /// port) does not stop unbound targets being served there; on another
     /// host its binding still does.
