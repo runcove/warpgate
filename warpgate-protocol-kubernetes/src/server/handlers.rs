@@ -27,6 +27,7 @@ use warpgate_core::recordings::{
     RecordingOwner, SessionRecordings, TerminalRecorder, TerminalRecordingStreamId,
 };
 use warpgate_core::{Services, WarpgateServerHandle};
+use warpgate_db_entities::Parameters;
 
 use crate::audit::{
     PendingRun, StreamOperation, classify_node_run, classify_pod_write, classify_stream,
@@ -211,7 +212,7 @@ pub async fn handle_api_request(
             )
             .await
             .map(IntoResponse::into_response)
-            .map_err(poem::Error::from)
+            .map_err(websocket_request_error)
         } else {
             // Not `.context(...)`: that converts the `WarpgateError` to an
             // `anyhow::Error`, which poem renders through `Display` instead
@@ -252,6 +253,16 @@ pub async fn handle_api_request(
     }
     .instrument(log_span)
     .await
+}
+
+/// The error a WebSocket request that was not upgraded is answered with. A
+/// [`WarpgateError`] keeps its own status (HTTP 503 for a stream refused for want
+/// of a recording) rather than the 500 poem gives an `anyhow::Error`.
+fn websocket_request_error(error: anyhow::Error) -> poem::Error {
+    match error.downcast::<WarpgateError>() {
+        Ok(error) => poem::Error::from(error),
+        Err(error) => poem::Error::from(error),
+    }
 }
 
 /// Normal credentials retain the /<target>/<api-path> route. Decode only the
@@ -645,7 +656,10 @@ struct ApiRequestRecord<'a> {
 }
 
 /// Writes an API request's record before the request is sent: the only place
-/// such a request is recorded ahead of sending. The record is the request with no
+/// a request that is not a WebSocket upgrade is recorded ahead of sending. (An
+/// upgrade is sent by [`_handle_websocket_request_inner`], which has no record
+/// of this kind and refuses the upgrades it cannot record when unrecorded
+/// sessions are refused.) The record is the request with no
 /// response yet. When unrecorded sessions are refused, that write is waited for,
 /// and if it fails the request is refused with
 /// [`WarpgateError::SessionRecordingFailed`] and must not be sent; every later
@@ -787,6 +801,14 @@ const RECORDABLE_SUBPROTOCOLS: [&str; 5] = [
 /// frame. A stream with no agreed subprotocol is not known to be recordable.
 fn is_recordable_subprotocol(negotiated: Option<&str>) -> bool {
     negotiated.is_some_and(|protocol| RECORDABLE_SUBPROTOCOLS.contains(&protocol))
+}
+
+/// Whether recording is switched on in the settings. An unreadable setting
+/// counts as on, so a refusal that depends on it fails closed.
+async fn recordings_enabled(services: &Services) -> bool {
+    Parameters::Entity::get(&services.db)
+        .await
+        .map_or(true, |parameters| parameters.recordings_enable)
 }
 
 /// Hands a frame of an exec / attach stream to its recorder, before the frame is
@@ -941,7 +963,10 @@ async fn _handle_websocket_request_inner(
     // Cancelled when the recording fails and unrecorded sessions are refused: the
     // stream then ends like a session close.
     let recording_failed = closed.child_token();
-    // Whether this stream has a recording it may not go on without.
+    let refuses_unrecorded = services.recordings.refuses_unrecorded_sessions();
+    // Whether this stream has a recording, and whether it may not go on without
+    // it.
+    let mut recorded = false;
     let mut recording_required = false;
     if let Some(metadata) = operation
         .as_ref()
@@ -954,12 +979,28 @@ async fn _handle_websocket_request_inner(
         )
         .await?
     {
-        recording_required = services.recordings.refuses_unrecorded_sessions();
+        recorded = true;
+        recording_required = refuses_unrecorded;
         tokio::spawn(run_websocket_recording(
             recorder,
             recorder_rx,
             recording_failed.clone(),
         ));
+    }
+
+    // Only exec and attach streams have a recording. When unrecorded sessions
+    // are refused, any other upgrade (a pod, service or node `proxy` path, for
+    // one) is refused here, before anything of it reaches the cluster; all but
+    // port-forward, which is documented as never recorded.
+    if refuses_unrecorded
+        && !recorded
+        && !operation
+            .as_ref()
+            .is_some_and(StreamOperation::is_port_forward)
+        && recordings_enabled(services).await
+    {
+        warn!("Refusing a Kubernetes stream that has no recording");
+        return Err(WarpgateError::SessionNotRecorded.into());
     }
 
     let ws_protocol = req
@@ -1490,8 +1531,8 @@ mod tests {
         use super::super::{
             ApiRecordingSession, ApiRequestRecord, FAILED_API_RECORDINGS, SessionRecordingMetadata,
             checked_api_recording, checked_stream_recording, is_recordable_subprotocol,
-            record_api_response, record_stream_frame, run_websocket_recording, send_recorded,
-            start_api_recording, start_stream_recording,
+            record_api_response, record_stream_frame, run_websocket_recording,
+            start_api_recording, start_stream_recording, write_request_record,
         };
         use crate::recording::{start_recording_api_named, start_recording_exec};
 
@@ -1928,7 +1969,7 @@ mod tests {
             if fail {
                 r.fail();
             }
-            let sent = send_recorded(
+            let sent = match write_request_record(
                 Some(&recorder),
                 &session,
                 &ApiRequestRecord {
@@ -1937,12 +1978,18 @@ mod tests {
                     headers: &HashMap::new(),
                     body: b"",
                 },
-                reqwest::Client::new().delete(&url),
-                &CancellationToken::new(),
-                true,
             )
             .await
-            .map(|response| response.status().as_u16());
+            {
+                Ok(()) => Ok(reqwest::Client::new()
+                    .delete(&url)
+                    .send()
+                    .await
+                    .unwrap()
+                    .status()
+                    .as_u16()),
+                Err(e) => Err(e),
+            };
             // Whatever reached the cluster has arrived by the time the send has
             // returned its response, or, refused, was never sent.
             let mut seen = Vec::new();
@@ -2020,7 +2067,10 @@ mod tests {
                     );
                     r.assert_one_failure_line(true);
                 } else {
-                    assert!(matches!(checked, Ok(Some(_))), "not checked when not required");
+                    assert!(
+                        matches!(checked, Ok(Some(_))),
+                        "not checked when not required"
+                    );
                 }
             }
         }
@@ -2047,9 +2097,399 @@ mod tests {
                     );
                     r.assert_one_failure_line(true);
                 } else {
-                    assert!(matches!(started, Ok(Some(_))), "not checked when not required");
+                    assert!(
+                        matches!(started, Ok(Some(_))),
+                        "not checked when not required"
+                    );
                 }
             }
+        }
+    }
+
+    /// The request handlers themselves, in front of a stand-in for the cluster:
+    /// what reaches the cluster.
+    mod through_the_handlers {
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use futures::{SinkExt, StreamExt};
+        use poem::listener::{Acceptor, Listener};
+        use poem::web::Data;
+        use poem::web::websocket::WebSocket;
+        use poem::{EndpointExt, IntoResponse, Request, Response};
+        use reqwest_websocket::Upgrade;
+        use sea_orm::ActiveValue::Set;
+        use sea_orm::{ActiveModelTrait, Database, DatabaseConnection, IntoActiveModel};
+        use tokio::sync::{Mutex, mpsc};
+        use tokio_tungstenite::tungstenite;
+        use tokio_util::sync::CancellationToken;
+        use uuid::Uuid;
+        use warpgate_common::auth::AuthStateUserInfo;
+        use warpgate_common::{
+            GlobalParams, KubernetesTargetAuth, KubernetesTargetTokenAuth, MaybeSecretRef, Target,
+            TargetKubernetesOptions, TargetOptions, Tls, WarpgateConfig, WarpgateConfigStore,
+        };
+        use warpgate_core::cluster::Cluster;
+        use warpgate_core::logging::KubernetesAuditSubject;
+        use warpgate_core::login_protection::LoginProtectionService;
+        use warpgate_core::rate_limiting::RateLimiterRegistry;
+        use warpgate_core::recordings::SessionRecordings;
+        use warpgate_core::{
+            ApprovalRequestSink, AuthStateStore, DatabaseConfigProvider, SecretBackendRegistry,
+            Services, SessionHandle, State, TargetAuthorization, TargetSessionStart,
+            UserSessionStateInit, WarpgateServerHandle,
+        };
+        use warpgate_db_entities::Parameters::{
+            self, ConfigMigrationValues, RecordingsDiskConfig, RecordingsStorageConfig,
+            set_config_migration_values,
+        };
+        use warpgate_db_migrations::migrate_database;
+
+        use super::super::{_handle_websocket_request_inner, websocket_request_error};
+        use crate::correlator::AdmittedSession;
+
+        const BINARY: &str = "v4.channel.k8s.io";
+
+        struct NoopHandle;
+
+        impl SessionHandle for NoopHandle {
+            fn close(&mut self) {}
+        }
+
+        /// What a handler is given for a request of an admitted session.
+        struct Proxy {
+            services: Services,
+            admitted: AdmittedSession,
+            handle: Arc<Mutex<WarpgateServerHandle>>,
+            subject: KubernetesAuditSubject,
+            closed: CancellationToken,
+            _dir: tempfile::TempDir,
+        }
+
+        async fn services(db: &DatabaseConnection, params: GlobalParams) -> Services {
+            let rate_limiter_registry = Arc::new(Mutex::new(RateLimiterRegistry::new(db.clone())));
+            let cluster = Arc::new(Cluster::new(db.clone(), 0).await.unwrap());
+            Services {
+                db: db.clone(),
+                recordings: Arc::new(SessionRecordings::new(db.clone(), &params)),
+                config: Arc::new(Mutex::new(WarpgateConfig {
+                    store: WarpgateConfigStore::default(),
+                })),
+                state: State::new(db, &rate_limiter_registry, cluster.node_id),
+                cluster: cluster.clone(),
+                rate_limiter_registry,
+                config_provider: Arc::new(DatabaseConfigProvider::new(db).into()),
+                auth_state_store: Arc::new(Mutex::new(AuthStateStore::new(ApprovalRequestSink {
+                    db: db.clone(),
+                    cluster,
+                }))),
+                admin_token: Arc::new(None),
+                login_protection: Arc::new(LoginProtectionService::new(db.clone()).await.unwrap()),
+                global_params: Arc::new(params),
+                listener_status: Default::default(),
+                secret_backends: Arc::new(SecretBackendRegistry::new(db.clone())),
+                live_streams: Default::default(),
+                pending_revocations: Default::default(),
+            }
+        }
+
+        /// A session admitted to a Kubernetes target at `cluster_url`, with recording
+        /// switched on or off in the settings and unrecorded sessions refused or not.
+        async fn proxy(cluster_url: &str, recordings_enabled: bool, refuse: bool) -> Proxy {
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+            let dir = tempfile::tempdir().unwrap();
+            set_config_migration_values(ConfigMigrationValues::default());
+            let db = Database::connect("sqlite::memory:").await.unwrap();
+            migrate_database(&db).await.unwrap();
+            let mut parameters = Parameters::Entity::get(&db)
+                .await
+                .unwrap()
+                .into_active_model();
+            parameters.recordings_enable = Set(recordings_enabled);
+            parameters.recordings_storage = Set(serde_json::to_string(
+                &RecordingsStorageConfig::Disk(RecordingsDiskConfig {
+                    path: "recordings".into(),
+                }),
+            )
+            .unwrap());
+            parameters.update(&db).await.unwrap();
+            let user = AuthStateUserInfo {
+                id: Uuid::new_v4(),
+                username: "alice".into(),
+            };
+            warpgate_db_entities::User::ActiveModel {
+                id: Set(user.id),
+                username: Set(user.username.clone()),
+                description: Set(String::new()),
+                credential_policy: Set(sea_orm::JsonValue::Object(Default::default())),
+                rate_limit_bytes_per_second: Set(None),
+                ldap_server_id: Set(None),
+                ldap_object_uuid: Set(None),
+                allowed_ip_ranges: Set(sea_orm::JsonValue::Null),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+            let params = GlobalParams::new(dir.path().join("warpgate.yaml"), false)
+                .unwrap()
+                .with_refuse_unrecorded_sessions(refuse);
+            let services = services(&db, params).await;
+
+            let handle = State::register_node_local_user_session(
+                &services.state,
+                crate::PROTOCOL_NAME,
+                UserSessionStateInit {
+                    remote_address: None,
+                    handle: Box::new(NoopHandle),
+                },
+            )
+            .await
+            .unwrap();
+            let target = Target {
+                id: Uuid::new_v4(),
+                name: "cluster".into(),
+                description: String::new(),
+                allow_roles: vec![],
+                options: TargetOptions::Kubernetes(TargetKubernetesOptions {
+                    cluster_url: cluster_url.into(),
+                    tls: Tls::default(),
+                    auth: KubernetesTargetAuth::Token(KubernetesTargetTokenAuth {
+                        token: MaybeSecretRef::from_stored("token".into()),
+                    }),
+                }),
+                rate_limit_bytes_per_second: None,
+                group_id: None,
+                ticket_max_duration_seconds: None,
+                ticket_requests_disabled: false,
+                ticket_require_approval: false,
+                require_approval: false,
+                ticket_max_uses: None,
+            };
+            let subject = KubernetesAuditSubject {
+                session_id: handle.lock().await.user_session_id().0,
+                user_id: user.id,
+                username: user.username.clone(),
+                target_id: target.id,
+                target_name: target.name.clone(),
+            };
+            let admitted = {
+                let mut handle = handle.lock().await;
+                handle.set_user_info(user.clone()).await.unwrap();
+                let authorization = TargetAuthorization::for_ticket_session(
+                    user,
+                    target,
+                    None,
+                    crate::PROTOCOL_NAME,
+                )
+                .unwrap()
+                .narrow::<TargetKubernetesOptions>()
+                .unwrap();
+                match handle.start_target_session(authorization).await {
+                    Ok(TargetSessionStart::Started(admitted)) => Arc::new(admitted),
+                    Ok(TargetSessionStart::NeedsApproval(_)) => panic!("needs approval"),
+                    Err(error) => panic!("{error}"),
+                }
+            };
+            Proxy {
+                services,
+                admitted,
+                handle,
+                subject,
+                closed: CancellationToken::new(),
+                _dir: dir,
+            }
+        }
+
+        /// A stand-in for the cluster's end of a stream: agrees to the first
+        /// subprotocol it is offered, sends one stdout frame, and reports each
+        /// upgrade's path and the subprotocols it was offered.
+        async fn stream_cluster() -> (String, mpsc::UnboundedReceiver<(String, String)>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let (arrived_tx, arrived_rx) = mpsc::unbounded_channel();
+            tokio::spawn(async move {
+                while let Ok((socket, _)) = listener.accept().await {
+                    let arrived_tx = arrived_tx.clone();
+                    tokio::spawn(async move {
+                        let agree = |request: &tungstenite::handshake::server::Request,
+                                     mut response: tungstenite::handshake::server::Response| {
+                            let offered = request
+                                .headers()
+                                .get("sec-websocket-protocol")
+                                .and_then(|value| value.to_str().ok())
+                                .unwrap_or_default()
+                                .to_owned();
+                            if let Some(first) = offered
+                                .split(',')
+                                .map(str::trim)
+                                .find(|protocol| !protocol.is_empty())
+                            {
+                                response
+                                    .headers_mut()
+                                    .insert("sec-websocket-protocol", first.parse().unwrap());
+                            }
+                            let _ = arrived_tx.send((request.uri().path().to_owned(), offered));
+                            Ok(response)
+                        };
+                        let Ok(mut stream) =
+                            tokio_tungstenite::accept_hdr_async(socket, agree).await
+                        else {
+                            return;
+                        };
+                        let _ = stream
+                            .send(tungstenite::Message::Binary(b"\x01out".to_vec().into()))
+                            .await;
+                        while let Some(Ok(_)) = stream.next().await {}
+                    });
+                }
+            });
+            (url, arrived_rx)
+        }
+
+        #[poem::handler]
+        async fn upgrade(
+            ws: WebSocket,
+            request: &Request,
+            proxy: Data<&Arc<Proxy>>,
+        ) -> poem::Result<Response> {
+            _handle_websocket_request_inner(
+                ws,
+                request,
+                proxy.admitted.clone(),
+                request.uri().path(),
+                &proxy.subject,
+                &proxy.services,
+                proxy.closed.clone(),
+                proxy.handle.clone(),
+            )
+            .await
+            .map(IntoResponse::into_response)
+            .map_err(websocket_request_error)
+        }
+
+        /// A stream opened through the WebSocket handler.
+        struct Stream {
+            /// The status the client was answered with.
+            status: u16,
+            /// The path and offered subprotocols of the upgrade that reached the
+            /// cluster, if one did.
+            reached_cluster: Option<(String, String)>,
+            /// The first frame the client was passed, if the stream opened.
+            first_frame: Option<Vec<u8>>,
+        }
+
+        async fn open(
+            recordings_enabled: bool,
+            refuse: bool,
+            path: &str,
+            offer: &[&str],
+        ) -> Stream {
+            let (cluster_url, mut arrived) = stream_cluster().await;
+            let proxy = Arc::new(proxy(&cluster_url, recordings_enabled, refuse).await);
+            let acceptor = poem::listener::TcpListener::bind("127.0.0.1:0")
+                .into_acceptor()
+                .await
+                .unwrap();
+            let address: SocketAddr = *acceptor.local_addr()[0].as_socket_addr().unwrap();
+            tokio::spawn(
+                poem::Server::new_with_acceptor(acceptor)
+                    .run(poem::Route::new().at("/*path", upgrade).data(proxy)),
+            );
+
+            let response = reqwest::Client::builder()
+                .http1_only()
+                .build()
+                .unwrap()
+                .get(format!("ws://{address}{path}"))
+                .upgrade()
+                .protocols(offer.iter().copied())
+                .send()
+                .await
+                .unwrap();
+            let status = response.status().as_u16();
+            if status != 101 {
+                // Refused in the handler, before anything is sent: nothing is
+                // on its way to the cluster.
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                return Stream {
+                    status,
+                    reached_cluster: arrived.try_recv().ok(),
+                    first_frame: None,
+                };
+            }
+            let reached_cluster = tokio::time::timeout(Duration::from_secs(10), arrived.recv())
+                .await
+                .expect("the upgrade reached the cluster");
+            let first_frame = match response.into_websocket().await {
+                Ok(mut socket) => {
+                    match tokio::time::timeout(Duration::from_secs(10), socket.next()).await {
+                        Ok(Some(Ok(reqwest_websocket::Message::Binary(data)))) => {
+                            Some(data.to_vec())
+                        }
+                        _ => None,
+                    }
+                }
+                Err(_) => None,
+            };
+            Stream {
+                status,
+                reached_cluster,
+                first_frame,
+            }
+        }
+
+        /// Required: an upgrade that has no recording (any but exec, attach and
+        /// port-forward) is refused with HTTP 503 and never reaches the cluster.
+        #[tokio::test]
+        async fn an_upgrade_with_no_recording_is_refused_when_required() {
+            for path in [
+                "/api/v1/namespaces/default/pods/pod/proxy/ws",
+                "/api/v1/namespaces/default/services/service/proxy/ws",
+                "/api/v1/nodes/node/proxy/exec/default/pod/container",
+                // A port-forward's path behind a proxy path is not a port-forward.
+                "/api/v1/namespaces/default/services/service/proxy/api/v1/namespaces/default/pods/pod/portforward",
+                "/api/v1/nodes/node/proxy/api/v1/namespaces/default/pods/pod/portforward",
+                "/apis/example.com/v1/namespaces/default/things/thing/stream",
+                // Not a pod's subresource: deeper than the classifier reads.
+                "/api/v1/namespaces/default/pods/pod/exec/more",
+            ] {
+                let stream = open(true, true, path, &[BINARY]).await;
+                assert_eq!(stream.status, 503, "{path}");
+                assert_eq!(stream.reached_cluster, None, "{path}");
+            }
+        }
+
+        /// Such an upgrade goes on, unrecorded, when unrecorded sessions are not
+        /// refused, and when recording is switched off (nothing is recorded then,
+        /// so nothing is refused for want of a recording).
+        #[tokio::test]
+        async fn an_upgrade_with_no_recording_goes_on_when_not_required() {
+            let path = "/api/v1/namespaces/default/pods/pod/proxy/ws";
+            for (recordings_enabled, refuse) in [(true, false), (false, true)] {
+                let stream = open(recordings_enabled, refuse, path, &[BINARY]).await;
+                assert_eq!(stream.status, 101, "{recordings_enabled} {refuse}");
+                assert_eq!(
+                    stream.reached_cluster,
+                    Some((path.to_owned(), BINARY.to_owned())),
+                    "{recordings_enabled} {refuse}"
+                );
+                assert_eq!(stream.first_frame.as_deref(), Some(&b"\x01out"[..]));
+            }
+        }
+
+        /// Port-forward is never recorded, and is not refused for it.
+        #[tokio::test]
+        async fn a_port_forward_is_not_refused_when_required() {
+            let path = "/api/v1/namespaces/default/pods/pod/portforward";
+            let offer = "SPDY/3.1+portforward.k8s.io";
+            let stream = open(true, true, path, &[offer]).await;
+            assert_eq!(stream.status, 101);
+            assert_eq!(
+                stream.reached_cluster,
+                Some((path.to_owned(), offer.to_owned()))
+            );
+            assert_eq!(stream.first_frame.as_deref(), Some(&b"\x01out"[..]));
         }
     }
 }

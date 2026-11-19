@@ -225,7 +225,13 @@ start is refused rather than continuing unrecorded:
   file before the request is forwarded, so a disk that takes a new file but
   not its writes refuses the request too. The request's own record is then
   written and waited for in the same way, still before the request is
-  forwarded (below).
+  forwarded (below). A WebSocket upgrade has no such record, and only an exec
+  or attach stream has a recording. So, while recording is switched on, any
+  other upgrade (a pod, service or node `proxy` path, for one) is answered
+  with that error (HTTP 503) and does not reach the cluster, and the proxy
+  logs `Refusing a Kubernetes stream that has no recording`. The one
+  exception is port-forward, which is never recorded and is not refused
+  (below).
 - **Web SSH client:** the shell is not opened on the target; the viewer gets
   the error and the session ends.
 - **Web desktop client:** the session ends with the error, before
@@ -373,6 +379,8 @@ What the option does not cover:
   Kubernetes exec and attach websocket text frames, and every frame of an
   exec or attach stream on a subprotocol other than the `channel.k8s.io`
   ones above, with the option off (with it on they close the stream, above),
+  every other Kubernetes WebSocket upgrade
+  with the option off (with it on it is refused, above),
   the bodies of streamed Kubernetes API responses to reads (`watch`, `logs -f`
   and other chunked responses; the request and its response are recorded,
   with an empty response body), native RDP frames dropped from the recording

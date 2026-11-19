@@ -633,6 +633,11 @@ impl StreamKind {
 }
 
 impl StreamOperation {
+    /// A port-forward: raw TCP, which is audited but never recorded.
+    pub const fn is_port_forward(&self) -> bool {
+        matches!(self.kind, StreamKind::PortForward { .. })
+    }
+
     /// The recording to open for this operation, if it produces a terminal
     /// stream. Port forwarding carries raw TCP rather than a terminal, so it is
     /// audited but not recorded here.
@@ -914,6 +919,9 @@ mod tests {
         assert_eq!(ports, &vec!["5432".to_owned(), "8080".to_owned()]);
         // Raw TCP, not a terminal: audited, but nothing to record.
         assert!(operation.recording_metadata().is_none());
+        assert!(operation.is_port_forward());
+        assert!(!stream("/db-0/exec").unwrap().is_port_forward());
+        assert!(!stream("/db-0/attach").unwrap().is_port_forward());
         assert_eq!(operation.kind.subresource(), "portforward");
     }
 
