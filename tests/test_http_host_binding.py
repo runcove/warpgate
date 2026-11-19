@@ -185,6 +185,24 @@ class Test:
             else:
                 _refused(response)
 
+        # A ticket for a target bound to no host is served on a host no target
+        # is bound to, and not on a bound host, whose origin it would share.
+        with admin_client(url) as api:
+            ticket = api.create_ticket(
+                sdk.CreateTicketRequest(target_name=other.name, username=user.username)
+            ).secret
+        for base_url, served in ((url, True), (free_url, True), (bound_url, False)):
+            ticket_session = requests.Session()
+            ticket_session.verify = False
+            response = ticket_session.get(
+                f"{base_url}/?warpgate-ticket={ticket}",
+                allow_redirects=False,
+            )
+            if served:
+                assert _served_by(response) == ["other"]
+            else:
+                _refused(response)
+
         # A target bound to no host is served on any host by the query
         # parameter, the main host included.
         response = session.get(

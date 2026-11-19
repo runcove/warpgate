@@ -395,10 +395,12 @@ fn target_served_on_host(target: &Target, request_host: Option<&str>) -> bool {
 }
 
 /// [`target_served_on_host`] for a ticket's target, which is resolved by id,
-/// not by host. A bound target is also resolved from the request's host as
-/// any request on it is ([`get_target_by_request_host`]), so a binding that
-/// lookup refuses (on the control-plane host, at any port, or on a hostname
-/// another target shares) is refused for a ticket too, as an error.
+/// not by host. The request's host is resolved as any request on it is
+/// ([`get_target_by_request_host`]): a bound target is served only if that
+/// lookup finds it, so a binding the lookup refuses (on the control-plane
+/// host, at any port, or on a hostname another target shares) is refused for
+/// a ticket too, as an error; an unbound target is served only on a host no
+/// target is bound to, so a host bound to one target serves no other.
 pub(crate) async fn ticket_target_served_on_host(
     services: &Services,
     target: &Target,
@@ -407,15 +409,19 @@ pub(crate) async fn ticket_target_served_on_host(
     if !target_served_on_host(target, request_host) {
         return Ok(false);
     }
+    let Some(host) = request_host else {
+        return Ok(true);
+    };
     let bound = target
         .options
         .external_host()
         .is_some_and(|bound| !bound.is_empty());
-    let (true, Some(host)) = (bound, request_host) else {
-        return Ok(true);
-    };
-    let found = get_target_by_request_host(services, host).await?;
-    Ok(found.is_some_and(|found| found.id == target.id))
+    let host_owner = get_target_by_request_host(services, host).await?;
+    Ok(if bound {
+        host_owner.is_some_and(|owner| owner.id == target.id)
+    } else {
+        host_owner.is_none()
+    })
 }
 
 /// Whether `target` is bound to `request_host`: it has a binding, and
@@ -911,6 +917,60 @@ mod live_stream_tests {
             ticket_target_served_on_host(&services, &shared, Some("shared.example.com:3000"))
                 .await
                 .is_err()
+        );
+    }
+
+    /// A ticket for a target bound to no host is not served on a host bound
+    /// to another target, whose origin it would share; it is served on a host
+    /// no target is bound to. A bound target is served on its own host.
+    #[tokio::test]
+    async fn an_unbound_ticket_target_is_not_served_on_another_targets_host() {
+        use warpgate_core::ConfigProvider;
+
+        let db = memory_db().await;
+        let services = services(db.clone()).await;
+        services.config.lock().await.store.external_host = Some("warp.example.com".into());
+
+        let bound = bound_target(&services, &db, "bound", "vm.example.com:3000").await;
+        let unbound_id = public_target(&db).await;
+        let unbound = services
+            .config_provider
+            .get_target_by_id(unbound_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            !ticket_target_served_on_host(&services, &unbound, Some("vm.example.com:3000"))
+                .await
+                .unwrap()
+        );
+        // a host bound without a port, requested at a default port
+        bound_target(&services, &db, "app", "app.example.com").await;
+        assert!(
+            !ticket_target_served_on_host(&services, &unbound, Some("app.example.com:443"))
+                .await
+                .unwrap()
+        );
+        assert!(
+            ticket_target_served_on_host(&services, &unbound, Some("free.example.com"))
+                .await
+                .unwrap()
+        );
+        assert!(
+            ticket_target_served_on_host(&services, &unbound, Some("warp.example.com"))
+                .await
+                .unwrap()
+        );
+        assert!(
+            ticket_target_served_on_host(&services, &unbound, None)
+                .await
+                .unwrap()
+        );
+        assert!(
+            ticket_target_served_on_host(&services, &bound, Some("vm.example.com:3000"))
+                .await
+                .unwrap()
         );
     }
 
