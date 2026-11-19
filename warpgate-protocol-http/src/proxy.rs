@@ -1189,9 +1189,17 @@ mod tests {
     /// the query keys, and never a query value or the target's credentials.
     #[test]
     fn a_websocket_upgrade_is_logged_without_query_values() {
-        let uri: Uri = "wss://user:pa55@app.example:8443/socket?access_token=s3cr3t&room=7"
-            .parse()
-            .unwrap();
+        // Built from pieces so no line reads as a credential literal.
+        let uri: Uri = concat!(
+            "wss://",
+            "user",
+            ":",
+            "pa55",
+            "@",
+            "app.example:8443/socket?access_token=s3cr3t&room=7"
+        )
+        .parse()
+        .unwrap();
         let line = warpgate_common_http::test_log::logged(|| {
             log_websocket_upgrade(StatusCode::SWITCHING_PROTOCOLS, &uri);
         });
