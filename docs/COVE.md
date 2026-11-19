@@ -216,6 +216,9 @@ start is refused rather than continuing unrecorded:
   them. A direct port forward opened before its target session exists (while
   an approval is pending) cannot be recorded, so with the option on its open
   is rejected; the client can open it again once the session is approved.
+  With the option off, such a forward is held unanswered until the session
+  is approved, then recorded and opened like any other forward; nothing of it
+  reaches the target before then.
 - **Kubernetes:** the API request is answered with that error (HTTP 503) and
   is not forwarded; an exec or attach stream fails before it is opened. An API
   request's recording writes its first line and waits for it to reach the

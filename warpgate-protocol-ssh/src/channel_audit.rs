@@ -11,6 +11,9 @@ use crate::common::PtyRequest;
 pub struct ChannelAudit {
     channel_id: Uuid,
     recorder: Option<TerminalRecorder>,
+    /// Input received while the recording waits to start (see
+    /// [`Self::await_recorder`]); `None` otherwise.
+    pending_input: Option<Vec<u8>>,
     detector: Option<CommandDetector>,
 }
 
@@ -19,11 +22,30 @@ impl ChannelAudit {
         Self {
             channel_id,
             recorder: None,
+            pending_input: None,
             detector: None,
         }
     }
 
+    /// The channel's recording starts later, once its target session exists.
+    /// Input received until then still reaches the target, so it is held and
+    /// written to the recording when it starts (see
+    /// [`Self::take_pending_input`]).
+    pub fn await_recorder(&mut self) {
+        if self.recorder.is_none() && self.pending_input.is_none() {
+            self.pending_input = Some(vec![]);
+        }
+    }
+
+    /// The input held since [`Self::await_recorder`], and stop holding it.
+    /// The caller writes it to the recording before attaching it, or drops it
+    /// when the recording did not start.
+    pub fn take_pending_input(&mut self) -> Vec<u8> {
+        self.pending_input.take().unwrap_or_default()
+    }
+
     pub fn set_recorder(&mut self, recorder: TerminalRecorder) {
+        self.pending_input = None;
         self.recorder = Some(recorder);
     }
 
@@ -85,9 +107,13 @@ impl ChannelAudit {
     }
 
     async fn record(&mut self, stream: TerminalRecordingStreamId, data: &[u8]) -> ControlFlow<()> {
-        let result = match self.recorder.as_ref() {
-            Some(recorder) => recorder.write(stream, data).await,
-            None => Ok(()),
+        let result = match (self.recorder.as_ref(), self.pending_input.as_mut(), stream) {
+            (Some(recorder), _, stream) => recorder.write(stream, data).await,
+            (None, Some(input), TerminalRecordingStreamId::Input) => {
+                input.extend_from_slice(data);
+                Ok(())
+            }
+            _ => Ok(()),
         };
         self.check(result)
     }
@@ -105,5 +131,28 @@ impl ChannelAudit {
         } else {
             ControlFlow::Continue(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ops::ControlFlow;
+
+    use uuid::Uuid;
+
+    use super::ChannelAudit;
+
+    #[tokio::test]
+    async fn input_is_held_only_while_the_recording_is_awaited() {
+        let mut audit = ChannelAudit::new(Uuid::new_v4());
+        assert_eq!(audit.on_input(b"before").await, ControlFlow::Continue(()));
+        audit.await_recorder();
+        assert_eq!(audit.on_input(b"ab").await, ControlFlow::Continue(()));
+        assert_eq!(audit.on_output(b"output").await, ControlFlow::Continue(()));
+        assert_eq!(audit.on_input(b"cd").await, ControlFlow::Continue(()));
+        assert_eq!(audit.take_pending_input(), b"abcd");
+        // Taken: no longer held.
+        assert_eq!(audit.on_input(b"after").await, ControlFlow::Continue(()));
+        assert!(audit.take_pending_input().is_empty());
     }
 }

@@ -43,8 +43,8 @@ use warpgate_core::auth::step_up::{
 use warpgate_core::auth::submit_credential;
 use warpgate_core::login_protection::FailedAttemptInfo;
 use warpgate_core::recordings::{
-    ConnectionRecorder, RecordingOwner, TerminalRecorder, TrafficConnectionParams,
-    TrafficRecorder,
+    ConnectionRecorder, RecordingOwner, TerminalRecorder, TerminalRecordingStreamId,
+    TrafficConnectionParams, TrafficRecorder,
 };
 use warpgate_core::{
     AdmittedTarget, ApprovedTarget, AuthorizedIdentity, ConfigProvider, Services,
@@ -359,6 +359,13 @@ pub struct ServerSession {
     /// the target until that recording has started and holds it (see
     /// [`Self::release_held_input`]).
     held_input: Vec<(Uuid, HeldInput)>,
+    /// Direct port-forward opens made while [`Self::target_session_id`] was
+    /// still `None`, in arrival order. They stay unanswered, so the client
+    /// cannot send anything on them that would go unrecorded, and are opened
+    /// when the target session is stamped. Dropping one rejects its open.
+    /// With unrecorded sessions refused they are rejected instead of held
+    /// (see [`Self::refuses_forward_without_target_session`]).
+    held_direct_opens: Vec<HeldDirectOpen>,
     /// The user and target named on a failed recording's log line; set with
     /// [`Self::target_session_id`].
     recording_owner: RecordingOwner,
@@ -2038,6 +2045,7 @@ mod tests {
                 target_session_id: None,
                 pending_recordings: vec![],
                 held_input: vec![],
+                held_direct_opens: vec![],
                 recording_owner: ssh_recording_owner(),
                 recording_refused: false,
                 traffic_recorders: HashMap::new(),
@@ -2594,9 +2602,10 @@ mod tests {
             }
 
             /// A direct forward opened before its target session exists
-            /// (behind an approval gate) cannot be recorded: refused when
-            /// unrecorded sessions are refused and recording is on, let
-            /// through otherwise.
+            /// (behind an approval gate) has nothing to record against: it is
+            /// refused when unrecorded sessions are refused and recording is
+            /// on, and otherwise held unanswered until the stamp. Either way
+            /// nothing reaches the target.
             #[tokio::test]
             async fn a_direct_forward_before_the_target_session_follows_the_setting() {
                 for (refuse, recording) in [(true, true), (false, true), (true, false)] {
@@ -2611,58 +2620,26 @@ mod tests {
                         parameters.update(&c.s.db).await.unwrap();
                     }
                     let open = FakeOpen::default();
-                    let session = &mut c.s.session;
-                    let target = &mut c.sent;
-                    let opened = tokio::select! {
-                        () = async {
-                            session
-                                ._channel_open_direct_tcpip(
-                                    server_channel(1),
-                                    direct_tcpip(),
-                                    open.clone(),
-                                )
-                                .await
-                                .unwrap();
-                        } => false,
-                        // An open that went out waits for this reply, so this
-                        // branch wins whenever the target was reached.
-                        Some((command, reply)) = target.recv() => {
-                            let _ = reply.map(|r| r.send(Ok(())));
-                            reaches_target(&command)
-                        }
-                    };
-                    let refused = refuse && recording;
-                    assert_eq!(opened, !refused, "refuse: {refuse}, recording: {recording}");
-                    if refused {
-                        assert_eq!(open.accepted(), Some(false));
+                    c.s.session
+                        ._channel_open_direct_tcpip(server_channel(1), direct_tcpip(), open.clone())
+                        .await
+                        .unwrap();
+                    let sent = drain(&mut c.sent);
+                    let case = format!("refuse: {refuse}, recording: {recording}");
+                    assert!(!sent.iter().any(reaches_target), "{case}: {sent:?}");
+                    if refuse && recording {
+                        assert_eq!(open.accepted(), Some(false), "{case}");
+                        assert!(c.s.session.held_direct_opens.is_empty(), "{case}");
+                    } else {
+                        assert_eq!(open.accepted(), None, "{case}: held unanswered");
+                        assert_eq!(c.s.session.held_direct_opens.len(), 1, "{case}");
                     }
                 }
             }
 
-            /// A shell parked for an approval gate is recorded when the gate
-            /// lets it through; if that start is refused, the connect that
-            /// follows the stamp must not dial the target.
-            #[tokio::test]
-            async fn a_recording_refused_at_the_stamp_never_dials_the_target() {
-                let dir = tempfile::tempdir().unwrap();
-                // The target session's id is minted at the stamp, so the root
-                // itself is made unusable: a regular file.
-                std::fs::write(dir.path().join("recordings"), "not a directory").unwrap();
-                let params = GlobalParams::new(dir.path().join("warpgate.yaml"), false)
-                    .unwrap()
-                    .with_refuse_unrecorded_sessions(true);
-                let mut s = sign_in_with(INSIDE, params).await;
-                enable_recordings(&s.db).await;
-                let (tx, mut sent) = tokio::sync::mpsc::unbounded_channel();
-                s.session.rc_tx = tx;
-                let ch = open_session_channel(&mut s.session, 1);
-                let channel = s.session.map_channel(ch).unwrap();
-                let _ = s
-                    .session
-                    .start_terminal_recording(channel, SshRecordingMetadata::Shell { channel: 1 })
-                    .await;
-                assert_eq!(s.session.pending_recordings.len(), 1, "parked");
-
+            /// A started target session for `s`'s user on a target that needs
+            /// no approval.
+            async fn admitted_target(s: &SignIn) -> AdmittedTarget<TargetSSHOptions> {
                 let options: TargetSSHOptions = serde_json::from_value(serde_json::json!({
                     "host": "target.invalid",
                     "username": "alice",
@@ -2702,7 +2679,107 @@ mod tests {
                 let TargetSessionStart::Started(admitted) = started else {
                     panic!("no approval is required");
                 };
+                admitted
+            }
 
+            /// A forward held before the target session existed is opened at
+            /// the stamp, with its recorder made and its setup record written
+            /// before the open goes to the target; the target is not dialled
+            /// from the stamp (its caller does that).
+            #[tokio::test]
+            async fn a_held_direct_forward_is_recorded_and_opened_at_the_stamp() {
+                let dir = tempfile::tempdir().unwrap();
+                std::fs::create_dir_all(dir.path().join("recordings")).unwrap();
+                let params = GlobalParams::new(dir.path().join("warpgate.yaml"), false).unwrap();
+                let mut s = sign_in_with(INSIDE, params).await;
+                enable_recordings(&s.db).await;
+                let (tx, mut sent) = tokio::sync::mpsc::unbounded_channel();
+                s.session.rc_tx = tx;
+                let open = FakeOpen::default();
+                s.session
+                    ._channel_open_direct_tcpip(server_channel(1), direct_tcpip(), open.clone())
+                    .await
+                    .unwrap();
+                assert_eq!(s.session.held_direct_opens.len(), 1, "held");
+                assert!(drain(&mut sent).is_empty());
+
+                let admitted = admitted_target(&s).await;
+                let key = TrafficRecorderKey::Tcp("db".into(), 5432);
+                let session = &mut s.session;
+                let (_, opened) = tokio::join!(session.stamp_approved_target(admitted), async {
+                    let (command, reply) = sent.recv().await.unwrap();
+                    let _ = reply.map(|r| r.send(Ok(())));
+                    command
+                });
+                assert!(
+                    matches!(
+                        opened,
+                        RCCommand::Channel(_, ChannelOperation::OpenDirectTCPIP(_))
+                    ),
+                    "{opened:?}"
+                );
+                let RCCommand::Channel(channel, _) = opened else {
+                    unreachable!()
+                };
+                assert_eq!(open.accepted(), Some(true));
+                assert!(s.session.held_direct_opens.is_empty());
+                assert!(s.session.traffic_recorders.contains_key(&key));
+                assert!(
+                    s.session
+                        .channels
+                        .get(&channel)
+                        .is_some_and(|c| c.traffic_recorder.is_some()),
+                    "the recorder is attached"
+                );
+                let sent = drain(&mut sent);
+                assert!(
+                    !sent.iter().any(|c| matches!(c, RCCommand::Connect(_))),
+                    "dialled from the stamp: {sent:?}"
+                );
+            }
+
+            /// A shell parked for an approval gate is recorded when the gate
+            /// lets it through; if that start is refused, the connect that
+            /// follows the stamp must not dial the target, and a forward held
+            /// for the stamp is rejected.
+            #[tokio::test]
+            async fn a_recording_refused_at_the_stamp_never_dials_the_target() {
+                let dir = tempfile::tempdir().unwrap();
+                // The target session's id is minted at the stamp, so the root
+                // itself is made unusable: a regular file.
+                std::fs::write(dir.path().join("recordings"), "not a directory").unwrap();
+                let params = GlobalParams::new(dir.path().join("warpgate.yaml"), false)
+                    .unwrap()
+                    .with_refuse_unrecorded_sessions(true);
+                let mut s = sign_in_with(INSIDE, params).await;
+                enable_recordings(&s.db).await;
+                let (tx, mut sent) = tokio::sync::mpsc::unbounded_channel();
+                s.session.rc_tx = tx;
+                let ch = open_session_channel(&mut s.session, 1);
+                let channel = s.session.map_channel(ch).unwrap();
+                let _ = s
+                    .session
+                    .start_terminal_recording(channel, SshRecordingMetadata::Shell { channel: 1 })
+                    .await;
+                assert_eq!(s.session.pending_recordings.len(), 1, "parked");
+                let held = FakeOpen::default();
+                s.session.held_direct_opens.push(HeldDirectOpen {
+                    channel: server_channel(2),
+                    operation: ChannelOperation::OpenDirectTCPIP(direct_tcpip()),
+                    recording: (
+                        TrafficRecorderKey::Tcp("db".into(), 5432),
+                        SshRecordingMetadata::DirectTcpIp {
+                            host: "db".into(),
+                            port: 5432,
+                        },
+                        TrafficConnectionParams::Socket {
+                            socket_path: "/unused".into(),
+                        },
+                    ),
+                    open_handle: HeldReply(Box::new(held.clone())),
+                });
+
+                let admitted = admitted_target(&s).await;
                 s.session.stamp_approved_target(admitted).await;
                 let connected = s.session.maybe_connect_remote().await;
 
@@ -2716,6 +2793,11 @@ mod tests {
                     Some(WarpgateError::SessionNotRecorded)
                 ));
                 assert!(closed(&s), "the connection is closed");
+                assert_eq!(held.accepted(), Some(false), "the held forward is rejected");
+                assert!(
+                    !sent.iter().any(reaches_target),
+                    "sent to the target: {sent:?}"
+                );
             }
 
             /// A connected shell channel whose recording started, on a real disk
@@ -4457,6 +4539,56 @@ impl OpenReply for ChannelOpenHandle {
     }
 }
 
+/// An [`OpenReply`] boxed, so held opens of any reply type share one list.
+trait HeldOpenReply: Send + Sync {
+    fn accept_boxed(self: Box<Self>) -> futures::future::BoxFuture<'static, ()>;
+    fn reject_boxed(
+        self: Box<Self>,
+        reason: ChannelOpenFailure,
+    ) -> futures::future::BoxFuture<'static, ()>;
+}
+
+impl<T: OpenReply + Sync + 'static> HeldOpenReply for T {
+    fn accept_boxed(self: Box<Self>) -> futures::future::BoxFuture<'static, ()> {
+        (*self).accept().boxed()
+    }
+
+    fn reject_boxed(
+        self: Box<Self>,
+        reason: ChannelOpenFailure,
+    ) -> futures::future::BoxFuture<'static, ()> {
+        (*self).reject(reason).boxed()
+    }
+}
+
+/// A held open's reply, of whichever [`OpenReply`] type it was made with.
+struct HeldReply(Box<dyn HeldOpenReply>);
+
+impl OpenReply for HeldReply {
+    fn accept(self) -> impl Future<Output = ()> + Send {
+        self.0.accept_boxed()
+    }
+
+    fn reject(self, reason: ChannelOpenFailure) -> impl Future<Output = ()> + Send {
+        self.0.reject_boxed(reason)
+    }
+}
+
+type TrafficRecording = (
+    TrafficRecorderKey,
+    SshRecordingMetadata,
+    TrafficConnectionParams,
+);
+
+/// A direct port-forward open held until the target session exists (see
+/// [`ServerSession::held_direct_opens`]).
+struct HeldDirectOpen {
+    channel: ServerChannelId,
+    operation: ChannelOperation,
+    recording: TrafficRecording,
+    open_handle: HeldReply,
+}
+
 impl ServerSession {
     pub async fn start(
         remote_address: SocketAddr,
@@ -4530,6 +4662,7 @@ impl ServerSession {
             target_session_id: None,
             pending_recordings: vec![],
             held_input: vec![],
+            held_direct_opens: vec![],
             recording_owner: ssh_recording_owner(),
             recording_refused: false,
             traffic_recorders: HashMap::new(),
@@ -5414,6 +5547,35 @@ impl ServerSession {
         self.target_env = admitted.options().env.clone();
         self.target = TargetSelection::Found(admitted);
         self.start_pending_recordings().await;
+        self.open_held_direct_opens().await;
+    }
+
+    /// Opens the direct forwards held while no target session existed, now
+    /// that their recordings can start. The caller dials the target after
+    /// the stamp. A refused session (see [`Self::recording_refused`]) opens
+    /// none of them.
+    async fn open_held_direct_opens(&mut self) {
+        for open in std::mem::take(&mut self.held_direct_opens) {
+            let channel = open.channel;
+            if self.recording_refused {
+                open.open_handle
+                    .reject(ChannelOpenFailure::AdministrativelyProhibited)
+                    .await;
+                continue;
+            }
+            if let Err(error) = self
+                .open_recorded_forward(
+                    channel,
+                    open.operation,
+                    open.recording,
+                    open.open_handle,
+                    false,
+                )
+                .await
+            {
+                error!(%channel, ?error, "Failed to open a held port forward");
+            }
+        }
     }
 
     /// Confirm `channel` as open and re-dispatch everything held back while its
@@ -6115,7 +6277,7 @@ impl ServerSession {
         &mut self,
         channel: ServerChannelId,
         params: DirectTCPIPParams,
-        open_handle: impl OpenReply,
+        open_handle: impl OpenReply + Sync + 'static,
     ) -> Result<()> {
         info!(%channel, "Opening direct TCP/IP channel from {}:{} to {}:{}", params.originator_address, params.originator_port, params.host_to_connect, params.port_to_connect);
         let key = TrafficRecorderKey::Tcp(params.host_to_connect.clone(), params.port_to_connect);
@@ -6143,7 +6305,7 @@ impl ServerSession {
         &mut self,
         channel: ServerChannelId,
         path: String,
-        open_handle: impl OpenReply,
+        open_handle: impl OpenReply + Sync + 'static,
     ) -> Result<()> {
         info!(%channel, "Opening direct streamlocal channel to {}", path);
         let key = TrafficRecorderKey::Socket(path.clone());
@@ -6161,17 +6323,49 @@ impl ServerSession {
     }
 
     /// A direct forward: its recorder is made before anything reaches the
-    /// target, and a refusal rejects the open.
+    /// target, and a refusal rejects the open. Before the target session
+    /// exists the open is held (see [`Self::held_direct_opens`]).
     async fn _channel_open_forward(
         &mut self,
         channel: ServerChannelId,
         operation: ChannelOperation,
-        (key, metadata, connection_params): (
-            TrafficRecorderKey,
-            SshRecordingMetadata,
-            TrafficConnectionParams,
-        ),
+        recording: TrafficRecording,
+        open_handle: impl OpenReply + Sync + 'static,
+    ) -> Result<()> {
+        if self.target_session_id.is_none() {
+            if self.refuses_forward_without_target_session(&recording.0).await {
+                open_handle
+                    .reject(ChannelOpenFailure::AdministrativelyProhibited)
+                    .await;
+                return Ok(());
+            }
+            // Unlike a session channel, a direct channel is the whole
+            // interaction, so the connection is initiated here: this starts
+            // the approval gate if nothing else has yet.
+            let _ = self.maybe_connect_remote().await;
+            debug!(%channel, "Holding port forward until the target session starts");
+            self.held_direct_opens.push(HeldDirectOpen {
+                channel,
+                operation,
+                recording,
+                open_handle: HeldReply(Box::new(open_handle)),
+            });
+            return Ok(());
+        }
+        self.open_recorded_forward(channel, operation, recording, open_handle, true)
+            .await
+    }
+
+    /// Makes the forward's recorder and writes its setup record, then opens
+    /// it; a refusal rejects the open. With `dial`, the target is connected
+    /// first if it is not yet.
+    async fn open_recorded_forward(
+        &mut self,
+        channel: ServerChannelId,
+        operation: ChannelOperation,
+        (key, metadata, connection_params): TrafficRecording,
         open_handle: impl OpenReply,
+        dial: bool,
     ) -> Result<()> {
         if self
             .prepare_traffic_recorder(&key, metadata)
@@ -6197,7 +6391,9 @@ impl ServerSession {
         // Unlike a session channel — whose later shell/exec/subsystem request
         // dials the target — a direct channel is the whole interaction, so the
         // connection must be initiated here.
-        let _ = self.maybe_connect_remote().await;
+        if dial {
+            let _ = self.maybe_connect_remote().await;
+        }
         self._channel_open(channel, operation, recorder, open_handle)
             .await
     }
@@ -6372,6 +6568,10 @@ impl ServerSession {
         // run through an approved gate is recorded like any other.
         let Some(target_session_id) = self.target_session_id else {
             self.pending_recordings.push((channel_id, metadata));
+            // Input sent meanwhile is held and written when it starts.
+            if let Some(channel_state) = self.channels.get_mut(&channel_id) {
+                channel_state.audit.await_recorder();
+            }
             return ControlFlow::Continue(());
         };
         let started = self
@@ -6398,6 +6598,13 @@ impl ServerSession {
         started: warpgate_core::recordings::Result<Option<TerminalRecorder>>,
     ) -> ControlFlow<()> {
         let required = self.services.recordings.refuses_unrecorded_sessions();
+        // Input held while the recording waited for its target session; dropped
+        // with the recording if it did not start.
+        let pending_input = self
+            .channels
+            .get_mut(&channel_id)
+            .map(|c| c.audit.take_pending_input())
+            .unwrap_or_default();
         let recorder = match started {
             Ok(Some(recorder)) => {
                 let seeded = match self
@@ -6411,6 +6618,14 @@ impl ServerSession {
                             .await
                     }
                     None => Ok(()),
+                };
+                let seeded = match seeded {
+                    Ok(()) if !pending_input.is_empty() => {
+                        recorder
+                            .write(TerminalRecordingStreamId::Input, &pending_input)
+                            .await
+                    }
+                    seeded => seeded,
                 };
                 let seeded = match seeded {
                     Ok(()) if required => recorder.write_header().await,
@@ -6667,13 +6882,7 @@ impl ServerSession {
             return ControlFlow::Continue(());
         }
         let Some(target_session_id) = self.target_session_id else {
-            if self.services.recordings.refuses_unrecorded_sessions()
-                && self.recordings_enabled().await
-            {
-                warn!(
-                    ?key,
-                    "Refusing a forward opened before its target session exists: it cannot be recorded"
-                );
+            if self.refuses_forward_without_target_session(key).await {
                 return ControlFlow::Break(());
             }
             error!(?key, "No target session for traffic recording");
@@ -6693,6 +6902,21 @@ impl ServerSession {
             Err(_) => return self.refuse_unrecorded_session().await,
         }
         ControlFlow::Continue(())
+    }
+
+    /// A forward with no target session to record against yet is refused
+    /// when unrecorded sessions are refused and recording is on; otherwise a
+    /// direct forward is held until the target session exists.
+    async fn refuses_forward_without_target_session(&self, key: &TrafficRecorderKey) -> bool {
+        let refuses = self.services.recordings.refuses_unrecorded_sessions()
+            && self.recordings_enabled().await;
+        if refuses {
+            warn!(
+                ?key,
+                "Refusing a forward opened before its target session exists: it cannot be recorded"
+            );
+        }
+        refuses
     }
 
     /// Whether recording is switched on in the settings. An unreadable setting
@@ -6817,16 +7041,6 @@ impl ServerSession {
             return Ok(());
         }
 
-        // The channel's recording is parked behind an approval gate: the input
-        // is held, not dropped (#2065), and is recorded and forwarded once that
-        // recording has started (see `release_held_input`).
-        let held = self.holds_input_for_recording(channel_id);
-        // Closed before the unrecorded input reaches the target.
-        if !held && self.record_input(channel_id, &data).await.is_break() {
-            self.close_on_recording_failure().await;
-            return Ok(());
-        }
-
         if has_pty {
             let _ = self
                 .event_sender
@@ -6858,8 +7072,19 @@ impl ServerSession {
             return Ok(());
         }
 
-        if held {
+        // The channel's recording is parked behind an approval gate: the input
+        // is held, not dropped (#2065), and is recorded and forwarded once that
+        // recording has started (see `release_held_input`).
+        if self.holds_input_for_recording(channel_id) {
             self.held_input.push((channel_id, HeldInput::Data(data)));
+            return Ok(());
+        }
+
+        // Only what goes to the target is recorded, so neither the menu's
+        // keystrokes nor a host-key prompt's reply.
+        // Closed before the unrecorded input reaches the target.
+        if self.record_input(channel_id, &data).await.is_break() {
+            self.close_on_recording_failure().await;
             return Ok(());
         }
 
