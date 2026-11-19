@@ -672,14 +672,7 @@ pub async fn proxy_normal_request(
     // the session menu, the login banner, or both. An encoded body can't be edited.
     // Not on a host bound to the target: the embedded UI reads `info` and
     // signs out, which that host does not serve ([`embeds_session_ui`]).
-    let embed_ui = embeds_session_ui(&options)
-        && response.status() == StatusCode::OK
-        && !response
-            .headers()
-            .contains_key(http::header::CONTENT_ENCODING)
-        && response
-            .content_type()
-            .is_some_and(|content_type| content_type.starts_with("text/html"))
+    let embed_ui = page_takes_session_ui(&options, &response)
         && ctx
             .parameters()
             .await
@@ -711,6 +704,20 @@ pub async fn proxy_normal_request(
 /// and its links would 404.
 fn embeds_session_ui(options: &TargetHTTPOptions) -> bool {
     options.external_host.as_deref().is_none_or(str::is_empty)
+}
+
+/// Whether the embedded UI may go into this response of the target's: only
+/// where the target's pages take it at all ([`embeds_session_ui`]), and only
+/// into a usable HTML page whose body can be edited.
+fn page_takes_session_ui(options: &TargetHTTPOptions, response: &Response) -> bool {
+    embeds_session_ui(options)
+        && response.status() == StatusCode::OK
+        && !response
+            .headers()
+            .contains_key(http::header::CONTENT_ENCODING)
+        && response
+            .content_type()
+            .is_some_and(|content_type| content_type.starts_with("text/html"))
 }
 
 /// A request to the target that failed, as the gateway error it becomes. The
@@ -2159,6 +2166,50 @@ mod tests {
         assert!(embeds_session_ui(&options));
         options.external_host = Some("vm.example.test:8443".into());
         assert!(!embeds_session_ui(&options));
+    }
+
+    /// A page from a target bound to its own host reaches the browser as the
+    /// target sent it, with nothing of Warpgate's added to it, and with the
+    /// frame headers every proxied response gets. The same page from a
+    /// target served on the main host is one the embedded UI goes into.
+    #[tokio::test]
+    async fn a_page_on_a_bound_host_is_passed_on_as_the_target_sent_it() {
+        const PAGE: &str = "<html><head><title>t</title></head><body>page</body></html>";
+        let upstream = || {
+            reqwest::Response::from(
+                http::Response::builder()
+                    .header("Content-Type", "text/html; charset=utf-8")
+                    .header("Content-Security-Policy", "frame-ancestors *")
+                    .header("X-Frame-Options", "ALLOWALL")
+                    .body(PAGE)
+                    .unwrap(),
+            )
+        };
+
+        let mut bound = make_options("http://backend.internal");
+        bound.external_host = Some("vm.example.test:8443".into());
+        let client_response = upstream();
+        let mut response: Response = "".into();
+        copy_client_response(&client_response, &mut response);
+        let embed_ui = page_takes_session_ui(&bound, &response);
+        assert!(!embed_ui);
+        let (_close_tx, close_rx) = broadcast::channel(1);
+        copy_client_body(client_response, &mut response, embed_ui, close_rx, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            header_values(&response, "content-security-policy"),
+            ["frame-ancestors *", "frame-ancestors 'self'"]
+        );
+        assert_eq!(header_values(&response, "x-frame-options"), ["SAMEORIGIN"]);
+        let body = response.into_body().into_string().await.unwrap();
+        assert_eq!(body, PAGE);
+        assert!(!body.contains("warpgate"));
+
+        let unbound = make_options("http://backend.internal");
+        let mut response: Response = "".into();
+        copy_client_response(&upstream(), &mut response);
+        assert!(page_takes_session_ui(&unbound, &response));
     }
 
     #[test]
