@@ -9090,6 +9090,7 @@ name = "warpgate-common-http"
 version = "0.30.2"
 dependencies = [
  "anyhow",
+ "bytes",
  "html-escape",
  "poem",
  "poem-openapi",

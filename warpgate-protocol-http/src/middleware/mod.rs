@@ -1,3 +1,4 @@
+mod body_limit;
 mod cookie_host;
 mod loopback_cookie;
 mod loopback_host;
@@ -7,6 +8,7 @@ mod origin_check;
 mod security_headers;
 pub(crate) mod ticket;
 
+pub use body_limit::*;
 pub use cookie_host::*;
 pub use loopback_cookie::*;
 pub use loopback_host::*;

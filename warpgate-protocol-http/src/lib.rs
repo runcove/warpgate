@@ -45,7 +45,8 @@ use warpgate_common_http::logging::{
     get_client_ip, log_request_error, log_request_result, span_for_request,
 };
 use warpgate_common_http::{
-    PlainHttpListener, WARPGATE_PLAYGROUND_CSP, cluster_peer_extension,
+    HTTP2_MAX_CONCURRENT_STREAMS_PER_CONN, PlainHttpListener, WARPGATE_PLAYGROUND_CSP,
+    cluster_peer_extension,
     warpgate_csp_with_connect_src,
 };
 use warpgate_core::{ProtocolServer, Services};
@@ -64,7 +65,7 @@ use crate::common::{endpoint_auth, page_auth};
 use crate::middleware::{
     CookieHostMiddleware, LOOPBACK_SESSION_COOKIE_MAX_AGE_CAP, LoopbackHostMiddleware,
     LoopbackSessionCookieMiddleware, ManagementScopeMiddleware, OriginCheckMiddleware,
-    SecurityHeadersMiddleware, TargetOriginCheckMiddleware, TicketMiddleware,
+    SecurityHeadersMiddleware, TargetOriginCheckMiddleware, TicketMiddleware, limit_request_body,
 };
 use crate::session::SessionStore;
 use crate::session_handle::warpgate_server_handle_for_request;
@@ -293,6 +294,7 @@ impl ProtocolServer for HTTPProtocolServer {
                 // 404 whatever its origin.
                 .with(OriginCheckMiddleware)
                 .with(ManagementScopeMiddleware)
+                .around(limit_request_body)
                 .around({
                     let services = services;
                     move |ep, req| {
@@ -443,7 +445,10 @@ impl ProtocolServer for HTTPProtocolServer {
         );
 
         Ok(async move {
-            Server::new_with_acceptor(acceptor).run(app).await?;
+            Server::new_with_acceptor(acceptor)
+                .http2_max_concurrent_streams(HTTP2_MAX_CONCURRENT_STREAMS_PER_CONN)
+                .run(app)
+                .await?;
             Ok(())
         }
         .boxed())
