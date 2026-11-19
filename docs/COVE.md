@@ -223,7 +223,9 @@ start is refused rather than continuing unrecorded:
   is not forwarded; an exec or attach stream fails before it is opened. An API
   request's recording writes its first line and waits for it to reach the
   file before the request is forwarded, so a disk that takes a new file but
-  not its writes refuses the request too.
+  not its writes refuses the request too. The request's own record is then
+  written and waited for in the same way, still before the request is
+  forwarded (below).
 - **Web SSH client:** the shell is not opened on the target; the viewer gets
   the error and the session ends.
 - **Web desktop client:** the session ends with the error, before
@@ -281,7 +283,14 @@ With the option on, a recording that fails mid-session closes the session
 too: in SSH (the client is shown `session closed: its recording failed`), the
 web SSH client, Kubernetes exec and attach streams, native RDP and VNC, and
 the web desktop client. In SSH and the web SSH client, nothing more passes
-once the session is closed for its recording. A Kubernetes API request that
+once the session is closed for its recording. A Kubernetes API request is
+recorded twice in its `data.ndjson`: a line with the request and no response
+(`response_status` and `response_body` are `null`) before the request is
+sent, and a line with the request and its response afterwards; a request
+that fails after it was sent has the first line only. With the option on,
+the first line is waited for before the request is sent, and if that write
+fails the request is refused (HTTP 503, `session closed: its recording
+failed`) and never reaches the cluster. A Kubernetes API request that
 has already been sent to the cluster still gets its response, since failing
 it would hide whether it was applied; but its write is waited for, and once a
 write of a Kubernetes session's recording has failed, every later API request

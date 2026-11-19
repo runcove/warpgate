@@ -57,6 +57,17 @@
             const responseBytes = raw.response_body
                 ? Uint8Array.from(raw.response_body)
                 : new Uint8Array()
+            // A request is written twice: before it is sent, with no response,
+            // and again with its response. Show the complete one only.
+            const previous = parsed.at(-1)
+            if (
+                raw.response_status != null &&
+                previous?.responseStatus === undefined &&
+                previous?.requestMethod === raw.request_method &&
+                previous?.requestPath === raw.request_path
+            ) {
+                parsed.pop()
+            }
             parsed.push({
                 timestamp: new Date(raw.timestamp),
                 requestMethod: raw.request_method,

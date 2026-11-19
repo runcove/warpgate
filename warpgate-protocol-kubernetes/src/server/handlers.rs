@@ -478,10 +478,19 @@ async fn _handle_normal_request_inner(
         "Sending request to upstream Kubernetes API"
     );
 
-    // A write that reached the cluster runs to completion across a close, so
-    // the client learns whether it was applied and an audited one keeps its
-    // event. A close before dispatch still refuses it.
     let is_write = !req.method().is_safe();
+    write_request_record(
+        recorder_opt.as_ref(),
+        &recording_session,
+        &ApiRequestRecord {
+            method,
+            url: full_url.as_ref(),
+            headers: &redacted_headers,
+            body: &body_bytes,
+        },
+    )
+    .await?;
+
     if is_write && closed.is_cancelled() {
         return Err(WarpgateError::UserSessionEnded);
     }
@@ -626,10 +635,57 @@ impl FailedApiRecordings {
     }
 }
 
-/// Records an API request and its response. A failure is logged and counted once,
-/// and the response still goes out, even when unrecorded sessions are refused: the
-/// request has already reached the cluster, and failing it would hide whether it was
-/// applied. When they are refused, the write is waited for, and a failure refuses
+/// What an API request's record says of the request itself.
+struct ApiRequestRecord<'a> {
+    method: &'a str,
+    url: &'a str,
+    /// Already redacted (see [`redact_headers`]).
+    headers: &'a HashMap<String, String>,
+    body: &'a [u8],
+}
+
+/// Writes an API request's record before the request is sent: the only place
+/// such a request is recorded ahead of sending. The record is the request with no
+/// response yet. When unrecorded sessions are refused, that write is waited for,
+/// and if it fails the request is refused with
+/// [`WarpgateError::SessionRecordingFailed`] and must not be sent; every later
+/// request of the session is refused too (see [`FailedApiRecordings`]). Otherwise
+/// a failed write is logged and counted once and the request goes on.
+async fn write_request_record(
+    recorder: Option<&KubernetesRecorder>,
+    session: &ApiRecordingSession,
+    record: &ApiRequestRecord<'_>,
+) -> Result<(), WarpgateError> {
+    if let Some(recorder) = recorder {
+        let recorded = async {
+            recorder
+                .record_request(
+                    record.method,
+                    record.url,
+                    record.headers.clone(),
+                    record.body,
+                )
+                .await?;
+            if session.required {
+                recorder.flush().await?;
+            }
+            Ok::<(), warpgate_core::recordings::Error>(())
+        }
+        .await;
+        if let Err(e) = recorded
+            && recorder.write_failed(&e)
+        {
+            FAILED_API_RECORDINGS.mark(session);
+            return Err(WarpgateError::SessionRecordingFailed);
+        }
+    }
+    Ok(())
+}
+
+/// Records an API request with its response, after the record [`write_request_record`]
+/// wrote before sending it. A failure is logged and counted once, and the response
+/// still goes out, even when unrecorded sessions are refused: the request has
+/// already reached the cluster, and failing it would hide whether it was applied. When they are refused, the write is waited for, and a failure refuses
 /// every later request of the session (see [`FailedApiRecordings`]).
 #[allow(clippy::too_many_arguments)]
 async fn record_api_response(
@@ -1371,9 +1427,9 @@ mod tests {
         use warpgate_db_migrations::migrate_database;
 
         use super::super::{
-            ApiRecordingSession, FAILED_API_RECORDINGS, SessionRecordingMetadata,
+            ApiRecordingSession, ApiRequestRecord, FAILED_API_RECORDINGS, SessionRecordingMetadata,
             checked_api_recording, checked_stream_recording, record_api_response,
-            run_websocket_recording, start_api_recording, start_stream_recording,
+            run_websocket_recording, send_recorded, start_api_recording, start_stream_recording,
         };
         use crate::recording::{start_recording_api_named, start_recording_exec};
 
@@ -1619,6 +1675,139 @@ mod tests {
                     !FAILED_API_RECORDINGS.contains(&TargetSessionId(Uuid::new_v4())),
                     "another session is not affected"
                 );
+            }
+        }
+
+        /// A stand-in for the cluster: answers every request with an empty 200,
+        /// and reports, for each request, what was in the recordings under `root`
+        /// at the moment the request arrived.
+        async fn cluster(root: PathBuf) -> (String, mpsc::UnboundedReceiver<String>) {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            fn recorded(dir: &std::path::Path) -> String {
+                let mut found = String::new();
+                for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        found += &recorded(&path);
+                    } else if path.file_name().is_some_and(|name| name == "data.ndjson") {
+                        found += &std::fs::read_to_string(&path).unwrap_or_default();
+                    }
+                }
+                found
+            }
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/api/v1/pods", listener.local_addr().unwrap());
+            let (arrived_tx, arrived_rx) = mpsc::unbounded_channel();
+            tokio::spawn(async move {
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    let mut request = Vec::new();
+                    let mut buffer = [0; 1024];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match socket.read(&mut buffer).await {
+                            Ok(n) if n > 0 => request.extend_from_slice(&buffer[..n]),
+                            _ => break,
+                        }
+                    }
+                    let _ = arrived_tx.send(recorded(&root));
+                    let _ = socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                        )
+                        .await;
+                }
+            });
+            (url, arrived_rx)
+        }
+
+        async fn send(
+            r: &Recording,
+            required: bool,
+            fail: bool,
+        ) -> (Result<u16, WarpgateError>, Vec<String>, ApiRecordingSession) {
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+            let (url, mut arrived) = cluster(r.root.clone()).await;
+            let session = r.session(required);
+            let recorder = start_api_recording(&owner(), &session, &r.recordings)
+                .await
+                .unwrap()
+                .unwrap();
+            if fail {
+                r.fail();
+            }
+            let sent = send_recorded(
+                Some(&recorder),
+                &session,
+                &ApiRequestRecord {
+                    method: "DELETE",
+                    url: &url,
+                    headers: &HashMap::new(),
+                    body: b"",
+                },
+                reqwest::Client::new().delete(&url),
+                &CancellationToken::new(),
+                true,
+            )
+            .await
+            .map(|response| response.status().as_u16());
+            // Whatever reached the cluster has arrived by the time the send has
+            // returned its response, or, refused, was never sent.
+            let mut seen = Vec::new();
+            while let Ok(recorded) = arrived.try_recv() {
+                seen.push(recorded);
+            }
+            (sent, seen, session)
+        }
+
+        /// Required: an API request's record is in its recording before the
+        /// request reaches the cluster.
+        #[tokio::test]
+        async fn an_api_request_is_recorded_before_it_is_sent_when_required() {
+            let r = recording(true).await;
+            let (sent, seen, _session) = send(&r, true, false).await;
+            assert_eq!(sent.unwrap(), 200);
+            assert_eq!(seen.len(), 1, "the request was sent once");
+            let lines: Vec<serde_json::Value> = seen[0]
+                .lines()
+                .filter(|line| !line.is_empty())
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            assert_eq!(lines[0]["request_method"], "DELETE");
+            assert!(
+                lines[0]["request_path"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with("/api/v1/pods")
+            );
+            assert!(lines[0]["response_status"].is_null());
+        }
+
+        /// An API request whose record cannot be written: required, it is refused
+        /// and never sent, the failure is logged and counted once, and the session's
+        /// next request is refused too; otherwise it is sent unrecorded.
+        #[tokio::test]
+        async fn an_api_request_whose_record_fails_is_not_sent_when_required() {
+            for required in [true, false] {
+                let r = recording(required).await;
+                let (sent, seen, session) = send(&r, required, true).await;
+                if required {
+                    assert!(
+                        matches!(sent, Err(WarpgateError::SessionRecordingFailed)),
+                        "refused: {sent:?}"
+                    );
+                    assert!(seen.is_empty(), "nothing reached the cluster: {seen:?}");
+                    r.assert_one_failure_line(true);
+                    assert!(matches!(
+                        start_api_recording(&owner(), &session, &r.recordings).await,
+                        Err(WarpgateError::SessionRecordingFailed)
+                    ));
+                } else {
+                    assert_eq!(sent.unwrap(), 200);
+                    assert_eq!(seen.len(), 1, "the request was sent once");
+                    assert!(!FAILED_API_RECORDINGS.contains(&session.id));
+                }
             }
         }
 

@@ -11,7 +11,9 @@ use warpgate_core::recordings::{
 };
 use warpgate_db_entities::Recording::RecordingKind;
 
-/// One recorded Kubernetes API request/response as stored in a data NDJSON line
+/// One recorded Kubernetes API request/response as stored in a data NDJSON line.
+/// A request has two lines: its record without a response (`response_status` and
+/// `response_body` null), written before it is sent, then the complete record.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct KubernetesRecordingItem {
     #[serde(with = "time::serde::rfc3339")]
@@ -49,6 +51,30 @@ impl KubernetesRecorder {
     /// Waits for everything recorded so far to reach the file.
     pub async fn flush(&self) -> Result<(), warpgate_core::recordings::Error> {
         self.writer.flush().await
+    }
+
+    /// Writes a request's record with no response yet: the line that says the
+    /// request was about to be sent. [`Self::record_response`] follows it with the
+    /// complete record once the response is in.
+    pub async fn record_request(
+        &self,
+        method: &str,
+        path: &str,
+        headers: std::collections::HashMap<String, String>,
+        request_body: &[u8],
+    ) -> Result<(), warpgate_core::recordings::Error> {
+        self.writer
+            .write_json_line(&KubernetesRecordingItem {
+                timestamp: OffsetDateTime::now_utc(),
+                request_method: method.to_string(),
+                request_path: path.to_string(),
+                request_headers: headers,
+                request_body: Bytes::from(request_body.to_vec()),
+                response_status: None,
+                response_body: None,
+            })
+            .await?;
+        Ok(())
     }
 
     pub async fn record_response(
