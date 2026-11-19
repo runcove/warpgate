@@ -2076,6 +2076,77 @@ mod tests {
                     .await;
                 resp.assert_text(stamp.to_string()).await;
             }
+
+            /// The same through the cookie gate, mounted outside the session
+            /// middleware as `lib.rs` mounts it: the redeem response gives
+            /// the browser the bound host's session cookie beside the
+            /// removal of the nonce cookie, and that cookie is served there.
+            #[tokio::test]
+            async fn a_redeem_through_the_cookie_gate_sets_the_session_cookie() {
+                use crate::common::HOST_SESSION_COOKIE_NAME;
+                use crate::middleware::CookieGateMiddleware;
+
+                /// The `name=value` pair of the `name` cookie `resp` sets.
+                fn pair_set(resp: &TestResponse, name: &str) -> Option<String> {
+                    set_cookies(resp)
+                        .into_iter()
+                        .find(|pair| pair.starts_with(&format!("{name}=")))
+                }
+
+                let db = memory_db().await;
+                let target = bound_target(&db).await;
+                let user = user_for(&db, target).await;
+                let ctx = UnauthenticatedRequestContext::new(services(db.clone()).await).await;
+                let cli = TestClient::new(
+                    app(db.clone())
+                        .await
+                        .with(CookieGateMiddleware::new(false, None))
+                        .data(ctx),
+                );
+
+                let stamp = OffsetDateTime::now_utc().unix_timestamp() - 10;
+                let resp = cli
+                    .get(format!("/sign-in?user={user}&stamp={stamp}"))
+                    .header("host", CONTROL_PLANE)
+                    .send()
+                    .await;
+                resp.assert_status_is_ok();
+                let control = pair_set(&resp, HOST_SESSION_COOKIE_NAME)
+                    .expect("a session cookie on the control plane");
+                let opened = open(&db, target, HOST, "/page", OffsetDateTime::now_utc())
+                    .await
+                    .unwrap()
+                    .unwrap();
+
+                let resp = start(&cli, &control, user, &opened.challenge).await;
+                resp.assert_status(StatusCode::SEE_OTHER);
+                let location = resp.0.headers()["location"].to_str().unwrap().to_owned();
+                let redeem = location
+                    .strip_prefix(&format!("https://{HOST}"))
+                    .expect("sent to the bound host")
+                    .to_owned();
+                let resp = cli
+                    .get(&redeem)
+                    .header("host", HOST)
+                    .header("cookie", format!("{HANDOFF_COOKIE_NAME}={}", opened.nonce))
+                    .send()
+                    .await;
+                resp.assert_status(StatusCode::SEE_OTHER);
+                resp.assert_header("location", format!("https://{HOST}/page"));
+                assert!(clears_the_nonce(&resp), "{:?}", set_cookies(&resp));
+                let bound = pair_set(&resp, HOST_SESSION_COOKIE_NAME)
+                    .unwrap_or_else(|| panic!("no session cookie in {:?}", set_cookies(&resp)));
+                assert_ne!(bound, control);
+
+                let resp = cli
+                    .get("/stamp")
+                    .header("host", HOST)
+                    .header("cookie", &bound)
+                    .send()
+                    .await;
+                resp.assert_text(stamp.to_string()).await;
+            }
+
             /// A handoff that expired while the browser signed in is refused
             /// with a body telling the user to open the page again, and
             /// nothing is minted.

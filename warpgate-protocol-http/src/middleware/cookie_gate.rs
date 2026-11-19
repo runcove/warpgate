@@ -322,10 +322,12 @@ impl<E: Endpoint> Endpoint for CookieGateEndpoint<E> {
 
         let mut resp = self.inner.call(req).await?.into_response();
 
+        // Every value: `HeaderMap::remove` would hand back the first only.
         let set_cookies: Vec<HeaderValue> = resp
-            .headers_mut()
-            .remove(header::SET_COOKIE)
-            .into_iter()
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .cloned()
             .collect();
         let mut out = Vec::new();
         for value in set_cookies {
@@ -544,6 +546,58 @@ mod tests {
     fn unit_gate_leaves_other_set_cookies_alone() {
         assert_eq!(gate_set_cookie("a=1; Path=/", HTTPS), None);
         assert_eq!(gate_set_cookie("a=1; Path=/", HTTP_BEHIND_PROXY), None);
+    }
+
+    /// A response carrying several `Set-Cookie` headers leaves the gate with
+    /// every one of them, in order, each in its browser form.
+    #[tokio::test]
+    async fn every_set_cookie_of_a_response_passes_the_gate() {
+        use poem::test::TestClient;
+        use poem::{EndpointExt, handler};
+
+        use crate::test_db::{memory_db, services};
+
+        #[handler]
+        fn sets_three() -> Response {
+            let mut resp = Response::builder().finish();
+            for value in [
+                "a=1; Path=/".to_owned(),
+                format!("{HANDOFF_COOKIE_NAME}=; Path=/; Secure; HttpOnly; Max-Age=0"),
+                format!("{SESSION_COOKIE_NAME}=S; Path=/; SameSite=Lax"),
+                "b=2; Path=/".to_owned(),
+            ] {
+                resp.headers_mut()
+                    .append(header::SET_COOKIE, HeaderValue::from_str(&value).unwrap());
+            }
+            resp
+        }
+
+        let ctx = UnauthenticatedRequestContext::new(services(memory_db().await).await).await;
+        let app = sets_three
+            .with(CookieGateMiddleware::new(false, None))
+            .data(ctx);
+        let resp = TestClient::new(app)
+            .get("/")
+            .header("host", "vm1.warp.example")
+            .send()
+            .await;
+        resp.assert_status_is_ok();
+        let names: Vec<String> = resp
+            .0
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|value| {
+                Cookie::parse(value.to_str().unwrap().to_owned())
+                    .unwrap()
+                    .name()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(
+            names,
+            ["a", HANDOFF_COOKIE_NAME, HOST_SESSION_COOKIE_NAME, "b"]
+        );
     }
 
     #[test]
