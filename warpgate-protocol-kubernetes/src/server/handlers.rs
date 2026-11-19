@@ -1534,7 +1534,9 @@ mod tests {
             record_api_response, record_stream_frame, run_websocket_recording,
             start_api_recording, start_stream_recording, write_request_record,
         };
-        use crate::recording::{start_recording_api_named, start_recording_exec};
+        use crate::recording::{
+            KubernetesRecorder, start_recording_api_named, start_recording_exec,
+        };
 
         struct Recording {
             recordings: SessionRecordings,
@@ -1914,7 +1916,7 @@ mod tests {
         /// A stand-in for the cluster: answers every request with an empty 200,
         /// and reports, for each request, what was in the recordings under `root`
         /// at the moment the request arrived.
-        async fn cluster(root: PathBuf) -> (String, mpsc::UnboundedReceiver<String>) {
+        pub(super) async fn cluster(root: PathBuf) -> (String, mpsc::UnboundedReceiver<String>) {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
             fn recorded(dir: &std::path::Path) -> String {
@@ -1958,7 +1960,12 @@ mod tests {
             r: &Recording,
             required: bool,
             fail: bool,
-        ) -> (Result<u16, WarpgateError>, Vec<String>, ApiRecordingSession) {
+        ) -> (
+            Result<u16, WarpgateError>,
+            Vec<String>,
+            ApiRecordingSession,
+            KubernetesRecorder,
+        ) {
             let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
             let (url, mut arrived) = cluster(r.root.clone()).await;
             let session = r.session(required);
@@ -1996,7 +2003,7 @@ mod tests {
             while let Ok(recorded) = arrived.try_recv() {
                 seen.push(recorded);
             }
-            (sent, seen, session)
+            (sent, seen, session, recorder)
         }
 
         /// Required: an API request's record is in its recording before the
@@ -2004,7 +2011,7 @@ mod tests {
         #[tokio::test]
         async fn an_api_request_is_recorded_before_it_is_sent_when_required() {
             let r = recording(true).await;
-            let (sent, seen, _session) = send(&r, true, false).await;
+            let (sent, seen, _session, _recorder) = send(&r, true, false).await;
             assert_eq!(sent.unwrap(), 200);
             assert_eq!(seen.len(), 1, "the request was sent once");
             let lines: Vec<serde_json::Value> = seen[0]
@@ -2025,12 +2032,15 @@ mod tests {
 
         /// An API request whose record cannot be written: required, it is refused
         /// and never sent, the failure is logged and counted once, and the session's
-        /// next request is refused too; otherwise it is sent unrecorded.
+        /// next request is refused too; otherwise it is sent unrecorded. Not
+        /// required, the record's write is not waited for, so the failure shows at a
+        /// later write of the same recording: that it does show is what says the
+        /// request was sent over a recording that could not be written.
         #[tokio::test]
         async fn an_api_request_whose_record_fails_is_not_sent_when_required() {
             for required in [true, false] {
                 let r = recording(required).await;
-                let (sent, seen, session) = send(&r, required, true).await;
+                let (sent, seen, session, recorder) = send(&r, required, true).await;
                 if required {
                     assert!(
                         matches!(sent, Err(WarpgateError::SessionRecordingFailed)),
@@ -2045,6 +2055,28 @@ mod tests {
                 } else {
                     assert_eq!(sent.unwrap(), 200);
                     assert_eq!(seen.len(), 1, "the request was sent once");
+                    assert!(
+                        !seen[0].contains("DELETE"),
+                        "its record was not in the recording: {seen:?}"
+                    );
+                    for _ in 0..1000 {
+                        if r.recordings.failed_recordings() > 0 {
+                            break;
+                        }
+                        record_api_response(
+                            &recorder,
+                            &session,
+                            "DELETE",
+                            "/api/v1/pods",
+                            HashMap::new(),
+                            b"",
+                            200,
+                            b"",
+                        )
+                        .await;
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    r.assert_one_failure_line(false);
                     assert!(!FAILED_API_RECORDINGS.contains(&session.id));
                 }
             }
@@ -2107,9 +2139,10 @@ mod tests {
     }
 
     /// The request handlers themselves, in front of a stand-in for the cluster:
-    /// what reaches the cluster.
+    /// what reaches the cluster, and what the recording held when it did.
     mod through_the_handlers {
         use std::net::SocketAddr;
+        use std::path::PathBuf;
         use std::sync::Arc;
         use std::time::Duration;
 
@@ -2117,7 +2150,7 @@ mod tests {
         use poem::listener::{Acceptor, Listener};
         use poem::web::Data;
         use poem::web::websocket::WebSocket;
-        use poem::{EndpointExt, IntoResponse, Request, Response};
+        use poem::{Body, EndpointExt, IntoResponse, Request, Response};
         use reqwest_websocket::Upgrade;
         use sea_orm::ActiveValue::Set;
         use sea_orm::{ActiveModelTrait, Database, DatabaseConnection, IntoActiveModel};
@@ -2129,6 +2162,7 @@ mod tests {
         use warpgate_common::{
             GlobalParams, KubernetesTargetAuth, KubernetesTargetTokenAuth, MaybeSecretRef, Target,
             TargetKubernetesOptions, TargetOptions, Tls, WarpgateConfig, WarpgateConfigStore,
+            WarpgateError,
         };
         use warpgate_core::cluster::Cluster;
         use warpgate_core::logging::KubernetesAuditSubject;
@@ -2146,8 +2180,12 @@ mod tests {
         };
         use warpgate_db_migrations::migrate_database;
 
-        use super::super::{_handle_websocket_request_inner, websocket_request_error};
+        use super::super::{
+            _handle_normal_request_inner, _handle_websocket_request_inner, websocket_request_error,
+        };
+        use super::failing_mid_session::cluster;
         use crate::correlator::AdmittedSession;
+        use crate::server::UpstreamClientCache;
 
         const BINARY: &str = "v4.channel.k8s.io";
 
@@ -2164,6 +2202,8 @@ mod tests {
             handle: Arc<Mutex<WarpgateServerHandle>>,
             subject: KubernetesAuditSubject,
             closed: CancellationToken,
+            /// The recordings root.
+            root: PathBuf,
             _dir: tempfile::TempDir,
         }
 
@@ -2297,7 +2337,92 @@ mod tests {
                 handle,
                 subject,
                 closed: CancellationToken::new(),
+                root: dir.path().join("recordings"),
                 _dir: dir,
+            }
+        }
+
+        /// Required: a request sent through the handler has its record in the
+        /// recording when it reaches the cluster.
+        #[tokio::test]
+        async fn the_handler_records_an_api_request_before_sending_it_when_required() {
+            let dir = tempfile::tempdir().unwrap();
+            // The stand-in reads the recordings root, which the proxy's fixture
+            // creates: the cluster comes first, for its address.
+            let listener_root = dir.path().join("root");
+            let (url, mut arrived) = cluster(listener_root.clone()).await;
+            let cluster_url = url.strip_suffix("/api/v1/pods").unwrap();
+            let p = proxy(cluster_url, true, true).await;
+            std::os::unix::fs::symlink(&p.root, &listener_root).unwrap();
+
+            let request = Request::builder()
+                .method(poem::http::Method::DELETE)
+                .uri_str("/api/v1/pods")
+                .finish();
+            let response = _handle_normal_request_inner(
+                &request,
+                Body::empty(),
+                p.admitted.clone(),
+                &UpstreamClientCache::new(Duration::from_secs(60)),
+                "/api/v1/pods",
+                &p.subject,
+                &p.services,
+                p.closed.clone(),
+                p.handle.clone(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), 200);
+
+            let seen = arrived.try_recv().expect("the request reached the cluster");
+            let lines: Vec<serde_json::Value> = seen
+                .lines()
+                .filter(|line| !line.is_empty())
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            assert_eq!(lines[0]["request_method"], "DELETE");
+            assert!(lines[0]["response_status"].is_null());
+        }
+
+        /// An API request whose recording cannot start (the recordings root is a
+        /// file) goes through the handler: required, it is refused and never
+        /// reaches the cluster; otherwise it is sent unrecorded.
+        #[tokio::test]
+        async fn the_handler_refuses_an_api_request_it_cannot_record_when_required() {
+            for refuse in [true, false] {
+                let dir = tempfile::tempdir().unwrap();
+                let (url, mut arrived) = cluster(dir.path().join("unread")).await;
+                let cluster_url = url.strip_suffix("/api/v1/pods").unwrap();
+                let p = proxy(cluster_url, true, refuse).await;
+                std::fs::write(&p.root, b"").unwrap();
+
+                let request = Request::builder()
+                    .method(poem::http::Method::DELETE)
+                    .uri_str("/api/v1/pods")
+                    .finish();
+                let response = _handle_normal_request_inner(
+                    &request,
+                    Body::empty(),
+                    p.admitted.clone(),
+                    &UpstreamClientCache::new(Duration::from_secs(60)),
+                    "/api/v1/pods",
+                    &p.subject,
+                    &p.services,
+                    p.closed.clone(),
+                    p.handle.clone(),
+                )
+                .await;
+                if refuse {
+                    assert!(
+                        matches!(response, Err(WarpgateError::SessionNotRecorded)),
+                        "refused"
+                    );
+                    assert!(arrived.try_recv().is_err(), "nothing was sent");
+                } else {
+                    assert_eq!(response.ok().unwrap().status(), 200);
+                    assert!(arrived.try_recv().is_ok(), "the request was sent");
+                }
             }
         }
 
