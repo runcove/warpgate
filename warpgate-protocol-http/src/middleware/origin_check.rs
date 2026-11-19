@@ -787,6 +787,120 @@ mod tests {
             .assert_status_is_ok();
     }
 
+    /// Two targets on hosts of their own under one parent domain, and a
+    /// browser signed in on both. Its requests to the first host carry that
+    /// host's session cookie whatever page sends them (the hosts are
+    /// same-site), under the browser's cookie name and through the cookie
+    /// gate, as served. A page on the second host changes nothing on the
+    /// first: not through the target, by any method or a websocket, and not
+    /// by signing that host's session out.
+    #[tokio::test]
+    async fn a_page_on_one_target_host_cannot_act_on_another() {
+        use crate::middleware::CookieGateMiddleware;
+
+        const HOST: &str = "vm.warpgate.example.test:8443";
+        const SIBLING: &str = "https://vm2.warpgate.example.test:8443";
+        const COOKIE: &str = "__Host-warpgate-http-session=abc; theme=dark";
+
+        let services = crate::test_db::services(crate::test_db::memory_db().await).await;
+        // What reached the route: whether the session cookie came through
+        // the gate, under the name it has inside.
+        let seen = |req: Request| {
+            let session = req
+                .headers()
+                .get_all(header::COOKIE)
+                .iter()
+                .any(|value| value.as_bytes().starts_with(b"warpgate-http-session=abc"));
+            if session { "session" } else { "no session" }
+        };
+        let app = Route::new()
+            .nest("/@warpgate", make_sync(seen).with(OriginCheckMiddleware))
+            .nest_no_strip("/", make_sync(seen).with(TargetOriginCheckMiddleware))
+            .with(CookieGateMiddleware::new(false, None))
+            .data(PlainHttpListener(false))
+            .data(UnauthenticatedRequestContext::new(services).await);
+
+        let send = async |method: Method, path: &str, from: Option<&str>, signed_in: bool| {
+            let websocket = method == Method::GET;
+            let mut headers = vec![("host", HOST)];
+            if signed_in {
+                headers.push(("cookie", COOKIE));
+            }
+            if let Some(from) = from {
+                let site = if from == TARGET {
+                    "same-origin"
+                } else {
+                    "same-site"
+                };
+                headers.push(("origin", from));
+                headers.push(("sec-fetch-site", site));
+            }
+            if websocket {
+                headers.push(("upgrade", "websocket"));
+                headers.push(("connection", "Upgrade"));
+            }
+            let response = app.get_response(request(method, path, &headers)).await;
+            let status = response.status();
+            let body = response.into_body().into_string().await.unwrap();
+            (status, body)
+        };
+
+        // GET here is a websocket upgrade.
+        let methods = [
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+            Method::GET,
+        ];
+        for method in methods {
+            let path = "/vms/somevm/start";
+            // The target's own page acts, as the session.
+            let (status, body) = send(method.clone(), path, Some(TARGET), true).await;
+            assert_eq!(
+                (status, body.as_str()),
+                (StatusCode::OK, "session"),
+                "{method}"
+            );
+            // The other target's page does not, with or without `Origin`.
+            for from in [Some(SIBLING), Some(MAIN)] {
+                let (status, _) = send(method.clone(), path, from, true).await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{method} {from:?}");
+            }
+            let headers = [
+                ("host", HOST),
+                ("cookie", COOKIE),
+                ("sec-fetch-site", "same-site"),
+                ("upgrade", "websocket"),
+            ];
+            let headers = if method == Method::GET {
+                &headers[..]
+            } else {
+                &headers[..3]
+            };
+            let response = app
+                .get_response(request(method.clone(), path, headers))
+                .await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method}");
+            // Without the session it acts as no one, so it is not this
+            // check's to refuse.
+            let (status, body) = send(method.clone(), path, Some(SIBLING), false).await;
+            assert_eq!(
+                (status, body.as_str()),
+                (StatusCode::OK, "no session"),
+                "{method}"
+            );
+        }
+
+        // Signing this host's session out is its own page's to do.
+        let (status, _) = send(Method::POST, LOGOUT, Some(TARGET), true).await;
+        assert_eq!(status, StatusCode::OK);
+        for signed_in in [true, false] {
+            let (status, _) = send(Method::POST, LOGOUT, Some(SIBLING), signed_in).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "signed in: {signed_in}");
+        }
+    }
+
     #[test]
     fn session_cookie_is_recognised_by_its_decoded_name() {
         let carries = |cookies: &[&str]| {
