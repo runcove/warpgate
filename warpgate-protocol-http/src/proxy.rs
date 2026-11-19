@@ -372,18 +372,34 @@ fn rewrite_set_cookie(value: &HeaderValue) -> anyhow::Result<HeaderValue> {
     Ok(cookie.to_string().parse()?)
 }
 
+/// The longest cookie name, in bytes, that is logged whole.
+const LOGGED_COOKIE_NAME_MAX_BYTES: usize = 64;
+
+/// `name` cut to at most `LOGGED_COOKIE_NAME_MAX_BYTES` bytes, on a char
+/// boundary, with a `…` after the cut; a name that fits is returned as is.
+fn truncated_cookie_name(name: &str) -> String {
+    if name.len() <= LOGGED_COOKIE_NAME_MAX_BYTES {
+        return name.to_owned();
+    }
+    let mut end = LOGGED_COOKIE_NAME_MAX_BYTES;
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &name[..end])
+}
+
 /// The cookie name of a `Set-Cookie` value, for a log line: only the name,
 /// never the value; none if there is no `name=` or it is not plain ASCII.
+/// A name longer than 64 bytes is cut and followed by a `…`.
 fn set_cookie_name_for_log(value: &HeaderValue) -> Option<String> {
     let bytes = value.as_bytes();
     let name = bytes.get(..bytes.iter().position(|&b| b == b'=')?)?;
     let name = std::str::from_utf8(name).ok()?.trim();
     (!name.is_empty()
-        && name.len() <= 64
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)))
-    .then(|| name.to_owned())
+    .then(|| truncated_cookie_name(name))
 }
 
 /// Whether a target's `Set-Cookie` value is dropped: it is nameless, or names
@@ -2161,6 +2177,26 @@ mod tests {
         assert_eq!(set_cookie_name_for_log(&value), None);
         let value = HeaderValue::from_static("secretvalue-without-equals");
         assert_eq!(set_cookie_name_for_log(&value), None);
+    }
+
+    #[test]
+    fn a_long_cookie_name_is_logged_cut_to_64_bytes_and_an_ellipsis() {
+        let header = |name: &str| HeaderValue::from_str(&format!("{name}=v")).unwrap();
+        let long = "n".repeat(100);
+        assert_eq!(
+            set_cookie_name_for_log(&header(&long)),
+            Some(format!("{}…", "n".repeat(64)))
+        );
+        // Exactly 64 bytes is logged whole.
+        let exact = "e".repeat(64);
+        assert_eq!(set_cookie_name_for_log(&header(&exact)), Some(exact));
+        // The cut backs up to a char boundary.
+        let multi_byte = format!("{}{}", "a".repeat(63), "\u{e9}".repeat(10));
+        assert!(!multi_byte.is_char_boundary(64));
+        assert_eq!(
+            truncated_cookie_name(&multi_byte),
+            format!("{}…", "a".repeat(63))
+        );
     }
 
     fn rewrite_cookie(set_cookie: &str) -> Cookie<'static> {
