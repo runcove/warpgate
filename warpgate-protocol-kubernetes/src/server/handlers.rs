@@ -795,12 +795,26 @@ const RECORDABLE_SUBPROTOCOLS: [&str; 5] = [
 ];
 
 /// Whether an exec / attach stream on the subprotocol the cluster agreed to can be
-/// recorded. The client names the subprotocols it offers and the cluster picks
-/// one, so it can be one this proxy does not offer: in the base64 ones the channel
+/// recorded. In the base64 subprotocols, which a client can offer, the channel
 /// byte is a digit and the data is encoded, and the recorder would skip every
 /// frame. A stream with no agreed subprotocol is not known to be recordable.
 fn is_recordable_subprotocol(negotiated: Option<&str>) -> bool {
     negotiated.is_some_and(|protocol| RECORDABLE_SUBPROTOCOLS.contains(&protocol))
+}
+
+/// The subprotocols the cluster is asked to choose from: those the client
+/// offers (the value of its `Sec-WebSocket-Protocol` header), and with
+/// `recording_required` only the ones that can be recorded, so the cluster
+/// cannot agree to a stream the recording cannot hold. A stream left with
+/// none of those is refused before it is opened.
+fn cluster_subprotocols(offered: &str, recording_required: bool) -> Vec<String> {
+    offered
+        .split(',')
+        .map(str::trim)
+        .filter(|protocol| !protocol.is_empty())
+        .filter(|protocol| !recording_required || RECORDABLE_SUBPROTOCOLS.contains(protocol))
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 /// Whether recording is switched on in the settings. An unreadable setting
@@ -1003,12 +1017,18 @@ async fn _handle_websocket_request_inner(
         return Err(WarpgateError::SessionNotRecorded.into());
     }
 
-    let ws_protocol = req
+    let offered_protocols = req
         .headers()
         .get("sec-websocket-protocol")
         .and_then(|h| h.to_str().ok())
-        .context("missing Sec-Websocket-Protocol request header")?
-        .to_string();
+        .context("missing Sec-Websocket-Protocol request header")?;
+    let ws_protocols = cluster_subprotocols(offered_protocols, recording_required);
+    if recording_required && ws_protocols.is_empty() {
+        warn!(
+            "Refusing a Kubernetes stream: the client offers no subprotocol that can be recorded"
+        );
+        return Err(WarpgateError::SessionNotRecorded.into());
+    }
 
     let audit_subject = audit_subject.clone();
 
@@ -1020,7 +1040,7 @@ async fn _handle_websocket_request_inner(
                 client
                     .get(full_url.clone())
                     .upgrade()
-                    .protocols(vec![ws_protocol])
+                    .protocols(ws_protocols)
                     .send(),
             )
             .await
@@ -1054,6 +1074,9 @@ async fn _handle_websocket_request_inner(
             .map_err(websocket_error_without_url)
             .context("negotiating websocket connection with Kubernetes")?;
 
+        // The cluster was offered recordable subprotocols only (see
+        // [`cluster_subprotocols`]) and the negotiation above fails on any
+        // other answer, so this holds; it is checked all the same.
         if recording_required && !is_recordable_subprotocol(client_socket.protocol()) {
             bail!("Closing the Kubernetes stream: its subprotocol cannot be recorded");
         }
@@ -2181,13 +2204,16 @@ mod tests {
         use warpgate_db_migrations::migrate_database;
 
         use super::super::{
-            _handle_normal_request_inner, _handle_websocket_request_inner, websocket_request_error,
+            _handle_normal_request_inner, _handle_websocket_request_inner, cluster_subprotocols,
+            websocket_request_error,
         };
         use super::failing_mid_session::cluster;
         use crate::correlator::AdmittedSession;
         use crate::server::UpstreamClientCache;
 
+        const EXEC: &str = "/api/v1/namespaces/default/pods/pod/exec?command=sh";
         const BINARY: &str = "v4.channel.k8s.io";
+        const BASE64: &str = "base64.channel.k8s.io";
 
         struct NoopHandle;
 
@@ -2502,6 +2528,8 @@ mod tests {
             reached_cluster: Option<(String, String)>,
             /// The first frame the client was passed, if the stream opened.
             first_frame: Option<Vec<u8>>,
+            /// The subprotocol the client was answered with, if the stream opened.
+            protocol: Option<String>,
         }
 
         async fn open(
@@ -2541,26 +2569,29 @@ mod tests {
                     status,
                     reached_cluster: arrived.try_recv().ok(),
                     first_frame: None,
+                    protocol: None,
                 };
             }
             let reached_cluster = tokio::time::timeout(Duration::from_secs(10), arrived.recv())
                 .await
                 .expect("the upgrade reached the cluster");
-            let first_frame = match response.into_websocket().await {
+            let (first_frame, protocol) = match response.into_websocket().await {
                 Ok(mut socket) => {
+                    let protocol = socket.protocol().map(ToOwned::to_owned);
                     match tokio::time::timeout(Duration::from_secs(10), socket.next()).await {
                         Ok(Some(Ok(reqwest_websocket::Message::Binary(data)))) => {
-                            Some(data.to_vec())
+                            (Some(data.to_vec()), protocol)
                         }
-                        _ => None,
+                        _ => (None, protocol),
                     }
                 }
-                Err(_) => None,
+                Err(_) => (None, None),
             };
             Stream {
                 status,
                 reached_cluster,
                 first_frame,
+                protocol,
             }
         }
 
@@ -2615,6 +2646,56 @@ mod tests {
                 Some((path.to_owned(), offer.to_owned()))
             );
             assert_eq!(stream.first_frame.as_deref(), Some(&b"\x01out"[..]));
+        }
+
+        /// Required: the cluster is offered only the subprotocols an exec stream's
+        /// recording can hold, so it cannot agree to another; a client that offers
+        /// none of them is refused with HTTP 503 before the stream is opened. Not
+        /// required, the cluster is offered what the client offers.
+        #[tokio::test]
+        async fn a_recorded_stream_is_offered_to_the_cluster_on_recordable_subprotocols_only() {
+            let path = "/api/v1/namespaces/default/pods/pod/exec";
+
+            let stream = open(true, true, EXEC, &[BASE64, BINARY]).await;
+            assert_eq!(stream.status, 101);
+            assert_eq!(
+                stream.reached_cluster,
+                Some((path.to_owned(), BINARY.to_owned()))
+            );
+            // The client is answered with the subprotocol the cluster agreed to.
+            assert_eq!(stream.protocol.as_deref(), Some(BINARY));
+            assert_eq!(stream.first_frame.as_deref(), Some(&b"\x01out"[..]));
+
+            let stream = open(true, true, EXEC, &[BASE64]).await;
+            assert_eq!(stream.status, 503);
+            assert_eq!(stream.reached_cluster, None);
+
+            let stream = open(true, false, EXEC, &[BASE64, BINARY]).await;
+            assert_eq!(stream.status, 101);
+            assert_eq!(
+                stream.reached_cluster,
+                Some((path.to_owned(), format!("{BASE64}, {BINARY}")))
+            );
+        }
+
+        #[test]
+        fn the_cluster_is_offered_recordable_subprotocols_only_when_required() {
+            let offered = "base64.channel.k8s.io, v5.channel.k8s.io,v4.channel.k8s.io, ,chat";
+            assert_eq!(
+                cluster_subprotocols(offered, true),
+                ["v5.channel.k8s.io", "v4.channel.k8s.io"]
+            );
+            assert_eq!(
+                cluster_subprotocols(offered, false),
+                [
+                    "base64.channel.k8s.io",
+                    "v5.channel.k8s.io",
+                    "v4.channel.k8s.io",
+                    "chat"
+                ]
+            );
+            assert!(cluster_subprotocols("base64.channel.k8s.io", true).is_empty());
+            assert!(cluster_subprotocols("", true).is_empty());
         }
     }
 }

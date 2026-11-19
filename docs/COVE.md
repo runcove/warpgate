@@ -289,13 +289,17 @@ With the option on, a Kubernetes exec or attach stream that has a recording
 goes on only in a form the recording can hold, which is binary websocket
 frames on one of the `channel.k8s.io` subprotocols Warpgate offers
 (`channel.k8s.io` and `v2.` to `v5.channel.k8s.io`). The client names the
-subprotocols it asks the cluster for, so the cluster can agree to another
-(in the base64 ones the same stdin and stdout travel encoded): the stream is
-then closed as soon as the cluster has agreed, as is one with no agreed
-subprotocol, before any frame passes, and the proxy logs `Closing the
-Kubernetes stream: its subprotocol cannot be recorded`. The cluster has
-accepted the stream by then, so an exec's command (which is in the
-recording's metadata and the audit event) may have started, with no input.
+subprotocols it asks for (in the base64 ones the same stdin and stdout
+travel encoded), and of those Warpgate asks the cluster only for the ones
+above, so the cluster is not asked for a stream the recording cannot hold. A
+client that names none of them is refused before the stream reaches the
+cluster (HTTP 503, `session refused: its recording could not be started`),
+and the proxy logs `Refusing a Kubernetes stream: the client offers no
+subprotocol that can be recorded`. If the cluster answers with a subprotocol
+it was not asked for, or with none, the stream fails as it opens, before any
+frame passes; the cluster has accepted the stream by then, so an exec's
+command (which is in the recording's metadata and the audit event) may have
+started, with no input.
 On a subprotocol that can be recorded, the stream is closed at the first
 text frame from either side, before that frame is passed on, and the proxy
 logs `Closing the Kubernetes stream: a text frame cannot be recorded`. Ping,
@@ -378,8 +382,8 @@ What the option does not cover:
   extended data sent from the client to the target, Kubernetes port-forward,
   Kubernetes exec and attach websocket text frames, and every frame of an
   exec or attach stream on a subprotocol other than the `channel.k8s.io`
-  ones above, with the option off (with it on they close the stream, above),
-  every other Kubernetes WebSocket upgrade
+  ones above, with the option off (with it on the first close the stream and
+  the second is not opened, above), every other Kubernetes WebSocket upgrade
   with the option off (with it on it is refused, above),
   the bodies of streamed Kubernetes API responses to reads (`watch`, `logs -f`
   and other chunked responses; the request and its response are recorded,
