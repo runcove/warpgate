@@ -9091,10 +9091,12 @@ version = "0.30.2"
 dependencies = [
  "anyhow",
  "bytes",
+ "futures",
  "html-escape",
  "poem",
  "poem-openapi",
  "rcgen",
+ "reqwest 0.13.5",
  "rustls",
  "serde",
  "thiserror 2.0.21",
