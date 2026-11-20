@@ -78,7 +78,6 @@ features = ["std"]
 
 [dependencies.sspi]
 version = "0.21"
-features = ["scard"]
 
 [dependencies.tracing]
 version = "0.1"
