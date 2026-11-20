@@ -46,4 +46,5 @@ a `Credentials::SmartCard` credential with a "smart card support is not built in
 Nothing in Warpgate uses RDP smart-card sign-in. The feature pulled in `winscard` and
 `iso7816`, and through them `heapless` 0.7.17, which carries RUSTSEC-2026-0574 to 0582.
 Like the lint override above, this is not in `warpgate.patch`; re-apply it by hand on
-re-vendor, or drop it once a `heapless` release clear of those advisories is in the tree.
+re-vendor. The `scard` feature must stay off on the next upstream rebase (heapless 0.7 advisories);
+re-enable it only once the `heapless` it pulls in is clear of them.
