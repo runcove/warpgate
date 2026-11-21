@@ -3430,6 +3430,138 @@ mod tests {
                 }
             }
 
+            /// Sends `command` as an exec on `r`'s channel with `record_scp` off,
+            /// then `payload` from the client and `reply` from the target.
+            /// Returns what the recordings hold for each stream.
+            #[cfg(target_os = "linux")]
+            async fn exec_with_record_scp_off(
+                r: &mut Recorded,
+                command: &'static [u8],
+                payload: &'static [u8],
+                reply: &'static [u8],
+            ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+                let mut parameters = entities::Parameters::Entity::get(&r.s.db)
+                    .await
+                    .unwrap()
+                    .into_active_model();
+                parameters.record_scp = Set(false);
+                parameters.update(&r.s.db).await.unwrap();
+                let (accepted, replied) = oneshot::channel();
+                r.s.session
+                    .handle_server_handler_event(ServerHandlerEvent::ExecRequest(
+                        r.ch,
+                        Bytes::from_static(command),
+                        accepted,
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(replied.await, Ok(true));
+                r.s.session
+                    .handle_server_handler_event(ServerHandlerEvent::Data(
+                        r.ch,
+                        Bytes::from_static(payload),
+                        oneshot::channel().0,
+                    ))
+                    .await
+                    .unwrap();
+                let sent = drain(&mut r.sent);
+                assert!(
+                    sent.iter().any(|c| matches!(
+                        c,
+                        RCCommand::Channel(_, ChannelOperation::RequestExec(_))
+                    )),
+                    "the exec reaches the target: {sent:?}"
+                );
+                assert!(
+                    sent.iter().any(|c| matches!(
+                        c,
+                        RCCommand::Channel(_, ChannelOperation::Data(data)) if &data[..] == payload
+                    )),
+                    "the data reaches the target: {sent:?}"
+                );
+                // No client is attached, so the write to it may fail: the
+                // recording comes first.
+                let _ =
+                    r.s.session
+                        .handle_remote_event(RCEvent::Output(r.channel, Bytes::from_static(reply)))
+                        .await;
+                match r.s.session.channels.get_mut(&r.channel) {
+                    Some(channel) if r.root.exists() => {
+                        assert!(channel.audit.write_recording_header().await.is_continue());
+                        recorded_streams(&r.root)
+                    }
+                    _ => Default::default(),
+                }
+            }
+
+            /// With recording required, `record_scp` off does not stop an exec
+            /// whose command starts with `scp` from being recorded, in both
+            /// directions, and one line says so, with the session and without the
+            /// command.
+            #[cfg(target_os = "linux")]
+            #[tokio::test]
+            async fn an_scp_exec_is_recorded_when_required_though_record_scp_is_off() {
+                let mut r = connected_shell(true).await;
+                let (input, output, _) = exec_with_record_scp_off(
+                    &mut r,
+                    b"scp -V; exec sftp-server",
+                    b"client-bytes",
+                    b"server-bytes",
+                )
+                .await;
+                assert_eq!(input, b"client-bytes", "the client's data");
+                assert_eq!(output, b"server-bytes", "the target's data");
+
+                let session = r.s.session.id.to_string();
+                let lines: Vec<_> = warpgate_core::recordings::test_support::log_events()
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|values| values.get("session") == Some(&session))
+                    .filter(|values| {
+                        values
+                            .get("message")
+                            .is_some_and(|m| m.contains("record_scp is off"))
+                    })
+                    .cloned()
+                    .collect();
+                assert_eq!(lines.len(), 1, "one line: {lines:?}");
+                assert!(
+                    !format!("{lines:?}").contains("sftp-server"),
+                    "no command text: {lines:?}"
+                );
+            }
+
+            /// Without recording required, `record_scp` off still leaves an scp
+            /// exec unrecorded.
+            #[cfg(target_os = "linux")]
+            #[tokio::test]
+            async fn an_scp_exec_is_not_recorded_when_not_required_and_record_scp_is_off() {
+                let mut r = connected_shell(false).await;
+                let (input, output, error) = exec_with_record_scp_off(
+                    &mut r,
+                    b"scp -V; exec sftp-server",
+                    b"client-bytes",
+                    b"server-bytes",
+                )
+                .await;
+                assert!(input.is_empty(), "{input:?}");
+                assert!(output.is_empty(), "{output:?}");
+                assert!(error.is_empty(), "{error:?}");
+                let session = r.s.session.id.to_string();
+                assert!(
+                    !warpgate_core::recordings::test_support::log_events()
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|values| values.get("session") == Some(&session)
+                            && values
+                                .get("message")
+                                .is_some_and(|m| m.contains("record_scp is off"))),
+                    "no override line"
+                );
+            }
+
             /// A forward to an address an earlier forward already made a traffic
             /// recorder for, which has died since: the failure is seen before the
             /// open goes to the target. Required: the open is rejected and the
@@ -5729,11 +5861,19 @@ impl ServerSession {
                 .await
                 .map_or(true, |p| p.record_scp);
 
-            if !should_record {
-                info!(channel=%channel_id, "Not recording SCP exec session, command was '{command}'");
+            if !should_record && self.refuses_the_unrecordable().await {
+                warn!(
+                    session = %self.id,
+                    channel = %channel_id,
+                    "record_scp is off but recording is required, so the scp exec is recorded anyway"
+                );
+                true
+            } else {
+                if !should_record {
+                    info!(channel=%channel_id, "Not recording SCP exec session, command was '{command}'");
+                }
+                should_record
             }
-
-            should_record
         } else {
             true
         };
