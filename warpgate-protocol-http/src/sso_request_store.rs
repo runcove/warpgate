@@ -89,6 +89,12 @@ impl<V> SsoRequestStore<V> {
             .await
     }
 
+    /// How many handshakes are held.
+    #[cfg(test)]
+    pub async fn len(&self) -> usize {
+        self.inner.lock().await.len()
+    }
+
     /// Drop expired entries. Called periodically from the HTTP server's
     /// housekeeping loop.
     pub async fn vacuum(&self) {

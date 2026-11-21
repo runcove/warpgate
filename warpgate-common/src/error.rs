@@ -61,6 +61,10 @@ pub enum WarpgateError {
     /// outside the user's current allowed IP ranges.
     #[error("sign-in refused: the user may not sign in from this address")]
     UserNoLongerAdmitted,
+    /// A sign-in of any kind on a session authorized by a ticket. A ticket
+    /// session never becomes a user session: the person signs out first.
+    #[error("sign-in refused on a ticket session: sign out, then sign in with single sign-on")]
+    TicketSessionSignIn,
     #[error(transparent)]
     Anyhow(#[from] anyhow::Error),
     #[error(transparent)]
@@ -144,6 +148,7 @@ impl UserFacingReason for WarpgateError {
             | Self::UserSessionAlreadyAttributed
             | Self::UserSessionEnded
             | Self::UserNoLongerAdmitted
+            | Self::TicketSessionSignIn
             | Self::NoAdminAccess
             | Self::NoAdminPermission(_)
             | Self::TargetUserOutranksAdmin
@@ -247,7 +252,9 @@ impl ResponseError for WarpgateError {
                 poem::http::StatusCode::FORBIDDEN
             }
             Self::SessionLimitReached => poem::http::StatusCode::TOO_MANY_REQUESTS,
-            Self::SessionNotApproved => poem::http::StatusCode::FORBIDDEN,
+            Self::SessionNotApproved | Self::TicketSessionSignIn => {
+                poem::http::StatusCode::FORBIDDEN
+            }
             Self::SessionNotRecorded | Self::SessionRecordingFailed => {
                 poem::http::StatusCode::SERVICE_UNAVAILABLE
             }

@@ -51,6 +51,46 @@ Warpgate logs the real underlying reason server-side.
 - An existing Warpgate session cookie may survive a failed retry. Treat a
   request that arrives with `login_error` as a failure whatever the session says.
 
+### A fifth outcome: 403 for a ticket session
+
+A browser session opened with a ticket never signs in, by any route, so it
+never becomes a user session. Each of these answers `403 Forbidden` with a
+plain-text body (sign out, then sign in with single sign-on), and stores and
+changes nothing:
+
+- the SSO start: `/@warpgate/api/sso/auto-start` (with or without `force`)
+  and `/@warpgate/api/sso/providers/<name>/start`, and the login page's own
+  auto-redirect;
+- the SSO return (`/@warpgate/api/sso/return`), checked before the handshake
+  is looked up, so the session stays a ticket session;
+- the completion of any other sign-in: password, OTP, passkey.
+
+This is not a `login_error` code and is never sent to `next`: the browser
+gets the 403 itself. The four codes above are unchanged.
+
+## Always start SSO: `/sso/auto-start?force=1`
+
+`GET /@warpgate/api/sso/auto-start?force=1` starts SSO even when the browser
+is already signed in, and whether or not `sso_auto_redirect` is on.
+
+| Query      | Meaning                                                              |
+|------------|----------------------------------------------------------------------|
+| `force`    | Only the exact value `1` turns this on. Anything else: today's behaviour. |
+| `provider` | Optional, used only with `force=1`: the SSO provider's name, compared exactly. |
+| `next`     | Where the browser returns after the sign-in; the safe-redirect rule above applies, an unsafe one is dropped. |
+| `login`    | `login=password` still wins: the login page with the password form, no SSO. |
+
+With `force=1`:
+
+- a configured `provider` is started (302 to the identity provider);
+- with no `provider` and exactly one configured, that one is started;
+- an unknown `provider`, or none named among several, gets the login page
+  (302 to `/@warpgate#/login`, with `next`), never an error;
+- a ticket session gets 403 (above).
+
+The return stamps the session's `last_sso_at`. A password, OTP or passkey
+sign-in never does, so `?login=password` never makes a session fresh.
+
 ## Recordings a separate reader can read: `--recordings-keep-group-read`
 
 By default Warpgate sets each recording directory to exactly `0700` and each

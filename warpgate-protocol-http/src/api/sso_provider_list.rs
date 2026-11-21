@@ -506,6 +506,14 @@ impl Api {
         code: Option<&String>,
         state: Option<&String>,
     ) -> Result<Result<String, SsoFailure>, WarpgateError> {
+        // First: a ticket session never becomes a user session. Refused with
+        // 403 before the handshake is taken or anything is written, so the
+        // session stays exactly as it was. `authorize_session` refuses it too.
+        if crate::common::is_ticket_session(session) {
+            warn!("SSO return refused: the browser session is authorized by a ticket");
+            return Err(WarpgateError::TicketSessionSignIn);
+        }
+
         // pull services locally for convenience
         let services = ctx.services();
         let client_ip = get_client_ip_addr(req, services).await;
@@ -860,10 +868,9 @@ mod tests {
     /// no cookie, and the caller's session is still logged in afterwards.
     #[tokio::test]
     async fn get_sso_logout_is_405_and_leaves_the_session_logged_in() {
-        use poem::handler;
         use poem::session::{CookieConfig, MemoryStorage, ServerSession, Session};
         use poem::test::TestClient;
-        use poem::{EndpointExt, Route, get};
+        use poem::{EndpointExt, Route, get, handler};
         use poem_openapi::OpenApiService;
 
         #[handler]
