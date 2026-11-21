@@ -3331,6 +3331,105 @@ mod tests {
                 }
             }
 
+            /// What the recordings under `root` hold for each stream, in order.
+            #[cfg(target_os = "linux")]
+            fn recorded_streams(root: &std::path::Path) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+                use warpgate_core::recordings::{TerminalRecordingItem, TerminalRecordingStreamId};
+
+                fn files(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+                    for entry in std::fs::read_dir(dir).unwrap() {
+                        let path = entry.unwrap().path();
+                        if path.is_dir() {
+                            files(&path, out);
+                        } else {
+                            out.push(path);
+                        }
+                    }
+                }
+                let mut paths = vec![];
+                files(root, &mut paths);
+                let (mut input, mut output, mut error) = (vec![], vec![], vec![]);
+                for path in paths {
+                    let text = std::fs::read_to_string(path).unwrap();
+                    for line in text.lines() {
+                        if let Ok(TerminalRecordingItem::Data { stream, data, .. }) =
+                            serde_json::from_str(line)
+                        {
+                            match stream {
+                                TerminalRecordingStreamId::Input => input.extend(&data[..]),
+                                TerminalRecordingStreamId::Output => output.extend(&data[..]),
+                                TerminalRecordingStreamId::Error => error.extend(&data[..]),
+                            }
+                        }
+                    }
+                }
+                (input, output, error)
+            }
+
+            /// An exec is recorded whatever it runs: an SFTP server started as a
+            /// command has its packets, binary as they are, in the recording in
+            /// both directions, with what it writes to stderr.
+            #[cfg(target_os = "linux")]
+            #[tokio::test]
+            async fn an_execd_sftp_server_has_its_data_recorded_when_required() {
+                // SSH_FXP_INIT and SSH_FXP_VERSION, version 3.
+                const INIT: &[u8] = &[0, 0, 0, 5, 1, 0, 0, 0, 3];
+                const VERSION: &[u8] = &[0, 0, 0, 5, 2, 0, 0, 0, 3];
+                for command in ["/usr/lib/openssh/sftp-server", "internal-sftp"] {
+                    let mut r = connected_shell(true).await;
+                    let (reply, replied) = oneshot::channel();
+                    r.s.session
+                        .handle_server_handler_event(ServerHandlerEvent::ExecRequest(
+                            r.ch,
+                            Bytes::from(command),
+                            reply,
+                        ))
+                        .await
+                        .unwrap();
+                    assert_eq!(replied.await, Ok(true), "{command}");
+                    r.s.session
+                        .handle_server_handler_event(ServerHandlerEvent::Data(
+                            r.ch,
+                            Bytes::from_static(INIT),
+                            oneshot::channel().0,
+                        ))
+                        .await
+                        .unwrap();
+                    let sent = drain(&mut r.sent);
+                    assert!(
+                        sent.iter().any(|c| matches!(
+                            c,
+                            RCCommand::Channel(_, ChannelOperation::Data(data)) if &data[..] == INIT
+                        )),
+                        "{command}: {sent:?}"
+                    );
+                    // No client is attached, so the write to it may fail: the
+                    // recording comes first.
+                    let _ =
+                        r.s.session
+                            .handle_remote_event(RCEvent::Output(
+                                r.channel,
+                                Bytes::from_static(VERSION),
+                            ))
+                            .await;
+                    let _ =
+                        r.s.session
+                            .handle_remote_event(RCEvent::ExtendedData {
+                                channel: r.channel,
+                                data: Bytes::from_static(b"debug1"),
+                                ext: 1,
+                            })
+                            .await;
+
+                    let audit = &mut r.s.session.channels.get_mut(&r.channel).unwrap().audit;
+                    assert!(audit.write_recording_header().await.is_continue());
+                    let (input, output, error) = recorded_streams(&r.root);
+                    assert_eq!(input, INIT, "{command}: the client's packets");
+                    assert_eq!(output, VERSION, "{command}: the server's packets");
+                    assert_eq!(error, b"debug1", "{command}: the server's stderr");
+                }
+            }
+
             /// A forward to an address an earlier forward already made a traffic
             /// recorder for, which has died since: the failure is seen before the
             /// open goes to the target. Required: the open is rejected and the
