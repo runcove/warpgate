@@ -3886,6 +3886,64 @@ mod tests {
                 }
             }
 
+            /// A channel closed while an approval gate holds the session leaves
+            /// no parked recording behind: when the gate opens, no recording is
+            /// started for the closed channel.
+            #[cfg(target_os = "linux")]
+            #[tokio::test]
+            async fn a_channel_closed_at_an_approval_gate_leaves_no_pending_recording() {
+                for required in [true, false] {
+                    let mut r = gated_shell(required).await;
+                    // A close is only taken from an attached client.
+                    let _client = attach_client(&mut r.s.session).await;
+                    request_exec(&mut r, "cat").await;
+                    assert_eq!(
+                        r.s.session.pending_recordings.len(),
+                        1,
+                        "required: {required}: parked"
+                    );
+
+                    // The target answers each command the way the real client
+                    // does, so the close completes.
+                    let (close_reply, closing) = oneshot::channel();
+                    {
+                        let handling = r.s.session.handle_server_handler_event(
+                            ServerHandlerEvent::ChannelClose(r.ch, close_reply),
+                        );
+                        tokio::pin!(handling);
+                        loop {
+                            tokio::select! {
+                                result = &mut handling => {
+                                    result.unwrap();
+                                    break;
+                                }
+                                Some((_, reply)) = r.sent.recv() => {
+                                    if let Some(reply) = reply {
+                                        let _ = reply.send(Ok(()));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    assert_eq!(closing.await, Ok(()));
+                    assert!(
+                        r.s.session.pending_recordings.is_empty(),
+                        "required: {required}: the closed channel's recording is dropped"
+                    );
+
+                    gate_opens(&mut r).await;
+                    assert!(
+                        r.s.session.pending_recordings.is_empty(),
+                        "required: {required}"
+                    );
+                    assert!(
+                        !r.root.exists(),
+                        "required: {required}: no recording was started"
+                    );
+                    assert!(!closed(&r.s), "the session goes on");
+                }
+            }
+
             /// A forward to an address an earlier forward already made a traffic
             /// recorder for, which has died since: the failure is seen before the
             /// open goes to the target. Required: the open is rejected and the
@@ -7967,8 +8025,11 @@ impl ServerSession {
         };
         debug!(channel=%channel_id, "Closing channel");
         // A channel closed before its parked recording started has nothing to
-        // record its held input: none of it goes to the target.
+        // record its held input: none of it goes to the target, and the parked
+        // recording is dropped so none is started for it when the gate opens.
         self.held_input.retain(|(holder, _)| *holder != channel_id);
+        self.pending_recordings
+            .retain(|(parked, _)| *parked != channel_id);
         self.send_command_and_wait(RCCommand::Channel(channel_id, ChannelOperation::Close))
             .await?;
         self.channels.close(channel_id);

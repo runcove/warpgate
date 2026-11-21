@@ -1497,7 +1497,8 @@ mod tests {
     use uuid::Uuid;
     use warpgate_common::UserFacingReason;
 
-    use super::{ConnectionError, resolve_chain_ids};
+    use super::{ConnectionError, queue_channel_op, resolve_chain_ids};
+    use crate::common::ChannelOperation;
 
     #[test]
     fn resolve_chain_ids_returns_ordered_chain() {
@@ -1521,6 +1522,39 @@ mod tests {
         // `a` jumps through `b`, but `b` resolves to no SSH target.
         let jumps: HashMap<Uuid, Option<Uuid>> = HashMap::from([(a, Some(b))]);
         assert!(resolve_chain_ids(a, |id| jumps.get(&id).copied()).is_err());
+    }
+
+    /// Closing one channel before the target connection is up drops only that
+    /// channel's queued operations; every other channel keeps its own, in order.
+    #[test]
+    fn queue_channel_op_close_drops_only_the_closed_channels_ops() {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut pending = vec![];
+        queue_channel_op(&mut pending, a, ChannelOperation::RequestShell);
+        queue_channel_op(&mut pending, b, ChannelOperation::RequestExec("one".into()));
+        queue_channel_op(&mut pending, a, ChannelOperation::Eof);
+        queue_channel_op(&mut pending, b, ChannelOperation::Eof);
+        queue_channel_op(&mut pending, b, ChannelOperation::RequestExec("two".into()));
+
+        queue_channel_op(&mut pending, a, ChannelOperation::Close);
+
+        assert!(
+            pending.iter().all(|(channel, _)| *channel == b),
+            "the closed channel's ops are dropped: {pending:?}"
+        );
+        assert!(matches!(
+            pending.as_slice(),
+            [
+                (_, ChannelOperation::RequestExec(one)),
+                (_, ChannelOperation::Eof),
+                (_, ChannelOperation::RequestExec(two)),
+            ] if one == "one" && two == "two"
+        ));
+
+        // A close is not itself queued, and a close for a channel with nothing
+        // queued leaves the others alone.
+        queue_channel_op(&mut pending, a, ChannelOperation::Close);
+        assert_eq!(pending.len(), 3);
     }
 
     #[test]

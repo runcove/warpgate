@@ -417,7 +417,9 @@
                                             channel and would be normally
                                             recorded like any other command.
                                             Disable to prevent SCP recordings
-                                            from wasting storage space.
+                                            from wasting storage space. Has no
+                                            effect when recording is required:
+                                            SCP is then recorded regardless.
                                         </HelpText>
                                     {/if}
                                 </Subsection>
