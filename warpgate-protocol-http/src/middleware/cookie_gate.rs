@@ -542,6 +542,22 @@ mod tests {
         assert_eq!(c.same_site(), Some(SameSite::Lax));
     }
 
+    /// The gate renames by cookie name alone: it cannot tell Warpgate's own
+    /// `warpgate-http-session` from one a proxied target sent, so it would
+    /// promote either to the browser's `__Host-` session cookie. What keeps a
+    /// target's from reaching it is the proxy, which strips Warpgate's cookie
+    /// names from a target's response before the gate sees it; this test pins
+    /// the gate's side of that boundary, so the filter cannot be dropped as
+    /// redundant.
+    #[test]
+    fn unit_gate_promotes_a_session_set_cookie_whoever_sent_it() {
+        let from_a_target = "warpgate-http-session=FORGED; Path=/; Max-Age=3600";
+        let out = gate_set_cookie(from_a_target, HTTPS).unwrap().unwrap();
+        let cookie = Cookie::parse(out).unwrap();
+        assert_eq!(cookie.name(), HOST_SESSION_COOKIE_NAME);
+        assert_eq!(cookie.value(), "FORGED");
+    }
+
     #[test]
     fn unit_gate_leaves_other_set_cookies_alone() {
         assert_eq!(gate_set_cookie("a=1; Path=/", HTTPS), None);

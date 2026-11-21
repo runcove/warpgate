@@ -424,6 +424,15 @@ pub async fn purge_expired<C: ConnectionTrait>(
     HttpHandoff::purge_expired(db, now).await
 }
 
+/// Whether `req` is not a framed or embedded load: its `Sec-Fetch-Dest`, when
+/// the browser sends one, is `document`. A browser too old to send it passes,
+/// as it does the `Sec-Fetch-Mode` check of [`is_navigation_request`].
+fn is_top_level_document(req: &Request) -> bool {
+    req.headers()
+        .get("sec-fetch-dest")
+        .is_none_or(|dest| dest == "document")
+}
+
 /// The bound host's [`BEGIN_PATH`]: starts a sign-in from a host bound to a
 /// target, which no navigation there starts by itself when the target is
 /// public. It opens the same handoff an unauthenticated navigation on that
@@ -449,7 +458,7 @@ pub async fn begin_endpoint(req: &Request) -> poem::Result<Response> {
     else {
         return Err(NotFoundError.into());
     };
-    if !is_https_navigation(req) {
+    if !is_https_navigation(req) || !is_top_level_document(req) {
         return Ok(refusal(StatusCode::FORBIDDEN));
     }
     let next = query_value(req, BEGIN_NEXT_PARAM)
@@ -2735,6 +2744,27 @@ mod tests {
                 assert_eq!(set_cookies(&resp), Vec::<String>::new());
 
                 assert_eq!(HttpHandoff::Entity::find().all(&db).await.unwrap(), vec![]);
+            }
+
+            /// A framed begin is refused: `Sec-Fetch-Dest` other than
+            /// `document` (`iframe`, `frame`, `empty`...) opens nothing, and
+            /// sets no cookie; `document`, or no such header (an older
+            /// browser), begins as usual.
+            #[tokio::test]
+            async fn begin_refuses_a_framed_navigation() {
+                let db = memory_db().await;
+                public_bound_target(&db).await;
+                let cli = TestClient::new(begin_app(db.clone(), false).await);
+                for dest in ["iframe", "frame", "embed", "object", "empty", ""] {
+                    let resp = begin(&cli, HOST, Some("/page"), &[("sec-fetch-dest", dest)]).await;
+                    resp.assert_status(StatusCode::FORBIDDEN);
+                    assert!(set_cookies(&resp).is_empty(), "{dest}");
+                }
+                assert_eq!(HttpHandoff::Entity::find().all(&db).await.unwrap(), vec![]);
+                for headers in [&[("sec-fetch-dest", "document")][..], &[]] {
+                    let resp = begin(&cli, HOST, Some("/page"), headers).await;
+                    resp.assert_status(StatusCode::SEE_OTHER);
+                }
             }
 
             /// An anonymous visitor on a public target's own host begins a

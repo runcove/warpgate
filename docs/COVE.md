@@ -537,7 +537,9 @@ one; a page that wants its visitor signed in sends the browser to
 
     GET /@warpgate/handoff/begin?next=<path>
 
-on its own host, as a top-level navigation over HTTPS.
+on its own host, as a top-level navigation over HTTPS (a request that is
+framed, that is, one whose `Sec-Fetch-Dest` is present and not `document`, is
+refused; a browser that sends no `Sec-Fetch-Dest` is not).
 
 - `next` is the page on this host to come back to. It is checked as the SSO
   `next` is (see "SSO failure"): a site-relative path, still one after
@@ -556,7 +558,7 @@ on its own host, as a top-level navigation over HTTPS.
   access to the target is refused there and gets no session on the target's
   host. The handoff completes only in the browser that began it (the cookie
   holds a nonce the redeem checks); it is single-use and lasts 120 seconds.
-- A request that is not a navigation, or not over HTTPS, gets 403.
+- A request that is not a navigation, is framed, or is not over HTTPS, gets 403.
 
 ## Public web targets (`public: true`)
 
@@ -598,7 +600,7 @@ Each step of a handoff is rate-limited per client address, on each node.
 ## Rolling back to the previous release
 
 The way back from this release is to deploy the previous release,
-v0.30.2-cove.27. That release refuses to start on a database this release
+v0.30.2-cove.29. That release refuses to start on a database this release
 has migrated (`Migration file of version 'm00097_cove_http_sso_stamps' is
 missing`), so the database goes back first:
 
