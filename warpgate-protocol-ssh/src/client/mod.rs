@@ -372,6 +372,21 @@ impl ChannelPipe {
     }
 }
 
+/// Holds `op` until the target connection is up. A channel closed before then
+/// is never opened at the target: its queued operations, an exec or shell
+/// request among them, are dropped rather than replayed.
+pub(crate) fn queue_channel_op(
+    pending: &mut Vec<(Uuid, ChannelOperation)>,
+    channel_id: Uuid,
+    op: ChannelOperation,
+) {
+    if matches!(op, ChannelOperation::Close) {
+        pending.retain(|(queued, _)| *queued != channel_id);
+    } else {
+        pending.push((channel_id, op));
+    }
+}
+
 pub struct RemoteClient {
     id: UserSessionId,
     tx: Sender<RCEvent>,
@@ -485,7 +500,7 @@ impl RemoteClient {
         reply: &mut Option<RCCommandReply>,
     ) -> Result<(), SshClientError> {
         if self.state != RCState::Connected {
-            self.pending_ops.push((channel_id, op));
+            queue_channel_op(&mut self.pending_ops, channel_id, op);
             return Ok(());
         }
 

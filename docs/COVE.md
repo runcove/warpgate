@@ -353,8 +353,13 @@ What the option does not cover:
   a `tcpip-forward` or `streamlocal-forward` request, and for a web SSH
   client session, which connects when the session
   is created. No shell, command or forward reaches the target before its
-  recording has started. Input is a known limit: while an SSH session waits
-  for an approval gate, a shell or exec request on a session channel has its
-  recording started only once the gate is approved, and what the client
-  sends on that channel during the wait is held and passed to the target
-  after the approval, but is not in the recording.
+  recording has started. Input follows the same rule: while an SSH session
+  waits for an approval gate, a shell or exec request on a session channel
+  has its recording started only once the gate is approved, and what the
+  client sends on that channel during the wait is held, whether or not
+  recording is required. Once the recording has started it is written to the
+  recording and passed to the target, in the order it was sent. With the
+  option on, if the recording fails to start, none of it is passed to the
+  target and the target is not dialled. A channel closed during the wait
+  passes none of its held input, and its queued shell or exec request does
+  not run.

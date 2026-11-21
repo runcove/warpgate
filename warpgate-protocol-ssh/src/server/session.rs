@@ -3819,6 +3819,73 @@ mod tests {
                 assert!(!closed(&r.s), "the session goes on");
             }
 
+            /// A channel closed while an approval gate holds the session: what
+            /// was held for it is dropped, none of it is forwarded, and its exec
+            /// is not run once the target connects.
+            #[cfg(target_os = "linux")]
+            #[tokio::test]
+            async fn a_channel_closed_at_an_approval_gate_forwards_and_runs_nothing() {
+                for required in [true, false] {
+                    let mut r = gated_shell(required).await;
+                    // A close is only taken from an attached client.
+                    let _client = attach_client(&mut r.s.session).await;
+                    request_exec(&mut r, "touch /tmp/ran").await;
+                    client_sends(&mut r, b"during-the-wait").await;
+                    assert_eq!(r.s.session.held_input.len(), 1, "held");
+
+                    // The target answers each command the way the real client
+                    // does, so the close completes.
+                    let (close_reply, closing) = oneshot::channel();
+                    let mut sent = vec![];
+                    {
+                        let handling = r.s.session.handle_server_handler_event(
+                            ServerHandlerEvent::ChannelClose(r.ch, close_reply),
+                        );
+                        tokio::pin!(handling);
+                        loop {
+                            tokio::select! {
+                                result = &mut handling => {
+                                    result.unwrap();
+                                    break;
+                                }
+                                Some((command, reply)) = r.sent.recv() => {
+                                    sent.push(command);
+                                    if let Some(reply) = reply {
+                                        let _ = reply.send(Ok(()));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    assert_eq!(closing.await, Ok(()));
+                    sent.extend(drain(&mut r.sent));
+
+                    assert!(
+                        r.s.session.held_input.is_empty(),
+                        "required: {required}: held input discarded"
+                    );
+                    gate_opens(&mut r).await;
+                    sent.extend(drain(&mut r.sent));
+                    assert!(
+                        forwarded_input(&sent).is_empty(),
+                        "required: {required}: forwarded: {sent:?}"
+                    );
+
+                    // What the target connection replays once it is up.
+                    let mut replayed = vec![];
+                    for command in sent {
+                        if let RCCommand::Channel(channel, operation) = command {
+                            crate::client::queue_channel_op(&mut replayed, channel, operation);
+                        }
+                    }
+                    assert!(
+                        replayed.is_empty(),
+                        "required: {required}: replayed to the target: {replayed:?}"
+                    );
+                    assert!(!closed(&r.s), "the session goes on");
+                }
+            }
+
             /// A forward to an address an earlier forward already made a traffic
             /// recorder for, which has died since: the failure is seen before the
             /// open goes to the target. Required: the open is rejected and the
