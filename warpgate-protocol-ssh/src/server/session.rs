@@ -296,6 +296,12 @@ pub enum TrafficRecorderKey {
     Socket(String),
 }
 
+/// What a client sent on a channel whose recording had not started yet.
+enum HeldInput {
+    Data(Bytes),
+    Eof,
+}
+
 pub struct ServerSession {
     pub id: UserSessionId,
     user_info: Option<AuthStateUserInfo>,
@@ -341,6 +347,11 @@ pub struct ServerSession {
     /// Recording requests made while [`Self::target_session_id`] was still
     /// `None`, in arrival order. Drained on stamp.
     pending_recordings: Vec<(Uuid, SshRecordingMetadata)>,
+    /// Client input (and the EOF that ends it) for channels whose recording is
+    /// in [`Self::pending_recordings`], in arrival order. Nothing of it goes to
+    /// the target until that recording has started and holds it (see
+    /// [`Self::release_held_input`]).
+    held_input: Vec<(Uuid, HeldInput)>,
     /// The user and target named on a failed recording's log line; set with
     /// [`Self::target_session_id`].
     recording_owner: RecordingOwner,
@@ -2019,6 +2030,7 @@ mod tests {
                 target: TargetSelection::None,
                 target_session_id: None,
                 pending_recordings: vec![],
+                held_input: vec![],
                 recording_owner: ssh_recording_owner(),
                 recording_refused: false,
                 traffic_recorders: HashMap::new(),
@@ -3562,6 +3574,251 @@ mod tests {
                 );
             }
 
+            /// A session held by an approval gate: no target session, nothing
+            /// dialled.
+            #[cfg(target_os = "linux")]
+            async fn gated_shell(refuse: bool) -> Recorded {
+                let mut r = connected_shell(refuse).await;
+                r.s.session.target = TargetSelection::AwaitingApproval;
+                r.s.session.target_session_id = None;
+                r.s.session.rc_state = RCState::NotInitialized;
+                r
+            }
+
+            #[cfg(target_os = "linux")]
+            async fn request_exec(r: &mut Recorded, command: &'static str) {
+                let (reply, replied) = oneshot::channel();
+                r.s.session
+                    .handle_server_handler_event(ServerHandlerEvent::ExecRequest(
+                        r.ch,
+                        Bytes::from_static(command.as_bytes()),
+                        reply,
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(replied.await, Ok(true));
+            }
+
+            #[cfg(target_os = "linux")]
+            async fn client_sends(r: &mut Recorded, data: &'static [u8]) {
+                r.s.session
+                    .handle_server_handler_event(ServerHandlerEvent::Data(
+                        r.ch,
+                        Bytes::from_static(data),
+                        oneshot::channel().0,
+                    ))
+                    .await
+                    .unwrap();
+            }
+
+            /// The gate approves: the target session exists and the parked
+            /// recordings start.
+            #[cfg(target_os = "linux")]
+            async fn gate_opens(r: &mut Recorded) {
+                r.s.session.target = TargetSelection::Connected;
+                r.s.session.target_session_id = Some(r.id);
+                r.s.session.start_pending_recordings().await;
+            }
+
+            /// The client data and EOFs among `sent`, in order (`None`: an EOF).
+            #[cfg(target_os = "linux")]
+            fn forwarded_input(sent: &[RCCommand]) -> Vec<Option<Vec<u8>>> {
+                sent.iter()
+                    .filter_map(|c| match c {
+                        RCCommand::Channel(_, ChannelOperation::Data(data)) => {
+                            Some(Some(data.to_vec()))
+                        }
+                        RCCommand::Channel(_, ChannelOperation::Eof) => Some(None),
+                        _ => None,
+                    })
+                    .collect()
+            }
+
+            #[cfg(target_os = "linux")]
+            async fn recorded_input(r: &mut Recorded) -> Vec<u8> {
+                let audit = &mut r.s.session.channels.get_mut(&r.channel).unwrap().audit;
+                assert!(audit.write_recording_header().await.is_continue());
+                recorded_streams(&r.root).0
+            }
+
+            /// Stdin sent to an exec while an approval gate holds the session
+            /// is not dropped (#2065), and none of it reaches the target until
+            /// the exec's recording has started: it is then recorded and
+            /// forwarded, once, whether or not recording is required.
+            #[cfg(target_os = "linux")]
+            #[tokio::test]
+            async fn exec_input_during_an_approval_gate_is_recorded_before_it_is_forwarded() {
+                for required in [true, false] {
+                    let mut r = gated_shell(required).await;
+                    request_exec(&mut r, "/usr/lib/openssh/sftp-server").await;
+                    assert_eq!(r.s.session.pending_recordings.len(), 1, "parked");
+                    client_sends(&mut r, b"during-the-wait").await;
+
+                    let sent = drain(&mut r.sent);
+                    assert!(
+                        sent.iter().any(|c| matches!(
+                            c,
+                            RCCommand::Channel(_, ChannelOperation::RequestExec(_))
+                        )),
+                        "required: {required}: the exec is queued: {sent:?}"
+                    );
+                    assert!(
+                        forwarded_input(&sent).is_empty(),
+                        "required: {required}: forwarded with no recording: {sent:?}"
+                    );
+
+                    gate_opens(&mut r).await;
+                    assert_eq!(
+                        forwarded_input(&drain(&mut r.sent)),
+                        [Some(b"during-the-wait".to_vec())],
+                        "required: {required}"
+                    );
+                    client_sends(&mut r, b"|after").await;
+                    assert_eq!(
+                        forwarded_input(&drain(&mut r.sent)),
+                        [Some(b"|after".to_vec())],
+                        "required: {required}"
+                    );
+                    assert_eq!(
+                        recorded_input(&mut r).await,
+                        b"during-the-wait|after",
+                        "required: {required}"
+                    );
+                    assert!(!closed(&r.s), "the session goes on");
+                }
+            }
+
+            /// Keystrokes typed into a PTY shell while an approval gate holds
+            /// the session are held the same way: recorded, then forwarded.
+            #[cfg(target_os = "linux")]
+            #[tokio::test]
+            async fn shell_keystrokes_during_an_approval_gate_are_recorded_before_they_are_forwarded()
+             {
+                let mut r = gated_shell(true).await;
+                r.s.session.channels.get_mut(&r.channel).unwrap().mark_pty();
+                let _client = attach_client(&mut r.s.session).await;
+                let (reply, replied) = oneshot::channel();
+                r.s.session
+                    .handle_server_handler_event(ServerHandlerEvent::ShellRequest(r.ch, reply))
+                    .await
+                    .unwrap();
+                assert_eq!(replied.await, Ok(true));
+                assert_eq!(r.s.session.pending_recordings.len(), 1, "parked");
+
+                client_sends(&mut r, b"stty -echo\n").await;
+                client_sends(&mut r, b"cat secret\n").await;
+                let sent = drain(&mut r.sent);
+                assert!(
+                    forwarded_input(&sent).is_empty(),
+                    "forwarded with no recording: {sent:?}"
+                );
+
+                gate_opens(&mut r).await;
+                assert_eq!(
+                    forwarded_input(&drain(&mut r.sent)),
+                    [
+                        Some(b"stty -echo\n".to_vec()),
+                        Some(b"cat secret\n".to_vec())
+                    ]
+                );
+                assert_eq!(recorded_input(&mut r).await, b"stty -echo\ncat secret\n");
+            }
+
+            /// What was held goes out in the order it came, behind the exec
+            /// request and ahead of what is sent after the gate, with the EOF
+            /// that ended it still at its end; the recording has every byte
+            /// once, in that order.
+            #[cfg(target_os = "linux")]
+            #[tokio::test]
+            async fn input_held_at_an_approval_gate_keeps_its_order() {
+                let mut r = gated_shell(true).await;
+                // An EOF is only taken from an attached client.
+                let _client = attach_client(&mut r.s.session).await;
+                request_exec(&mut r, "cat").await;
+                for piece in [&b"one,"[..], b"two,", b"three"] {
+                    client_sends(&mut r, piece).await;
+                }
+                r.s.session
+                    .handle_server_handler_event(ServerHandlerEvent::ChannelEof(
+                        r.ch,
+                        oneshot::channel().0,
+                    ))
+                    .await
+                    .unwrap();
+
+                gate_opens(&mut r).await;
+
+                let sent = drain(&mut r.sent);
+                let exec = sent.iter().position(|c| {
+                    matches!(c, RCCommand::Channel(_, ChannelOperation::RequestExec(_)))
+                });
+                let first_input = sent
+                    .iter()
+                    .position(|c| matches!(c, RCCommand::Channel(_, ChannelOperation::Data(_))));
+                assert!(exec.is_some() && exec < first_input, "{sent:?}");
+                assert_eq!(
+                    forwarded_input(&sent),
+                    [
+                        Some(b"one,".to_vec()),
+                        Some(b"two,".to_vec()),
+                        Some(b"three".to_vec()),
+                        None
+                    ]
+                );
+                assert!(r.s.session.held_input.is_empty());
+                assert_eq!(recorded_input(&mut r).await, b"one,two,three");
+            }
+
+            /// Recording is required and the parked recording cannot start when
+            /// the gate opens: nothing that was held is forwarded, then or
+            /// later, and the session is closed.
+            #[cfg(target_os = "linux")]
+            #[tokio::test]
+            async fn input_held_at_an_approval_gate_is_never_forwarded_without_its_recording() {
+                let mut r = gated_shell(true).await;
+                // An EOF is only taken from an attached client.
+                let _client = attach_client(&mut r.s.session).await;
+                request_exec(&mut r, "cat").await;
+                client_sends(&mut r, b"during-the-wait").await;
+                r.s.session
+                    .handle_server_handler_event(ServerHandlerEvent::ChannelEof(
+                        r.ch,
+                        oneshot::channel().0,
+                    ))
+                    .await
+                    .unwrap();
+                // The recordings root is unusable: a regular file.
+                std::fs::write(&r.root, "not a directory").unwrap();
+
+                gate_opens(&mut r).await;
+                client_sends(&mut r, b"after").await;
+
+                let sent = drain(&mut r.sent);
+                assert!(forwarded_input(&sent).is_empty(), "forwarded: {sent:?}");
+                assert!(r.s.session.held_input.is_empty());
+                assert!(r.s.session.recording_refused);
+                assert!(closed(&r.s), "the connection is closed");
+            }
+
+            /// Not required, and the parked recording cannot start: the session
+            /// goes on unrecorded, as before, and the held input is forwarded.
+            #[cfg(target_os = "linux")]
+            #[tokio::test]
+            async fn input_held_at_an_approval_gate_is_forwarded_when_recording_is_not_required() {
+                let mut r = gated_shell(false).await;
+                request_exec(&mut r, "cat").await;
+                client_sends(&mut r, b"during-the-wait").await;
+                std::fs::write(&r.root, "not a directory").unwrap();
+
+                gate_opens(&mut r).await;
+
+                assert_eq!(
+                    forwarded_input(&drain(&mut r.sent)),
+                    [Some(b"during-the-wait".to_vec())]
+                );
+                assert!(!closed(&r.s), "the session goes on");
+            }
+
             /// A forward to an address an earlier forward already made a traffic
             /// recorder for, which has died since: the failure is seen before the
             /// open goes to the target. Required: the open is rejected and the
@@ -4092,6 +4349,7 @@ impl ServerSession {
             target: TargetSelection::None,
             target_session_id: None,
             pending_recordings: vec![],
+            held_input: vec![],
             recording_owner: ssh_recording_owner(),
             recording_refused: false,
             traffic_recorders: HashMap::new(),
@@ -6040,9 +6298,72 @@ impl ServerSession {
                 .start_terminal_recording(channel_id, metadata)
                 .await
                 .is_break()
+                || self.release_held_input(channel_id).await.is_break()
             {
+                // Refused: what was held is never forwarded.
+                self.held_input.clear();
                 return;
             }
+        }
+    }
+
+    /// Whether `channel_id`'s input is held back for now: its recording is
+    /// parked until the target session exists, so nothing could record it. The
+    /// target selection menu is the exception: its keystrokes drive the menu
+    /// and are never forwarded.
+    fn holds_input_for_recording(&self, channel_id: Uuid) -> bool {
+        !matches!(self.target, TargetSelection::Menu)
+            && self
+                .pending_recordings
+                .iter()
+                .any(|(parked, _)| *parked == channel_id)
+    }
+
+    /// Forwards what was held for `channel_id` while its recording was parked,
+    /// in arrival order, each piece written to the recording first. `Break`
+    /// when the recording failed and the session was closed: the rest is not
+    /// forwarded.
+    async fn release_held_input(&mut self, channel_id: Uuid) -> ControlFlow<()> {
+        let (held, rest) = std::mem::take(&mut self.held_input)
+            .into_iter()
+            .partition(|(holder, _)| *holder == channel_id);
+        self.held_input = rest;
+        let held: Vec<(Uuid, HeldInput)> = held;
+        for (_, input) in held {
+            let operation = match input {
+                HeldInput::Data(data) => {
+                    if self.record_input(channel_id, &data).await.is_break() {
+                        self.close_on_recording_failure().await;
+                        return ControlFlow::Break(());
+                    }
+                    ChannelOperation::Data(data)
+                }
+                HeldInput::Eof => ChannelOperation::Eof,
+            };
+            let _ = self.send_command(RCCommand::Channel(channel_id, operation));
+        }
+        ControlFlow::Continue(())
+    }
+
+    /// Writes client input to the channel's recordings. `Break` when one failed
+    /// and unrecorded sessions are refused: the caller closes the session and
+    /// does not forward `data`.
+    async fn record_input(&mut self, channel_id: Uuid, data: &Bytes) -> ControlFlow<()> {
+        let mut recording_failed = false;
+        if let Some(channel_state) = self.channels.get_mut(&channel_id) {
+            recording_failed = channel_state.audit.on_input(data).await.is_break();
+
+            if let Some(recorder) = channel_state.traffic_recorder.as_mut()
+                && let Err(error) = recorder.write_tx(data).await
+            {
+                recording_failed |= recorder.write_failed(&format_args!("{error:#}"));
+                channel_state.traffic_recorder = None;
+            }
+        }
+        if recording_failed {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
         }
     }
 
@@ -6305,19 +6626,12 @@ impl ServerSession {
             return Ok(());
         }
 
-        let mut recording_failed = false;
-        if let Some(channel_state) = self.channels.get_mut(&channel_id) {
-            recording_failed = channel_state.audit.on_input(&data).await.is_break();
-
-            if let Some(recorder) = channel_state.traffic_recorder.as_mut()
-                && let Err(error) = recorder.write_tx(&data).await
-            {
-                recording_failed |= recorder.write_failed(&format_args!("{error:#}"));
-                channel_state.traffic_recorder = None;
-            }
-        }
+        // The channel's recording is parked behind an approval gate: the input
+        // is held, not dropped (#2065), and is recorded and forwarded once that
+        // recording has started (see `release_held_input`).
+        let held = self.holds_input_for_recording(channel_id);
         // Closed before the unrecorded input reaches the target.
-        if recording_failed {
+        if !held && self.record_input(channel_id, &data).await.is_break() {
             self.close_on_recording_failure().await;
             return Ok(());
         }
@@ -6350,6 +6664,11 @@ impl ServerSession {
         // scp or Ansible pipelining payloads sent right after the exec
         // request) must not be dropped (#2065).
         if matches!(self.target, TargetSelection::Menu) {
+            return Ok(());
+        }
+
+        if held {
+            self.held_input.push((channel_id, HeldInput::Data(data)));
             return Ok(());
         }
 
@@ -7580,6 +7899,9 @@ impl ServerSession {
             return Ok(());
         };
         debug!(channel=%channel_id, "Closing channel");
+        // A channel closed before its parked recording started has nothing to
+        // record its held input: none of it goes to the target.
+        self.held_input.retain(|(holder, _)| *holder != channel_id);
         self.send_command_and_wait(RCCommand::Channel(channel_id, ChannelOperation::Close))
             .await?;
         self.channels.close(channel_id);
@@ -7601,7 +7923,7 @@ impl ServerSession {
         let _ = self.send_command(RCCommand::Channel(channel_id, ChannelOperation::Abort));
     }
 
-    fn _channel_eof(&self, server_channel_id: ServerChannelId) -> Result<()> {
+    fn _channel_eof(&mut self, server_channel_id: ServerChannelId) -> Result<()> {
         if self.rc_state == RCState::Disconnected || self.session_handle.is_none() {
             debug!(channel=%server_channel_id.0, "Ignoring eof after backend shutdown");
             return Ok(());
@@ -7609,6 +7931,11 @@ impl ServerSession {
 
         let channel_id = self.map_channel(server_channel_id)?;
         debug!(channel=%channel_id, "EOF");
+        // Behind the input it ends, which is still held for its recording.
+        if self.holds_input_for_recording(channel_id) {
+            self.held_input.push((channel_id, HeldInput::Eof));
+            return Ok(());
+        }
         let _ = self.send_command(RCCommand::Channel(channel_id, ChannelOperation::Eof));
         Ok(())
     }
