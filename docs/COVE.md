@@ -263,6 +263,17 @@ the target and is answered with a failure (OpenSSH's client goes on without
 the forwarding), and an X11 or agent channel the target opens is closed
 before it reaches the client.
 
+With the option on (and recording on), SSH refuses every subsystem request
+on a session channel, SFTP and any other, since a subsystem is never
+recorded: the request is not passed to the target and is answered with a
+failure (OpenSSH's `sftp` client reports `subsystem request failed on
+channel 0` and exits), and Warpgate logs `Refusing a subsystem request:
+recording is required and a subsystem cannot be recorded` with the
+subsystem's name. This holds while an approval gate holds the session too:
+the request is refused when it is made, not kept for after the approval. The
+session itself stays open. `scp` in its SFTP mode (OpenSSH 9.0 and later by
+default) is such a request; `scp -O` is an exec and is recorded as one.
+
 With the option on, a recording that fails mid-session closes the session
 too: in SSH (the client is shown `session closed: its recording failed`), the
 web SSH client, Kubernetes exec and attach streams, native RDP and VNC, and
@@ -323,21 +334,22 @@ What the option does not cover:
   nothing. Nor does repointing the recordings root through the admin
   settings (ConfigEdit): a session whose recording starts under the new root
   is recorded there, and nothing is refused.
-- **What is never recorded**, so never refused for want of a recording: any
-  SSH subsystem (SFTP and every other), `scp` with `record_scp` off, SSH
+- **What is never recorded**, so never refused for want of a recording:
+  `scp` with `record_scp` off, SSH
   extended data sent from the client to the target, Kubernetes port-forward,
   Kubernetes exec and attach websocket frames that are not binary, the
   bodies of streamed Kubernetes API responses to reads (`watch`, `logs -f`
   and other chunked responses; the request and its response are recorded,
   with an empty response body), native RDP frames dropped from the recording
   when its queue is full with the option off (no failure line is logged for
-  them), and MySQL, PostgreSQL and HTTP targets. SSH X11 and agent
-  forwarding are never recorded either; with the option on they are refused
-  (above), and with it off they pass unrecorded.
+  them), and MySQL, PostgreSQL and HTTP targets. SSH subsystems (SFTP and
+  every other), X11 and agent forwarding are never recorded either; with
+  the option on they are refused (above), and with it off they pass
+  unrecorded.
 - **Connecting before the recording starts.** With the option on, Warpgate
   may connect and authenticate to the target before a recording exists: for
-  a `tcpip-forward` or `streamlocal-forward` request and a subsystem
-  request, and for a web SSH client session, which connects when the session
+  a `tcpip-forward` or `streamlocal-forward` request, and for a web SSH
+  client session, which connects when the session
   is created. No shell, command or forward reaches the target before its
   recording has started. Input is a known limit: while an SSH session waits
   for an approval gate, a shell or exec request on a session channel has its
