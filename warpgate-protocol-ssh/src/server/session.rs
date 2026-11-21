@@ -3339,8 +3339,56 @@ mod tests {
                         refused_subsystem_lines(r.channel).len(),
                         usize::from(required)
                     );
+                    let after = r.s.session.map_channel(ch).unwrap();
+                    assert_eq!(
+                        refused_subsystem_lines(after),
+                        if required {
+                            vec![format!("{:?}", "after-the-gate")]
+                        } else {
+                            vec![]
+                        }
+                    );
                     assert!(!closed(&r.s), "the session goes on");
                 }
+            }
+
+            /// A subsystem request on a channel that has already run a shell.
+            /// Required: it is refused like any other, nothing reaches the
+            /// target, one line is logged, and the shell's channel and the
+            /// session go on.
+            #[cfg(target_os = "linux")]
+            #[tokio::test]
+            async fn a_subsystem_request_on_a_channel_that_ran_a_shell_is_refused_when_required() {
+                let mut r = connected_shell(true).await;
+                let _client = attach_client(&mut r.s.session).await;
+                let (reply, replied) = oneshot::channel();
+                r.s.session
+                    .handle_server_handler_event(ServerHandlerEvent::ShellRequest(r.ch, reply))
+                    .await
+                    .unwrap();
+                assert_eq!(replied.await, Ok(true), "the shell is accepted");
+                let shell = drain(&mut r.sent);
+                assert!(
+                    shell.iter().any(|c| matches!(
+                        c,
+                        RCCommand::Channel(id, ChannelOperation::RequestShell) if *id == r.channel
+                    )),
+                    "the shell went to the target: {shell:?}"
+                );
+
+                let shell_channel = r.ch;
+                let (accepted, asked) = request_subsystem(&mut r, shell_channel, "sftp").await;
+
+                assert!(!accepted, "the client is told it failed");
+                assert!(asked.is_none(), "sent to the target: {asked:?}");
+                let later = drain(&mut r.sent);
+                assert!(later.is_empty(), "queued for the target: {later:?}");
+                assert_eq!(
+                    refused_subsystem_lines(r.channel),
+                    [format!("{:?}", "sftp")]
+                );
+                assert!(!r.s.session.recording_refused);
+                assert!(!closed(&r.s), "the session goes on");
             }
 
             /// What the recordings under `root` hold for each stream, in order.

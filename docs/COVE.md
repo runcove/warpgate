@@ -335,9 +335,11 @@ What the option does not cover:
   settings (ConfigEdit): a session whose recording starts under the new root
   is recorded there, and nothing is refused.
 - **What is never recorded**, so never refused for want of a recording:
-  `scp` with `record_scp` off while the option is off (with the option on and
-  recording switched on, the option overrides `record_scp`: the `scp` exec is
-  recorded like any other exec, and Warpgate logs one warning saying so), SSH
+  `scp` with `record_scp` off while the option is off (this leaves any exec
+  whose command starts with `scp ` unrecorded, not only scp transfers, for
+  example `scp -V; exec sh`; with the option on and recording switched on,
+  the option overrides `record_scp`: the `scp` exec is recorded like any
+  other exec, and Warpgate logs one warning saying so), SSH
   extended data sent from the client to the target, Kubernetes port-forward,
   Kubernetes exec and attach websocket frames that are not binary, the
   bodies of streamed Kubernetes API responses to reads (`watch`, `logs -f`
