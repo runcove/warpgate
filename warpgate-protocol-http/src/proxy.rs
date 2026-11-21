@@ -382,10 +382,12 @@ fn truncated_cookie_name(name: &str) -> String {
         return name.to_owned();
     }
     let mut end = LOGGED_COOKIE_NAME_MAX_BYTES;
-    while !name.is_char_boundary(end) {
+    loop {
+        if let Some(head) = name.get(..end) {
+            return format!("{head}…");
+        }
         end -= 1;
     }
-    format!("{}…", &name[..end])
 }
 
 /// The cookie name of a `Set-Cookie` value, for a log line: only the name,
