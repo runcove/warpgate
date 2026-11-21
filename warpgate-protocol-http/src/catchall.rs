@@ -11,7 +11,7 @@ use uuid::Uuid;
 use warpgate_common::auth::AuthStateUserInfo;
 use warpgate_common::{
     HostBindingConflict, Target, TargetHTTPOptions, TargetOptions, WarpgateError,
-    host_binding_conflict,
+    host_binding_conflict, same_binding_hostname,
 };
 use warpgate_common_http::auth::UnauthenticatedRequestContext;
 use warpgate_common_http::{
@@ -416,12 +416,34 @@ pub(crate) async fn ticket_target_served_on_host(
         .options
         .external_host()
         .is_some_and(|bound| !bound.is_empty());
-    let host_owner = get_target_by_request_host(services, host).await?;
-    Ok(if bound {
-        host_owner.is_some_and(|owner| owner.id == target.id)
+    if bound {
+        let host_owner = get_target_by_request_host(services, host).await?;
+        Ok(host_owner.is_some_and(|owner| owner.id == target.id))
     } else {
-        host_owner.is_none()
-    })
+        unbound_target_served_on_host(services, host).await
+    }
+}
+
+/// Whether a target bound to no host is served on `request_host`: only if no
+/// target is bound to its hostname, at any port.
+pub(crate) async fn unbound_target_served_on_host(
+    services: &Services,
+    request_host: &str,
+) -> Result<bool, WarpgateError> {
+    Ok(!hostname_is_bound(services, request_host).await?)
+}
+
+/// Whether any target is bound to the hostname of `request_host`, at any
+/// port: a hostname serves one target, whatever the port.
+async fn hostname_is_bound(services: &Services, request_host: &str) -> Result<bool, WarpgateError> {
+    Ok(services
+        .config_provider
+        .list_targets()
+        .await?
+        .iter()
+        .filter_map(|target| target.options.external_host())
+        .filter(|bound| !bound.is_empty())
+        .any(|bound| same_binding_hostname(bound, request_host)))
 }
 
 /// Whether `target` is bound to `request_host`: it has a binding, and
@@ -548,8 +570,19 @@ async fn get_target_for_request(
                     .get_target_by_name(target_name.as_str())
                     .await?
             };
+        // A target bound to no host is not served on a hostname another
+        // target is bound to, at any port.
+        let unbound_served = match request_host.as_deref() {
+            Some(host) => unbound_target_served_on_host(ctx.services(), host).await?,
+            None => true,
+        };
         let target = target.filter(|target| {
-            let served = target_served_on_host(target, request_host.as_deref());
+            let unbound = target
+                .options
+                .external_host()
+                .is_none_or(|bound| bound.is_empty());
+            let served = target_served_on_host(target, request_host.as_deref())
+                && (unbound_served || !unbound);
             if !served {
                 debug!(
                     "Target {} is not served on host {:?}",
@@ -740,8 +773,8 @@ mod live_stream_tests {
     use warpgate_db_entities::{Role, Target, TargetRoleAssignment, User, UserRoleAssignment};
 
     use super::{
-        ticket_target_served_on_host, watch_admitted_live_stream, watch_live_stream,
-        watch_public_live_stream,
+        ticket_target_served_on_host, unbound_target_served_on_host, watch_admitted_live_stream,
+        watch_live_stream, watch_public_live_stream,
     };
     use crate::test_db::{memory_db, services};
 
@@ -964,6 +997,53 @@ mod live_stream_tests {
         );
         assert!(
             ticket_target_served_on_host(&services, &unbound, None)
+                .await
+                .unwrap()
+        );
+        assert!(
+            ticket_target_served_on_host(&services, &bound, Some("vm.example.com:3000"))
+                .await
+                .unwrap()
+        );
+    }
+
+    /// A hostname serves one target whatever the port: with `vm.example.com`
+    /// bound at :3000, a target bound to nothing is refused on the same
+    /// hostname at another port and with none, for a ticket and for the
+    /// user path's `warpgate-target`; the bound target is still served on its
+    /// own host.
+    #[tokio::test]
+    async fn an_unbound_target_is_not_served_on_a_bound_hostname_at_another_port() {
+        use warpgate_core::ConfigProvider;
+
+        let db = memory_db().await;
+        let services = services(db.clone()).await;
+
+        let bound = bound_target(&services, &db, "bound", "vm.example.com:3000").await;
+        let unbound_id = public_target(&db).await;
+        let unbound = services
+            .config_provider
+            .get_target_by_id(unbound_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        for host in ["vm.example.com:4000", "vm.example.com", "VM.example.com."] {
+            assert!(
+                !ticket_target_served_on_host(&services, &unbound, Some(host))
+                    .await
+                    .unwrap(),
+                "ticket on {host}"
+            );
+            assert!(
+                !unbound_target_served_on_host(&services, host)
+                    .await
+                    .unwrap(),
+                "user path on {host}"
+            );
+        }
+        assert!(
+            unbound_target_served_on_host(&services, "other.example.com:4000")
                 .await
                 .unwrap()
         );
