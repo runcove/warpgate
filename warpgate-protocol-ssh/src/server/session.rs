@@ -3175,6 +3175,162 @@ mod tests {
                 }
             }
 
+            /// Sends a subsystem request on `ch`, answering the target's side if
+            /// the request gets that far. Returns what the client is told and the
+            /// command the target was sent, if any.
+            #[cfg(target_os = "linux")]
+            async fn request_subsystem(
+                r: &mut Recorded,
+                ch: ServerChannelId,
+                name: &str,
+            ) -> (bool, Option<RCCommand>) {
+                let (reply, replied) = oneshot::channel();
+                let session = &mut r.s.session;
+                let target = &mut r.sent;
+                let handled = session.handle_server_handler_event(
+                    ServerHandlerEvent::SubsystemRequest(ch, name.into(), reply),
+                );
+                tokio::pin!(handled);
+                let mut asked = None;
+                loop {
+                    tokio::select! {
+                        result = &mut handled => {
+                            result.unwrap();
+                            break;
+                        }
+                        // A request that went out waits for this reply.
+                        Some((command, reply)) = target.recv(), if asked.is_none() => {
+                            let _ = reply.map(|r| r.send(Ok(())));
+                            asked = Some(command);
+                        }
+                    }
+                }
+                (replied.await.unwrap(), asked)
+            }
+
+            /// The lines logged for a subsystem refused on `channel`.
+            #[cfg(target_os = "linux")]
+            fn refused_subsystem_lines(channel: Uuid) -> Vec<String> {
+                let channel = channel.to_string();
+                warpgate_core::recordings::test_support::log_events()
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|values| values.get("channel") == Some(&channel))
+                    .filter_map(|values| values.get("subsystem").cloned())
+                    .collect()
+            }
+
+            #[cfg(target_os = "linux")]
+            async fn disable_recordings(db: &DatabaseConnection) {
+                let mut parameters = entities::Parameters::Entity::get(db)
+                    .await
+                    .unwrap()
+                    .into_active_model();
+                parameters.recordings_enable = Set(false);
+                parameters.update(db).await.unwrap();
+            }
+
+            /// A subsystem has no recorder. Required (and recording on): an SFTP
+            /// request and any other subsystem request are answered with a
+            /// failure and never reach the target, one line is logged for each,
+            /// the channel goes on waiting for a request and the session goes on.
+            /// Not required, or recording switched off: the request goes to the
+            /// target and is accepted, as before.
+            #[cfg(target_os = "linux")]
+            #[tokio::test]
+            async fn a_subsystem_request_is_refused_when_required() {
+                for (required, recording) in [(true, true), (false, true), (true, false)] {
+                    let refused = required && recording;
+                    let mut r = connected_shell(required).await;
+                    if !recording {
+                        disable_recordings(&r.s.db).await;
+                    }
+                    for (n, name) in [(2, "sftp"), (3, "netconf")] {
+                        let case = format!("required: {required}, recording: {recording}, {name}");
+                        let ch = open_session_channel(&mut r.s.session, n);
+                        let channel = r.s.session.map_channel(ch).unwrap();
+                        // As `_channel_open` leaves a session channel.
+                        r.s.session
+                            .channels
+                            .get_mut(&channel)
+                            .unwrap()
+                            .awaits_request = true;
+
+                        let (accepted, asked) = request_subsystem(&mut r, ch, name).await;
+
+                        let awaits = r.s.session.channels.get(&channel).unwrap().awaits_request;
+                        let lines = refused_subsystem_lines(channel);
+                        let later = drain(&mut r.sent);
+                        assert!(later.is_empty(), "{case}: {later:?}");
+                        if refused {
+                            assert!(asked.is_none(), "{case}: sent to the target: {asked:?}");
+                            assert!(!accepted, "{case}: the client is told it failed");
+                            assert!(awaits, "{case}: the channel still awaits a request");
+                            assert_eq!(lines, [format!("{name:?}")], "{case}");
+                        } else {
+                            assert!(
+                                matches!(
+                                    &asked,
+                                    Some(RCCommand::Channel(id, ChannelOperation::RequestSubsystem(sent)))
+                                        if *id == channel && sent == name
+                                ),
+                                "{case}: {asked:?}"
+                            );
+                            assert!(accepted, "{case}");
+                            assert!(!awaits, "{case}");
+                            assert!(lines.is_empty(), "{case}: {lines:?}");
+                        }
+                        assert!(!r.s.session.recording_refused, "{case}");
+                        assert!(!closed(&r.s), "{case}: the session goes on");
+                    }
+                }
+            }
+
+            /// A subsystem request made while an approval gate holds the session.
+            /// Required: it is refused there and then, so nothing is queued for
+            /// the target and nothing goes out once the gate lets the session
+            /// through; a request made after the gate is refused too. Not
+            /// required: the request is queued for the target, as before.
+            #[cfg(target_os = "linux")]
+            #[tokio::test]
+            async fn a_subsystem_request_at_an_approval_gate_is_refused_when_required() {
+                for required in [true, false] {
+                    let mut r = connected_shell(required).await;
+                    // Held by the gate: no target session, nothing dialled.
+                    r.s.session.target = TargetSelection::AwaitingApproval;
+                    r.s.session.target_session_id = None;
+                    r.s.session.rc_state = RCState::NotInitialized;
+
+                    let held = r.ch;
+                    let (accepted, asked) = request_subsystem(&mut r, held, "sftp").await;
+
+                    assert_eq!(accepted, !required, "required: {required}");
+                    assert_eq!(asked.is_some(), !required, "queued: {asked:?}");
+                    assert!(
+                        matches!(r.s.session.target, TargetSelection::AwaitingApproval),
+                        "the gate still holds the session"
+                    );
+
+                    // The gate lets the session through.
+                    r.s.session.target = TargetSelection::Connected;
+                    r.s.session.target_session_id = Some(r.id);
+                    r.s.session.rc_state = RCState::Connected;
+                    let ch = open_session_channel(&mut r.s.session, 2);
+                    let (accepted, asked) = request_subsystem(&mut r, ch, "after-the-gate").await;
+
+                    assert_eq!(accepted, !required, "required: {required}");
+                    assert_eq!(asked.is_some(), !required, "sent: {asked:?}");
+                    let later = drain(&mut r.sent);
+                    assert!(later.is_empty(), "sent to the target: {later:?}");
+                    assert_eq!(
+                        refused_subsystem_lines(r.channel).len(),
+                        usize::from(required)
+                    );
+                    assert!(!closed(&r.s), "the session goes on");
+                }
+            }
+
             /// A forward to an address an earlier forward already made a traffic
             /// recorder for, which has died since: the failure is seen before the
             /// open goes to the target. Required: the open is rejected and the
@@ -4694,8 +4850,8 @@ impl ServerSession {
                     ._channel_subsystem_request(server_channel_id, name)
                     .await
                 {
-                    Ok(()) => {
-                        let _ = reply.send(true);
+                    Ok(accepted) => {
+                        let _ = reply.send(accepted);
                         Ok(())
                     }
                     Err(SshClientError::Russh(russh::Error::ChannelOpenFailure(_))) => {
@@ -5838,12 +5994,27 @@ impl ServerSession {
         }
     }
 
+    /// `false` when the request is refused, without reaching the target.
     pub async fn _channel_subsystem_request(
         &mut self,
         server_channel_id: ServerChannelId,
         name: String,
-    ) -> Result<(), SshClientError> {
+    ) -> Result<bool, SshClientError> {
         let channel_id = self.map_channel(server_channel_id)?;
+        // A subsystem (SFTP and every other) has no recorder, so with unrecorded
+        // sessions refused (and recording on) it is refused here, whatever the
+        // state of the target connection: nothing dials the target for it and
+        // nothing is queued for it behind an approval gate. The channel still
+        // awaits its request, so its data stays dropped.
+        if self.refuses_the_unrecordable().await {
+            warn!(
+                session = %self.id,
+                channel = %channel_id,
+                subsystem = ?name,
+                "Refusing a subsystem request: recording is required and a subsystem cannot be recorded"
+            );
+            return Ok(false);
+        }
         info!(channel=%channel_id, "Requesting subsystem {}", &name);
         self.end_request_wait(channel_id);
         let _ = self.maybe_connect_remote().await;
@@ -5852,7 +6023,7 @@ impl ServerSession {
             ChannelOperation::RequestSubsystem(name),
         ))
         .await?;
-        Ok(())
+        Ok(true)
     }
 
     async fn _data(&mut self, server_channel_id: ServerChannelId, data: Bytes) -> Result<()> {
@@ -6043,12 +6214,17 @@ impl ServerSession {
     /// the target, and a channel the target opens for either is closed before it
     /// reaches the client. OpenSSH's client goes on without the forwarding.
     async fn refuses_unrecordable_forwarding(&self, kind: &str) -> bool {
-        let refused = self.services.recordings.refuses_unrecorded_sessions()
-            && self.recordings_enabled().await;
+        let refused = self.refuses_the_unrecordable().await;
         if refused {
             debug!(%kind, "Refusing forwarding: it cannot be recorded");
         }
         refused
+    }
+
+    /// Whether a request that has no recorder at all is refused: unrecorded
+    /// sessions are refused and recording is switched on.
+    async fn refuses_the_unrecordable(&self) -> bool {
+        self.services.recordings.refuses_unrecorded_sessions() && self.recordings_enabled().await
     }
 
     async fn _auth_publickey_offer(
