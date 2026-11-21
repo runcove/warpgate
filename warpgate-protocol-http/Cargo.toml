@@ -52,10 +52,10 @@ warpgate-web-ssh = { path = "../warpgate-web-ssh", default-features = false }
 poem = { workspace = true, features = ["test"] }
 rustls = { workspace = true, features = ["aws_lc_rs"] }
 sea-orm = { workspace = true, features = ["sqlx-sqlite"] }
+tokio = { workspace = true, features = ["test-util"] }
 warpgate-common-http = { path = "../warpgate-common-http", default-features = false, features = [
     "test-util",
 ] }
-tokio = { workspace = true, features = ["test-util"] }
 warpgate-db-migrations = { path = "../warpgate-db-migrations", features = [
     "sqlite",
 ] }

@@ -376,7 +376,7 @@ fn rewrite_set_cookie(value: &HeaderValue) -> anyhow::Result<HeaderValue> {
 /// never the value; none if there is no `name=` or it is not plain ASCII.
 fn set_cookie_name_for_log(value: &HeaderValue) -> Option<String> {
     let bytes = value.as_bytes();
-    let name = &bytes[..bytes.iter().position(|&b| b == b'=')?];
+    let name = bytes.get(..bytes.iter().position(|&b| b == b'=')?)?;
     let name = std::str::from_utf8(name).ok()?.trim();
     (!name.is_empty()
         && name.len() <= 64
@@ -2097,7 +2097,7 @@ mod tests {
             .collect();
 
         assert_eq!(cookie_headers.len(), 1);
-        let cookie = Cookie::parse(cookie_headers[0].as_str()).unwrap();
+        let cookie = Cookie::parse(cookie_headers.first().unwrap().as_str()).unwrap();
         assert_eq!(cookie.name(), "lsws_uid");
         assert_eq!(cookie.value(), "abc");
         assert_eq!(cookie.domain(), None);
@@ -2177,7 +2177,7 @@ mod tests {
             .map(|v| v.to_str().unwrap().to_string())
             .collect();
         assert_eq!(cookie_headers.len(), 1);
-        Cookie::parse(cookie_headers[0].clone()).unwrap()
+        Cookie::parse(cookie_headers.first().unwrap().clone()).unwrap()
     }
 
     #[test]
