@@ -27,7 +27,7 @@ use warpgate_common::helpers::websocket::{pump_websocket, websocket_connect_fail
 use warpgate_common::http_headers::{
     ForwardFilter, X_FORWARDED_FOR, X_FORWARDED_HOST, X_FORWARDED_PROTO,
 };
-use warpgate_common::{TargetHTTPOptions, WarpgateError, try_block};
+use warpgate_common::{TargetHTTPOptions, WarpgateError};
 use warpgate_common_http::logging::{get_client_ip, log_request_result, upstream_uri_for_log};
 use warpgate_common_http::ticket_query::without_ticket_query_param;
 use warpgate_common_http::{
@@ -328,29 +328,62 @@ fn rewrite_response(
         }
     }
 
-    if let http::header::Entry::Occupied(mut entry) = headers.entry(http::header::SET_COOKIE) {
-        for value in entry.iter_mut() {
-            try_block!({
-                let mut cookie = Cookie::parse(value.to_str()?)?;
-                // Some apps clear a cookie by re-setting it with an expiration
-                // in the past. We keep these as-is
-                // https://github.com/warp-tech/warpgate/issues/2112
-                if let Some(cookie::Expiration::DateTime(expires)) = cookie.expires()
-                    && expires >= cookie::time::OffsetDateTime::now_utc()
-                {
-                    cookie.set_expires(cookie::Expiration::Session);
+    // A `Set-Cookie` that cannot be parsed is dropped, not forwarded as is:
+    // it could carry a `Domain` that was never stripped.
+    let set_cookies: Vec<HeaderValue> = headers
+        .get_all(http::header::SET_COOKIE)
+        .iter()
+        .cloned()
+        .collect();
+    if !set_cookies.is_empty() {
+        headers.remove(http::header::SET_COOKIE);
+        for value in set_cookies {
+            match rewrite_set_cookie(&value) {
+                Ok(rewritten) => {
+                    headers.append(http::header::SET_COOKIE, rewritten);
                 }
-                // the domain set by the target isn't going to match the actual host anyway
-                // https://github.com/warp-tech/warpgate/issues/2048
-                cookie.unset_domain();
-                *value = cookie.to_string().parse()?;
-            } catch (error: anyhow::Error) {
-                warn!(?error, header=?value, "Failed to parse response cookie");
-            });
+                Err(error) => {
+                    warn!(
+                        ?error,
+                        cookie_name = set_cookie_name_for_log(&value).as_deref(),
+                        "Dropping an unparseable response cookie"
+                    );
+                }
+            }
         }
     }
 
     Ok(())
+}
+
+fn rewrite_set_cookie(value: &HeaderValue) -> anyhow::Result<HeaderValue> {
+    let mut cookie = Cookie::parse(value.to_str()?)?;
+    // Some apps clear a cookie by re-setting it with an expiration
+    // in the past. We keep these as-is
+    // https://github.com/warp-tech/warpgate/issues/2112
+    if let Some(cookie::Expiration::DateTime(expires)) = cookie.expires()
+        && expires >= cookie::time::OffsetDateTime::now_utc()
+    {
+        cookie.set_expires(cookie::Expiration::Session);
+    }
+    // the domain set by the target isn't going to match the actual host anyway
+    // https://github.com/warp-tech/warpgate/issues/2048
+    cookie.unset_domain();
+    Ok(cookie.to_string().parse()?)
+}
+
+/// The cookie name of a `Set-Cookie` value, for a log line: only the name,
+/// never the value; none if there is no `name=` or it is not plain ASCII.
+fn set_cookie_name_for_log(value: &HeaderValue) -> Option<String> {
+    let bytes = value.as_bytes();
+    let name = &bytes[..bytes.iter().position(|&b| b == b'=')?];
+    let name = std::str::from_utf8(name).ok()?.trim();
+    (!name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)))
+    .then(|| name.to_owned())
 }
 
 /// Whether a target's `Set-Cookie` value is dropped: it is nameless, or names
@@ -2096,6 +2129,38 @@ mod tests {
             .to_str()
             .unwrap();
         assert_eq!(location, "/@warpgate#/login?next=%2Fvms");
+    }
+
+    #[test]
+    fn rewrite_response_drops_an_unparseable_set_cookie() {
+        let mut resp = poem::Response::builder()
+            .header(
+                http::header::SET_COOKIE,
+                HeaderValue::from_bytes(b"sid=caf\xe9; Path=/; Domain=example.com").unwrap(),
+            )
+            .header(http::header::SET_COOKIE, "ok=1; Domain=100.0.0.1")
+            .body(());
+        let options = make_options("https://100.0.0.1:7080");
+        let source_uri = Uri::try_from("https://100.0.0.1:7080/index.php").unwrap();
+        rewrite_response(&mut resp, &options, &source_uri).unwrap();
+        let forwarded: Vec<_> = resp
+            .headers()
+            .get_all(http::header::SET_COOKIE)
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(forwarded, ["ok=1"]);
+    }
+
+    #[test]
+    fn unparseable_cookie_log_name_holds_no_value() {
+        let value = HeaderValue::from_bytes(b"sid=caf\xe9secret; Domain=example.com").unwrap();
+        assert_eq!(set_cookie_name_for_log(&value).as_deref(), Some("sid"));
+        // Nothing identifying when no plain name can be had.
+        let value = HeaderValue::from_bytes(b"caf\xe9=secret").unwrap();
+        assert_eq!(set_cookie_name_for_log(&value), None);
+        let value = HeaderValue::from_static("secretvalue-without-equals");
+        assert_eq!(set_cookie_name_for_log(&value), None);
     }
 
     fn rewrite_cookie(set_cookie: &str) -> Cookie<'static> {
