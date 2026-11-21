@@ -1554,8 +1554,8 @@ mod tests {
         use super::super::{
             ApiRecordingSession, ApiRequestRecord, FAILED_API_RECORDINGS, SessionRecordingMetadata,
             checked_api_recording, checked_stream_recording, is_recordable_subprotocol,
-            record_api_response, record_stream_frame, run_websocket_recording,
-            start_api_recording, start_stream_recording, write_request_record,
+            record_api_response, record_stream_frame, run_websocket_recording, start_api_recording,
+            start_stream_recording, write_request_record,
         };
         use crate::recording::{
             KubernetesRecorder, start_recording_api_named, start_recording_exec,
@@ -2463,6 +2463,7 @@ mod tests {
                 while let Ok((socket, _)) = listener.accept().await {
                     let arrived_tx = arrived_tx.clone();
                     tokio::spawn(async move {
+                        #[allow(clippy::result_large_err)]
                         let agree = |request: &tungstenite::handshake::server::Request,
                                      mut response: tungstenite::handshake::server::Response| {
                             let offered = request
