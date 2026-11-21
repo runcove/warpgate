@@ -182,6 +182,15 @@ pub struct TargetHTTPOptions {
     /// that account.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unix_socket: Option<String>,
+
+    /// When `true`, every request Warpgate proxies to this target on a signed-in
+    /// session carries a short-lived signed statement of who the session is and
+    /// when it last did single sign-on (header `x-warpgate-session-freshness`).
+    /// The keys that verify it are published at `/@warpgate/api/statement-keys`.
+    /// Default `false`. `#[oai(default)]` for the same reason as on `public`.
+    #[serde(default)]
+    #[oai(default)]
+    pub signed_statement: bool,
 }
 
 impl TargetHTTPOptions {
@@ -248,6 +257,30 @@ pub fn check_unix_socket_path(path: &str) -> Result<(), String> {
         return Err("`unix_socket` must name a socket file".into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod signed_statement_tests {
+    use super::*;
+
+    /// Off unless set; an older stored row without the field reads as off; it
+    /// round-trips and appears in the JSON the admin API returns.
+    #[test]
+    fn signed_statement_defaults_to_off_and_round_trips() {
+        let plain: TargetHTTPOptions =
+            serde_json::from_value(serde_json::json!({"url": "http://app.local"})).unwrap();
+        assert!(!plain.signed_statement);
+
+        let on: TargetHTTPOptions = serde_json::from_value(
+            serde_json::json!({"url": "http://app.local", "signed_statement": true}),
+        )
+        .unwrap();
+        assert!(on.signed_statement);
+        let json = serde_json::to_value(&on).unwrap();
+        assert_eq!(json["signed_statement"], true);
+        let back: TargetHTTPOptions = serde_json::from_value(json).unwrap();
+        assert_eq!(back, on);
+    }
 }
 
 #[cfg(test)]

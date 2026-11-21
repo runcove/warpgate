@@ -28,6 +28,7 @@ use warpgate_common::http_headers::{
     ForwardFilter, X_FORWARDED_FOR, X_FORWARDED_HOST, X_FORWARDED_PROTO,
 };
 use warpgate_common::{TargetHTTPOptions, WarpgateError};
+use warpgate_common_http::auth::session_auth_time;
 use warpgate_common_http::logging::{get_client_ip, log_request_result, upstream_uri_for_log};
 use warpgate_common_http::ticket_query::without_ticket_query_param;
 use warpgate_common_http::{
@@ -35,11 +36,17 @@ use warpgate_common_http::{
     buffer_response,
 };
 use warpgate_core::AdmittedTarget;
+use warpgate_core::session_statement::{
+    STATEMENT_HEADER, STATEMENT_TTL_SECS, StatementAuth, StatementClaims, session_hash,
+    sign_statement,
+};
+use warpgate_core::statement_keys::{ActiveStatementKey, active_statement_key};
 use warpgate_tls::{TlsMode, configure_tls_connector};
 use warpgate_web::lookup_built_file;
 
 use crate::client_cache::{HttpClientCache, build_client};
 use crate::common::{SessionExt, is_public_session_authorization, is_warpgate_cookie_name};
+use crate::step_up::StepUpSessionExt;
 use crate::unix_socket::checked_unix_socket;
 
 /// Injecting the embedded UI needs the whole page in memory. A larger page is
@@ -266,6 +273,115 @@ fn apply_url_credentials<B: SomeRequestBuilder>(
 ) -> B {
     match authorization_header {
         Some(value) => req.set_header(http::header::AUTHORIZATION, value),
+        None => req,
+    }
+}
+
+/// What the signed session statement says for this request, or `None` when it
+/// says nothing: no signed-in session, or the public-target bypass's
+/// throwaway session, which names no one. Read from the browser session, never
+/// from anything the caller sent.
+fn statement_claims(
+    session: &Session,
+    target_id: uuid::Uuid,
+    method: &str,
+    path_and_query: &str,
+    now: i64,
+) -> Option<StatementClaims> {
+    let auth = session.get_auth()?;
+    if is_public_session_authorization(&auth) {
+        return None;
+    }
+    let (kind, tid) = match &auth {
+        SessionAuthorization::User { .. } => (StatementAuth::User, None),
+        SessionAuthorization::Ticket { ticket_id, .. } => {
+            (StatementAuth::Ticket, ticket_id.map(|id| id.to_string()))
+        }
+    };
+    Some(StatementClaims {
+        aud: target_id.to_string(),
+        sub: auth.user_id().to_string(),
+        name: auth.username().clone(),
+        auth: kind,
+        last_sso_at: session.get_last_sso_at().map(|at| at.unix_timestamp()),
+        auth_time: session_auth_time(session).and_then(|at| i64::try_from(at).ok()),
+        iat: now,
+        exp: now + STATEMENT_TTL_SECS,
+        m: method.to_owned(),
+        p: path_and_query.to_owned(),
+        tid,
+        sh: session.get_session_id().map(|id| session_hash(id.0)),
+    })
+}
+
+/// The header value for this request: the statement, signed with `key`.
+/// Sensitive, so that no debug output of the request shows it.
+fn statement_header_value(
+    session: &Session,
+    key: &ActiveStatementKey,
+    target_id: uuid::Uuid,
+    method: &str,
+    path_and_query: &str,
+    now: i64,
+) -> Option<HeaderValue> {
+    let claims = statement_claims(session, target_id, method, path_and_query, now)?;
+    let signed = match sign_statement(&key.kid, &key.key, &claims) {
+        Ok(signed) => signed,
+        Err(error) => {
+            warn!(%error, "Could not sign the session statement; none is sent");
+            return None;
+        }
+    };
+    let mut value = HeaderValue::from_str(&signed).ok()?;
+    value.set_sensitive(true);
+    Some(value)
+}
+
+/// The session statement for a request to `uri` on a target with
+/// `signed_statement` on; `None` (no header) when the target has it off, no
+/// active key can be read, or the session is not a signed-in one. `uri` is
+/// the upstream address as forwarded, so the path and query are signed as the
+/// target will see them.
+async fn session_statement(
+    req: &Request,
+    ctx: &AuthenticatedRequestContext,
+    target_id: uuid::Uuid,
+    options: &TargetHTTPOptions,
+    uri: &Uri,
+) -> Result<Option<HeaderValue>> {
+    if !options.signed_statement {
+        return Ok(None);
+    }
+    let session = <&Session>::from_request_without_body(req).await?;
+    if session.get_auth().is_none() {
+        return Ok(None);
+    }
+    let key = match active_statement_key(&ctx.services().db).await {
+        Ok(Some(key)) => key,
+        Ok(None) => return Ok(None),
+        Err(error) => {
+            warn!(%error, "Could not read the session statement key; none is sent");
+            return Ok(None);
+        }
+    };
+    let path_and_query = uri.path_and_query().map_or("/", PathAndQuery::as_str);
+    Ok(statement_header_value(
+        session,
+        &key,
+        target_id,
+        req.method().as_str(),
+        path_and_query,
+        time::OffsetDateTime::now_utc().unix_timestamp(),
+    ))
+}
+
+/// Set the session statement as the LAST header step both proxy paths run,
+/// after the target's configured headers and the URL credentials, with
+/// replace semantics: upstream sees one copy, Warpgate's, whatever an earlier
+/// step put under the name.
+fn apply_session_statement<B: SomeRequestBuilder>(req: B, statement: Option<HeaderValue>) -> B {
+    match statement {
+        Some(value) => req.set_header(HeaderName::from_static(STATEMENT_HEADER), value),
         None => req,
     }
 }
@@ -625,6 +741,10 @@ pub async fn proxy_normal_request(
     client_request = inject_own_headers(req, client_request).await?;
     client_request = rewrite_request(client_request, &options)?;
     client_request = apply_url_credentials(client_request, authorization_header);
+    client_request = apply_session_statement(
+        client_request,
+        session_statement(req, ctx, admitted.target().id, &options, &uri).await?,
+    );
 
     if req.headers().contains_key(http::header::CONTENT_LENGTH)
         || req.headers().contains_key(http::header::TRANSFER_ENCODING)
@@ -785,6 +905,7 @@ pub async fn proxy_websocket_request(
         uri.clone(),
         ctx,
         options,
+        admitted.target().id,
         close_rx,
         keepalive_guard,
     )
@@ -840,12 +961,14 @@ fn extract_basic_auth(uri: Uri) -> anyhow::Result<(Option<HeaderValue>, Uri)> {
     Ok((Some(auth_value), uri))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn proxy_ws_inner(
     req: &Request,
     ws: WebSocket,
     uri: Uri,
     ctx: &AuthenticatedRequestContext,
     options: TargetHTTPOptions,
+    target_id: uuid::Uuid,
     mut close_rx: broadcast::Receiver<()>,
     keepalive_guard: SessionKeepaliveGuard,
 ) -> poem::Result<impl IntoResponse> {
@@ -873,6 +996,10 @@ async fn proxy_ws_inner(
     client_request = inject_own_headers(req, client_request).await?;
     client_request = rewrite_request(client_request, &options)?;
     client_request = apply_url_credentials(client_request, authorization_header);
+    client_request = apply_session_statement(
+        client_request,
+        session_statement(req, ctx, target_id, &options, &uri).await?,
+    );
 
     let tls_config = configure_tls_connector(!options.tls.verify, false, None)
         .await
@@ -1278,6 +1405,201 @@ mod tests {
                 );
             }
         }
+    }
+
+    const STATEMENT_TARGET: uuid::Uuid = uuid::Uuid::from_u128(0x77);
+
+    fn statement_key() -> ActiveStatementKey {
+        ActiveStatementKey::from_seed(&[7u8; 32])
+    }
+
+    fn user_auth(name: &str) -> SessionAuthorization {
+        SessionAuthorization::User {
+            user_id: uuid::Uuid::from_u128(0xA11CE),
+            username: name.into(),
+        }
+    }
+
+    fn statement_for(session: &Session, method: &str, path: &str) -> Option<StatementClaims> {
+        let value = statement_header_value(
+            session,
+            &statement_key(),
+            STATEMENT_TARGET,
+            method,
+            path,
+            1000,
+        )?;
+        let value = value.to_str().unwrap().to_owned();
+        let key = statement_key();
+        let parts: Vec<&str> = value.split('.').collect();
+        assert_eq!(parts.len(), 4, "v1.kid.payload.sig");
+        assert_eq!((parts[0], parts[1]), ("v1", key.kid.as_str()));
+        // The signature verifies over the bytes as sent.
+        let sig: [u8; 64] = data_encoding::BASE64URL_NOPAD
+            .decode(parts[3].as_bytes())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        ed25519_verify(
+            &key,
+            &warpgate_core::session_statement::signed_message(parts[1], parts[2]),
+            &sig,
+        );
+        let json = data_encoding::BASE64URL_NOPAD
+            .decode(parts[2].as_bytes())
+            .unwrap();
+        Some(serde_json::from_slice(&json).unwrap())
+    }
+
+    fn ed25519_verify(key: &ActiveStatementKey, message: &[u8], sig: &[u8; 64]) {
+        use ed25519_dalek::{Signature, Verifier};
+        key.key
+            .verifying_key()
+            .verify(message, &Signature::from_bytes(sig))
+            .expect("a valid signature");
+    }
+
+    /// A user session carries a `user` statement for this target, request and
+    /// session; a password sign-in has `last_sso_at` null and `auth_time` set,
+    /// an SSO stamp sets `last_sso_at`.
+    #[test]
+    fn a_user_session_gets_a_user_statement() {
+        let session = Session::default();
+        session.set_auth(user_auth("alice"));
+        session.set("auth_time", 900u64);
+        let session_id = uuid::Uuid::from_u128(0xFEED);
+        session.set(
+            crate::session::SESSION_ID_SESSION_KEY,
+            warpgate_common::UserSessionId(session_id),
+        );
+
+        let claims = statement_for(&session, "POST", "/a/b?c=1").unwrap();
+        assert_eq!(claims.aud, STATEMENT_TARGET.to_string());
+        assert_eq!(claims.sub, uuid::Uuid::from_u128(0xA11CE).to_string());
+        assert_eq!(claims.name, "alice");
+        assert_eq!(claims.auth, StatementAuth::User);
+        assert_eq!(claims.last_sso_at, None);
+        assert_eq!(claims.auth_time, Some(900));
+        assert_eq!((claims.iat, claims.exp), (1000, 1030));
+        assert_eq!((claims.m.as_str(), claims.p.as_str()), ("POST", "/a/b?c=1"));
+        assert_eq!(claims.tid, None);
+        assert_eq!(claims.sh, Some(session_hash(session_id)));
+
+        session.set_last_sso_at(time::OffsetDateTime::from_unix_timestamp(950).unwrap());
+        let claims = statement_for(&session, "GET", "/").unwrap();
+        assert_eq!(claims.last_sso_at, Some(950));
+    }
+
+    /// A session with no Warpgate session id has `sh` null.
+    #[test]
+    fn a_session_without_an_id_has_a_null_session_hash() {
+        let session = Session::default();
+        session.set_auth(user_auth("alice"));
+        assert_eq!(statement_for(&session, "GET", "/").unwrap().sh, None);
+    }
+
+    /// A ticket session carries `ticket` and its ticket id, and is never
+    /// stamped with an `auth_time`.
+    #[test]
+    fn a_ticket_session_gets_a_ticket_statement() {
+        let ticket_id = uuid::Uuid::from_u128(0x71C);
+        let session = Session::default();
+        session.set_auth(SessionAuthorization::Ticket {
+            user_id: uuid::Uuid::from_u128(0xA11CE),
+            username: "alice".into(),
+            target_id: STATEMENT_TARGET,
+            ticket_id: Some(ticket_id),
+        });
+        let claims = statement_for(&session, "GET", "/").unwrap();
+        assert_eq!(claims.auth, StatementAuth::Ticket);
+        assert_eq!(claims.tid, Some(ticket_id.to_string()));
+        assert_eq!(claims.auth_time, None);
+
+        session.set_auth(SessionAuthorization::Ticket {
+            user_id: uuid::Uuid::from_u128(0xA11CE),
+            username: "alice".into(),
+            target_id: STATEMENT_TARGET,
+            ticket_id: None,
+        });
+        assert_eq!(statement_for(&session, "GET", "/").unwrap().tid, None);
+    }
+
+    /// No session, and the public-target throwaway session, get no statement.
+    #[test]
+    fn an_anonymous_session_gets_no_statement() {
+        assert!(statement_for(&Session::default(), "GET", "/").is_none());
+        let throwaway = Session::default();
+        throwaway.set_auth(SessionAuthorization::Ticket {
+            user_id: uuid::Uuid::nil(),
+            username: "<public>".into(),
+            target_id: STATEMENT_TARGET,
+            ticket_id: None,
+        });
+        assert!(statement_for(&throwaway, "GET", "/").is_none());
+    }
+
+    /// The statement is the last header step on both builders: it replaces a
+    /// caller's copy and a configured one, and upstream sees exactly one,
+    /// Warpgate's. With no statement, nothing is added.
+    #[tokio::test]
+    async fn the_statement_is_set_last_with_one_copy_on_both_builders() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let client = reqwest::Client::builder().build().unwrap();
+        let options: TargetHTTPOptions = serde_json::from_value(serde_json::json!({
+            "url": "http://upstream.example/",
+            "headers": {STATEMENT_HEADER: "configured"},
+        }))
+        .unwrap();
+        let session = Session::default();
+        session.set_auth(user_auth("alice"));
+        let statement = statement_header_value(
+            &session,
+            &statement_key(),
+            STATEMENT_TARGET,
+            "GET",
+            "/",
+            1000,
+        );
+        assert!(statement.is_some());
+        let expected = statement.as_ref().unwrap().to_str().unwrap().to_owned();
+
+        // A client's copy never reaches the builders: the `x-warpgate-` prefix
+        // is dropped when the caller's headers are copied.
+        let mut req = Request::builder()
+            .header(STATEMENT_HEADER, "forged")
+            .header("X-Warpgate-Session-Freshness", "forged-again")
+            .finish();
+        req.extensions_mut().insert(session);
+
+        let plain =
+            caller_then_configured(&req, client.get("http://upstream.example/"), &options).await;
+        let plain = apply_session_statement(plain, statement.clone())
+            .build()
+            .unwrap()
+            .headers()
+            .clone();
+        let websocket = caller_then_configured(&req, http::request::Builder::new(), &options).await;
+        let websocket = apply_session_statement(websocket, statement)
+            .headers_ref()
+            .unwrap()
+            .clone();
+        for (path, upstream) in [("plain", plain), ("websocket", websocket)] {
+            let values: Vec<_> = upstream
+                .get_all(STATEMENT_HEADER)
+                .iter()
+                .map(|value| value.to_str().unwrap().to_owned())
+                .collect();
+            assert_eq!(values, std::slice::from_ref(&expected), "{path} path");
+        }
+
+        // No statement: the configured header is left as configured and the
+        // step adds nothing.
+        let untouched = apply_session_statement(http::request::Builder::new(), None);
+        assert!(
+            untouched
+                .headers_ref()
+                .is_none_or(http::HeaderMap::is_empty)
+        );
     }
 
     /// The Authorization-relevant part of the header steps `proxy_normal_request`
@@ -2053,6 +2375,7 @@ mod tests {
             external_host: None,
             public: false,
             unix_socket: None,
+            signed_statement: false,
         }
     }
 

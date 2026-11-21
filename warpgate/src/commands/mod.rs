@@ -9,3 +9,4 @@ pub mod migrate;
 pub mod recover_access;
 pub mod run;
 pub mod setup;
+pub mod statement_keys;

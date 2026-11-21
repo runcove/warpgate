@@ -125,6 +125,8 @@ mod m00089_cove_open_session_indexes;
 mod m00090_cove_pending_session_closes;
 // Users whose sessions are all still to be closed after a saved edit.
 mod m00095_cove_pending_user_closes;
+// Keys that sign session statements for HTTP targets with `signed_statement`.
+mod m00096_cove_statement_keys;
 
 pub(crate) mod helpers;
 
@@ -237,6 +239,7 @@ impl MigratorTrait for Migrator {
             Box::new(m00089_cove_open_session_indexes::Migration),
             Box::new(m00090_cove_pending_session_closes::Migration),
             Box::new(m00095_cove_pending_user_closes::Migration),
+            Box::new(m00096_cove_statement_keys::Migration),
         ]
     }
 }
@@ -372,5 +375,37 @@ mod tests {
 
         db.close().await.unwrap();
         std::fs::remove_file(path).unwrap();
+    }
+
+    /// The statement-key table comes with the last migration, on a database
+    /// that already ran the earlier ones, and keeps one row per slot.
+    #[tokio::test]
+    async fn statement_keys_table_applies_to_an_existing_database() {
+        use sea_orm::{ConnectionTrait, Statement};
+
+        set_config_migration_values(ConfigMigrationValues::default());
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        migrate_database(&db).await.unwrap();
+        migrate_database_down(&db, 1).await.unwrap();
+        assert!(
+            db.execute_unprepared("SELECT kid FROM cove_statement_keys")
+                .await
+                .is_err()
+        );
+
+        migrate_database_up(&db, 1).await.unwrap();
+        let insert = |kid: &str, slot: &str| {
+            Statement::from_string(
+                db.get_database_backend(),
+                format!(
+                    "INSERT INTO cove_statement_keys (kid, public_key, secret_key, slot, created_at) \
+                     VALUES ('{kid}', 'p', 's', '{slot}', '2026-01-01T00:00:00Z')"
+                ),
+            )
+        };
+        db.execute(insert("a", "active")).await.unwrap();
+        db.execute(insert("b", "next")).await.unwrap();
+        // At most one row per slot.
+        assert!(db.execute(insert("c", "active")).await.is_err());
     }
 }

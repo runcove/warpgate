@@ -22,6 +22,7 @@ macro_rules! with_every_table_in_order {
             Node,
             LdapServer,
             SshClientKey,
+            StatementKey,
             SecretBackend,
             TargetGroup,
             KnownHost,

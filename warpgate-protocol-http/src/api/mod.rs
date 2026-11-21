@@ -10,6 +10,7 @@ pub mod logo;
 pub mod sso_backchannel_logout;
 pub mod sso_provider_detail;
 pub mod sso_provider_list;
+pub mod statement_keys;
 pub mod targets_list;
 pub mod ticket_request_targets;
 pub mod ticket_requests;
@@ -25,6 +26,7 @@ pub fn get() -> impl OpenApi {
         sso_provider_list::Api,
         sso_provider_detail::Api,
         sso_backchannel_logout::Api,
+        statement_keys::Api,
         credentials::Api,
         api_tokens::Api,
         ticket_requests::Api,

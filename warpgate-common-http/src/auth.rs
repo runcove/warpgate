@@ -30,6 +30,12 @@ pub fn stamp_session_auth_time(session: &Session) {
     session.set(AUTH_TIME_SESSION_KEY, now_unix());
 }
 
+/// When the session last signed in, Unix seconds, as `authorize_session`
+/// stamped it; `None` for a session that never did (a ticket session).
+pub fn session_auth_time(session: &Session) -> Option<u64> {
+    session.get::<u64>(AUTH_TIME_SESSION_KEY)
+}
+
 /// Checks web_auth_max_age_seconds policy
 /// For sensitive endpoints (Web SSH start, ticket creation)
 pub async fn web_reauth_required(

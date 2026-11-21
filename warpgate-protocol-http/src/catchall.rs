@@ -1338,6 +1338,7 @@ mod public_target_tests {
             external_host: external_host.map(str::to_string),
             public,
             unix_socket: None,
+            signed_statement: false,
         }
     }
 
@@ -1685,6 +1686,7 @@ mod target_selection_tests {
                 external_host: external_host.map(str::to_string),
                 public: false,
                 unix_socket: None,
+                signed_statement: false,
             }),
             rate_limit_bytes_per_second: None,
             group_id: None,

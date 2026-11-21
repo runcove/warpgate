@@ -91,6 +91,70 @@ With `force=1`:
 The return stamps the session's `last_sso_at`. A password, OTP or passkey
 sign-in never does, so `?login=password` never makes a session fresh.
 
+## Signed session statement: `x-warpgate-session-freshness`
+
+An HTTP target with `signed_statement` on (a boolean in the target's HTTP
+options, off by default, settable through the admin API only) receives, on
+every proxied request from a signed-in browser session, one header:
+
+    x-warpgate-session-freshness: v1.<kid>.<payload>.<sig>
+
+It is set last, after the target's configured headers and URL credentials,
+with one copy upstream, on plain and WebSocket requests. A request with no
+signed-in session (and the public-target bypass) carries none; so does a
+Warpgate with no statement key. The admin API refuses a configured header
+whose name starts with `x-warpgate-` (case-insensitive).
+
+- `payload` is base64url (no padding) of JSON with these fields in this order:
+  `aud` (target id), `sub` (user id), `name` (username), `auth` (`user` or
+  `ticket`), `last_sso_at` (Unix seconds or `null`), `auth_time` (Unix seconds
+  or `null`; a ticket session is never stamped), `iat`, `exp` (`iat` + 30),
+  `m` (method), `p` (upstream path and query as forwarded), `tid` (ticket id,
+  only for a ticket session that has one), `sh` (session hash or `null`).
+- `sh` is base64url (no padding) of SHA-256 over the length-prefixed
+  `cove-session-hash-v1` and the Warpgate session id in hyphenated lowercase;
+  `null` when the browser session has no id.
+- `sig` is base64url (no padding) of the 64-byte Ed25519 signature over, for
+  each of `cove-session-freshness-v1`, `kid` and the `payload` text exactly as
+  sent: a 4-byte big-endian length, then the bytes.
+- `kid` is base64url (no padding) of SHA-256 of the raw 32-byte public key.
+
+A verifier checks the version, looks `kid` up among the keys it pinned,
+verifies the signature over the bytes it received, then reads the payload,
+and checks `aud`, `m`, `p` and `exp` against its own request.
+
+### Keys
+
+`GET /@warpgate/api/statement-keys` (no authentication; a host bound to a
+target answers 404) returns `[{kid, alg: "Ed25519", public_key, signing}]`;
+`signing` is true for the one key that signs. The list is empty, and nothing
+is signed, when `WARPGATE_ENCRYPTION_KEY` is not set. The private half is
+stored encrypted, never shown by any API, UI or log.
+
+Rotation is on the host: `warpgate statement-keys list | add-next | promote
+<kid> | retire <kid>`. Publish first: `add-next`, pin the new key in every
+verifier, `promote` (the signing key becomes `retiring`), then `retire` the
+old one. `promote` refuses while a `retiring` key exists; `retire` refuses the
+signing key.
+
+### Shared test vector
+
+Seed: the 32 bytes 0, 1, ..., 31. Session id
+`01234567-89ab-cdef-0123-456789abcdef`. Fields: `aud`
+`6f1b0c3e-0000-4000-8000-000000000001`, `sub`
+`9a7e5b2c-0000-4000-8000-000000000002`, `name` `alice`, `auth` `user`,
+`last_sso_at` 1795000000, `auth_time` 1795000000, `iat` 1795000100, `exp`
+1795000130, `m` `POST`, `p` `/vms/dev/delete?confirm=1`.
+
+- public key: `A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg`
+- `kid`: `Vkdap1RjR0wChd9dvyvKtz2mUTWIOem3dIGy6rEHcIw`
+- `sh`: `csYevRtBmdkph9kYTknQH15jWwvnGD8dkDC7ixc-y2I`
+- header value (one line, joined from the parts below):
+
+```
+v1.Vkdap1RjR0wChd9dvyvKtz2mUTWIOem3dIGy6rEHcIw.eyJhdWQiOiI2ZjFiMGMzZS0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJzdWIiOiI5YTdlNWIyYy0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDIiLCJuYW1lIjoiYWxpY2UiLCJhdXRoIjoidXNlciIsImxhc3Rfc3NvX2F0IjoxNzk1MDAwMDAwLCJhdXRoX3RpbWUiOjE3OTUwMDAwMDAsImlhdCI6MTc5NTAwMDEwMCwiZXhwIjoxNzk1MDAwMTMwLCJtIjoiUE9TVCIsInAiOiIvdm1zL2Rldi9kZWxldGU_Y29uZmlybT0xIiwic2giOiJjc1lldlJ0Qm1ka3BoOWtZVGtuUUgxNWpXd3ZuR0Q4ZGtEQzdpeGMteTJJIn0.r0FhJpXpIu0dSPz7gEfBeLe88WDNwQ-uONJhskmSmg7kOuBtod3JiptM-K7ueulsWyJTFuurTQrx2MnafZQ1Ag
+```
+
 ## Recordings a separate reader can read: `--recordings-keep-group-read`
 
 By default Warpgate sets each recording directory to exactly `0700` and each

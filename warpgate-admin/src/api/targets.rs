@@ -35,6 +35,20 @@ async fn unix_socket_refusal(admin: &AdminContext, options: &TargetOptions) -> O
     options.check_unix_socket(loopback).err()
 }
 
+/// Why an HTTP target's configured headers are refused, if they are: a name
+/// in the `x-warpgate-` family is Warpgate's own (identity headers, the
+/// session statement), compared ASCII case-insensitively.
+fn reserved_header_refusal(options: &TargetOptions) -> Option<String> {
+    let TargetOptions::Http(options) = options else {
+        return None;
+    };
+    options
+        .headers
+        .keys()
+        .any(|name| name.trim().to_ascii_lowercase().starts_with("x-warpgate-"))
+        .then(|| "header names starting with `x-warpgate-` are reserved".to_owned())
+}
+
 /// Why an HTTP target's `external_host` binding is refused, if it is: it is
 /// on the control-plane host (at any port), or another target's binding
 /// shares its hostname (at any port), compared ASCII case-insensitively
@@ -163,6 +177,11 @@ impl ListApi {
                 &reason,
             )));
         }
+        if let Some(reason) = reserved_header_refusal(&body.options) {
+            return Ok(CreateTargetResponse::BadRequest(invalid_field(
+                "headers", &reason,
+            )));
+        }
         if let Some(reason) = host_binding_refusal(&admin, &body.options, None).await? {
             warn!("Rejecting request: {reason}");
             return Ok(CreateTargetResponse::Conflict(Json(reason)));
@@ -258,6 +277,10 @@ impl DetailApi {
         admin.require(AdminPermission::TargetsEdit)?;
 
         if let Some(reason) = unix_socket_refusal(&admin, &body.options).await {
+            warn!("Rejecting request: {reason}");
+            return Ok(UpdateTargetResponse::BadRequest);
+        }
+        if let Some(reason) = reserved_header_refusal(&body.options) {
             warn!("Rejecting request: {reason}");
             return Ok(UpdateTargetResponse::BadRequest);
         }
@@ -526,6 +549,38 @@ mod tests {
             "http": {"url": "http://h", "external_host": external_host}
         }))
         .unwrap()
+    }
+
+    /// A configured header in Warpgate's own `x-warpgate-` family is refused
+    /// in any letter case; other names, and other target kinds, pass.
+    #[test]
+    fn x_warpgate_header_names_are_refused() {
+        let with_header = |name: &str| -> TargetOptions {
+            serde_json::from_value(serde_json::json!({
+                "http": {"url": "http://h", "headers": {name: "v", "X-Other": "v"}}
+            }))
+            .unwrap()
+        };
+        for name in [
+            "x-warpgate-session-freshness",
+            "X-Warpgate-Session-Freshness",
+            "X-WARPGATE-USERNAME",
+            "x-warpgate-anything",
+        ] {
+            assert!(
+                reserved_header_refusal(&with_header(name)).is_some(),
+                "{name}"
+            );
+        }
+        for name in ["x-warpgated", "authorization", "x-backend-token"] {
+            assert!(
+                reserved_header_refusal(&with_header(name)).is_none(),
+                "{name}"
+            );
+        }
+        let no_headers: TargetOptions =
+            serde_json::from_value(serde_json::json!({"http": {"url": "http://h"}})).unwrap();
+        assert!(reserved_header_refusal(&no_headers).is_none());
     }
 
     /// An update is checked against every OTHER target: a target keeping

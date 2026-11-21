@@ -428,6 +428,7 @@ mod tests {
                 external_host: None,
                 public: false,
                 unix_socket: None,
+                signed_statement: false,
             }),
             rate_limit_bytes_per_second: None,
             group_id: None,
