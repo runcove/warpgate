@@ -23,8 +23,8 @@ use futures::stream::BoxStream;
 pub use keepalive::{SessionKeepalive, SessionKeepaliveGuard};
 use poem::error::ReadBodyError;
 use poem::http::{HeaderMap, HeaderName, HeaderValue, header};
-pub use request::{PlainHttpListener, trusted_host_header, trusted_proto};
 use poem::{Body, Request};
+pub use request::{PlainHttpListener, trusted_host_header, trusted_proto};
 use warpgate_common::WarpgateError;
 pub use warpgate_common::http_headers::{
     X_WARPGATE_CLUSTER_CLIENT_HOST, X_WARPGATE_CLUSTER_CLIENT_IP, X_WARPGATE_CLUSTER_CLIENT_PROTO,

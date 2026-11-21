@@ -6333,7 +6333,10 @@ impl ServerSession {
         open_handle: impl OpenReply + Sync + 'static,
     ) -> Result<()> {
         if self.target_session_id.is_none() {
-            if self.refuses_forward_without_target_session(&recording.0).await {
+            if self
+                .refuses_forward_without_target_session(&recording.0)
+                .await
+            {
                 open_handle
                     .reject(ChannelOpenFailure::AdministrativelyProhibited)
                     .await;

@@ -46,8 +46,7 @@ use warpgate_common_http::logging::{
 };
 use warpgate_common_http::{
     HTTP2_MAX_CONCURRENT_STREAMS_PER_CONN, PlainHttpListener, WARPGATE_PLAYGROUND_CSP,
-    cluster_peer_extension,
-    warpgate_csp_with_connect_src,
+    cluster_peer_extension, warpgate_csp_with_connect_src,
 };
 use warpgate_core::{ProtocolServer, Services};
 use warpgate_db_entities::Parameters::RecordingsStorageConfig;
