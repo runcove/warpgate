@@ -325,8 +325,10 @@ pub async fn cleanup_db(
             .to_owned()
     };
 
-    // Keyset pagination on the recording id: a failed file removal leaves its row
-    // in place, so paging by offset or by "the first N rows" would not advance.
+    // Keyset pagination on the recording id: no row is deleted until every page
+    // has been read, so "the first N rows" would not advance. A row whose file
+    // removal fails is still deleted below, so its file is left orphaned, as
+    // before this change.
     let mut after: Option<Uuid> = None;
     loop {
         let mut query = Recording::Entity::find()
@@ -827,6 +829,30 @@ mod tests {
             }
         }
 
+        // More recordings on an expired session than one removal page holds, so
+        // the keyset pagination over recording files crosses a page boundary.
+        for _ in 0..RECORDING_CLEANUP_BATCH + 100 {
+            let name = format!("rec-{}", Uuid::new_v4());
+            Recording::ActiveModel {
+                id: Set(Uuid::new_v4()),
+                name: Set(name.clone()),
+                started: Set(old),
+                ended: Set(None),
+                session_id: Set(expired[0]),
+                kind: Set(RecordingKind::Terminal),
+                metadata: Set("{}".into()),
+                generation: Set(3),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+            let folder = rec_root.join(expired[0].to_string()).join(&name);
+            std::fs::create_dir_all(&folder).unwrap();
+            std::fs::write(folder.join("data.ndjson"), "{}").unwrap();
+            expired_recordings.push(folder);
+        }
+        assert!(expired_recordings.len() > RECORDING_CLEANUP_BATCH as usize);
+
         // Bulk expired sessions: copies of the template row with fresh ids.
         db.execute_unprepared(&format!(
             "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < {BULK}) \
@@ -862,6 +888,9 @@ mod tests {
 
         let remaining_recordings = Recording::Entity::find().all(&db).await.unwrap();
         assert_eq!(remaining_recordings.len(), kept_recordings.len());
+        assert!(remaining_recordings
+            .iter()
+            .all(|r| kept.contains(&r.session_id)));
         assert!(expired_recordings.iter().all(|f| !f.exists()));
         assert!(kept_recordings.iter().all(|f| f.exists()));
 
@@ -984,10 +1013,7 @@ mod sqlite_pool_tests {
                 .fetch_one(&mut *c)
                 .await
                 .unwrap();
-            assert_eq!(
-                fk, 1,
-                "the pool handed out a connection with foreign keys off"
-            );
+            assert_eq!(fk, 1, "the pool handed out a connection with foreign keys off");
             held.push(c);
         }
         drop(held);
@@ -1017,10 +1043,7 @@ mod sqlite_pool_tests {
             .fetch_one(&mut *conn)
             .await
             .unwrap();
-        assert_eq!(
-            fk, 1,
-            "before_acquire must discard a connection with foreign keys off"
-        );
+        assert_eq!(fk, 1, "before_acquire must discard a connection with foreign keys off");
         drop(conn);
         pool.close().await;
         let _ = std::fs::remove_dir_all(&dir);
