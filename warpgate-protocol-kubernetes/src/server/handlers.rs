@@ -973,45 +973,26 @@ async fn _handle_websocket_request_inner(
     // whether session recording happens to be switched on.
     let operation = classify_stream(api_path, req.uri().query());
 
-    let (recorder_tx, recorder_rx) = mpsc::channel::<Vec<u8>>(1000);
-    // Cancelled when the recording fails and unrecorded sessions are refused: the
-    // stream then ends like a session close.
-    let recording_failed = closed.child_token();
-    let refuses_unrecorded = services.recordings.refuses_unrecorded_sessions();
-    // Whether this stream has a recording, and whether it may not go on without
-    // it.
-    let mut recorded = false;
-    let mut recording_required = false;
-    if let Some(metadata) = operation
+    let metadata = operation
         .as_ref()
-        .and_then(StreamOperation::recording_metadata)
-        && let Some(recorder) = start_stream_recording(
-            &recording_owner(audit_subject),
-            &admitted.id(),
-            &services.recordings,
-            metadata,
-        )
-        .await?
-    {
-        recorded = true;
-        recording_required = refuses_unrecorded;
-        tokio::spawn(run_websocket_recording(
-            recorder,
-            recorder_rx,
-            recording_failed.clone(),
-        ));
-    }
+        .and_then(StreamOperation::recording_metadata);
+    let refuses_unrecorded = services.recordings.refuses_unrecorded_sessions();
+    // Recording is on and a stream without one is refused.
+    let recordings_on = refuses_unrecorded && recordings_enabled(services).await;
 
+    // Every refusal that depends on the request alone comes before the
+    // recording starts, so a refused stream leaves no recording of a command
+    // that never reached the cluster.
+    //
     // Only exec and attach streams have a recording. When unrecorded sessions
     // are refused, any other upgrade (a pod, service or node `proxy` path, for
     // one) is refused here, before anything of it reaches the cluster; all but
     // port-forward, which is documented as never recorded.
-    if refuses_unrecorded
-        && !recorded
+    if recordings_on
+        && metadata.is_none()
         && !operation
             .as_ref()
             .is_some_and(StreamOperation::is_port_forward)
-        && recordings_enabled(services).await
     {
         warn!("Refusing a Kubernetes stream that has no recording");
         return Err(WarpgateError::SessionNotRecorded.into());
@@ -1022,12 +1003,38 @@ async fn _handle_websocket_request_inner(
         .get("sec-websocket-protocol")
         .and_then(|h| h.to_str().ok())
         .context("missing Sec-Websocket-Protocol request header")?;
-    let ws_protocols = cluster_subprotocols(offered_protocols, recording_required);
-    if recording_required && ws_protocols.is_empty() {
+    // A stream that will be recorded and may not go on without it is offered to
+    // the cluster on recordable subprotocols only.
+    let ws_protocols = cluster_subprotocols(offered_protocols, recordings_on && metadata.is_some());
+    if recordings_on && metadata.is_some() && ws_protocols.is_empty() {
         warn!(
             "Refusing a Kubernetes stream: the client offers no subprotocol that can be recorded"
         );
         return Err(WarpgateError::SessionNotRecorded.into());
+    }
+
+    let (recorder_tx, recorder_rx) = mpsc::channel::<Vec<u8>>(1000);
+    // Cancelled when the recording fails and unrecorded sessions are refused: the
+    // stream then ends like a session close.
+    let recording_failed = closed.child_token();
+    // Whether this stream has a recording, and whether it may not go on without
+    // it.
+    let mut recording_required = false;
+    if let Some(metadata) = metadata
+        && let Some(recorder) = start_stream_recording(
+            &recording_owner(audit_subject),
+            &admitted.id(),
+            &services.recordings,
+            metadata,
+        )
+        .await?
+    {
+        recording_required = refuses_unrecorded;
+        tokio::spawn(run_websocket_recording(
+            recorder,
+            recorder_rx,
+            recording_failed.clone(),
+        ));
     }
 
     let audit_subject = audit_subject.clone();
@@ -2531,6 +2538,19 @@ mod tests {
             first_frame: Option<Vec<u8>>,
             /// The subprotocol the client was answered with, if the stream opened.
             protocol: Option<String>,
+            /// How many files and folders the stream left under the recordings
+            /// root: none when no recording was started.
+            recordings: usize,
+        }
+
+        /// Files and folders under `dir`, all levels.
+        fn entries_under(dir: &std::path::Path) -> usize {
+            std::fs::read_dir(dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|entry| 1 + entries_under(&entry.path()))
+                .sum()
         }
 
         async fn open(
@@ -2541,6 +2561,7 @@ mod tests {
         ) -> Stream {
             let (cluster_url, mut arrived) = stream_cluster().await;
             let proxy = Arc::new(proxy(&cluster_url, recordings_enabled, refuse).await);
+            let root = proxy.root.clone();
             let acceptor = poem::listener::TcpListener::bind("127.0.0.1:0")
                 .into_acceptor()
                 .await
@@ -2571,6 +2592,7 @@ mod tests {
                     reached_cluster: arrived.try_recv().ok(),
                     first_frame: None,
                     protocol: None,
+                    recordings: entries_under(&root),
                 };
             }
             let reached_cluster = tokio::time::timeout(Duration::from_secs(10), arrived.recv())
@@ -2593,6 +2615,7 @@ mod tests {
                 reached_cluster,
                 first_frame,
                 protocol,
+                recordings: entries_under(&root),
             }
         }
 
@@ -2666,10 +2689,13 @@ mod tests {
             // The client is answered with the subprotocol the cluster agreed to.
             assert_eq!(stream.protocol.as_deref(), Some(BINARY));
             assert_eq!(stream.first_frame.as_deref(), Some(&b"\x01out"[..]));
+            // The stream that went through was recorded.
+            assert!(stream.recordings > 0);
 
             let stream = open(true, true, EXEC, &[BASE64]).await;
             assert_eq!(stream.status, 503);
             assert_eq!(stream.reached_cluster, None);
+            assert_eq!(stream.recordings, 0, "a refused stream is not recorded");
 
             let stream = open(true, false, EXEC, &[BASE64, BINARY]).await;
             assert_eq!(stream.status, 101);
@@ -2677,6 +2703,20 @@ mod tests {
                 stream.reached_cluster,
                 Some((path.to_owned(), format!("{BASE64}, {BINARY}")))
             );
+        }
+
+        /// A stream refused for want of a `Sec-WebSocket-Protocol` header is
+        /// refused before its recording starts: nothing reaches the cluster, and no
+        /// recording of the command is left. Without the header the refusal is the
+        /// same whether or not unrecorded sessions are refused.
+        #[tokio::test]
+        async fn a_stream_with_no_subprotocol_header_is_refused_without_a_recording() {
+            for refuse in [true, false] {
+                let stream = open(true, refuse, EXEC, &[]).await;
+                assert_ne!(stream.status, 101, "{refuse}");
+                assert_eq!(stream.reached_cluster, None, "{refuse}");
+                assert_eq!(stream.recordings, 0, "{refuse}");
+            }
         }
 
         #[test]
