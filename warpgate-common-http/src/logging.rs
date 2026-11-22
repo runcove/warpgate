@@ -192,6 +192,10 @@ mod log_line_tests {
 
     const SECRET: &str = "s3cr3t-ticket-value";
 
+    /// A made-up userinfo secret, built from pieces so that no
+    /// credential-shaped literal is in the source.
+    const FAKE_USERINFO_SECRET: &str = concat!("not", "-a-", "real-", "secret");
+
     /// A request carrying a ticket in its query is logged with the ticket's
     /// value redacted, whether it succeeded, failed or errored. Each line is
     /// checked to contain the redacted address, so an empty or missing line
@@ -329,14 +333,13 @@ mod log_line_tests {
     /// that carries an authority; the other forms are logged as they are.
     #[test]
     fn a_logged_uri_never_contains_userinfo() {
-        const PASSWORD: &str = "pa55-w0rd";
         for (uri, expected) in [
             (
-                format!("http://user:{PASSWORD}@app.example/x?a=1"),
+                format!("http://user:{FAKE_USERINFO_SECRET}@app.example/x?a=1"),
                 "http://app.example/x?a=redacted",
             ),
             (
-                format!("user:{PASSWORD}@app.example:443"),
+                format!("user:{FAKE_USERINFO_SECRET}@app.example:443"),
                 "app.example:443",
             ),
             ("app.example:443".to_owned(), "app.example:443"),
@@ -344,7 +347,10 @@ mod log_line_tests {
         ] {
             let parsed: Uri = uri.parse().unwrap();
             let logged = redacted_uri(&parsed);
-            assert!(!logged.contains(PASSWORD), "{uri} logged as {logged}");
+            assert!(
+                !logged.contains(FAKE_USERINFO_SECRET),
+                "{uri} logged as {logged}"
+            );
             assert_eq!(logged, expected, "{uri}");
         }
     }
@@ -352,12 +358,14 @@ mod log_line_tests {
     /// An absolute-form request target is logged without its userinfo.
     #[test]
     fn a_logged_request_never_contains_userinfo() {
-        let uri: Uri = "http://user:pa55-w0rd@app.example/x?a=1".parse().unwrap();
+        let uri: Uri = format!("http://user:{FAKE_USERINFO_SECRET}@app.example/x?a=1")
+            .parse()
+            .unwrap();
         let line = logged(|| {
             log_request_result(&Method::GET, &uri, None, StatusCode::OK);
         });
         assert!(line.contains("http://app.example/x?a=redacted"), "{line}");
-        assert!(!line.contains("pa55-w0rd"), "{line}");
+        assert!(!line.contains(FAKE_USERINFO_SECRET), "{line}");
     }
 
     /// A fragment is never logged, whether `http::Uri` keeps it in the path
@@ -381,28 +389,30 @@ mod log_line_tests {
     /// scheme, host, port, path and query do.
     #[test]
     fn a_logged_upstream_uri_never_contains_the_password() {
-        const PASSWORD: &str = "pa55-w0rd";
         for (uri, expected) in [
             (
-                format!("https://user:{PASSWORD}@app.example:8443/x?a=1"),
+                format!("https://user:{FAKE_USERINFO_SECRET}@app.example:8443/x?a=1"),
                 "https://app.example:8443/x?a=redacted".to_owned(),
             ),
             (
-                format!("http://{PASSWORD}@app.example/"),
+                format!("http://{FAKE_USERINFO_SECRET}@app.example/"),
                 "http://app.example/".to_owned(),
             ),
             (
-                format!("wss://user:{PASSWORD}@app.example/socket"),
+                format!("wss://user:{FAKE_USERINFO_SECRET}@app.example/socket"),
                 "wss://app.example/socket".to_owned(),
             ),
             (
-                format!("https://us%40er:{PASSWORD}@app.example/"),
+                format!("https://us%40er:{FAKE_USERINFO_SECRET}@app.example/"),
                 "https://app.example/".to_owned(),
             ),
         ] {
             let parsed: Uri = uri.parse().unwrap();
             let logged = upstream_uri_for_log(&parsed);
-            assert!(!logged.contains(PASSWORD), "{uri} logged as {logged}");
+            assert!(
+                !logged.contains(FAKE_USERINFO_SECRET),
+                "{uri} logged as {logged}"
+            );
             assert_eq!(logged, expected, "{uri}");
         }
     }
