@@ -145,13 +145,15 @@ equal keys hides a repeat.
 
 - `jti` is base64url (no padding) of 16 bytes from the operating system's
   random number generator, new for every statement, inside the signed bytes.
-  A receiver keeps a replay cache keyed on `(kid, jti)`, for at least the 30
-  seconds a statement lives (until `exp`), and refuses a statement it has
-  already seen.
-- `last_sso_at` is the time the identity provider says the user signed in
-  (W3 stamps it from the provider's sign-in time, not Warpgate's clock); until
-  W3 lands it is Warpgate's own clock at the SSO return. No other sign-in time
-  is in the statement: there is no `auth_time`.
+  A receiver keeps a replay cache keyed on `(kid, jti)`, holding each entry
+  until `exp` plus any clock leeway the verifier allows (at least the 30
+  seconds a statement lives), and refuses a statement it has already seen. The
+  cache is shared across verifier replicas: one shared store, not one per
+  process.
+- `last_sso_at` is Warpgate's own clock at the SSO return, as in "What
+  `last_sso_at` means" above. A follow-up (W3) will instead stamp it from the
+  identity provider's sign-in time. No other sign-in time is in the statement:
+  there is no `auth_time`.
 - `sh` is base64url (no padding) of SHA-256 over the length-prefixed
   `cove-session-hash-v1` and the Warpgate session id in hyphenated lowercase;
   `null` when the browser session has no id.
