@@ -1931,7 +1931,7 @@ mod tests {
         assert!(same == first, "everything but jti is equal");
     }
 
-    /// The emitted payload has exactly the 11 keys, in order, none repeated;
+    /// The emitted payload has exactly the 11 keys, none repeated;
     /// `last_sso_at` and `sh` are the only ones that may be null.
     #[test]
     fn the_emitted_payload_has_exactly_the_eleven_keys() {
@@ -1963,21 +1963,25 @@ mod tests {
             .unwrap();
             let object: serde_json::Map<String, serde_json::Value> =
                 serde_json::from_str(&json).unwrap();
+            // The map sorts its keys; the field order is pinned by the core
+            // vector test.
+            let mut expected = [
+                "aud",
+                "sub",
+                "name",
+                "auth",
+                "last_sso_at",
+                "iat",
+                "exp",
+                "jti",
+                "m",
+                "p",
+                "sh",
+            ];
+            expected.sort_unstable();
             assert_eq!(
                 object.keys().map(String::as_str).collect::<Vec<_>>(),
-                [
-                    "aud",
-                    "sub",
-                    "name",
-                    "auth",
-                    "last_sso_at",
-                    "iat",
-                    "exp",
-                    "jti",
-                    "m",
-                    "p",
-                    "sh"
-                ],
+                expected,
                 "{json}"
             );
             // Each key once: the serialized text has as many quoted-key
