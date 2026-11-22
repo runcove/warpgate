@@ -12,7 +12,7 @@ use tracing::warn;
 use uuid::Uuid;
 use warpgate_common::Secret;
 use warpgate_common::auth::AuthResult;
-use warpgate_common_http::auth::UnauthenticatedRequestContext;
+use warpgate_common_http::auth::{UnauthenticatedRequestContext, clear_session_auth_time};
 use warpgate_common_http::logging::get_client_ip;
 use warpgate_common_http::ticket_query::without_ticket_query_param;
 use warpgate_common_http::{SessionAuthorization, authorization_token};
@@ -23,6 +23,7 @@ use crate::api::common::end_login;
 use crate::catchall::ticket_target_served_on_host;
 use crate::common::{SessionExt, SessionRotation, get_auth_state_for_request};
 use crate::session::SessionStore;
+use crate::step_up::StepUpSessionExt;
 
 /// Request-data marker for a header-borne ticket: the request runs on a
 /// detached session that is never stored, so the user session registered for
@@ -423,6 +424,10 @@ impl<E: Endpoint> Endpoint for TicketMiddlewareEndpoint<E> {
                         target_id: authorization.target().id,
                         ticket_id: authorization.ticket_id(),
                     });
+                    // A ticket session is not a sign-in: no freshness from an
+                    // earlier user sign-in stays in it.
+                    session.clear_last_sso_at();
+                    clear_session_auth_time(&session);
                     if !session_is_temporary {
                         rotation = SessionRotation::for_request(&req).await?;
                     }

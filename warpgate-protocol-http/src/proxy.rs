@@ -1522,7 +1522,8 @@ mod tests {
     /// A ticket session gets no statement, with or without a ticket id, and
     /// even when the browser session still holds a `last_sso_at` and an
     /// `auth_time` from an earlier sign-in (a same-user ticket spent on a user
-    /// session replaces its authorization but keeps those stamps).
+    /// session once kept those stamps; the ticket middleware now clears them,
+    /// and this holds either way).
     #[test]
     fn a_ticket_session_gets_no_statement() {
         let ticket_id = uuid::Uuid::from_u128(0x71C);
@@ -1623,7 +1624,9 @@ mod tests {
                 1000,
             )
             .is_some();
-            format!("{auth} statement={statement}")
+            let stamps = session.get_last_sso_at().is_some()
+                || warpgate_common_http::auth::session_auth_time(session).is_some();
+            format!("{auth} statement={statement} stamps={stamps}")
         }
 
         async fn run(cli: &TestClient<impl Endpoint>, ticket: bool) -> String {
@@ -1653,6 +1656,9 @@ mod tests {
                         .get::<Session>()
                         .expect("session")
                         .set_auth(user_auth("alice"));
+                    let session = req.extensions().get::<Session>().expect("session");
+                    session.set_last_sso_at(time::OffsetDateTime::from_unix_timestamp(950).unwrap());
+                    session.set("auth_time", 900u64);
                     ep.call(req).await
                 })
                 .data(std::sync::Arc::new(Mutex::new(SessionStore::new())))
@@ -1662,9 +1668,10 @@ mod tests {
         );
 
         // Control: the user session alone gets a statement.
-        assert_eq!(run(&cli, false).await, "user statement=true");
-        // The same user's ticket downgrades it to ticket auth: no statement.
-        assert_eq!(run(&cli, true).await, "ticket statement=false");
+        assert_eq!(run(&cli, false).await, "user statement=true stamps=true");
+        // The same user's ticket downgrades it to ticket auth: no statement,
+        // and no `last_sso_at` or `auth_time` left in the session.
+        assert_eq!(run(&cli, true).await, "ticket statement=false stamps=false");
     }
 
     /// The signed path is the one the request goes out with: reqwest (plain path) resolves

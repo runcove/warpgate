@@ -126,7 +126,7 @@ whose name starts with `x-warpgate-` (case-insensitive).
 
 A session started with a ticket carries none, even when it was a user session
 before: a ticket for the same user, presented on a user session, makes it a
-ticket session, and it keeps the `last_sso_at` and `auth_time` it already had.
+ticket session, and its `last_sso_at` and `auth_time` are cleared.
 The statement is made only while the session's authorization is a user's, so
 `auth` is always `user`; the field is kept so a verifier need not guess.
 

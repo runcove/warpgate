@@ -30,6 +30,12 @@ pub fn stamp_session_auth_time(session: &Session) {
     session.set(AUTH_TIME_SESSION_KEY, now_unix());
 }
 
+/// Forget when the session signed in. Used when a ticket replaces the
+/// session's authorization, so no sign-in time outlives the user sign-in.
+pub fn clear_session_auth_time(session: &Session) {
+    session.remove(AUTH_TIME_SESSION_KEY);
+}
+
 /// When the session last signed in, Unix seconds, as `authorize_session`
 /// stamped it; `None` for a session that never did (a ticket session).
 pub fn session_auth_time(session: &Session) -> Option<u64> {
