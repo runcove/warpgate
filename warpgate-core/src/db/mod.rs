@@ -3,18 +3,22 @@ use std::time::Duration;
 use anyhow::Result;
 use sea_orm::sea_query::Expr;
 use sea_orm::{
-    ColumnTrait, ConnectOptions, Database, DatabaseConnection, DbErr, EntityOrSelect, EntityTrait,
-    QueryFilter, QuerySelect, SqlErr,
+    ColumnTrait, ConnectOptions, Database, DatabaseConnection, DbErr, EntityTrait, QueryFilter,
+    QueryOrder, QuerySelect, SqlErr,
 };
 use time::OffsetDateTime;
 use tracing::error;
+use uuid::Uuid;
 use warpgate_common::helpers::fs::secure_file;
-use warpgate_common::{GlobalParams, TargetSessionId, WarpgateConfig};
+use warpgate_common::{GlobalParams, WarpgateConfig};
 use warpgate_db_entities::Parameters::ConfigMigrationValues;
 use warpgate_db_entities::{TargetSession, UserSession};
 use warpgate_db_migrations::{migrate_database, migrate_database_down, migrate_database_up};
 
 use crate::recordings::SessionRecordings;
+
+/// Recordings whose files are removed per query in `cleanup_db`.
+const RECORDING_CLEANUP_BATCH: u64 = 500;
 
 pub fn is_unique_violation(err: &DbErr) -> bool {
     matches!(err.sql_err(), Some(SqlErr::UniqueConstraintViolation(_)))
@@ -280,56 +284,65 @@ pub async fn cleanup_db(
         .await?;
 
     {
-        let active_ticket_ids = Ticket::Entity::find()
-            .select()
+        // A subquery, not a materialised id list: SQLite caps bind variables.
+        let active_tickets = sea_orm::sea_query::Query::select()
             .column(Ticket::Column::Id)
-            .filter(
+            .from(Ticket::Entity)
+            .and_where(
                 Expr::col(Ticket::Column::Expiry)
                     .is_null()
                     .or(Expr::col(Ticket::Column::Expiry).gt(OffsetDateTime::now_utc())),
             )
-            .all(db)
-            .await?
-            .into_iter()
-            .map(|x| x.id)
-            .collect::<Vec<_>>();
+            .to_owned();
 
-        let mut request_deletion = TicketRequest::Entity::delete_many()
-            .filter(Expr::col(TicketRequest::Column::Created).lt(audit_cutoff));
-
-        if !active_ticket_ids.is_empty() {
-            request_deletion = request_deletion.filter(
+        TicketRequest::Entity::delete_many()
+            .filter(Expr::col(TicketRequest::Column::Created).lt(audit_cutoff))
+            .filter(
                 Expr::col(TicketRequest::Column::TicketId)
                     .is_null()
-                    .or(Expr::col(TicketRequest::Column::TicketId).is_not_in(active_ticket_ids)),
-            );
-        }
-
-        request_deletion.exec(db).await?;
+                    .or(TicketRequest::Column::TicketId.not_in_subquery(active_tickets)),
+            )
+            .exec(db)
+            .await?;
     }
 
     // Recordings are cleaned up by their parent session's `ended`, not their
     // own: a session ended abnormally (inactivity reaper, node shutdown, admin
     // close) never finalizes its recording, so `recording.ended` stays null and
     // the files would otherwise leak on disk forever.
-    let expired_session_ids: Vec<TargetSessionId> = TargetSession::Entity::find()
-        .filter(Expr::col(TargetSession::Column::Ended).is_not_null())
-        .filter(Expr::col(TargetSession::Column::Ended).lt(recording_cutoff))
-        .all(db)
-        .await?
-        .into_iter()
-        .map(|s| s.id)
-        .collect();
+    //
+    // A production database can hold more expired sessions than SQLite allows
+    // bind variables in one statement, so no query below takes the session ids
+    // as a list: they select expired sessions with a subquery, and the one step
+    // that needs the recordings themselves (removing their files) pages through
+    // them.
+    let expired_sessions = || {
+        sea_orm::sea_query::Query::select()
+            .column(TargetSession::Column::Id)
+            .from(TargetSession::Entity)
+            .and_where(Expr::col(TargetSession::Column::Ended).is_not_null())
+            .and_where(Expr::col(TargetSession::Column::Ended).lt(recording_cutoff))
+            .to_owned()
+    };
 
-    if !expired_session_ids.is_empty() {
-        let recordings_to_delete = Recording::Entity::find()
-            .filter(
-                Expr::col(Recording::Column::SessionId).is_in(expired_session_ids.iter().copied()),
-            )
-            .all(db)
-            .await?;
+    // Keyset pagination on the recording id: a failed file removal leaves its row
+    // in place, so paging by offset or by "the first N rows" would not advance.
+    let mut after: Option<Uuid> = None;
+    loop {
+        let mut query = Recording::Entity::find()
+            .filter(Recording::Column::SessionId.in_subquery(expired_sessions()))
+            .order_by_asc(Recording::Column::Id)
+            .limit(RECORDING_CLEANUP_BATCH);
+        if let Some(after) = after {
+            query = query.filter(Recording::Column::Id.gt(after));
+        }
+        let batch = query.all(db).await?;
+        let Some(last) = batch.last() else {
+            break;
+        };
+        after = Some(last.id);
 
-        for recording in recordings_to_delete {
+        for recording in batch {
             if let Err(error) = recordings
                 .remove(&recording.session_id, &recording.name)
                 .await
@@ -337,22 +350,21 @@ pub async fn cleanup_db(
                 error!(session=%recording.session_id, name=%recording.name, %error, "Failed to remove recording");
             }
         }
-
-        // Recording rows are deleted explicitly rather than left to the FK
-        // cascade so that the file removal above and the row removal form one
-        // visible, ordered sequence.
-        Recording::Entity::delete_many()
-            .filter(
-                Expr::col(Recording::Column::SessionId).is_in(expired_session_ids.iter().copied()),
-            )
-            .exec(db)
-            .await?;
-
-        TargetSession::Entity::delete_many()
-            .filter(Expr::col(TargetSession::Column::Id).is_in(expired_session_ids))
-            .exec(db)
-            .await?;
     }
+
+    // Recording rows are deleted explicitly rather than left to the FK
+    // cascade so that the file removal above and the row removal form one
+    // visible, ordered sequence.
+    Recording::Entity::delete_many()
+        .filter(Recording::Column::SessionId.in_subquery(expired_sessions()))
+        .exec(db)
+        .await?;
+
+    TargetSession::Entity::delete_many()
+        .filter(Expr::col(TargetSession::Column::Ended).is_not_null())
+        .filter(Expr::col(TargetSession::Column::Ended).lt(recording_cutoff))
+        .exec(db)
+        .await?;
 
     // Keep user sessions who still have target sessions referencing them
     UserSession::Entity::delete_many()
@@ -722,6 +734,140 @@ mod tests {
         }
         assert_eq!(HttpSession::Entity::find().count(&db).await.unwrap(), 0);
     }
+
+    /// More expired sessions than SQLite has bind variables (32,766): cleanup
+    /// must still remove them all, their recordings and files, and keep the rest.
+    #[tokio::test]
+    async fn cleanup_db_handles_more_expired_sessions_than_sqlite_has_variables() {
+        use sea_orm::{ActiveModelTrait, ConnectionTrait, IntoActiveModel, PaginatorTrait};
+        use warpgate_common::{TargetSessionId, UserSessionId};
+        use warpgate_db_entities::Parameters::{
+            self, RecordingsDiskConfig, RecordingsStorageConfig,
+        };
+        use warpgate_db_entities::Recording::{self, RecordingKind};
+        use warpgate_db_entities::TargetSession;
+
+        const BULK: u32 = 40_000;
+
+        set_config_migration_values(ConfigMigrationValues::default());
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        migrate_database(&db).await.unwrap();
+
+        let root = std::env::temp_dir().join(format!("wg-cleanup-bulk-{}", Uuid::new_v4()));
+        let rec_root = root.join("recordings");
+        std::fs::create_dir_all(&rec_root).unwrap();
+        let mut parameters = Parameters::Entity::get(&db)
+            .await
+            .unwrap()
+            .into_active_model();
+        parameters.recordings_enable = Set(true);
+        parameters.recordings_storage = Set(serde_json::to_string(&RecordingsStorageConfig::Disk(
+            RecordingsDiskConfig {
+                path: rec_root.to_string_lossy().into_owned(),
+            },
+        ))
+        .unwrap());
+        parameters.update(&db).await.unwrap();
+        let params = GlobalParams::new(root.join("warpgate.yaml"), false).unwrap();
+        let recordings = SessionRecordings::new(db.clone(), &params);
+
+        let now = OffsetDateTime::now_utc();
+        let old = now - time::Duration::days(100);
+        let session = |ended: Option<OffsetDateTime>| {
+            let id = TargetSessionId(Uuid::new_v4());
+            (
+                id,
+                TargetSession::ActiveModel {
+                    id: Set(id),
+                    user_session_id: Set(UserSessionId(Uuid::new_v4())),
+                    target_snapshot: Set("{}".into()),
+                    target_id: Set(Uuid::new_v4()),
+                    started: Set(old),
+                    ended: Set(ended),
+                    ..Default::default()
+                },
+            )
+        };
+
+        // Templates for the bulk copy, plus the sessions that carry recordings.
+        let (bulk_template, bulk_model) = session(Some(old));
+        bulk_model.insert(&db).await.unwrap();
+        let mut expired = vec![bulk_template];
+        let mut kept = vec![];
+        let mut expired_recordings = vec![];
+        let mut kept_recordings = vec![];
+        for (ended, is_expired) in [(Some(old), true), (Some(now), false), (None, false)] {
+            for _ in 0..3 {
+                let (id, model) = session(ended);
+                model.insert(&db).await.unwrap();
+                let name = format!("rec-{}", Uuid::new_v4());
+                Recording::ActiveModel {
+                    id: Set(Uuid::new_v4()),
+                    name: Set(name.clone()),
+                    started: Set(old),
+                    ended: Set(None),
+                    session_id: Set(id),
+                    kind: Set(RecordingKind::Terminal),
+                    metadata: Set("{}".into()),
+                    generation: Set(3),
+                }
+                .insert(&db)
+                .await
+                .unwrap();
+                let folder = rec_root.join(id.to_string()).join(&name);
+                std::fs::create_dir_all(&folder).unwrap();
+                std::fs::write(folder.join("data.ndjson"), "{}").unwrap();
+                if is_expired {
+                    expired.push(id);
+                    expired_recordings.push(folder);
+                } else {
+                    kept.push(id);
+                    kept_recordings.push(folder);
+                }
+            }
+        }
+
+        // Bulk expired sessions: copies of the template row with fresh ids.
+        db.execute_unprepared(&format!(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < {BULK}) \
+             INSERT INTO target_sessions \
+               (id, user_session_id, target_snapshot, target_id, started, ended) \
+             SELECT randomblob(16), randomblob(16), t.target_snapshot, randomblob(16), \
+                    t.started, t.ended \
+             FROM n, (SELECT * FROM target_sessions WHERE ended IS NOT NULL \
+                      ORDER BY ended LIMIT 1) t",
+        ))
+        .await
+        .unwrap();
+
+        let total = TargetSession::Entity::find().count(&db).await.unwrap();
+        assert!(total > 32_766 + 9, "seeded only {total} sessions");
+
+        cleanup_db(
+            &db,
+            &recordings,
+            &Duration::from_secs(30 * 24 * 3600),
+            &Duration::from_secs(30 * 24 * 3600),
+        )
+        .await
+        .unwrap();
+
+        let remaining = TargetSession::Entity::find().all(&db).await.unwrap();
+        let mut remaining_ids: Vec<_> = remaining.iter().map(|s| s.id.0).collect();
+        let mut kept_ids: Vec<_> = kept.iter().map(|s| s.0).collect();
+        remaining_ids.sort();
+        kept_ids.sort();
+        assert_eq!(remaining_ids, kept_ids);
+        assert!(!expired.iter().any(|id| remaining_ids.contains(&id.0)));
+
+        let remaining_recordings = Recording::Entity::find().all(&db).await.unwrap();
+        assert_eq!(remaining_recordings.len(), kept_recordings.len());
+        assert!(expired_recordings.iter().all(|f| !f.exists()));
+        assert!(kept_recordings.iter().all(|f| f.exists()));
+
+        db.close().await.unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 }
 
 #[cfg(all(test, feature = "sqlite"))]
@@ -838,7 +984,10 @@ mod sqlite_pool_tests {
                 .fetch_one(&mut *c)
                 .await
                 .unwrap();
-            assert_eq!(fk, 1, "the pool handed out a connection with foreign keys off");
+            assert_eq!(
+                fk, 1,
+                "the pool handed out a connection with foreign keys off"
+            );
             held.push(c);
         }
         drop(held);
@@ -868,7 +1017,10 @@ mod sqlite_pool_tests {
             .fetch_one(&mut *conn)
             .await
             .unwrap();
-        assert_eq!(fk, 1, "before_acquire must discard a connection with foreign keys off");
+        assert_eq!(
+            fk, 1,
+            "before_acquire must discard a connection with foreign keys off"
+        );
         drop(conn);
         pool.close().await;
         let _ = std::fs::remove_dir_all(&dir);
