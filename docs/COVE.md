@@ -107,7 +107,9 @@ token: a verifier (cove) must keep its own CSRF check and must not read a
 recent `last_sso_at` as proof that the user just chose to act.
 
 A follow-up (W3) will make `force=1` send `prompt=login` and `max_age=0` and
-stamp from the ID token's `auth_time`; until it lands, the above holds.
+stamp `last_sso_at` from the identity provider's sign-in time (the ID token's
+`auth_time`); until it lands, the above holds. The signed statement carries no
+`auth_time` of its own.
 
 ## Signed session statement: `x-warpgate-session-freshness`
 
@@ -126,16 +128,29 @@ whose name starts with `x-warpgate-` (case-insensitive).
 
 A session started with a ticket carries none, even when it was a user session
 before: a ticket for the same user, presented on a user session, makes it a
-ticket session, and its `last_sso_at` and `auth_time` are cleared.
+ticket session, and its `last_sso_at` is cleared.
 The statement is made only while the session's authorization is a user's, so
 `auth` is always `user`; the field is kept so a verifier need not guess.
 
-- `payload` is base64url (no padding) of JSON with these fields in this order:
-  `aud` (target id), `sub` (user id), `name` (username), `auth` (`user` or
-  `ticket`; always `user` today), `last_sso_at` (Unix seconds or `null`),
-  `auth_time` (Unix seconds or `null`), `iat`, `exp` (`iat` + 30), `m`
-  (method), `p` (upstream path and query as forwarded), `tid` (reserved, never
-  present today), `sh` (session hash or `null`).
+`payload` is base64url (no padding) of JSON with exactly these 11 keys, in this order, each exactly once:
+`aud` (target id), `sub` (user id), `name` (username), `auth` (always
+`user`), `last_sso_at` (Unix seconds or `null`), `iat`, `exp` (`iat` + 30),
+`jti`, `m` (method), `p` (upstream path and query as forwarded), `sh` (session
+hash or `null`). Only `last_sso_at` and `sh` may be `null`. A verifier rejects
+a payload with a missing key, a repeated key, any other key (so there is no
+`tid` and no `auth_time`), or a `jti` that does not decode to exactly 16 bytes.
+Check this on the text as received: a JSON parser that keeps the last of two
+equal keys hides a repeat.
+
+- `jti` is base64url (no padding) of 16 bytes from the operating system's
+  random number generator, new for every statement, inside the signed bytes.
+  A receiver keeps a replay cache keyed on `(kid, jti)`, for at least the 30
+  seconds a statement lives (until `exp`), and refuses a statement it has
+  already seen.
+- `last_sso_at` is the time the identity provider says the user signed in
+  (W3 stamps it from the provider's sign-in time, not Warpgate's clock); until
+  W3 lands it is Warpgate's own clock at the SSO return. No other sign-in time
+  is in the statement: there is no `auth_time`.
 - `sh` is base64url (no padding) of SHA-256 over the length-prefixed
   `cove-session-hash-v1` and the Warpgate session id in hyphenated lowercase;
   `null` when the browser session has no id.
@@ -178,16 +193,52 @@ Seed: the 32 bytes 0, 1, ..., 31. Session id
 `01234567-89ab-cdef-0123-456789abcdef`. Fields: `aud`
 `6f1b0c3e-0000-4000-8000-000000000001`, `sub`
 `9a7e5b2c-0000-4000-8000-000000000002`, `name` `alice`, `auth` `user`,
-`last_sso_at` 1795000000, `auth_time` 1795000000, `iat` 1795000100, `exp`
-1795000130, `m` `POST`, `p` `/vms/dev/delete?confirm=1`.
+`last_sso_at` 1795000000, `iat` 1795000100, `exp` 1795000130, `jti` the 16
+bytes `0xA5` (`paWlpaWlpaWlpaWlpaWlpQ`), `m` `POST`, `p`
+`/vms/dev/delete?confirm=1`.
 
 - public key: `A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg`
 - `kid`: `Vkdap1RjR0wChd9dvyvKtz2mUTWIOem3dIGy6rEHcIw`
 - `sh`: `csYevRtBmdkph9kYTknQH15jWwvnGD8dkDC7ixc-y2I`
-- header value (one line, joined from the parts below):
+- header value (accept):
 
 ```
-v1.Vkdap1RjR0wChd9dvyvKtz2mUTWIOem3dIGy6rEHcIw.eyJhdWQiOiI2ZjFiMGMzZS0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJzdWIiOiI5YTdlNWIyYy0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDIiLCJuYW1lIjoiYWxpY2UiLCJhdXRoIjoidXNlciIsImxhc3Rfc3NvX2F0IjoxNzk1MDAwMDAwLCJhdXRoX3RpbWUiOjE3OTUwMDAwMDAsImlhdCI6MTc5NTAwMDEwMCwiZXhwIjoxNzk1MDAwMTMwLCJtIjoiUE9TVCIsInAiOiIvdm1zL2Rldi9kZWxldGU_Y29uZmlybT0xIiwic2giOiJjc1lldlJ0Qm1ka3BoOWtZVGtuUUgxNWpXd3ZuR0Q4ZGtEQzdpeGMteTJJIn0.r0FhJpXpIu0dSPz7gEfBeLe88WDNwQ-uONJhskmSmg7kOuBtod3JiptM-K7ueulsWyJTFuurTQrx2MnafZQ1Ag
+v1.Vkdap1RjR0wChd9dvyvKtz2mUTWIOem3dIGy6rEHcIw.eyJhdWQiOiI2ZjFiMGMzZS0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJzdWIiOiI5YTdlNWIyYy0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDIiLCJuYW1lIjoiYWxpY2UiLCJhdXRoIjoidXNlciIsImxhc3Rfc3NvX2F0IjoxNzk1MDAwMDAwLCJpYXQiOjE3OTUwMDAxMDAsImV4cCI6MTc5NTAwMDEzMCwianRpIjoicGFXbHBhV2xwYVdscGFXbHBhV2xwUSIsIm0iOiJQT1NUIiwicCI6Ii92bXMvZGV2L2RlbGV0ZT9jb25maXJtPTEiLCJzaCI6ImNzWWV2UnRCbWRrcGg5a1lUa25RSDE1ald3dm5HRDhka0RDN2l4Yy15MkkifQ.uMiCuNaQvmp4o1EhcG1nAlRZSMB9KWAsVLOf0raV4Ac4rH7g6QCMPxDu84VkRz5SMMAya77y09S5S52ZQZygDw
+```
+
+Same fields with `last_sso_at` `null` and `sh` `null` (a password sign-in on a
+browser session with no session id); accept:
+
+```
+v1.Vkdap1RjR0wChd9dvyvKtz2mUTWIOem3dIGy6rEHcIw.eyJhdWQiOiI2ZjFiMGMzZS0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJzdWIiOiI5YTdlNWIyYy0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDIiLCJuYW1lIjoiYWxpY2UiLCJhdXRoIjoidXNlciIsImxhc3Rfc3NvX2F0IjpudWxsLCJpYXQiOjE3OTUwMDAxMDAsImV4cCI6MTc5NTAwMDEzMCwianRpIjoicGFXbHBhV2xwYVdscGFXbHBhV2xwUSIsIm0iOiJQT1NUIiwicCI6Ii92bXMvZGV2L2RlbGV0ZT9jb25maXJtPTEiLCJzaCI6bnVsbH0.6quPIPTzEvC7xdK8SXvc4vUo1xjOWYShKvJDMs7FyJCOpv4Sttou5oMDodRPqZZ79auxivVlzs8o7FU6ynJuBw
+```
+
+Signed with the same key, correct signatures, but refuse each: the payload
+breaks the 11-key rule.
+
+- `missing_jti`: no `jti` (10 keys).
+```
+v1.Vkdap1RjR0wChd9dvyvKtz2mUTWIOem3dIGy6rEHcIw.eyJhdWQiOiI2ZjFiMGMzZS0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJzdWIiOiI5YTdlNWIyYy0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDIiLCJuYW1lIjoiYWxpY2UiLCJhdXRoIjoidXNlciIsImxhc3Rfc3NvX2F0IjoxNzk1MDAwMDAwLCJpYXQiOjE3OTUwMDAxMDAsImV4cCI6MTc5NTAwMDEzMCwibSI6IlBPU1QiLCJwIjoiL3Ztcy9kZXYvZGVsZXRlP2NvbmZpcm09MSIsInNoIjoiY3NZZXZSdEJtZGtwaDlrWVRrblFIMTVqV3d2bkdEOGRrREM3aXhjLXkySSJ9.LlWIYgZU1-DrGdhAGyH2qpBo9KK-TYJLNPiVtLAMlMrL8ilgWVJBHRqZM2bLxwbHzFbzdRCIzpy_EU08NkmrDA
+```
+- `duplicate_m`: `m` twice (12 entries).
+```
+v1.Vkdap1RjR0wChd9dvyvKtz2mUTWIOem3dIGy6rEHcIw.eyJhdWQiOiI2ZjFiMGMzZS0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJzdWIiOiI5YTdlNWIyYy0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDIiLCJuYW1lIjoiYWxpY2UiLCJhdXRoIjoidXNlciIsImxhc3Rfc3NvX2F0IjoxNzk1MDAwMDAwLCJpYXQiOjE3OTUwMDAxMDAsImV4cCI6MTc5NTAwMDEzMCwianRpIjoicGFXbHBhV2xwYVdscGFXbHBhV2xwUSIsIm0iOiJQT1NUIiwicCI6Ii92bXMvZGV2L2RlbGV0ZT9jb25maXJtPTEiLCJtIjoiR0VUIiwic2giOiJjc1lldlJ0Qm1ka3BoOWtZVGtuUUgxNWpXd3ZuR0Q4ZGtEQzdpeGMteTJJIn0.FTUDKcyMFenG1CGdLFDKDVuIfNSE8c36qmLwzdFDlU5u7QVVrqTNMW-Xcny_15F_Ewny1VQOh40pya40T8qeDA
+```
+- `duplicate_m_for_missing_sh`: `m` twice and no `sh` (11 entries, wrong set).
+```
+v1.Vkdap1RjR0wChd9dvyvKtz2mUTWIOem3dIGy6rEHcIw.eyJhdWQiOiI2ZjFiMGMzZS0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJzdWIiOiI5YTdlNWIyYy0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDIiLCJuYW1lIjoiYWxpY2UiLCJhdXRoIjoidXNlciIsImxhc3Rfc3NvX2F0IjoxNzk1MDAwMDAwLCJpYXQiOjE3OTUwMDAxMDAsImV4cCI6MTc5NTAwMDEzMCwianRpIjoicGFXbHBhV2xwYVdscGFXbHBhV2xwUSIsIm0iOiJQT1NUIiwicCI6Ii92bXMvZGV2L2RlbGV0ZT9jb25maXJtPTEiLCJtIjoiR0VUIn0.T9VZ1vDmIVsJGhs-JzUIIuv7irHuHt0iEoXyPXGbZ_fZu7m3RPmbwCQbK851TaMZ2-QHh2qyeMDKuvLkhQpoAw
+```
+- `extra_tid`: an extra key `tid`.
+```
+v1.Vkdap1RjR0wChd9dvyvKtz2mUTWIOem3dIGy6rEHcIw.eyJhdWQiOiI2ZjFiMGMzZS0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJzdWIiOiI5YTdlNWIyYy0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDIiLCJuYW1lIjoiYWxpY2UiLCJhdXRoIjoidXNlciIsImxhc3Rfc3NvX2F0IjoxNzk1MDAwMDAwLCJpYXQiOjE3OTUwMDAxMDAsImV4cCI6MTc5NTAwMDEzMCwianRpIjoicGFXbHBhV2xwYVdscGFXbHBhV2xwUSIsIm0iOiJQT1NUIiwicCI6Ii92bXMvZGV2L2RlbGV0ZT9jb25maXJtPTEiLCJ0aWQiOiJ0Iiwic2giOiJjc1lldlJ0Qm1ka3BoOWtZVGtuUUgxNWpXd3ZuR0Q4ZGtEQzdpeGMteTJJIn0.mp4oOH_lLO2uil8-pbN3uSK5Et-SDDk2WnnelimGXv4cY_NjR8B5ZExQp6Fv8hWB8C0xKuPk9ySviLEzfln3Bg
+```
+- `null_name`: `name` is `null`.
+```
+v1.Vkdap1RjR0wChd9dvyvKtz2mUTWIOem3dIGy6rEHcIw.eyJhdWQiOiI2ZjFiMGMzZS0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJzdWIiOiI5YTdlNWIyYy0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDIiLCJuYW1lIjpudWxsLCJhdXRoIjoidXNlciIsImxhc3Rfc3NvX2F0IjoxNzk1MDAwMDAwLCJpYXQiOjE3OTUwMDAxMDAsImV4cCI6MTc5NTAwMDEzMCwianRpIjoicGFXbHBhV2xwYVdscGFXbHBhV2xwUSIsIm0iOiJQT1NUIiwicCI6Ii92bXMvZGV2L2RlbGV0ZT9jb25maXJtPTEiLCJzaCI6ImNzWWV2UnRCbWRrcGg5a1lUa25RSDE1ald3dm5HRDhka0RDN2l4Yy15MkkifQ.3SToDp5y6Uu_vKJeul7Wj6p9NEuJRCUqSlb_YFIvUNLA_DrcGntx6J-2NdlurPh2RZ-sdjqTqn8NsUHL6LkSBA
+```
+- `short_jti`: `jti` decodes to 15 bytes.
+```
+v1.Vkdap1RjR0wChd9dvyvKtz2mUTWIOem3dIGy6rEHcIw.eyJhdWQiOiI2ZjFiMGMzZS0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJzdWIiOiI5YTdlNWIyYy0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDIiLCJuYW1lIjoiYWxpY2UiLCJhdXRoIjoidXNlciIsImxhc3Rfc3NvX2F0IjoxNzk1MDAwMDAwLCJpYXQiOjE3OTUwMDAxMDAsImV4cCI6MTc5NTAwMDEzMCwianRpIjoicGFXbHBhV2xwYVdscGFXbHBhV2wiLCJtIjoiUE9TVCIsInAiOiIvdm1zL2Rldi9kZWxldGU_Y29uZmlybT0xIiwic2giOiJjc1lldlJ0Qm1ka3BoOWtZVGtuUUgxNWpXd3ZuR0Q4ZGtEQzdpeGMteTJJIn0.0pdcx6NyS6DRj4xlvmmsydOnPfm0uWHlCZUHdXH6Bl--3SfRixQy9j840ui9nhBgZzDaXeZnO-O-kKFBDRxACg
 ```
 
 ## Recordings a separate reader can read: `--recordings-keep-group-read`

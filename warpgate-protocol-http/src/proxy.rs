@@ -28,7 +28,6 @@ use warpgate_common::http_headers::{
     ForwardFilter, X_FORWARDED_FOR, X_FORWARDED_HOST, X_FORWARDED_PROTO,
 };
 use warpgate_common::{TargetHTTPOptions, WarpgateError};
-use warpgate_common_http::auth::session_auth_time;
 use warpgate_common_http::logging::{get_client_ip, log_request_result, upstream_uri_for_log};
 use warpgate_common_http::ticket_query::without_ticket_query_param;
 use warpgate_common_http::{
@@ -37,7 +36,7 @@ use warpgate_common_http::{
 };
 use warpgate_core::AdmittedTarget;
 use warpgate_core::session_statement::{
-    STATEMENT_HEADER, STATEMENT_TTL_SECS, StatementAuth, StatementClaims, session_hash,
+    STATEMENT_HEADER, STATEMENT_TTL_SECS, StatementAuth, StatementClaims, new_jti, session_hash,
     sign_statement,
 };
 use warpgate_core::statement_keys::{ActiveStatementKey, active_statement_key};
@@ -310,12 +309,11 @@ fn statement_claims(
         name: auth.username().clone(),
         auth: StatementAuth::User,
         last_sso_at: session.get_last_sso_at().map(|at| at.unix_timestamp()),
-        auth_time: session_auth_time(session).and_then(|at| i64::try_from(at).ok()),
         iat: now,
         exp: now + STATEMENT_TTL_SECS,
+        jti: new_jti()?,
         m: method.to_owned(),
         p: path_and_query.to_owned(),
-        tid: None,
         sh: session.get_session_id().map(|id| session_hash(id.0)),
     })
 }
@@ -1489,13 +1487,12 @@ mod tests {
     }
 
     /// A user session carries a `user` statement for this target, request and
-    /// session; a password sign-in has `last_sso_at` null and `auth_time` set,
-    /// an SSO stamp sets `last_sso_at`.
+    /// session; a password sign-in has `last_sso_at` null, an SSO stamp sets
+    /// it. No sign-in time is in the statement.
     #[test]
     fn a_user_session_gets_a_user_statement() {
         let session = Session::default();
         session.set_auth(user_auth("alice"));
-        session.set("auth_time", 900u64);
         let session_id = uuid::Uuid::from_u128(0xFEED);
         session.set(
             crate::session::SESSION_ID_SESSION_KEY,
@@ -1508,10 +1505,8 @@ mod tests {
         assert_eq!(claims.name, "alice");
         assert_eq!(claims.auth, StatementAuth::User);
         assert_eq!(claims.last_sso_at, None);
-        assert_eq!(claims.auth_time, Some(900));
         assert_eq!((claims.iat, claims.exp), (1000, 1030));
         assert_eq!((claims.m.as_str(), claims.p.as_str()), ("POST", "/a/b?c=1"));
-        assert_eq!(claims.tid, None);
         assert_eq!(claims.sh, Some(session_hash(session_id)));
 
         session.set_last_sso_at(time::OffsetDateTime::from_unix_timestamp(950).unwrap());
@@ -1665,7 +1660,8 @@ mod tests {
                         .expect("session")
                         .set_auth(user_auth("alice"));
                     let session = req.extensions().get::<Session>().expect("session");
-                    session.set_last_sso_at(time::OffsetDateTime::from_unix_timestamp(950).unwrap());
+                    session
+                        .set_last_sso_at(time::OffsetDateTime::from_unix_timestamp(950).unwrap());
                     session.set("auth_time", 900u64);
                     ep.call(req).await
                 })
@@ -1878,6 +1874,89 @@ mod tests {
             let values = statement_values(&upstream);
             assert_eq!(values.len(), 1);
             assert_ne!(values.first().map(String::as_str), Some("forged"));
+        }
+    }
+
+    /// Two identical requests give statements that differ only in `jti`, and
+    /// the `jti` is 16 bytes.
+    #[test]
+    fn identical_requests_differ_only_in_jti() {
+        let session = Session::default();
+        session.set_auth(user_auth("alice"));
+        let first = statement_for(&session, "POST", "/a?b=1").unwrap();
+        let second = statement_for(&session, "POST", "/a?b=1").unwrap();
+        assert_ne!(first.jti, second.jti);
+        for claims in [&first, &second] {
+            let jti = data_encoding::BASE64URL_NOPAD
+                .decode(claims.jti.as_bytes())
+                .unwrap();
+            assert_eq!(jti.len(), 16);
+        }
+        let mut same = second.clone();
+        same.jti = first.jti.clone();
+        assert!(same == first, "everything but jti is equal");
+    }
+
+    /// The emitted payload has exactly the 11 keys, in order, none repeated;
+    /// `last_sso_at` and `sh` are the only ones that may be null.
+    #[test]
+    fn the_emitted_payload_has_exactly_the_eleven_keys() {
+        let key = statement_key();
+        for with_optionals in [true, false] {
+            let session = Session::default();
+            session.set_auth(user_auth("alice"));
+            if with_optionals {
+                session.set_last_sso_at(time::OffsetDateTime::from_unix_timestamp(950).unwrap());
+                session.set(
+                    crate::session::SESSION_ID_SESSION_KEY,
+                    warpgate_common::UserSessionId(uuid::Uuid::from_u128(0xFEED)),
+                );
+            }
+            let value =
+                statement_header_value(&session, &key, STATEMENT_TARGET, "GET", "/", 1000).unwrap();
+            let payload = value
+                .to_str()
+                .unwrap()
+                .split('.')
+                .nth(2)
+                .unwrap()
+                .to_owned();
+            let json = String::from_utf8(
+                data_encoding::BASE64URL_NOPAD
+                    .decode(payload.as_bytes())
+                    .unwrap(),
+            )
+            .unwrap();
+            let object: serde_json::Map<String, serde_json::Value> =
+                serde_json::from_str(&json).unwrap();
+            assert_eq!(
+                object.keys().map(String::as_str).collect::<Vec<_>>(),
+                [
+                    "aud",
+                    "sub",
+                    "name",
+                    "auth",
+                    "last_sso_at",
+                    "iat",
+                    "exp",
+                    "jti",
+                    "m",
+                    "p",
+                    "sh"
+                ],
+                "{json}"
+            );
+            // Each key once: the serialized text has as many quoted-key
+            // colons as the map has keys.
+            for name in object.keys() {
+                assert_eq!(json.matches(&format!("\"{name}\":")).count(), 1, "{json}");
+            }
+            for (name, value) in &object {
+                if value.is_null() {
+                    assert!(matches!(name.as_str(), "last_sso_at" | "sh"), "{json}");
+                }
+            }
+            assert_eq!(object["auth"], "user");
         }
     }
 

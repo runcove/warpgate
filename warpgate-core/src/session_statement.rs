@@ -19,6 +19,7 @@
 
 use data_encoding::BASE64URL_NOPAD;
 use ed25519_dalek::{Signer, SigningKey};
+use rand::TryRng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -35,15 +36,19 @@ pub const SESSION_HASH_TAG: &[u8] = b"cove-session-hash-v1";
 /// `exp - iat`, fixed.
 pub const STATEMENT_TTL_SECS: i64 = 30;
 
-/// How the cookie session behind the request signed in.
+/// How the cookie session behind the request signed in. Only a user session
+/// gets a statement, so there is one value.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "lowercase")]
 pub enum StatementAuth {
     User,
-    Ticket,
 }
 
-/// What a statement says. Serialized in this field order.
+/// Bytes of the random `jti`.
+pub const JTI_BYTES: usize = 16;
+
+/// What a statement says. Serialized in this field order, and exactly these 11
+/// keys, each once; only `last_sso_at` and `sh` may be `null`.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct StatementClaims {
     /// Id of the target the request is for
@@ -56,22 +61,26 @@ pub struct StatementClaims {
     pub auth: StatementAuth,
     /// The session's last SSO return, Unix seconds; `null` when it never did SSO
     pub last_sso_at: Option<i64>,
-    /// The session's last sign-in of any kind, Unix seconds; `null` for a
-    /// session with no recorded sign-in. Audit only.
-    pub auth_time: Option<i64>,
     pub iat: i64,
     pub exp: i64,
+    /// Unique id of this statement: 16 random bytes from the OS RNG, base64url
+    /// without padding. A receiver keeps a replay cache keyed on `(kid, jti)`.
+    pub jti: String,
     /// Request method
     pub m: String,
     /// Upstream path and query, as forwarded
     pub p: String,
-    /// The ticket's id. Reserved: no statement is made for a ticket session,
-    /// so Warpgate never sets it
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tid: Option<String>,
     /// [`session_hash`] of Warpgate's session id; `null` when the browser
     /// session has none
     pub sh: Option<String>,
+}
+
+/// A fresh `jti`: 16 bytes straight from the OS RNG, base64url without
+/// padding. `None` if the OS RNG fails: no statement is better than a weak one.
+pub fn new_jti() -> Option<String> {
+    let mut bytes = [0u8; JTI_BYTES];
+    rand::rngs::SysRng.try_fill_bytes(&mut bytes).ok()?;
+    Some(BASE64URL_NOPAD.encode(&bytes))
 }
 
 /// Each part preceded by its length as a 4-byte big-endian integer.
@@ -146,14 +155,80 @@ pub(crate) mod tests {
             name: "alice".into(),
             auth: StatementAuth::User,
             last_sso_at: Some(1_795_000_000),
-            auth_time: Some(1_795_000_000),
             iat: 1_795_000_100,
             exp: 1_795_000_130,
+            jti: BASE64URL_NOPAD.encode(&[0xA5; JTI_BYTES]),
             m: "POST".into(),
             p: "/vms/dev/delete?confirm=1".into(),
-            tid: None,
             sh: Some(session_hash(VECTOR_SESSION_ID)),
         }
+    }
+
+    /// The payload keys, as a verifier must find them: each exactly once.
+    pub(crate) const PAYLOAD_KEYS: [&str; 11] = [
+        "aud",
+        "sub",
+        "name",
+        "auth",
+        "last_sso_at",
+        "iat",
+        "exp",
+        "jti",
+        "m",
+        "p",
+        "sh",
+    ];
+
+    /// Reads every `(key, value)` pair of a JSON object in order, keeping a
+    /// repeated key instead of dropping it the way a map would.
+    fn object_pairs(json: &[u8]) -> Option<Vec<(String, serde_json::Value)>> {
+        struct Pairs(Vec<(String, serde_json::Value)>);
+        impl<'de> Deserialize<'de> for Pairs {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                struct V;
+                impl<'de> serde::de::Visitor<'de> for V {
+                    type Value = Pairs;
+                    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                        f.write_str("a JSON object")
+                    }
+                    fn visit_map<A: serde::de::MapAccess<'de>>(
+                        self,
+                        mut map: A,
+                    ) -> Result<Pairs, A::Error> {
+                        let mut out = Vec::new();
+                        while let Some(pair) = map.next_entry()? {
+                            out.push(pair);
+                        }
+                        Ok(Pairs(out))
+                    }
+                }
+                d.deserialize_map(V)
+            }
+        }
+        serde_json::from_slice::<Pairs>(json)
+            .ok()
+            .map(|pairs| pairs.0)
+    }
+
+    /// The payload rule: exactly the 11 keys, each once and no other; only
+    /// `last_sso_at` and `sh` may be `null`; `jti` decodes to 16 bytes.
+    pub(crate) fn decode_payload(json: &[u8]) -> Option<StatementClaims> {
+        let pairs = object_pairs(json)?;
+        if pairs.len() != PAYLOAD_KEYS.len() {
+            return None;
+        }
+        for key in PAYLOAD_KEYS {
+            if pairs.iter().filter(|(name, _)| name == key).count() != 1 {
+                return None;
+            }
+        }
+        for (name, value) in &pairs {
+            if value.is_null() && !matches!(name.as_str(), "last_sso_at" | "sh") {
+                return None;
+            }
+        }
+        let claims: StatementClaims = serde_json::from_slice(json).ok()?;
+        (BASE64URL_NOPAD.decode(claims.jti.as_bytes()).ok()?.len() == JTI_BYTES).then_some(claims)
     }
 
     /// Parses and verifies a header value the way a verifier must: the
@@ -179,7 +254,18 @@ pub(crate) mod tests {
             .ok()?;
         key.verify(&signed_message(kid, payload), &Signature::from_bytes(&sig))
             .ok()?;
-        serde_json::from_slice(&BASE64URL_NOPAD.decode(payload.as_bytes()).ok()?).ok()
+        decode_payload(&BASE64URL_NOPAD.decode(payload.as_bytes()).ok()?)
+    }
+
+    /// Signs `json` as a payload verbatim, for payloads `sign_statement`
+    /// would never make.
+    fn sign_raw(key: &SigningKey, json: &str) -> String {
+        let payload = BASE64URL_NOPAD.encode(json.as_bytes());
+        let signature = key.sign(&signed_message(VECTOR_KID, &payload));
+        format!(
+            "{STATEMENT_VERSION}.{VECTOR_KID}.{payload}.{}",
+            BASE64URL_NOPAD.encode(&signature.to_bytes())
+        )
     }
 
     /// The shared vector, fixed byte for byte. cove's verifier must accept
@@ -208,12 +294,193 @@ pub(crate) mod tests {
         "v1.Vkdap1RjR0wChd9dvyvKtz2mUTWIOem3dIGy6rEHcIw.",
         "eyJhdWQiOiI2ZjFiMGMzZS0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJzdWIiOiI5YTdlNWIy",
         "Yy0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDIiLCJuYW1lIjoiYWxpY2UiLCJhdXRoIjoidXNlciIs",
-        "Imxhc3Rfc3NvX2F0IjoxNzk1MDAwMDAwLCJhdXRoX3RpbWUiOjE3OTUwMDAwMDAsImlhdCI6MTc5NTAw",
-        "MDEwMCwiZXhwIjoxNzk1MDAwMTMwLCJtIjoiUE9TVCIsInAiOiIvdm1zL2Rldi9kZWxldGU_Y29uZmly",
-        "bT0xIiwic2giOiJjc1lldlJ0Qm1ka3BoOWtZVGtuUUgxNWpXd3ZuR0Q4ZGtEQzdpeGMteTJJIn0",
+        "Imxhc3Rfc3NvX2F0IjoxNzk1MDAwMDAwLCJpYXQiOjE3OTUwMDAxMDAsImV4cCI6MTc5NTAwMDEzMCwi",
+        "anRpIjoicGFXbHBhV2xwYVdscGFXbHBhV2xwUSIsIm0iOiJQT1NUIiwicCI6Ii92bXMvZGV2L2RlbGV0",
+        "ZT9jb25maXJtPTEiLCJzaCI6ImNzWWV2UnRCbWRrcGg5a1lUa25RSDE1ald3dm5HRDhka0RDN2l4Yy15",
+        "MkkifQ",
         ".",
-        "r0FhJpXpIu0dSPz7gEfBeLe88WDNwQ-uONJhskmSmg7kOuBtod3JiptM-K7ueulsWyJTFuurTQrx2MnafZQ1Ag"
+        "uMiCuNaQvmp4o1EhcG1nAlRZSMB9KWAsVLOf0raV4Ac4rH7g6QCMPxDu84VkRz5SMMAya77y09S5S52ZQZygDw"
     );
+
+    /// The vector for a session with no session id: `sh` is `null`, and
+    /// `last_sso_at` too (a password sign-in).
+    #[test]
+    fn the_shared_vector_without_a_session_id() {
+        let key = vector_key();
+        let mut claims = vector_claims();
+        claims.sh = None;
+        claims.last_sso_at = None;
+        let value = sign_statement(VECTOR_KID, &key, &claims).unwrap();
+        assert_eq!(value, VECTOR_STATEMENT_NO_SESSION);
+        assert!(verify(&value, &key.verifying_key()) == Some(claims));
+    }
+
+    /// The vector's payload as JSON text.
+    fn vector_json() -> String {
+        serde_json::to_string(&vector_claims()).unwrap()
+    }
+
+    /// Payloads signed correctly under the vector key that a verifier must
+    /// still refuse: a key missing, a key twice, a key twice in place of a
+    /// missing one (the count is right, the set is not), an extra key, and a
+    /// `null` where none is allowed.
+    fn rejected_payloads() -> Vec<(&'static str, String)> {
+        let good = vector_json();
+        let jti = vector_claims().jti;
+        let sh_tail = format!(r#","sh":"{VECTOR_SH}"}}"#);
+        let without_sh = good.replace(&sh_tail, "}");
+        assert_ne!(without_sh, good);
+        vec![
+            (
+                "missing_jti",
+                good.replace(&format!(r#""jti":"{jti}","#), ""),
+            ),
+            (
+                "duplicate_m",
+                good.replace(&sh_tail, &format!(r#","m":"GET"{sh_tail}"#)),
+            ),
+            (
+                "duplicate_m_for_missing_sh",
+                without_sh.replace('}', r#","m":"GET"}"#),
+            ),
+            (
+                "extra_tid",
+                good.replace(&sh_tail, &format!(r#","tid":"t"{sh_tail}"#)),
+            ),
+            (
+                "null_name",
+                good.replace(r#""name":"alice""#, r#""name":null"#),
+            ),
+            (
+                "short_jti",
+                good.replace(&jti, &BASE64URL_NOPAD.encode(&[0xA5; JTI_BYTES - 1])),
+            ),
+        ]
+    }
+
+    #[test]
+    fn the_rejection_vectors() {
+        let key = vector_key();
+        let public = key.verifying_key();
+        let cases = rejected_payloads();
+        // The unmodified payload passes the same checks the cases fail.
+        assert!(verify(&sign_raw(&key, &vector_json()), &public).is_some());
+        assert_eq!(cases.len(), REJECTED.len());
+        for ((name, json), (expected_name, expected)) in cases.iter().zip(REJECTED) {
+            let value = sign_raw(&key, json);
+            assert_eq!(name, expected_name);
+            assert_eq!(&value, expected, "{name}");
+            // The signature is good: it is the payload that is refused.
+            let parts: Vec<&str> = value.split('.').collect();
+            let sig: [u8; 64] = BASE64URL_NOPAD
+                .decode(parts[3].as_bytes())
+                .unwrap()
+                .try_into()
+                .unwrap();
+            public
+                .verify(
+                    &signed_message(parts[1], parts[2]),
+                    &Signature::from_bytes(&sig),
+                )
+                .unwrap();
+            assert!(verify(&value, &public).is_none(), "{name}");
+        }
+    }
+
+    pub(crate) const VECTOR_STATEMENT_NO_SESSION: &str = concat!(
+        "v1.Vkdap1RjR0wChd9dvyvKtz2mUTWIOem3dIGy6rEHcIw.",
+        "eyJhdWQiOiI2ZjFiMGMzZS0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJzdWIiOiI5YTdlNWIy",
+        "Yy0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDIiLCJuYW1lIjoiYWxpY2UiLCJhdXRoIjoidXNlciIs",
+        "Imxhc3Rfc3NvX2F0IjpudWxsLCJpYXQiOjE3OTUwMDAxMDAsImV4cCI6MTc5NTAwMDEzMCwianRpIjoi",
+        "cGFXbHBhV2xwYVdscGFXbHBhV2xwUSIsIm0iOiJQT1NUIiwicCI6Ii92bXMvZGV2L2RlbGV0ZT9jb25m",
+        "aXJtPTEiLCJzaCI6bnVsbH0",
+        ".",
+        "6quPIPTzEvC7xdK8SXvc4vUo1xjOWYShKvJDMs7FyJCOpv4Sttou5oMDodRPqZZ79auxivVlzs8o7FU6ynJuBw"
+    );
+    pub(crate) const REJECTED: &[(&str, &str)] = &[
+        (
+            "missing_jti",
+            concat!(
+                "v1.Vkdap1RjR0wChd9dvyvKtz2mUTWIOem3dIGy6rEHcIw.",
+                "eyJhdWQiOiI2ZjFiMGMzZS0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJzdWIiOiI5YTdlNWIy",
+                "Yy0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDIiLCJuYW1lIjoiYWxpY2UiLCJhdXRoIjoidXNlciIs",
+                "Imxhc3Rfc3NvX2F0IjoxNzk1MDAwMDAwLCJpYXQiOjE3OTUwMDAxMDAsImV4cCI6MTc5NTAwMDEzMCwi",
+                "bSI6IlBPU1QiLCJwIjoiL3Ztcy9kZXYvZGVsZXRlP2NvbmZpcm09MSIsInNoIjoiY3NZZXZSdEJtZGtw",
+                "aDlrWVRrblFIMTVqV3d2bkdEOGRrREM3aXhjLXkySSJ9",
+                ".",
+                "LlWIYgZU1-DrGdhAGyH2qpBo9KK-TYJLNPiVtLAMlMrL8ilgWVJBHRqZM2bLxwbHzFbzdRCIzpy_EU08NkmrDA"
+            ),
+        ),
+        (
+            "duplicate_m",
+            concat!(
+                "v1.Vkdap1RjR0wChd9dvyvKtz2mUTWIOem3dIGy6rEHcIw.",
+                "eyJhdWQiOiI2ZjFiMGMzZS0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJzdWIiOiI5YTdlNWIy",
+                "Yy0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDIiLCJuYW1lIjoiYWxpY2UiLCJhdXRoIjoidXNlciIs",
+                "Imxhc3Rfc3NvX2F0IjoxNzk1MDAwMDAwLCJpYXQiOjE3OTUwMDAxMDAsImV4cCI6MTc5NTAwMDEzMCwi",
+                "anRpIjoicGFXbHBhV2xwYVdscGFXbHBhV2xwUSIsIm0iOiJQT1NUIiwicCI6Ii92bXMvZGV2L2RlbGV0",
+                "ZT9jb25maXJtPTEiLCJtIjoiR0VUIiwic2giOiJjc1lldlJ0Qm1ka3BoOWtZVGtuUUgxNWpXd3ZuR0Q4",
+                "ZGtEQzdpeGMteTJJIn0",
+                ".",
+                "FTUDKcyMFenG1CGdLFDKDVuIfNSE8c36qmLwzdFDlU5u7QVVrqTNMW-Xcny_15F_Ewny1VQOh40pya40T8qeDA"
+            ),
+        ),
+        (
+            "duplicate_m_for_missing_sh",
+            concat!(
+                "v1.Vkdap1RjR0wChd9dvyvKtz2mUTWIOem3dIGy6rEHcIw.",
+                "eyJhdWQiOiI2ZjFiMGMzZS0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJzdWIiOiI5YTdlNWIy",
+                "Yy0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDIiLCJuYW1lIjoiYWxpY2UiLCJhdXRoIjoidXNlciIs",
+                "Imxhc3Rfc3NvX2F0IjoxNzk1MDAwMDAwLCJpYXQiOjE3OTUwMDAxMDAsImV4cCI6MTc5NTAwMDEzMCwi",
+                "anRpIjoicGFXbHBhV2xwYVdscGFXbHBhV2xwUSIsIm0iOiJQT1NUIiwicCI6Ii92bXMvZGV2L2RlbGV0",
+                "ZT9jb25maXJtPTEiLCJtIjoiR0VUIn0",
+                ".",
+                "T9VZ1vDmIVsJGhs-JzUIIuv7irHuHt0iEoXyPXGbZ_fZu7m3RPmbwCQbK851TaMZ2-QHh2qyeMDKuvLkhQpoAw"
+            ),
+        ),
+        (
+            "extra_tid",
+            concat!(
+                "v1.Vkdap1RjR0wChd9dvyvKtz2mUTWIOem3dIGy6rEHcIw.",
+                "eyJhdWQiOiI2ZjFiMGMzZS0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJzdWIiOiI5YTdlNWIy",
+                "Yy0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDIiLCJuYW1lIjoiYWxpY2UiLCJhdXRoIjoidXNlciIs",
+                "Imxhc3Rfc3NvX2F0IjoxNzk1MDAwMDAwLCJpYXQiOjE3OTUwMDAxMDAsImV4cCI6MTc5NTAwMDEzMCwi",
+                "anRpIjoicGFXbHBhV2xwYVdscGFXbHBhV2xwUSIsIm0iOiJQT1NUIiwicCI6Ii92bXMvZGV2L2RlbGV0",
+                "ZT9jb25maXJtPTEiLCJ0aWQiOiJ0Iiwic2giOiJjc1lldlJ0Qm1ka3BoOWtZVGtuUUgxNWpXd3ZuR0Q4",
+                "ZGtEQzdpeGMteTJJIn0",
+                ".",
+                "mp4oOH_lLO2uil8-pbN3uSK5Et-SDDk2WnnelimGXv4cY_NjR8B5ZExQp6Fv8hWB8C0xKuPk9ySviLEzfln3Bg"
+            ),
+        ),
+        (
+            "null_name",
+            concat!(
+                "v1.Vkdap1RjR0wChd9dvyvKtz2mUTWIOem3dIGy6rEHcIw.",
+                "eyJhdWQiOiI2ZjFiMGMzZS0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJzdWIiOiI5YTdlNWIy",
+                "Yy0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDIiLCJuYW1lIjpudWxsLCJhdXRoIjoidXNlciIsImxh",
+                "c3Rfc3NvX2F0IjoxNzk1MDAwMDAwLCJpYXQiOjE3OTUwMDAxMDAsImV4cCI6MTc5NTAwMDEzMCwianRp",
+                "IjoicGFXbHBhV2xwYVdscGFXbHBhV2xwUSIsIm0iOiJQT1NUIiwicCI6Ii92bXMvZGV2L2RlbGV0ZT9j",
+                "b25maXJtPTEiLCJzaCI6ImNzWWV2UnRCbWRrcGg5a1lUa25RSDE1ald3dm5HRDhka0RDN2l4Yy15Mkki",
+                "fQ",
+                ".",
+                "3SToDp5y6Uu_vKJeul7Wj6p9NEuJRCUqSlb_YFIvUNLA_DrcGntx6J-2NdlurPh2RZ-sdjqTqn8NsUHL6LkSBA"
+            ),
+        ),
+        (
+            "short_jti",
+            concat!(
+                "v1.Vkdap1RjR0wChd9dvyvKtz2mUTWIOem3dIGy6rEHcIw.",
+                "eyJhdWQiOiI2ZjFiMGMzZS0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJzdWIiOiI5YTdlNWIy",
+                "Yy0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDIiLCJuYW1lIjoiYWxpY2UiLCJhdXRoIjoidXNlciIs",
+                "Imxhc3Rfc3NvX2F0IjoxNzk1MDAwMDAwLCJpYXQiOjE3OTUwMDAxMDAsImV4cCI6MTc5NTAwMDEzMCwi",
+                "anRpIjoicGFXbHBhV2xwYVdscGFXbHBhV2wiLCJtIjoiUE9TVCIsInAiOiIvdm1zL2Rldi9kZWxldGU_",
+                "Y29uZmlybT0xIiwic2giOiJjc1lldlJ0Qm1ka3BoOWtZVGtuUUgxNWpXd3ZuR0Q4ZGtEQzdpeGMteTJJ",
+                "In0",
+                ".",
+                "0pdcx6NyS6DRj4xlvmmsydOnPfm0uWHlCZUHdXH6Bl--3SfRixQy9j840ui9nhBgZzDaXeZnO-O-kKFBDRxACg"
+            ),
+        ),
+    ];
 
     #[test]
     fn the_payload_keeps_its_field_order_and_nulls() {
@@ -223,15 +490,8 @@ pub(crate) mod tests {
         let json = serde_json::to_string(&claims).unwrap();
         assert_eq!(
             json,
-            r#"{"aud":"6f1b0c3e-0000-4000-8000-000000000001","sub":"9a7e5b2c-0000-4000-8000-000000000002","name":"alice","auth":"user","last_sso_at":null,"auth_time":1795000000,"iat":1795000100,"exp":1795000130,"m":"POST","p":"/vms/dev/delete?confirm=1","sh":null}"#
+            r#"{"aud":"6f1b0c3e-0000-4000-8000-000000000001","sub":"9a7e5b2c-0000-4000-8000-000000000002","name":"alice","auth":"user","last_sso_at":null,"iat":1795000100,"exp":1795000130,"jti":"paWlpaWlpaWlpaWlpaWlpQ","m":"POST","p":"/vms/dev/delete?confirm=1","sh":null}"#
         );
-        claims.auth = StatementAuth::Ticket;
-        claims.tid = Some("t-1".into());
-        claims.auth_time = None;
-        let json = serde_json::to_string(&claims).unwrap();
-        assert!(json.contains(r#""auth":"ticket""#), "{json}");
-        assert!(json.contains(r#""auth_time":null"#), "{json}");
-        assert!(json.contains(r#""tid":"t-1","sh":null}"#), "{json}");
     }
 
     #[test]
