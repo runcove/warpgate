@@ -242,9 +242,11 @@ pub(crate) async fn published_statement_keys_with(
 
 /// How long a decrypted signing key is reused before the database is read
 /// again. A change made by another process (the `statement-keys` command)
-/// shows within this; one made in this process drops the cache at once. A
-/// promoted-away key is still published as retiring for at least this long, so
-/// a statement it signs in the window still verifies.
+/// shows within this; one made in this process drops the cache at once. So a
+/// running node may still sign with a promoted-away key for up to this long:
+/// nothing here keeps that key published, and `retire` deletes it at once, so
+/// the operator waits at least this long after `promote` before `retire`
+/// (docs/COVE.md, Keys). A statement signed in that window then still verifies.
 const ACTIVE_KEY_CACHE_TTL: Duration = Duration::from_secs(5);
 
 /// The decrypted active key, kept for [`ACTIVE_KEY_CACHE_TTL`].

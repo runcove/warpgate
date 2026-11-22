@@ -142,9 +142,12 @@ stored encrypted, never shown by any API, UI or log.
 
 Rotation is on the host: `warpgate statement-keys list | add-next | promote
 <kid> | retire <kid>`. Publish first: `add-next`, pin the new key in every
-verifier, `promote` (the signing key becomes `retiring`), then `retire` the
-old one. `promote` refuses while a `retiring` key exists; `retire` refuses the
-signing key.
+verifier, `promote` (the signing key becomes `retiring`), wait at least 5
+seconds, then `retire` the old one. Each running node keeps its signing key
+cached for up to 5 seconds, so it can still sign with the old key just after
+`promote`; `retire` deletes the key at once, and a verifier that has dropped it
+refuses those statements. `promote` refuses while a `retiring` key exists;
+`retire` refuses the signing key.
 
 ### Shared test vector
 
