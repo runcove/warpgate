@@ -91,6 +91,24 @@ With `force=1`:
 The return stamps the session's `last_sso_at`. A password, OTP or passkey
 sign-in never does, so `?login=password` never makes a session fresh.
 
+### What `last_sso_at` means
+
+`last_sso_at` means "Warpgate finished an SSO return at time t". Warpgate
+stamps it from its own clock at the SSO return
+(`warpgate-protocol-http/src/api/sso_provider_list.rs`); the ID token's
+`auth_time` is not used, and nothing sends `prompt=login` or `max_age`.
+
+It is only as fresh as the identity provider's own re-prompt policy. While
+the provider's session lives, another site can navigate the browser through
+`/sso/auto-start?force=1` (an unauthenticated GET; the session cookie is
+`SameSite=Lax`, so it is sent on a top-level navigation) and refresh the stamp
+with no user action. So `last_sso_at` is not an intent token and not a CSRF
+token: a verifier (cove) must keep its own CSRF check and must not read a
+recent `last_sso_at` as proof that the user just chose to act.
+
+A follow-up (W3) will make `force=1` send `prompt=login` and `max_age=0` and
+stamp from the ID token's `auth_time`; until it lands, the above holds.
+
 ## Signed session statement: `x-warpgate-session-freshness`
 
 An HTTP target with `signed_statement` on (a boolean in the target's HTTP
@@ -130,7 +148,9 @@ A verifier checks the version, looks `kid` up among the keys it pinned,
 verifies the signature over the bytes it received, then reads the payload,
 and checks `aud`, `m`, `p` and `exp` against its own request. A verifier must
 check `auth == "user"` before it trusts `last_sso_at`: a statement with any
-other `auth` says nothing about a fresh sign-in.
+other `auth` says nothing about a fresh sign-in. Even then `last_sso_at` only
+says an SSO return finished at that time (see "What `last_sso_at` means"); it
+does not show the user's intent, and the verifier's own CSRF check stays.
 
 ### Keys
 
