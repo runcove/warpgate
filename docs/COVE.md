@@ -129,7 +129,11 @@ whose name starts with `x-warpgate-` (case-insensitive).
 A session started with a ticket carries none, even when it was a user session
 before: a ticket for the same user, presented on a user session, makes it a
 ticket session, and its `last_sso_at` is cleared. A target bound to a host
-(`external_host` non-empty) carries none either, for anyone. The statement is
+(`external_host` non-empty) outside Warpgate's own external host and its
+subdomains (the session cookie domain) carries none either, for anyone; one
+bound to that host or a subdomain of it is treated like any other target
+(whole DNS labels, case-insensitive, one trailing dot and any port ignored).
+If Warpgate's own host cannot be determined, a bound host gets none. The statement is
 made only while the session's authorization is a user's, so `auth` is always
 `user`; the field is kept so a verifier need not guess.
 

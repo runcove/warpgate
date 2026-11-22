@@ -44,7 +44,9 @@ use warpgate_tls::{TlsMode, configure_tls_connector};
 use warpgate_web::lookup_built_file;
 
 use crate::client_cache::{HttpClientCache, build_client};
-use crate::common::{SessionExt, is_public_session_authorization, is_warpgate_cookie_name};
+use crate::common::{
+    SessionExt, is_public_session_authorization, is_warpgate_cookie_name, session_cookie_base_host,
+};
 use crate::step_up::StepUpSessionExt;
 use crate::unix_socket::checked_unix_socket;
 
@@ -345,18 +347,20 @@ fn statement_header_value(
 }
 
 /// The production gate: the header value for `session` on a target with
-/// `options`, or `None` when the target does not sign a statement (see
-/// [`signs_statement`]) or [`statement_header_value`] makes none.
+/// `options` and Warpgate's own `base_host`, or `None` when the target does
+/// not sign a statement (see [`signs_statement`]) or [`statement_header_value`] makes none.
+#[allow(clippy::too_many_arguments)] // the gate takes what its two callers hold
 fn gated_statement_header_value(
     session: &Session,
     options: &TargetHTTPOptions,
+    base_host: Option<&str>,
     key: &ActiveStatementKey,
     target_id: uuid::Uuid,
     method: &str,
     path_and_query: &str,
     now: i64,
 ) -> Option<HeaderValue> {
-    if !signs_statement(options) {
+    if !signs_statement(options, base_host) {
         return None;
     }
     statement_header_value(session, key, target_id, method, path_and_query, now)
@@ -384,12 +388,49 @@ fn upstream_path_and_query(uri: &Uri, url_normalised: bool) -> String {
     }
 }
 
+/// `host` without a port, a trailing dot and upper case; `None` if nothing is
+/// left. Handles a bracketed IPv6 literal.
+fn normalised_host(host: &str) -> Option<String> {
+    let host = if let Some(rest) = host.strip_prefix('[') {
+        rest.split_once(']').map_or(rest, |(inner, _)| inner)
+    } else {
+        match host.rsplit_once(':') {
+            Some((name, port)) if port.bytes().all(|b| b.is_ascii_digit()) => name,
+            _ => host,
+        }
+    };
+    let host = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
+    (!host.is_empty()).then_some(host)
+}
+
+/// Whether `host` is `base_host` or a subdomain of it, on whole DNS labels,
+/// case-insensitively, ignoring one trailing dot and any port. False when
+/// either is empty (an empty base matches nothing).
+fn host_is_within(host: &str, base_host: &str) -> bool {
+    let (Some(host), Some(base)) = (normalised_host(host), normalised_host(base_host)) else {
+        return false;
+    };
+    host == base
+        || host
+            .strip_suffix(base.as_str())
+            .is_some_and(|rest| rest.ends_with('.'))
+}
+
 /// Whether a target gets a statement at all: it has `signed_statement` on and
-/// is not bound to a host (`external_host`). A bound host is served as the
-/// target's own site, with no Warpgate sign-in behind it that a statement
-/// could vouch for, so none is made there.
-fn signs_statement(options: &TargetHTTPOptions) -> bool {
-    options.signed_statement && options.external_host.as_deref().is_none_or(str::is_empty)
+/// is either not bound to a host, or bound to Warpgate's own host
+/// (`base_host`, the one the session cookie is scoped to) or a subdomain of
+/// it, where the session cookie is sent. Any other bound host is the target's
+/// own site, outside that cookie, with no Warpgate sign-in behind it that a
+/// statement could vouch for, so none is made there. When `base_host` is not
+/// known, a bound host gets none.
+fn signs_statement(options: &TargetHTTPOptions, base_host: Option<&str>) -> bool {
+    if !options.signed_statement {
+        return false;
+    }
+    match options.external_host.as_deref() {
+        None | Some("") => true,
+        Some(bound) => base_host.is_some_and(|base| host_is_within(bound, base)),
+    }
 }
 
 /// The session statement for a request to `uri` on a target with
@@ -405,7 +446,12 @@ async fn session_statement(
     uri: &Uri,
     url_normalised: bool,
 ) -> Result<Option<HeaderValue>> {
-    if !signs_statement(options) {
+    let base_host = if options.external_host.as_deref().is_none_or(str::is_empty) {
+        None
+    } else {
+        session_cookie_base_host(&*ctx.services().config.lock().await).await
+    };
+    if !signs_statement(options, base_host.as_deref()) {
         return Ok(None);
     }
     let session = <&Session>::from_request_without_body(req).await?;
@@ -424,6 +470,7 @@ async fn session_statement(
     Ok(gated_statement_header_value(
         session,
         options,
+        base_host.as_deref(),
         &key,
         target_id,
         req.method().as_str(),
@@ -1815,12 +1862,25 @@ mod tests {
     /// The header steps both proxy paths run, in their order, for `session`
     /// on a target with `options`: the caller's headers, Warpgate's identity
     /// headers, the configured headers, then the session statement as
-    /// `gated_statement_header_value` (the gate `session_statement` calls) makes it (key `statement_key()`). Returns the
-    /// upstream headers of the plain and the WebSocket builder.
+    /// `gated_statement_header_value` (the gate `session_statement` calls)
+    /// makes it (key `statement_key()`), with `BASE_HOST` as Warpgate's own
+    /// host. Returns the upstream headers of the plain and the WebSocket
+    /// builder.
     async fn proxy_header_steps(
         session: Session,
         options: &TargetHTTPOptions,
         caller: &[(&str, &str)],
+    ) -> [http::HeaderMap; 2] {
+        proxy_header_steps_for_base(session, options, caller, Some(BASE_HOST)).await
+    }
+
+    /// [`proxy_header_steps`] with Warpgate's own host given (`None`: it
+    /// cannot be determined).
+    async fn proxy_header_steps_for_base(
+        session: Session,
+        options: &TargetHTTPOptions,
+        caller: &[(&str, &str)],
+        base_host: Option<&str>,
     ) -> [http::HeaderMap; 2] {
         let mut builder = Request::builder();
         for (name, value) in caller {
@@ -1833,6 +1893,7 @@ mod tests {
             gated_statement_header_value(
                 session,
                 options,
+                base_host,
                 &statement_key(),
                 STATEMENT_TARGET,
                 "GET",
@@ -1905,29 +1966,84 @@ mod tests {
         }
     }
 
-    /// A target bound to a host (`external_host`) gets no statement, even for a
-    /// user session, and a configured header of that name is still stripped. An
-    /// empty `external_host` binds nothing, so it still gets one.
+    const BASE_HOST: &str = "warp.example.com";
+
+    /// A target bound to a host inside Warpgate's own host (the session cookie
+    /// domain) gets a statement; one bound outside it, or with Warpgate's own
+    /// host unknown, gets none and a configured header of that name is still
+    /// stripped. An empty `external_host` binds nothing, so it still gets one.
     #[tokio::test]
-    async fn a_bound_host_target_gets_no_statement() {
+    async fn a_bound_host_gets_a_statement_only_inside_warpgates_own_host() {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let session = Session::default();
         session.set_auth(user_auth("alice"));
-        for bound in ["vm.example.test:8443", "vm.example.test"] {
+        let cases = [
+            ("warp.example.com", Some(BASE_HOST), true),
+            ("app.warp.example.com:8443", Some(BASE_HOST), true),
+            ("vm.example.test", Some(BASE_HOST), false),
+            ("evilwarp.example.com", Some(BASE_HOST), false),
+            ("warp.example.com.evil.test", Some(BASE_HOST), false),
+            ("app.warp.example.com", None, false),
+            ("app.warp.example.com", Some(""), false),
+        ];
+        for (bound, base, signed) in cases {
             let mut options = keyed_options(Some("configured"));
             options.external_host = Some(bound.into());
-            assert!(!signs_statement(&options));
-            for upstream in proxy_header_steps(session.clone(), &options, &[]).await {
-                assert!(statement_values(&upstream).is_empty(), "{bound}");
+            assert_eq!(signs_statement(&options, base), signed, "{bound} {base:?}");
+            for upstream in proxy_header_steps_for_base(session.clone(), &options, &[], base).await
+            {
+                let values = statement_values(&upstream);
+                assert_eq!(values.len(), usize::from(signed), "{bound} {base:?}");
+                assert_ne!(values.first().map(String::as_str), Some("configured"));
             }
         }
         for unbound in [None, Some(String::new())] {
             let mut options = keyed_options(None);
             options.external_host = unbound;
-            assert!(signs_statement(&options));
+            for base in [Some(BASE_HOST), None] {
+                assert!(signs_statement(&options, base));
+            }
             for upstream in proxy_header_steps(session.clone(), &options, &[]).await {
                 assert_eq!(statement_values(&upstream).len(), 1);
             }
+        }
+    }
+
+    #[test]
+    fn host_is_within_matches_whole_labels() {
+        let base = "warpgate.example";
+        for host in [
+            "warpgate.example",
+            "a.warpgate.example",
+            "a.b.c.warpgate.example",
+            "A.WarpGate.Example",
+            "a.warpgate.example.",
+            "warpgate.example:8443",
+            "a.warpgate.example:443",
+            "WARPGATE.EXAMPLE.:80",
+        ] {
+            assert!(host_is_within(host, base), "{host}");
+        }
+        for host in [
+            "evilwarpgate.example",
+            "warpgate.example.evil.test",
+            "example",
+            "other.example",
+            "xwarpgate.example:8443",
+            "",
+            ".",
+            ":8443",
+        ] {
+            assert!(!host_is_within(host, base), "{host}");
+        }
+        assert!(host_is_within("warpgate.example", "WARPGATE.example."));
+        assert!(host_is_within(
+            "a.warpgate.example",
+            "warpgate.example:8888"
+        ));
+        for empty in ["", ".", ":80"] {
+            assert!(!host_is_within("warpgate.example", empty), "{empty}");
+            assert!(!host_is_within("", empty));
         }
     }
 

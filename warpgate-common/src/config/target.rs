@@ -186,9 +186,10 @@ pub struct TargetHTTPOptions {
     /// When `true`, every request Warpgate proxies to this target on a signed-in
     /// session carries a short-lived signed statement of who the session is and
     /// when it last did single sign-on (header `x-warpgate-session-freshness`).
-    /// Two cases get none: a target bound to a host (`external_host` set), and
-    /// a ticket session (a ticket is a credential for one target, not a
-    /// sign-in).
+    /// Two cases get none: a target bound to a host (`external_host` set)
+    /// outside Warpgate's own host and its subdomains (where the session
+    /// cookie is sent), and a ticket session (a ticket is a credential for one
+    /// target, not a sign-in).
     /// The keys that verify it are published at `/@warpgate/api/statement-keys`.
     /// Default `false`. `#[oai(default)]` for the same reason as on `public`.
     #[serde(default)]
