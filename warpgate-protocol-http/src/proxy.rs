@@ -1770,6 +1770,102 @@ mod tests {
         );
     }
 
+    /// The header steps both proxy paths run, in their order, for `session`
+    /// on a target with `options`: the caller's headers, Warpgate's identity
+    /// headers, the configured headers, then the session statement as
+    /// `session_statement` would make it (key `statement_key()`). Returns the
+    /// upstream headers of the plain and the WebSocket builder.
+    async fn proxy_header_steps(
+        session: Session,
+        options: &TargetHTTPOptions,
+        caller: &[(&str, &str)],
+    ) -> [http::HeaderMap; 2] {
+        let mut builder = Request::builder();
+        for (name, value) in caller {
+            builder = builder.header(*name, *value);
+        }
+        let mut req = builder.finish();
+        req.extensions_mut().insert(session);
+        let statement = {
+            let session = <&Session>::from_request_without_body(&req).await.unwrap();
+            if options.signed_statement {
+                statement_header_value(
+                    session,
+                    &statement_key(),
+                    STATEMENT_TARGET,
+                    "GET",
+                    "/",
+                    1000,
+                )
+            } else {
+                None
+            }
+        };
+        let client = reqwest::Client::builder().build().unwrap();
+        let plain =
+            caller_then_configured(&req, client.get("http://upstream.example/"), options).await;
+        let plain = apply_session_statement(plain, statement.clone())
+            .build()
+            .unwrap()
+            .headers()
+            .clone();
+        let websocket = caller_then_configured(&req, http::request::Builder::new(), options).await;
+        let websocket = apply_session_statement(websocket, statement)
+            .headers_ref()
+            .unwrap()
+            .clone();
+        [plain, websocket]
+    }
+
+    fn keyed_options(configured: Option<&str>) -> TargetHTTPOptions {
+        serde_json::from_value(serde_json::json!({
+            "url": "http://upstream.example/",
+            "signed_statement": true,
+            "headers": configured.map_or_else(
+                || serde_json::json!({}),
+                |value| serde_json::json!({STATEMENT_HEADER: value}),
+            ),
+        }))
+        .unwrap()
+    }
+
+    fn statement_values(headers: &http::HeaderMap) -> Vec<String> {
+        headers
+            .get_all(STATEMENT_HEADER)
+            .iter()
+            .map(|value| value.to_str().unwrap().to_owned())
+            .collect()
+    }
+
+    /// A session made from a ticket, against a keyed target, sends no
+    /// statement upstream through the proxy header steps, whatever the caller
+    /// sent; the same steps for a user session send exactly one.
+    #[tokio::test]
+    async fn a_ticket_session_sends_no_statement_through_the_proxy_steps() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let caller = [(STATEMENT_HEADER, "forged")];
+        for ticket_id in [None, Some(uuid::Uuid::from_u128(0x71C))] {
+            let session = Session::default();
+            session.set_auth(SessionAuthorization::Ticket {
+                user_id: uuid::Uuid::from_u128(0xA11CE),
+                username: "alice".into(),
+                target_id: STATEMENT_TARGET,
+                ticket_id,
+            });
+            for upstream in proxy_header_steps(session, &keyed_options(None), &caller).await {
+                assert!(statement_values(&upstream).is_empty(), "{ticket_id:?}");
+            }
+        }
+
+        let session = Session::default();
+        session.set_auth(user_auth("alice"));
+        for upstream in proxy_header_steps(session, &keyed_options(None), &caller).await {
+            let values = statement_values(&upstream);
+            assert_eq!(values.len(), 1);
+            assert_ne!(values.first().map(String::as_str), Some("forged"));
+        }
+    }
+
     /// The Authorization-relevant part of the header steps `proxy_normal_request`
     /// and `proxy_ws_inner` both run, in their order: the caller's headers,
     /// the target's configured headers, then -- last, so nothing earlier can
