@@ -249,7 +249,15 @@ fn add_frame_protection(headers: &mut http::HeaderMap) {
 
 fn rewrite_request<B: SomeRequestBuilder>(mut req: B, options: &TargetHTTPOptions) -> Result<B> {
     for (k, v) in &options.headers {
-        req = req.set_header(HeaderName::try_from(k)?, HeaderValue::try_from(v)?);
+        let name = HeaderName::try_from(k)?;
+        // On a target with `signed_statement` on, the statement header is
+        // Warpgate's alone: a configured copy (the admin API refuses one now,
+        // but an older configuration may hold it) is dropped like a caller's,
+        // so with no statement made nothing under that name reaches upstream.
+        if options.signed_statement && name.as_str() == STATEMENT_HEADER {
+            continue;
+        }
+        req = req.set_header(name, HeaderValue::try_from(v)?);
     }
     Ok(req)
 }
@@ -1870,6 +1878,43 @@ mod tests {
             let values = statement_values(&upstream);
             assert_eq!(values.len(), 1);
             assert_ne!(values.first().map(String::as_str), Some("forged"));
+        }
+    }
+
+    /// On a keyed target a configured `x-warpgate-session-freshness` header
+    /// never reaches upstream when no statement is made (a ticket session, no
+    /// session), as a caller's copy never does; a statement replaces it
+    /// when one is made. A target with the statement off keeps its
+    /// configured header.
+    #[tokio::test]
+    async fn a_configured_statement_header_is_stripped_on_a_keyed_target() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let ticket = Session::default();
+        ticket.set_auth(SessionAuthorization::Ticket {
+            user_id: uuid::Uuid::from_u128(0xA11CE),
+            username: "alice".into(),
+            target_id: STATEMENT_TARGET,
+            ticket_id: None,
+        });
+        for session in [ticket, Session::default()] {
+            let options = keyed_options(Some("configured"));
+            for upstream in proxy_header_steps(session.clone(), &options, &[]).await {
+                assert!(statement_values(&upstream).is_empty());
+            }
+        }
+
+        let user = Session::default();
+        user.set_auth(user_auth("alice"));
+        for upstream in proxy_header_steps(user, &keyed_options(Some("configured")), &[]).await {
+            let values = statement_values(&upstream);
+            assert_eq!(values.len(), 1);
+            assert_ne!(values.first().map(String::as_str), Some("configured"));
+        }
+
+        let mut unkeyed = keyed_options(Some("configured"));
+        unkeyed.signed_statement = false;
+        for upstream in proxy_header_steps(Session::default(), &unkeyed, &[]).await {
+            assert_eq!(statement_values(&upstream), ["configured"]);
         }
     }
 
