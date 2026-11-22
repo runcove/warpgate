@@ -167,7 +167,10 @@ seconds, then `retire` the old one. Each running node keeps its signing key
 cached for up to 5 seconds, so it can still sign with the old key just after
 `promote`; `retire` deletes the key at once, and a verifier that has dropped it
 refuses those statements. `promote` refuses while a `retiring` key exists;
-`retire` refuses the signing key.
+`retire` refuses the signing key. `retire` does not enforce the 5 second wait
+after `promote`: an early `retire` deletes the key while a node may still sign
+with it, and those statements fail closed at a verifier that has dropped the
+key.
 
 ### Shared test vector
 
