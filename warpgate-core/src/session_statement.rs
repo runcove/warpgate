@@ -371,17 +371,16 @@ pub(crate) mod tests {
             assert_eq!(name, expected_name);
             assert_eq!(&value, expected, "{name}");
             // The signature is good: it is the payload that is refused.
-            let parts: Vec<&str> = value.split('.').collect();
+            let [_, kid, payload, sig] = value.split('.').collect::<Vec<_>>()[..] else {
+                panic!("four parts");
+            };
             let sig: [u8; 64] = BASE64URL_NOPAD
-                .decode(parts[3].as_bytes())
+                .decode(sig.as_bytes())
                 .unwrap()
                 .try_into()
                 .unwrap();
             public
-                .verify(
-                    &signed_message(parts[1], parts[2]),
-                    &Signature::from_bytes(&sig),
-                )
+                .verify(&signed_message(kid, payload), &Signature::from_bytes(&sig))
                 .unwrap();
             assert!(verify(&value, &public).is_none(), "{name}");
         }
@@ -513,8 +512,10 @@ pub(crate) mod tests {
         let mut tampered = vector_claims();
         tampered.p = "/vms/prod/delete?confirm=1".into();
         let forged_payload = BASE64URL_NOPAD.encode(&serde_json::to_vec(&tampered).unwrap());
-        let parts: Vec<&str> = value.split('.').collect();
-        let forged = format!("{}.{}.{forged_payload}.{}", parts[0], parts[1], parts[3]);
+        let [version, kid, _, sig] = value.split('.').collect::<Vec<_>>()[..] else {
+            panic!("four parts");
+        };
+        let forged = format!("{version}.{kid}.{forged_payload}.{sig}");
         assert!(verify(&forged, &key.verifying_key()).is_none());
     }
 

@@ -1466,22 +1466,23 @@ mod tests {
         )?;
         let value = value.to_str().unwrap().to_owned();
         let key = statement_key();
-        let parts: Vec<&str> = value.split('.').collect();
-        assert_eq!(parts.len(), 4, "v1.kid.payload.sig");
-        assert_eq!((parts[0], parts[1]), ("v1", key.kid.as_str()));
+        let [version, kid, payload, sig] = value.split('.').collect::<Vec<_>>()[..] else {
+            panic!("v1.kid.payload.sig");
+        };
+        assert_eq!((version, kid), ("v1", key.kid.as_str()));
         // The signature verifies over the bytes as sent.
         let sig: [u8; 64] = data_encoding::BASE64URL_NOPAD
-            .decode(parts[3].as_bytes())
+            .decode(sig.as_bytes())
             .unwrap()
             .try_into()
             .unwrap();
         ed25519_verify(
             &key,
-            &warpgate_core::session_statement::signed_message(parts[1], parts[2]),
+            &warpgate_core::session_statement::signed_message(kid, payload),
             &sig,
         );
         let json = data_encoding::BASE64URL_NOPAD
-            .decode(parts[2].as_bytes())
+            .decode(payload.as_bytes())
             .unwrap();
         Some(serde_json::from_slice(&json).unwrap())
     }
@@ -1994,7 +1995,7 @@ mod tests {
                     assert!(matches!(name.as_str(), "last_sso_at" | "sh"), "{json}");
                 }
             }
-            assert_eq!(object["auth"], "user");
+            assert_eq!(object.get("auth"), Some(&serde_json::json!("user")));
         }
     }
 
