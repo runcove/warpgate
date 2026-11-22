@@ -35,7 +35,6 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use governor::{DefaultKeyedRateLimiter, Quota};
-
 use http::StatusCode;
 use poem::error::NotFoundError;
 use poem::session::Session;
@@ -47,8 +46,7 @@ use time::OffsetDateTime;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 use warpgate_common::helpers::hash::{generate_ticket_secret, hash_secret};
-use warpgate_common::same_binding_hostname;
-use warpgate_common::{UserSessionId, WarpgateError};
+use warpgate_common::{UserSessionId, WarpgateError, same_binding_hostname};
 use warpgate_common_http::auth::{
     AuthenticatedRequestContext, RequestAuthorization, SessionAuthorization,
     UnauthenticatedRequestContext,
@@ -56,9 +54,8 @@ use warpgate_common_http::auth::{
 use warpgate_common_http::ext::is_navigation_request;
 use warpgate_common_http::logging::get_client_ip_addr;
 use warpgate_common_http::ticket_query::without_ticket_query_param;
-use warpgate_core::ConfigProvider;
-use warpgate_core::authorize_for_target;
 use warpgate_core::live_streams::host_binding;
+use warpgate_core::{ConfigProvider, authorize_for_target};
 use warpgate_db_entities::HttpHandoff;
 
 use crate::api::sso_provider_list::is_safe_redirect_target;
@@ -1704,11 +1701,10 @@ mod tests {
 
             use poem::{Endpoint, IntoResponse};
             use warpgate_common::StepUpIntervalConfig;
+            use warpgate_common_http::SessionAuthorization;
             use warpgate_db_entities::{Role, TargetRoleAssignment, UserRoleAssignment};
 
             use super::*;
-            use warpgate_common_http::SessionAuthorization;
-
             use crate::common::{SessionExt, session_id_for_login};
             use crate::test_db::insert_user;
 

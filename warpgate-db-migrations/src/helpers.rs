@@ -18,9 +18,8 @@ pub fn string_default_value(backend: DbBackend, value: &str) -> SimpleExpr {
 /// statement on its own and SQLite gets no table locks, so neither is given
 /// one; there the check relies on every node being stopped.
 pub(crate) fn http_sessions_lock_statement(backend: DbBackend) -> Option<sea_orm::Statement> {
-    (backend == DbBackend::Postgres).then(|| {
-        sea_orm::Statement::from_string(backend, "LOCK TABLE http_sessions IN SHARE MODE")
-    })
+    (backend == DbBackend::Postgres)
+        .then(|| sea_orm::Statement::from_string(backend, "LOCK TABLE http_sessions IN SHARE MODE"))
 }
 
 /// Refuses to roll back the migration named `migration` while any

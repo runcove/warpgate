@@ -2058,9 +2058,7 @@ mod public_session_tests {
     use poem::web::{Data, Path};
     use poem::{Endpoint, EndpointExt, Request, Route, get, handler};
     use uuid::Uuid;
-    use warpgate_common_http::SessionAuthorization;
-
-    use warpgate_common_http::RequestAuthorization;
+    use warpgate_common_http::{RequestAuthorization, SessionAuthorization};
 
     use super::{SessionExt, public_session_authorization};
     use crate::middleware::ticket::{TemporaryTicketSession, ticket_session_key};
