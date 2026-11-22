@@ -8021,7 +8021,7 @@
           },
           "signed_statement": {
             "type": "boolean",
-            "description": "When `true`, every request Warpgate proxies to this target on a signed-in\nsession carries a short-lived signed statement of who the session is and\nwhen it last did single sign-on (header `x-warpgate-session-freshness`).\nThe keys that verify it are published at `/@warpgate/api/statement-keys`.\nDefault `false`. `#[oai(default)]` for the same reason as on `public`.",
+            "description": "When `true`, every request Warpgate proxies to this target on a signed-in\nsession carries a short-lived signed statement of who the session is and\nwhen it last did single sign-on (header `x-warpgate-session-freshness`).\nTwo cases get none: a target bound to a host (`external_host` set), and\na ticket session (a ticket is a credential for one target, not a\nsign-in).\nThe keys that verify it are published at `/@warpgate/api/statement-keys`.\nDefault `false`. `#[oai(default)]` for the same reason as on `public`.",
             "default": false
           }
         }
