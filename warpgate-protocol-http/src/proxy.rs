@@ -1543,6 +1543,130 @@ mod tests {
         assert!(statement_for(&session, "GET", "/").is_some());
     }
 
+    /// A request carrying a ticket for the same user as its signed-in session
+    /// replaces that session's authorization with the ticket's, so it gets no
+    /// statement. Intended, and it fails closed: the request is no longer a
+    /// user-authenticated one. Runs the real ticket middleware over a user
+    /// session and asks `statement_header_value` what the request would carry.
+    #[tokio::test]
+    async fn a_same_user_ticket_on_a_user_session_downgrades_it_and_gets_no_statement() {
+        use poem::session::{CookieConfig, ServerSession};
+        use poem::test::TestClient;
+        use poem::{Endpoint, EndpointExt, Route, get, handler};
+        use sea_orm::ActiveModelTrait;
+        use sea_orm::ActiveValue::Set;
+        use tokio::sync::Mutex;
+        use warpgate_common::helpers::hash::hash_secret;
+        use warpgate_common_http::auth::UnauthenticatedRequestContext;
+        use warpgate_db_entities::Target::TargetKind;
+        use warpgate_db_entities::{Target, Ticket};
+
+        use crate::middleware::ticket::TicketMiddleware;
+        use crate::session::SessionStore;
+        use crate::test_db::{insert_user, memory_db, services};
+
+        const SECRET: &str = "t1cket-for-downgrade-check";
+        const HOST: &str = "vm.example.com:3000";
+        let user_id = uuid::Uuid::from_u128(0xA11CE);
+
+        let db = memory_db().await;
+        insert_user(&db, user_id, "alice").await;
+        let target_id = uuid::Uuid::new_v4();
+        Target::ActiveModel {
+            id: Set(target_id),
+            name: Set("bound".into()),
+            description: Set(String::new()),
+            kind: Set(TargetKind::Http),
+            options: Set(serde_json::json!({
+                "http": {"url": "http://h", "external_host": HOST}
+            })),
+            rate_limit_bytes_per_second: Set(None),
+            group_id: Set(None),
+            ticket_max_duration_seconds: Set(None),
+            ticket_requests_disabled: Set(false),
+            ticket_require_approval: Set(false),
+            ticket_max_uses: Set(None),
+            require_approval: Set(false),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        Ticket::ActiveModel {
+            id: Set(uuid::Uuid::new_v4()),
+            secret_hash: Set(hash_secret(SECRET)),
+            user_id: Set(user_id),
+            description: Set(String::new()),
+            target_id: Set(target_id),
+            uses_left: Set(Some(2)),
+            self_service: Set(false),
+            expiry: Set(None),
+            created: Set(time::OffsetDateTime::now_utc()),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        /// What the request ran as and whether it would carry a statement.
+        #[handler]
+        fn report(session: &Session) -> String {
+            let auth = match session.get_auth() {
+                Some(SessionAuthorization::User { .. }) => "user",
+                Some(SessionAuthorization::Ticket { .. }) => "ticket",
+                None => "none",
+            };
+            let statement = statement_header_value(
+                session,
+                &statement_key(),
+                STATEMENT_TARGET,
+                "GET",
+                "/",
+                1000,
+            )
+            .is_some();
+            format!("{auth} statement={statement}")
+        }
+
+        async fn run(cli: &TestClient<impl Endpoint>, ticket: bool) -> String {
+            let mut request = cli.get("/page").header("host", HOST);
+            if ticket {
+                request = request.query("warpgate-ticket", &SECRET);
+            }
+            let response = request.send().await;
+            let status = response.0.status();
+            let body = response.0.into_body().into_string().await.unwrap();
+            assert_eq!(status, StatusCode::OK, "{body}");
+            body
+        }
+
+        let services = services(db.clone()).await;
+        services.config.lock().await.store.external_host = Some("warp.example.com".into());
+        let ctx = UnauthenticatedRequestContext::new(services).await;
+        let storage = crate::session_storage::SharedSessionStorage::new(db.clone());
+        // Every request arrives on a session already signed in as alice,
+        // set before the ticket middleware runs.
+        let cli = TestClient::new(
+            Route::new()
+                .at("/*", get(report))
+                .with(TicketMiddleware::new())
+                .around(move |ep, req| async move {
+                    req.extensions()
+                        .get::<Session>()
+                        .expect("session")
+                        .set_auth(user_auth("alice"));
+                    ep.call(req).await
+                })
+                .data(std::sync::Arc::new(Mutex::new(SessionStore::new())))
+                .data(ctx)
+                .data(storage.clone())
+                .with(ServerSession::new(CookieConfig::default(), storage)),
+        );
+
+        // Control: the user session alone gets a statement.
+        assert_eq!(run(&cli, false).await, "user statement=true");
+        // The same user's ticket downgrades it to ticket auth: no statement.
+        assert_eq!(run(&cli, true).await, "ticket statement=false");
+    }
+
     /// The signed path is the one the request goes out with: reqwest (plain path) resolves
     /// dot segments (plain and percent-encoded), so the raw `/a/../b` would not match what upstream sees.
     #[test]
