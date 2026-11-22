@@ -278,9 +278,10 @@ fn apply_url_credentials<B: SomeRequestBuilder>(
 }
 
 /// What the signed session statement says for this request, or `None` when it
-/// says nothing: no signed-in session, or the public-target bypass's
-/// throwaway session, which names no one. Read from the browser session, never
-/// from anything the caller sent.
+/// says nothing: no signed-in session, the public-target bypass's throwaway
+/// session, which names no one, or a ticket session (a ticket is a credential
+/// for one target, never a sign-in; no statement is made for it). Read from
+/// the browser session, never from anything the caller sent.
 fn statement_claims(
     session: &Session,
     target_id: uuid::Uuid,
@@ -292,24 +293,21 @@ fn statement_claims(
     if is_public_session_authorization(&auth) {
         return None;
     }
-    let (kind, tid) = match &auth {
-        SessionAuthorization::User { .. } => (StatementAuth::User, None),
-        SessionAuthorization::Ticket { ticket_id, .. } => {
-            (StatementAuth::Ticket, ticket_id.map(|id| id.to_string()))
-        }
-    };
+    if !matches!(auth, SessionAuthorization::User { .. }) {
+        return None;
+    }
     Some(StatementClaims {
         aud: target_id.to_string(),
         sub: auth.user_id().to_string(),
         name: auth.username().clone(),
-        auth: kind,
+        auth: StatementAuth::User,
         last_sso_at: session.get_last_sso_at().map(|at| at.unix_timestamp()),
         auth_time: session_auth_time(session).and_then(|at| i64::try_from(at).ok()),
         iat: now,
         exp: now + STATEMENT_TTL_SECS,
         m: method.to_owned(),
         p: path_and_query.to_owned(),
-        tid,
+        tid: None,
         sh: session.get_session_id().map(|id| session_hash(id.0)),
     })
 }
@@ -337,6 +335,28 @@ fn statement_header_value(
     Some(value)
 }
 
+/// The path and query the upstream will receive for `uri`: reqwest parses the
+/// address with `url::Url`, which resolves dot segments (`/a/../b` goes out as
+/// `/b`) and percent-encodes some query characters, so the statement signs that
+/// form, not the raw one. The WebSocket path hands the `http::Uri` to
+/// tungstenite, which sends it as it is (`url_normalised` false). Falls back
+/// to the raw form if it cannot be parsed (the request would fail to build
+/// then anyway).
+fn upstream_path_and_query(uri: &Uri, url_normalised: bool) -> String {
+    let raw = || {
+        uri.path_and_query()
+            .map_or("/", PathAndQuery::as_str)
+            .to_owned()
+    };
+    if !url_normalised {
+        return raw();
+    }
+    match Url::parse(&uri.to_string()) {
+        Ok(url) => url[url::Position::BeforePath..url::Position::AfterQuery].to_owned(),
+        Err(_) => raw(),
+    }
+}
+
 /// The session statement for a request to `uri` on a target with
 /// `signed_statement` on; `None` (no header) when the target has it off, no
 /// active key can be read, or the session is not a signed-in one. `uri` is
@@ -348,6 +368,7 @@ async fn session_statement(
     target_id: uuid::Uuid,
     options: &TargetHTTPOptions,
     uri: &Uri,
+    url_normalised: bool,
 ) -> Result<Option<HeaderValue>> {
     if !options.signed_statement {
         return Ok(None);
@@ -364,13 +385,13 @@ async fn session_statement(
             return Ok(None);
         }
     };
-    let path_and_query = uri.path_and_query().map_or("/", PathAndQuery::as_str);
+    let path_and_query = upstream_path_and_query(uri, url_normalised);
     Ok(statement_header_value(
         session,
         &key,
         target_id,
         req.method().as_str(),
-        path_and_query,
+        &path_and_query,
         time::OffsetDateTime::now_utc().unix_timestamp(),
     ))
 }
@@ -743,7 +764,7 @@ pub async fn proxy_normal_request(
     client_request = apply_url_credentials(client_request, authorization_header);
     client_request = apply_session_statement(
         client_request,
-        session_statement(req, ctx, admitted.target().id, &options, &uri).await?,
+        session_statement(req, ctx, admitted.target().id, &options, &uri, true).await?,
     );
 
     if req.headers().contains_key(http::header::CONTENT_LENGTH)
@@ -998,7 +1019,7 @@ async fn proxy_ws_inner(
     client_request = apply_url_credentials(client_request, authorization_header);
     client_request = apply_session_statement(
         client_request,
-        session_statement(req, ctx, target_id, &options, &uri).await?,
+        session_statement(req, ctx, target_id, &options, &uri, false).await?,
     );
 
     let tls_config = configure_tls_connector(!options.tls.verify, false, None)
@@ -1498,30 +1519,53 @@ mod tests {
         assert_eq!(statement_for(&session, "GET", "/").unwrap().sh, None);
     }
 
-    /// A ticket session carries `ticket` and its ticket id, and is never
-    /// stamped with an `auth_time`.
+    /// A ticket session gets no statement, with or without a ticket id, and
+    /// even when the browser session still holds a `last_sso_at` and an
+    /// `auth_time` from an earlier sign-in (a same-user ticket spent on a user
+    /// session replaces its authorization but keeps those stamps).
     #[test]
-    fn a_ticket_session_gets_a_ticket_statement() {
+    fn a_ticket_session_gets_no_statement() {
         let ticket_id = uuid::Uuid::from_u128(0x71C);
         let session = Session::default();
-        session.set_auth(SessionAuthorization::Ticket {
-            user_id: uuid::Uuid::from_u128(0xA11CE),
-            username: "alice".into(),
-            target_id: STATEMENT_TARGET,
-            ticket_id: Some(ticket_id),
-        });
-        let claims = statement_for(&session, "GET", "/").unwrap();
-        assert_eq!(claims.auth, StatementAuth::Ticket);
-        assert_eq!(claims.tid, Some(ticket_id.to_string()));
-        assert_eq!(claims.auth_time, None);
+        session.set_last_sso_at(time::OffsetDateTime::from_unix_timestamp(950).unwrap());
+        session.set("auth_time", 900u64);
+        for ticket_id in [Some(ticket_id), None] {
+            session.set_auth(SessionAuthorization::Ticket {
+                user_id: uuid::Uuid::from_u128(0xA11CE),
+                username: "alice".into(),
+                target_id: STATEMENT_TARGET,
+                ticket_id,
+            });
+            assert!(statement_for(&session, "GET", "/").is_none());
+        }
+        // The same session as a user session does get one.
+        session.set_auth(user_auth("alice"));
+        assert!(statement_for(&session, "GET", "/").is_some());
+    }
 
-        session.set_auth(SessionAuthorization::Ticket {
-            user_id: uuid::Uuid::from_u128(0xA11CE),
-            username: "alice".into(),
-            target_id: STATEMENT_TARGET,
-            ticket_id: None,
-        });
-        assert_eq!(statement_for(&session, "GET", "/").unwrap().tid, None);
+    /// The signed path is the one the request goes out with: reqwest (plain path) resolves
+    /// dot segments (plain and percent-encoded), so the raw `/a/../b` would not match what upstream sees.
+    #[test]
+    fn the_signed_path_is_the_path_as_sent() {
+        let client = reqwest::Client::builder().build().unwrap();
+        for raw in [
+            "http://upstream.example/a/../b?x=1",
+            "http://upstream.example/a/./b",
+            "http://upstream.example/a/%2e%2e/b",
+            "http://upstream.example/a/%2E/b?q=1",
+            "http://upstream.example/a/b/..?z=1",
+            "http://upstream.example/..",
+            "http://upstream.example/plain?y=2",
+        ] {
+            let uri: Uri = raw.parse().unwrap();
+            let sent = client.get(uri.to_string()).build().unwrap();
+            let sent = &sent.url()[url::Position::BeforePath..url::Position::AfterQuery];
+            assert_eq!(upstream_path_and_query(&uri, true), sent, "{raw}");
+        }
+        let uri: Uri = "http://upstream.example/a/../b?x=1".parse().unwrap();
+        assert_eq!(upstream_path_and_query(&uri, true), "/b?x=1");
+        // The WebSocket path sends the address as it is.
+        assert_eq!(upstream_path_and_query(&uri, false), "/a/../b?x=1");
     }
 
     /// No session, and the public-target throwaway session, get no statement.

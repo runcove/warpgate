@@ -57,7 +57,7 @@ pub struct StatementClaims {
     /// The session's last SSO return, Unix seconds; `null` when it never did SSO
     pub last_sso_at: Option<i64>,
     /// The session's last sign-in of any kind, Unix seconds; `null` for a
-    /// session that never signed in (a ticket session). Audit only.
+    /// session with no recorded sign-in. Audit only.
     pub auth_time: Option<i64>,
     pub iat: i64,
     pub exp: i64,
@@ -65,7 +65,8 @@ pub struct StatementClaims {
     pub m: String,
     /// Upstream path and query, as forwarded
     pub p: String,
-    /// The ticket's id, only for a ticket session that has one
+    /// The ticket's id. Reserved: no statement is made for a ticket session,
+    /// so Warpgate never sets it
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tid: Option<String>,
     /// [`session_hash`] of Warpgate's session id; `null` when the browser

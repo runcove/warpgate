@@ -95,7 +95,8 @@ sign-in never does, so `?login=password` never makes a session fresh.
 
 An HTTP target with `signed_statement` on (a boolean in the target's HTTP
 options, off by default, settable through the admin API only) receives, on
-every proxied request from a signed-in browser session, one header:
+every proxied request from a browser session that signed in as a user, one
+header:
 
     x-warpgate-session-freshness: v1.<kid>.<payload>.<sig>
 
@@ -105,12 +106,18 @@ signed-in session (and the public-target bypass) carries none; so does a
 Warpgate with no statement key. The admin API refuses a configured header
 whose name starts with `x-warpgate-` (case-insensitive).
 
+A session started with a ticket carries none, even when it was a user session
+before: a ticket for the same user, presented on a user session, makes it a
+ticket session, and it keeps the `last_sso_at` and `auth_time` it already had.
+The statement is made only while the session's authorization is a user's, so
+`auth` is always `user`; the field is kept so a verifier need not guess.
+
 - `payload` is base64url (no padding) of JSON with these fields in this order:
   `aud` (target id), `sub` (user id), `name` (username), `auth` (`user` or
-  `ticket`), `last_sso_at` (Unix seconds or `null`), `auth_time` (Unix seconds
-  or `null`; a ticket session is never stamped), `iat`, `exp` (`iat` + 30),
-  `m` (method), `p` (upstream path and query as forwarded), `tid` (ticket id,
-  only for a ticket session that has one), `sh` (session hash or `null`).
+  `ticket`; always `user` today), `last_sso_at` (Unix seconds or `null`),
+  `auth_time` (Unix seconds or `null`), `iat`, `exp` (`iat` + 30), `m`
+  (method), `p` (upstream path and query as forwarded), `tid` (reserved, never
+  present today), `sh` (session hash or `null`).
 - `sh` is base64url (no padding) of SHA-256 over the length-prefixed
   `cove-session-hash-v1` and the Warpgate session id in hyphenated lowercase;
   `null` when the browser session has no id.
@@ -121,7 +128,9 @@ whose name starts with `x-warpgate-` (case-insensitive).
 
 A verifier checks the version, looks `kid` up among the keys it pinned,
 verifies the signature over the bytes it received, then reads the payload,
-and checks `aud`, `m`, `p` and `exp` against its own request.
+and checks `aud`, `m`, `p` and `exp` against its own request. A verifier must
+check `auth == "user"` before it trusts `last_sso_at`: a statement with any
+other `auth` says nothing about a fresh sign-in.
 
 ### Keys
 

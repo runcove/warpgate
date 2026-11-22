@@ -562,6 +562,16 @@
           },
           "400": {
             "description": "The request originates from a domain that has no cookie domain relationship\nwith `external_host` while `return_url_domain` is `external_host`"
+          },
+          "403": {
+            "description": "The browser session is authorized by a ticket, which never signs in",
+            "content": {
+              "text/plain; charset=utf-8": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "operationId": "start_sso"
@@ -570,7 +580,7 @@
     "/sso/auto-start": {
       "get": {
         "summary": "Server-side auto-SSO entry point.",
-        "description": "A front door that gates its own traffic and rides a `public` HTTP target\n(so Warpgate's own `page_auth` auto-redirect never sees the request)\nredirects unauthenticated browser navigations here instead of straight\nto the gateway login SPA. When the operator has opted into\nsingle-provider auto-redirect, this 302s directly to the IdP authorize\nURL — no SPA render, no button click. Otherwise (feature off, not\nexactly one provider, a provider/host mismatch, or the\n`?login=password` break-glass) it 302s to the normal gateway login page,\npreserving `next`.\n\nUnauthenticated by design (mirrors `/sso/providers` + `/sso/*/start`):\nit only ever *initiates* a login, and the resulting `next` is validated\nagainst [`is_safe_redirect_target`] before use.",
+        "description": "A front door that gates its own traffic and rides a `public` HTTP target\n(so Warpgate's own `page_auth` auto-redirect never sees the request)\nredirects unauthenticated browser navigations here instead of straight\nto the gateway login SPA. When the operator has opted into\nsingle-provider auto-redirect, this 302s directly to the IdP authorize\nURL — no SPA render, no button click. Otherwise (feature off, not\nexactly one provider, a provider/host mismatch, or the\n`?login=password` break-glass) it 302s to the normal gateway login page,\npreserving `next`.\n\n`force=1` always starts SSO, whether or not auto-redirect is on and\nwhether or not the browser is already signed in: with the provider\nnamed in `provider`, or the sole one when exactly one is configured.\nAn unknown provider, or none named among several, gets the login page.\n`?login=password` still wins.\n\nA session authorized by a ticket gets 403: it never signs in.\n\nUnauthenticated by design (mirrors `/sso/providers` + `/sso/*/start`):\nit only ever *initiates* a login, and the resulting `next` is validated\nagainst [`is_safe_redirect_target`] before use.",
         "parameters": [
           {
             "name": "next",
@@ -591,11 +601,41 @@
             "required": false,
             "deprecated": false,
             "explode": true
+          },
+          {
+            "name": "force",
+            "schema": {
+              "type": "string"
+            },
+            "in": "query",
+            "required": false,
+            "deprecated": false,
+            "explode": true
+          },
+          {
+            "name": "provider",
+            "schema": {
+              "type": "string"
+            },
+            "in": "query",
+            "required": false,
+            "deprecated": false,
+            "explode": true
           }
         ],
         "responses": {
           "302": {
-            "description": "Browser redirect — either straight to the IdP authorize URL (auto-SSO\nenabled, exactly one provider) or back to the gateway login SPA\n(feature off, not exactly one provider, or `?login=password`)."
+            "description": "Browser redirect — either straight to the IdP authorize URL (auto-SSO\nenabled, exactly one provider, or `force=1` with a provider to start)\nor back to the gateway login SPA (otherwise, or `?login=password`)."
+          },
+          "403": {
+            "description": "The browser session is authorized by a ticket, which never signs in",
+            "content": {
+              "text/plain; charset=utf-8": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "operationId": "auto_start_sso"
@@ -628,6 +668,26 @@
           }
         },
         "operationId": "sso_backchannel_logout"
+      }
+    },
+    "/statement-keys": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "The published keys; empty when Warpgate has no statement key",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/StatementKeyDescription"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "operationId": "get_statement_keys"
       }
     },
     "/profile/credentials": {
@@ -2706,6 +2766,34 @@
         "properties": {
           "url": {
             "type": "string"
+          }
+        }
+      },
+      "StatementKeyDescription": {
+        "type": "object",
+        "title": "StatementKeyDescription",
+        "required": [
+          "kid",
+          "alg",
+          "public_key",
+          "signing"
+        ],
+        "properties": {
+          "kid": {
+            "type": "string",
+            "description": "base64url (no padding) of the SHA-256 of the raw public key"
+          },
+          "alg": {
+            "type": "string",
+            "description": "Always `Ed25519`"
+          },
+          "public_key": {
+            "type": "string",
+            "description": "base64url (no padding) of the raw 32-byte public key"
+          },
+          "signing": {
+            "type": "boolean",
+            "description": "Whether this key signs; true for exactly one key when any exists"
           }
         }
       },

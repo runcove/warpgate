@@ -218,7 +218,7 @@ enum UpdateTargetResponse {
     #[oai(status = 200)]
     Ok(Json<TargetConfig>),
     #[oai(status = 400)]
-    BadRequest,
+    BadRequest(Json<String>),
     #[oai(status = 409)]
     Conflict(Json<String>),
     #[oai(status = 404)]
@@ -278,11 +278,16 @@ impl DetailApi {
 
         if let Some(reason) = unix_socket_refusal(&admin, &body.options).await {
             warn!("Rejecting request: {reason}");
-            return Ok(UpdateTargetResponse::BadRequest);
+            return Ok(UpdateTargetResponse::BadRequest(invalid_field(
+                "unix_socket",
+                &reason,
+            )));
         }
         if let Some(reason) = reserved_header_refusal(&body.options) {
             warn!("Rejecting request: {reason}");
-            return Ok(UpdateTargetResponse::BadRequest);
+            return Ok(UpdateTargetResponse::BadRequest(invalid_field(
+                "headers", &reason,
+            )));
         }
         if let Some(reason) = host_binding_refusal(&admin, &body.options, Some(id.0)).await? {
             warn!("Rejecting request: {reason}");
@@ -294,11 +299,17 @@ impl DetailApi {
             Ok(target) => target,
             Err(ResourceError::EmptyName) => {
                 warn!("Rejecting request: target name is empty");
-                return Ok(UpdateTargetResponse::BadRequest);
+                return Ok(UpdateTargetResponse::BadRequest(invalid_field(
+                    "name",
+                    "target name is empty",
+                )));
             }
             Err(ResourceError::ProtocolChange) => {
                 warn!("Rejecting request: a target's protocol cannot be changed after creation");
-                return Ok(UpdateTargetResponse::BadRequest);
+                return Ok(UpdateTargetResponse::BadRequest(invalid_field(
+                    "options",
+                    "a target's protocol cannot be changed after creation",
+                )));
             }
             Err(ResourceError::NameTaken) => {
                 return Ok(UpdateTargetResponse::Conflict(Json(

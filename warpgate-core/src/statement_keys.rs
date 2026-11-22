@@ -10,8 +10,12 @@
 //!
 //! Rotation is host-only (`warpgate statement-keys`), publish first, then
 //! sign: `add-next`, then (once every verifier has pinned it) `promote`, then
-//! `retire` the old key. Each node reads the active key per request, so a
-//! promotion needs no signal.
+//! `retire` the old key. Each node reads the active key from the database at
+//! most every few seconds ([`ACTIVE_KEY_CACHE_TTL`]), so a promotion needs no
+//! signal.
+
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use data_encoding::BASE64URL_NOPAD;
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -195,6 +199,7 @@ pub(crate) async fn ensure_statement_key_with(
     }
     match insert(db, StatementKeySlot::Active).await {
         Ok(kid) => {
+            ACTIVE_KEY_CACHE.clear();
             info!(%kid, "Generated the session statement key");
             Ok(Some(kid))
         }
@@ -235,13 +240,70 @@ pub(crate) async fn published_statement_keys_with(
         .collect())
 }
 
-/// The key that signs, read per request. `None` without an encryption key,
-/// without an active key, or when it cannot be decrypted (then a warning;
-/// the statement is left out and the target fails closed).
+/// How long a decrypted signing key is reused before the database is read
+/// again. A change made by another process (the `statement-keys` command)
+/// shows within this; one made in this process drops the cache at once. A
+/// promoted-away key is still published as retiring for at least this long, so
+/// a statement it signs in the window still verifies.
+const ACTIVE_KEY_CACHE_TTL: Duration = Duration::from_secs(5);
+
+/// The decrypted active key, kept for [`ACTIVE_KEY_CACHE_TTL`].
+#[derive(Default)]
+struct ActiveKeyCache(Mutex<Option<(Instant, Arc<ActiveStatementKey>)>>);
+
+impl ActiveKeyCache {
+    fn get(&self, ttl: Duration) -> Option<Arc<ActiveStatementKey>> {
+        let guard = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        guard
+            .as_ref()
+            .filter(|(at, _)| at.elapsed() < ttl)
+            .map(|(_, key)| key.clone())
+    }
+
+    fn put(&self, key: Arc<ActiveStatementKey>) {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Some((Instant::now(), key));
+    }
+
+    fn clear(&self) {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    }
+}
+
+static ACTIVE_KEY_CACHE: LazyLock<ActiveKeyCache> = LazyLock::new(ActiveKeyCache::default);
+
+/// The key that signs, decrypted once and reused for a few seconds, not read
+/// per request. `None` without an encryption key, without an active key, or
+/// when it cannot be decrypted (then a warning; the statement is left out and
+/// the target fails closed). Only a key is cached, never an absence.
 pub async fn active_statement_key(
     db: &DatabaseConnection,
-) -> Result<Option<ActiveStatementKey>, WarpgateError> {
-    active_statement_key_with(db, statement_keys_enabled()).await
+) -> Result<Option<Arc<ActiveStatementKey>>, WarpgateError> {
+    cached_active_statement_key(
+        &ACTIVE_KEY_CACHE,
+        db,
+        statement_keys_enabled(),
+        ACTIVE_KEY_CACHE_TTL,
+    )
+    .await
+}
+
+async fn cached_active_statement_key(
+    cache: &ActiveKeyCache,
+    db: &DatabaseConnection,
+    enabled: bool,
+    ttl: Duration,
+) -> Result<Option<Arc<ActiveStatementKey>>, WarpgateError> {
+    if !enabled {
+        return Ok(None);
+    }
+    if let Some(key) = cache.get(ttl) {
+        return Ok(Some(key));
+    }
+    let key = active_statement_key_with(db, enabled).await?.map(Arc::new);
+    if let Some(key) = &key {
+        cache.put(key.clone());
+    }
+    Ok(key)
 }
 
 pub(crate) async fn active_statement_key_with(
@@ -327,6 +389,7 @@ pub async fn promote_statement_key(
     target.slot = Set(StatementKeySlot::Active);
     target.update(&txn).await?;
     txn.commit().await?;
+    ACTIVE_KEY_CACHE.clear();
     Ok(())
 }
 
@@ -350,6 +413,7 @@ pub async fn retire_statement_key(
         .exec(&txn)
         .await?;
     txn.commit().await?;
+    ACTIVE_KEY_CACHE.clear();
     Ok(())
 }
 
@@ -555,5 +619,44 @@ mod tests {
                 .kid,
             kid
         );
+    }
+
+    /// The decrypted key is reused inside the cache's lifetime and read again
+    /// after it, so a promotion made elsewhere shows once it has passed; an
+    /// absent key is never cached.
+    #[tokio::test]
+    async fn the_active_key_is_cached_and_refreshed() {
+        let db = memory_db().await;
+        let cache = ActiveKeyCache::default();
+        let long = Duration::from_secs(3600);
+        assert!(
+            cached_active_statement_key(&cache, &db, true, long)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let first = ensure_statement_key_with(&db, true).await.unwrap().unwrap();
+        let a = cached_active_statement_key(&cache, &db, true, long)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.kid, first);
+
+        let next = add_next_with(&db, true).await.unwrap();
+        promote_statement_key(&db, &next).await.unwrap();
+        // Inside the lifetime: the cached key, with no database read.
+        let b = cached_active_statement_key(&cache, &db, true, long)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(Arc::ptr_eq(&a, &b));
+        // Past it: the promoted key.
+        let c = cached_active_statement_key(&cache, &db, true, Duration::ZERO)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(c.kid, next);
+        cache.clear();
+        assert!(cache.get(long).is_none());
     }
 }
