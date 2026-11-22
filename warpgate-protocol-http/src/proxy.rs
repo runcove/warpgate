@@ -363,6 +363,14 @@ fn upstream_path_and_query(uri: &Uri, url_normalised: bool) -> String {
     }
 }
 
+/// Whether a target gets a statement at all: it has `signed_statement` on and
+/// is not bound to a host (`external_host`). A bound host is served as the
+/// target's own site, with no Warpgate sign-in behind it that a statement
+/// could vouch for, so none is made there.
+fn signs_statement(options: &TargetHTTPOptions) -> bool {
+    options.signed_statement && options.external_host.as_deref().is_none_or(str::is_empty)
+}
+
 /// The session statement for a request to `uri` on a target with
 /// `signed_statement` on; `None` (no header) when the target has it off, no
 /// active key can be read, or the session is not a signed-in one. `uri` is
@@ -376,7 +384,7 @@ async fn session_statement(
     uri: &Uri,
     url_normalised: bool,
 ) -> Result<Option<HeaderValue>> {
-    if !options.signed_statement {
+    if !signs_statement(options) {
         return Ok(None);
     }
     let session = <&Session>::from_request_without_body(req).await?;
@@ -1799,7 +1807,7 @@ mod tests {
         req.extensions_mut().insert(session);
         let statement = {
             let session = <&Session>::from_request_without_body(&req).await.unwrap();
-            if options.signed_statement {
+            if signs_statement(options) {
                 statement_header_value(
                     session,
                     &statement_key(),
@@ -1874,6 +1882,32 @@ mod tests {
             let values = statement_values(&upstream);
             assert_eq!(values.len(), 1);
             assert_ne!(values.first().map(String::as_str), Some("forged"));
+        }
+    }
+
+    /// A target bound to a host (`external_host`) gets no statement, even for a
+    /// user session, and a configured header of that name is still stripped. An
+    /// empty `external_host` binds nothing, so it still gets one.
+    #[tokio::test]
+    async fn a_bound_host_target_gets_no_statement() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let session = Session::default();
+        session.set_auth(user_auth("alice"));
+        for bound in ["vm.example.test:8443", "vm.example.test"] {
+            let mut options = keyed_options(Some("configured"));
+            options.external_host = Some(bound.into());
+            assert!(!signs_statement(&options));
+            for upstream in proxy_header_steps(session.clone(), &options, &[]).await {
+                assert!(statement_values(&upstream).is_empty(), "{bound}");
+            }
+        }
+        for unbound in [None, Some(String::new())] {
+            let mut options = keyed_options(None);
+            options.external_host = unbound;
+            assert!(signs_statement(&options));
+            for upstream in proxy_header_steps(session.clone(), &options, &[]).await {
+                assert_eq!(statement_values(&upstream).len(), 1);
+            }
         }
     }
 
