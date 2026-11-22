@@ -311,7 +311,10 @@ fn statement_claims(
         last_sso_at: session.get_last_sso_at().map(|at| at.unix_timestamp()),
         iat: now,
         exp: now + STATEMENT_TTL_SECS,
-        jti: new_jti()?,
+        jti: new_jti().or_else(|| {
+            warn!("Could not read the operating system's random number generator for the session statement; none is sent");
+            None
+        })?,
         m: method.to_owned(),
         p: path_and_query.to_owned(),
         sh: session.get_session_id().map(|id| session_hash(id.0)),
@@ -339,6 +342,24 @@ fn statement_header_value(
     let mut value = HeaderValue::from_str(&signed).ok()?;
     value.set_sensitive(true);
     Some(value)
+}
+
+/// The production gate: the header value for `session` on a target with
+/// `options`, or `None` when the target does not sign a statement (see
+/// [`signs_statement`]) or [`statement_header_value`] makes none.
+fn gated_statement_header_value(
+    session: &Session,
+    options: &TargetHTTPOptions,
+    key: &ActiveStatementKey,
+    target_id: uuid::Uuid,
+    method: &str,
+    path_and_query: &str,
+    now: i64,
+) -> Option<HeaderValue> {
+    if !signs_statement(options) {
+        return None;
+    }
+    statement_header_value(session, key, target_id, method, path_and_query, now)
 }
 
 /// The path and query the upstream will receive for `uri`: reqwest parses the
@@ -400,8 +421,9 @@ async fn session_statement(
         }
     };
     let path_and_query = upstream_path_and_query(uri, url_normalised);
-    Ok(statement_header_value(
+    Ok(gated_statement_header_value(
         session,
+        options,
         &key,
         target_id,
         req.method().as_str(),
@@ -1793,7 +1815,7 @@ mod tests {
     /// The header steps both proxy paths run, in their order, for `session`
     /// on a target with `options`: the caller's headers, Warpgate's identity
     /// headers, the configured headers, then the session statement as
-    /// `session_statement` would make it (key `statement_key()`). Returns the
+    /// `gated_statement_header_value` (the gate `session_statement` calls) makes it (key `statement_key()`). Returns the
     /// upstream headers of the plain and the WebSocket builder.
     async fn proxy_header_steps(
         session: Session,
@@ -1808,18 +1830,15 @@ mod tests {
         req.extensions_mut().insert(session);
         let statement = {
             let session = <&Session>::from_request_without_body(&req).await.unwrap();
-            if signs_statement(options) {
-                statement_header_value(
-                    session,
-                    &statement_key(),
-                    STATEMENT_TARGET,
-                    "GET",
-                    "/",
-                    1000,
-                )
-            } else {
-                None
-            }
+            gated_statement_header_value(
+                session,
+                options,
+                &statement_key(),
+                STATEMENT_TARGET,
+                "GET",
+                "/",
+                1000,
+            )
         };
         let client = reqwest::Client::builder().build().unwrap();
         let plain =
