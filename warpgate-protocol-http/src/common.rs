@@ -1611,6 +1611,26 @@ mod tests {
     }
 
     #[test]
+    fn deeply_nested_blob_origin_is_cross_origin() {
+        // `Url::origin` recursed through nested `blob:` URLs and overflowed
+        // the stack before url 2.5.9 (RUSTSEC-2026-0592).
+        let nested = format!("{}https://example.com", "blob:".repeat(100_000));
+        let accepted = [url::Url::parse("https://example.com").unwrap().origin()];
+        for header in ["origin", "referer"] {
+            let req = poem::Request::builder()
+                .method(http::Method::POST)
+                .uri_str("/@warpgate/admin/api/sessions/x/close")
+                .header(header, nested.as_str())
+                .finish();
+            assert!(super::is_cross_origin_request(
+                &req,
+                Some("example.com"),
+                &accepted
+            ));
+        }
+    }
+
+    #[test]
     fn cross_origin_warpgate_requests() {
         use http::Method;
 

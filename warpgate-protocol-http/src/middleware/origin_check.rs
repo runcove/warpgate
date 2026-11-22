@@ -538,6 +538,16 @@ mod tests {
     }
 
     #[test]
+    fn loopback_refuses_a_deeply_nested_blob_origin() {
+        // `Url::origin` recursed through nested `blob:` URLs and overflowed
+        // the stack before url 2.5.9 (RUSTSEC-2026-0592).
+        let nested = format!("{}{LOOPBACK_OWN}", "blob:".repeat(100_000));
+        let own = loopback_own();
+        let check = post("/vms/new", Some(&nested));
+        assert!(!check.is_same_origin_on_loopback(Some(&own)));
+    }
+
+    #[test]
     fn loopback_without_origin_needs_same_origin_fetch_metadata() {
         let own = loopback_own();
         let without_origin = |site| OriginCheckRequest {
