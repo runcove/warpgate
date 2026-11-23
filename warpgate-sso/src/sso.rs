@@ -988,10 +988,7 @@ mod tests {
         let (config, _, _) = stand_in_idp().await;
         let client = SsoClient::new(config).unwrap();
         for reauth in [Reauth::Force, Reauth::MaxAge(Duration::from_secs(3600))] {
-            let request = client
-                .start_login(RETURN_URL.into(), reauth)
-                .await
-                .unwrap();
+            let request = client.start_login(RETURN_URL.into(), reauth).await.unwrap();
             let query = query(&request);
             assert!(
                 has(

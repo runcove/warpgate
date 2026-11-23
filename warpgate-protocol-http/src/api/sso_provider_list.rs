@@ -755,7 +755,8 @@ impl Api {
                     // user who only ever logs in via password would never
                     // re-SSO and the step-up gate would silently become a
                     // no-op.
-                    match resulting_stamp.and_then(|at| OffsetDateTime::from_unix_timestamp(at).ok())
+                    match resulting_stamp
+                        .and_then(|at| OffsetDateTime::from_unix_timestamp(at).ok())
                     {
                         Some(at) => session.set_last_sso_at(at),
                         None => session.clear_last_sso_at(),

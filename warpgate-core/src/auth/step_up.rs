@@ -899,8 +899,14 @@ mod tests {
             Duration::from_secs(2 * 3600 - 1800)
         );
         assert_eq!(reauth_max_age(Duration::ZERO), Duration::ZERO);
-        assert_eq!(reauth_max_age(Duration::from_secs(3)), Duration::from_secs(3));
-        assert_eq!(reauth_max_age(Duration::MAX), Duration::MAX - REAUTH_MARGIN_CAP);
+        assert_eq!(
+            reauth_max_age(Duration::from_secs(3)),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            reauth_max_age(Duration::MAX),
+            Duration::MAX - REAUTH_MARGIN_CAP
+        );
     }
 
     #[test]

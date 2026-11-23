@@ -184,7 +184,9 @@ pub(crate) async fn start_sso_and_get_auth_url(
             .step_up_interval
             .as_ref()
             .and_then(|s| s.http)
-            .map_or(Reauth::None, |interval| Reauth::MaxAge(reauth_max_age(interval)))
+            .map_or(Reauth::None, |interval| {
+                Reauth::MaxAge(reauth_max_age(interval))
+            })
     };
 
     let client = SsoClient::new(provider_config.provider.clone())?;
