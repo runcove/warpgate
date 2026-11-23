@@ -90,8 +90,23 @@ With `force=1`:
 - the authorize request carries `prompt=login` and `max_age=0`, so the
   identity provider asks the user to sign in again rather than resume its own
   session. Every other SSO start (the login page's provider buttons, the
-  auto-redirect) never sends `prompt`, and sends `max_age=<step_up_interval.http>`
-  in seconds when HTTP step-up is configured, nothing otherwise.
+  auto-redirect) never sends `prompt`, and sends `max_age` in seconds when
+  HTTP step-up is configured, nothing otherwise. That `max_age` is
+  `step_up_interval.http` less a margin of a quarter of it (at most one hour),
+  never below zero, so a login the provider takes as recent keeps a stamp that
+  outlasts the interval by the margin. The return applies the same value: a
+  stamp not newer than now less that `max_age` does not count as recent;
+- a `force=1` or step-up start also sends the OpenID Connect `claims`
+  parameter `{"id_token":{"auth_time":{"essential":true}}}`, for providers
+  that include `auth_time` only when asked.
+
+Per provider type: Google rejects `prompt=login`, so a `google` provider gets
+`max_age=0` and the `claims` parameter without `prompt`, and a `force=1`
+return there still stamps only from an `auth_time` not older than the handshake
+(see below); if Google does not report one, the user cannot sign in under HTTP
+step-up. Entra (`azure`) and `custom` providers get `prompt=login`; whether
+they report `auth_time` is the provider's behaviour, so confirm it for each
+before turning step-up on.
 
 The return stamps the session's `last_sso_at`. A password, OTP or passkey
 sign-in never does, so `?login=password` never makes a session fresh.
@@ -115,9 +130,11 @@ handshake is refused and never stamps. The stamp is written only when:
 
 Otherwise the return still signs the user in and leaves the stamp as it was,
 with one exception: when HTTP step-up is on and the session would be left with
-no stamp inside `step_up_interval.http`, the sign-in is refused (the
-`sso_failed` return). A `force=1` return whose `auth_time` is stale therefore
-signs in only on a session whose existing stamp is still fresh.
+no recent stamp (newer than now less the `max_age` above), the sign-in is
+refused (the `sso_failed` return), before the credential is submitted. A
+`force=1` return whose `auth_time` is stale therefore signs in only on a
+session whose existing stamp is still recent; a different user's return never
+inherits the session's stamp.
 
 An identity provider that does not return `auth_time` never stamps; with HTTP
 step-up on, its users cannot sign in. Confirm that the provider returns
@@ -132,10 +149,10 @@ intent token and not a CSRF token: a verifier (cove) must keep its own CSRF
 check and must not read a recent `last_sso_at` as proof that the user chose
 this action.
 
-Cove's side (`runcove-exdwn`): for one request that needs a fresh sign-in,
-start one `force=1` round. If the statement from the session it returns to
-carries a `last_sso_at` that did not advance past the one the request began
-with, refuse the request; do not start a second round. The signed statement
+Cove's side: for one request that needs a fresh sign-in, start one `force=1`
+round. If the statement from the session it returns to does not carry a
+`last_sso_at` of at least cove's own request start less 120 s, refuse the
+request; do not start a second round. The signed statement
 carries no `auth_time` of its own.
 
 ## Signed session statement: `x-warpgate-session-freshness`
@@ -197,8 +214,8 @@ verifies the signature over the bytes it received, then reads the payload,
 and checks `aud`, `m`, `p` and `exp` against its own request. A verifier must
 check `auth == "user"` before it trusts `last_sso_at`: a statement with any
 other `auth` says nothing about a fresh sign-in. Even then `last_sso_at` only
-says an SSO return finished at that time (see "What `last_sso_at` means"); it
-does not show the user's intent, and the verifier's own CSRF check stays.
+says the identity provider reported the user's last sign-in at that time (see
+"What `last_sso_at` means"); it does not show the user's intent, and the verifier's own CSRF check stays.
 
 ### Keys
 
