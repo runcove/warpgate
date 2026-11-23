@@ -19,7 +19,7 @@ use warpgate_common_http::ext::construct_external_url;
 use warpgate_common_http::logging::get_client_ip_addr;
 use warpgate_common_http::{SessionAuthorization, warpgate_csp_with_script_nonce};
 use warpgate_core::ConfigProvider;
-use warpgate_core::auth::step_up::{is_fresh, sso_stamp};
+use warpgate_core::auth::step_up::{is_recent_enough, sso_stamp};
 use warpgate_core::auth::submit_credential;
 use warpgate_sso::{SsoClient, SsoInternalProviderConfig, SsoLoginResponse, SsoProviderConfig};
 
@@ -742,7 +742,7 @@ impl Api {
             let resulting = new_stamp
                 .or(previous)
                 .and_then(|at| OffsetDateTime::from_unix_timestamp(at).ok());
-            if !is_fresh(resulting, interval, now) {
+            if !is_recent_enough(resulting, interval, now) {
                 warn!(
                     username = %username,
                     forced,

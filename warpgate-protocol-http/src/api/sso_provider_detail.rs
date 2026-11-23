@@ -11,6 +11,7 @@ use tracing::{debug, warn};
 use warpgate_common::WarpgateError;
 use warpgate_common_http::auth::UnauthenticatedRequestContext;
 use warpgate_common_http::ext::construct_external_url;
+use warpgate_core::auth::step_up::reauth_max_age;
 use warpgate_sso::{Reauth, SsoClient, SsoLoginRequest, SsoReturnUrlDomainPreference};
 
 use crate::api::sso_provider_list::is_safe_redirect_target;
@@ -183,7 +184,7 @@ pub(crate) async fn start_sso_and_get_auth_url(
             .step_up_interval
             .as_ref()
             .and_then(|s| s.http)
-            .map_or(Reauth::None, Reauth::MaxAge)
+            .map_or(Reauth::None, |interval| Reauth::MaxAge(reauth_max_age(interval)))
     };
 
     let client = SsoClient::new(provider_config.provider.clone())?;
