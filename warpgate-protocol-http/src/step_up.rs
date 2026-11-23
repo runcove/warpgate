@@ -62,9 +62,9 @@ pub trait StepUpSessionExt {
     /// parseable as a valid `OffsetDateTime`.
     fn get_last_sso_at(&self) -> Option<OffsetDateTime>;
 
-    /// Stamp `last_sso_at` on the session to `now`. Called from the SSO
-    /// return handler after `authorize_session`.
-    fn set_last_sso_at(&self, now: OffsetDateTime);
+    /// Stamp `last_sso_at` on the session. Called from the SSO return handler
+    /// after `authorize_session`, with the time `sso_stamp` decided on.
+    fn set_last_sso_at(&self, at: OffsetDateTime);
 
     /// Clear the stamp. Used when forcing re-SSO so the new login starts
     /// from a clean slate.
@@ -77,8 +77,8 @@ impl StepUpSessionExt for Session {
         OffsetDateTime::from_unix_timestamp(secs).ok()
     }
 
-    fn set_last_sso_at(&self, now: OffsetDateTime) {
-        self.set(LAST_SSO_AT_SESSION_KEY, now.unix_timestamp());
+    fn set_last_sso_at(&self, at: OffsetDateTime) {
+        self.set(LAST_SSO_AT_SESSION_KEY, at.unix_timestamp());
     }
 
     fn clear_last_sso_at(&self) {

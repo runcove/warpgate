@@ -108,6 +108,8 @@ pub(crate) async fn start_sso_and_get_auth_url(
     ctx: &UnauthenticatedRequestContext,
     provider_name: &str,
     next: Option<String>,
+    // Demand a fresh login at the provider (`prompt=login`, `max_age=0`).
+    force: bool,
 ) -> Result<StartSsoOutcome, WarpgateError> {
     // A ticket session never becomes a user session, so it never starts one.
     if is_ticket_session(session) {
@@ -172,6 +174,18 @@ pub(crate) async fn start_sso_and_get_auth_url(
         .origin()
         .ascii_serialization();
 
+    // Read under the lock, which is dropped below.
+    let reauth = if force {
+        Reauth::Force
+    } else {
+        config
+            .store
+            .step_up_interval
+            .as_ref()
+            .and_then(|s| s.http)
+            .map_or(Reauth::None, Reauth::MaxAge)
+    };
+
     let client = SsoClient::new(provider_config.provider.clone())?;
 
     // Release the global `config` lock before the IdP network round-trip
@@ -182,9 +196,7 @@ pub(crate) async fn start_sso_and_get_auth_url(
     // `config` while a single login is mid-flight against the IdP.
     drop(config);
 
-    let sso_req = client
-        .start_login(return_url.to_string(), Reauth::None)
-        .await?;
+    let sso_req = client.start_login(return_url.to_string(), reauth).await?;
 
     let url = sso_req.auth_url().to_string();
     // The OAuth `state` (CSRF token) the IdP echoes back on the callback — the
@@ -231,7 +243,7 @@ impl Api {
         name: Path<String>,
         next: Query<Option<String>>,
     ) -> Result<StartSsoResponse, WarpgateError> {
-        match start_sso_and_get_auth_url(req, session, ctx.0, &name.0, next.0).await? {
+        match start_sso_and_get_auth_url(req, session, ctx.0, &name.0, next.0, false).await? {
             StartSsoOutcome::Ok(url) => {
                 Ok(StartSsoResponse::Ok(Json(StartSsoResponseParams { url })))
             }
@@ -309,8 +321,15 @@ impl Api {
         };
 
         if let Some(provider_name) = chosen_provider {
-            match start_sso_and_get_auth_url(req, session, ctx.0, &provider_name, next.clone())
-                .await?
+            match start_sso_and_get_auth_url(
+                req,
+                session,
+                ctx.0,
+                &provider_name,
+                next.clone(),
+                force,
+            )
+            .await?
             {
                 StartSsoOutcome::Ok(url) => {
                     return Ok(
@@ -620,14 +639,48 @@ mod ticket_session_tests {
         }
     }
 
+    #[handler]
+    fn stamp(session: &Session) -> String {
+        use crate::step_up::StepUpSessionExt;
+        session
+            .get_last_sso_at()
+            .map_or_else(|| "none".into(), |at| at.unix_timestamp().to_string())
+    }
+
     async fn app(providers: Vec<SsoProviderConfig>) -> (impl Endpoint, SsoRequestStore) {
+        app_with(providers, None).await
+    }
+
+    async fn app_with(
+        providers: Vec<SsoProviderConfig>,
+        step_up_http: Option<std::time::Duration>,
+    ) -> (impl Endpoint, SsoRequestStore) {
+        use sea_orm::ActiveModelTrait;
+        use sea_orm::ActiveValue::Set;
+
         let db = memory_db().await;
         insert_user(&db, ALICE, "alice").await;
+        // The e-mail the stand-in provider's ID tokens carry.
+        warpgate_db_entities::SsoCredential::ActiveModel {
+            id: Set(Uuid::from_u128(0xc0de)),
+            user_id: Set(ALICE),
+            provider: Set(None),
+            email: Set("alice@example.test".into()),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
         let services = services(db.clone()).await;
         {
             let mut config = services.config.lock().await;
             config.store.external_host = Some(HOST.into());
             config.store.sso_providers = providers;
+            if let Some(http) = step_up_http {
+                config.store.step_up_interval = Some(warpgate_common::StepUpIntervalConfig {
+                    http: Some(http),
+                    ..Default::default()
+                });
+            }
         }
         let ctx = UnauthenticatedRequestContext::new(services).await;
         let storage = SharedSessionStorage::new(db);
@@ -642,6 +695,7 @@ mod ticket_session_tests {
             .at("/as-user", get(as_user))
             .at("/as-ticket", get(as_ticket))
             .at("/kind", get(auth_kind))
+            .at("/stamp", get(stamp))
             .data(SessionStore::new())
             .data(ctx)
             .data(sso_store.clone())
@@ -825,5 +879,291 @@ mod ticket_session_tests {
             .await
             .assert_text("ticket")
             .await;
+    }
+
+    // ---- the return path against an identity provider that signs ID tokens ----
+
+    use std::sync::Mutex as StdMutex;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    fn unix_now() -> i64 {
+        i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+        .unwrap()
+    }
+
+    /// A provider whose token endpoint hands back whatever ID token the test
+    /// last put in the slot, signed with a fresh P-256 key it publishes.
+    struct SigningIdp {
+        issuer: String,
+        slot: Arc<StdMutex<String>>,
+        key: jsonwebtoken::EncodingKey,
+    }
+
+    #[handler]
+    fn token_endpoint(slot: Data<&Arc<StdMutex<String>>>) -> poem::web::Json<serde_json::Value> {
+        poem::web::Json(serde_json::json!({
+            "access_token": "access",
+            "token_type": "bearer",
+            "id_token": slot.0.lock().unwrap().clone(),
+        }))
+    }
+
+    async fn signing_idp() -> SigningIdp {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let issuer = format!("http://{}", listener.local_addr().unwrap());
+        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        // An uncompressed SEC1 point: 0x04, then x, then y.
+        let point = key_pair.public_key_raw();
+        let coordinate = |range| data_encoding::BASE64URL_NOPAD.encode(point.get(range).unwrap());
+        let jwks = serde_json::json!({ "keys": [{
+            "kty": "EC", "crv": "P-256", "kid": "k1", "use": "sig",
+            "x": coordinate(1..33), "y": coordinate(33..65),
+        }]});
+        let key =
+            jsonwebtoken::EncodingKey::from_ec_pem(key_pair.serialize_pem().as_bytes()).unwrap();
+        let discovery = serde_json::json!({
+            "issuer": issuer,
+            "authorization_endpoint": format!("{issuer}/authorize"),
+            "token_endpoint": format!("{issuer}/token"),
+            "jwks_uri": format!("{issuer}/jwks"),
+            "response_types_supported": ["code"],
+            "subject_types_supported": ["public"],
+            "id_token_signing_alg_values_supported": ["ES256"],
+        });
+        let slot = Arc::new(StdMutex::new(String::new()));
+        let app = Route::new()
+            .at(
+                "/.well-known/openid-configuration",
+                get(poem::endpoint::make_sync(move |_| {
+                    poem::web::Json(discovery.clone())
+                })),
+            )
+            .at(
+                "/jwks",
+                get(poem::endpoint::make_sync(move |_| {
+                    poem::web::Json(jwks.clone())
+                })),
+            )
+            .at("/token", poem::post(token_endpoint))
+            .data(slot.clone());
+        let acceptor = poem::listener::TcpAcceptor::from_tokio(listener).unwrap();
+        tokio::spawn(poem::Server::new_with_acceptor(acceptor).run(app));
+        SigningIdp { issuer, slot, key }
+    }
+
+    impl SigningIdp {
+        /// Makes the token endpoint answer with an ID token for `nonce`.
+        fn issue(&self, nonce: &str, auth_time: Option<i64>) {
+            let now = unix_now();
+            let mut claims = serde_json::json!({
+                "iss": self.issuer,
+                "sub": "alice-sub",
+                "aud": "client",
+                "iat": now,
+                "exp": now + 300,
+                "nonce": nonce,
+                "email": "alice@example.test",
+                "email_verified": true,
+                "preferred_username": "alice",
+            });
+            if let Some(auth_time) = auth_time {
+                claims["auth_time"] = serde_json::json!(auth_time);
+            }
+            let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
+            header.kid = Some("k1".into());
+            *self.slot.lock().unwrap() = jsonwebtoken::encode(&header, &claims, &self.key).unwrap();
+        }
+    }
+
+    /// One browser against the app and the signing provider.
+    struct Browser<E> {
+        cli: TestClient<E>,
+        cookie: Option<String>,
+        idp: SigningIdp,
+    }
+
+    struct Started {
+        state: String,
+        nonce: String,
+        query: std::collections::HashMap<String, String>,
+    }
+
+    async fn browser(step_up_http: Option<Duration>) -> Browser<impl Endpoint> {
+        let idp = signing_idp().await;
+        let (app, _) = app_with(vec![provider("idp", &idp.issuer)], step_up_http).await;
+        Browser {
+            cli: TestClient::new(app),
+            cookie: None,
+            idp,
+        }
+    }
+
+    impl<E: Endpoint> Browser<E> {
+        async fn get(&mut self, path: &str) -> TestResponse {
+            fetch(&self.cli, &mut self.cookie, path).await
+        }
+
+        /// Starts a login through `path` and reads the authorize URL it sends
+        /// the browser to.
+        async fn start(&mut self, path: &str) -> Started {
+            let resp = self.get(path).await;
+            let url = if resp.0.status() == StatusCode::FOUND {
+                location(&resp)
+            } else {
+                resp.assert_status_is_ok();
+                let body = resp.json().await;
+                body.value().object().get("url").string().to_owned()
+            };
+            let query: std::collections::HashMap<String, String> = url::Url::parse(&url)
+                .unwrap()
+                .query_pairs()
+                .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                .collect();
+            Started {
+                state: query["state"].clone(),
+                nonce: query["nonce"].clone(),
+                query,
+            }
+        }
+
+        /// Returns from the provider on `started`, with an ID token for
+        /// `nonce` carrying `auth_time`.
+        async fn finish(&mut self, started: &Started, nonce: &str, auth_time: Option<i64>) {
+            self.idp.issue(nonce, auth_time);
+            self.get(&format!(
+                "/api/sso/return?code=code&state={}",
+                started.state
+            ))
+            .await;
+        }
+
+        async fn stamp(&mut self) -> String {
+            let resp = self.get("/stamp").await;
+            resp.0.into_body().into_string().await.unwrap()
+        }
+
+        async fn kind(&mut self) -> String {
+            let resp = self.get("/kind").await;
+            resp.0.into_body().into_string().await.unwrap()
+        }
+    }
+
+    const FORCE_START: &str = "/api/sso/auto-start?force=1";
+    const PLAIN_START: &str = "/api/sso/providers/idp/start";
+
+    #[tokio::test]
+    async fn force_sends_prompt_login_and_max_age_zero_even_with_step_up_set() {
+        for interval in [None, Some(Duration::from_secs(3600))] {
+            let mut b = browser(interval).await;
+            let started = b.start(FORCE_START).await;
+            assert_eq!(started.query["prompt"], "login");
+            assert_eq!(started.query["max_age"], "0");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_plain_start_sends_the_step_up_interval_as_max_age_only_when_set() {
+        let mut b = browser(Some(Duration::from_secs(3600))).await;
+        let started = b.start(PLAIN_START).await;
+        assert_eq!(started.query["max_age"], "3600");
+        assert!(!started.query.contains_key("prompt"));
+
+        let mut b = browser(None).await;
+        let started = b.start(PLAIN_START).await;
+        assert!(!started.query.contains_key("max_age"));
+        assert!(!started.query.contains_key("prompt"));
+    }
+
+    #[tokio::test]
+    async fn a_fresh_auth_time_stamps_the_session_with_that_time() {
+        let mut b = browser(None).await;
+        let started = b.start(PLAIN_START).await;
+        let auth_time = unix_now() - 45;
+        b.finish(&started, &started.nonce, Some(auth_time)).await;
+        assert_eq!(b.kind().await, "user");
+        assert_eq!(b.stamp().await, auth_time.to_string());
+    }
+
+    #[tokio::test]
+    async fn an_absent_or_future_auth_time_signs_in_without_a_stamp() {
+        for auth_time in [None, Some(unix_now() + 3600)] {
+            let mut b = browser(None).await;
+            let started = b.start(PLAIN_START).await;
+            b.finish(&started, &started.nonce, auth_time).await;
+            assert_eq!(b.kind().await, "user", "{auth_time:?}");
+            assert_eq!(b.stamp().await, "none", "{auth_time:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_forced_return_does_not_take_a_replayed_older_id_token() {
+        let mut b = browser(None).await;
+        // A normal login leaves an old stamp, and an ID token for its handshake.
+        let first = b.start(PLAIN_START).await;
+        let old = unix_now() - 3000;
+        b.finish(&first, &first.nonce, Some(old)).await;
+        assert_eq!(b.stamp().await, old.to_string());
+
+        // The forced handshake gets the first handshake's token replayed, bound
+        // to the first nonce: refused, and the stamp does not move.
+        let forced = b.start(FORCE_START).await;
+        b.finish(&forced, &first.nonce, Some(old)).await;
+        assert_eq!(b.stamp().await, old.to_string());
+
+        // Even a token bound to the forced handshake does not advance the
+        // stamp when its auth_time predates the handshake: the provider did
+        // not log the user in again. The sign-in goes through; the stamp stays.
+        let forced = b.start(FORCE_START).await;
+        b.finish(&forced, &forced.nonce, Some(old + 10)).await;
+        assert_eq!(b.stamp().await, old.to_string());
+
+        // A real fresh login does advance it.
+        let forced = b.start(FORCE_START).await;
+        let fresh = unix_now();
+        b.finish(&forced, &forced.nonce, Some(fresh)).await;
+        assert_eq!(b.stamp().await, fresh.to_string());
+    }
+
+    #[tokio::test]
+    async fn with_step_up_on_a_return_that_leaves_the_stamp_stale_is_refused() {
+        // No auth_time at all, and an auth_time older than the interval.
+        for auth_time in [None, Some(unix_now() - 7200)] {
+            let mut b = browser(Some(Duration::from_secs(3600))).await;
+            let started = b.start(PLAIN_START).await;
+            b.finish(&started, &started.nonce, auth_time).await;
+            assert_eq!(b.kind().await, "none", "{auth_time:?}");
+            assert_eq!(b.stamp().await, "none", "{auth_time:?}");
+        }
+
+        // A recent one is let in and stamped.
+        let mut b = browser(Some(Duration::from_secs(3600))).await;
+        let started = b.start(PLAIN_START).await;
+        let recent = unix_now() - 60;
+        b.finish(&started, &started.nonce, Some(recent)).await;
+        assert_eq!(b.kind().await, "user");
+        assert_eq!(b.stamp().await, recent.to_string());
+    }
+
+    #[tokio::test]
+    async fn a_stale_forced_return_signs_in_on_a_fresh_stamp_and_keeps_it() {
+        let mut b = browser(Some(Duration::from_secs(3600))).await;
+        let started = b.start(PLAIN_START).await;
+        let recent = unix_now() - 60;
+        b.finish(&started, &started.nonce, Some(recent)).await;
+        assert_eq!(b.stamp().await, recent.to_string());
+
+        // The provider reports a login from before the forced handshake: the
+        // stamp does not advance, and the still-fresh one carries the session.
+        let forced = b.start(FORCE_START).await;
+        b.finish(&forced, &forced.nonce, Some(unix_now() - 1800))
+            .await;
+        assert_eq!(b.kind().await, "user");
+        assert_eq!(b.stamp().await, recent.to_string());
     }
 }

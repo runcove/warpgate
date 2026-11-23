@@ -599,6 +599,7 @@ async fn try_auto_sso_redirect(req: &Request) -> poem::Result<Option<Response>> 
         ctx.0,
         &provider_name,
         next,
+        false,
     )
     .await?
     {
