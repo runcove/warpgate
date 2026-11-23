@@ -86,30 +86,57 @@ With `force=1`:
 - with no `provider` and exactly one configured, that one is started;
 - an unknown `provider`, or none named among several, gets the login page
   (302 to `/@warpgate#/login`, with `next`), never an error;
-- a ticket session gets 403 (above).
+- a ticket session gets 403 (above);
+- the authorize request carries `prompt=login` and `max_age=0`, so the
+  identity provider asks the user to sign in again rather than resume its own
+  session. Every other SSO start (the login page's provider buttons, the
+  auto-redirect) never sends `prompt`, and sends `max_age=<step_up_interval.http>`
+  in seconds when HTTP step-up is configured, nothing otherwise.
 
 The return stamps the session's `last_sso_at`. A password, OTP or passkey
 sign-in never does, so `?login=password` never makes a session fresh.
 
 ### What `last_sso_at` means
 
-`last_sso_at` means "Warpgate finished an SSO return at time t". Warpgate
-stamps it from its own clock at the SSO return
-(`warpgate-protocol-http/src/api/sso_provider_list.rs`); the ID token's
-`auth_time` is not used, and nothing sends `prompt=login` or `max_age`.
+`last_sso_at` means "the identity provider says the user last signed in at
+time t". Warpgate stamps it, at an SSO return, from the `auth_time` claim of
+the ID token that return exchanged, never from its own clock
+(`warpgate-core/src/auth/step_up.rs`, `sso_stamp`). That token is bound to the
+handshake by its single-use `state` and its `nonce`, so a token from another
+handshake is refused and never stamps. The stamp is written only when:
 
-It is only as fresh as the identity provider's own re-prompt policy. While
-the provider's session lives, another site can navigate the browser through
-`/sso/auto-start?force=1` (an unauthenticated GET; the session cookie is
-`SameSite=Lax`, so it is sent on a top-level navigation) and refresh the stamp
-with no user action. So `last_sso_at` is not an intent token and not a CSRF
-token: a verifier (cove) must keep its own CSRF check and must not read a
-recent `last_sso_at` as proof that the user just chose to act.
+- `auth_time` is present, and at most 120 s ahead of Warpgate's clock (a
+  later one is ignored; one within the 120 s is clamped to now);
+- for a `force=1` handshake, `auth_time` is not more than 120 s before the
+  handshake began (an identity provider that ignored `prompt=login` and sent
+  an old sign-in time does not advance the stamp);
+- it is later than the stamp the session already has, so a stamp never moves
+  backwards.
 
-A follow-up (W3) will make `force=1` send `prompt=login` and `max_age=0` and
-stamp `last_sso_at` from the identity provider's sign-in time (the ID token's
-`auth_time`); until it lands, the above holds. The signed statement carries no
-`auth_time` of its own.
+Otherwise the return still signs the user in and leaves the stamp as it was,
+with one exception: when HTTP step-up is on and the session would be left with
+no stamp inside `step_up_interval.http`, the sign-in is refused (the
+`sso_failed` return). A `force=1` return whose `auth_time` is stale therefore
+signs in only on a session whose existing stamp is still fresh.
+
+An identity provider that does not return `auth_time` never stamps; with HTTP
+step-up on, its users cannot sign in. Confirm that the provider returns
+`auth_time` after `prompt=login` before relying on it.
+
+Another site can still navigate the browser through `/sso/auto-start?force=1`
+(an unauthenticated GET; the session cookie is `SameSite=Lax`, so it is sent
+on a top-level navigation). `force=1` makes the user sign in again at the
+identity provider, so no stamp is refreshed without a fresh sign-in, but a
+user who is shown that prompt may complete it. `last_sso_at` is still not an
+intent token and not a CSRF token: a verifier (cove) must keep its own CSRF
+check and must not read a recent `last_sso_at` as proof that the user chose
+this action.
+
+Cove's side (`runcove-exdwn`): for one request that needs a fresh sign-in,
+start one `force=1` round. If the statement from the session it returns to
+carries a `last_sso_at` that did not advance past the one the request began
+with, refuse the request; do not start a second round. The signed statement
+carries no `auth_time` of its own.
 
 ## Signed session statement: `x-warpgate-session-freshness`
 
@@ -154,10 +181,9 @@ equal keys hides a repeat.
   seconds a statement lives), and refuses a statement it has already seen. The
   cache is shared across verifier replicas: one shared store, not one per
   process.
-- `last_sso_at` is Warpgate's own clock at the SSO return, as in "What
-  `last_sso_at` means" above. A follow-up (W3) will instead stamp it from the
-  identity provider's sign-in time. No other sign-in time is in the statement:
-  there is no `auth_time`.
+- `last_sso_at` is the identity provider's sign-in time (the ID token's
+  `auth_time`), as in "What `last_sso_at` means" above. No other sign-in time
+  is in the statement: there is no `auth_time`.
 - `sh` is base64url (no padding) of SHA-256 over the length-prefixed
   `cove-session-hash-v1` and the Warpgate session id in hyphenated lowercase;
   `null` when the browser session has no id.
