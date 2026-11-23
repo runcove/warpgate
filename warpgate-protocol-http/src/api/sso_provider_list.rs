@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use poem::Request;
 use poem::session::Session;
@@ -657,6 +658,34 @@ impl Api {
             )));
         };
 
+        // The stamp this return leaves on the session, decided before the
+        // credential is submitted so a refused return leaves nothing accepted
+        // in the auth state.
+        let step_up_interval = ctx
+            .services()
+            .config
+            .lock()
+            .await
+            .store
+            .step_up_interval
+            .as_ref()
+            .and_then(|s| s.http);
+        let Ok(resulting_stamp) = resulting_sso_stamp(
+            session,
+            &username,
+            &response,
+            started_at,
+            forced,
+            OffsetDateTime::now_utc(),
+            step_up_interval,
+        ) else {
+            return Ok(Err(SsoFailure::at(
+                &return_to,
+                SsoLoginError::SsoFailed,
+                "The SSO provider did not report a recent authentication",
+            )));
+        };
+
         let state_arc = match get_or_create_auth_state_for_request(req, &username, &ctx, None).await
         {
             Ok(state) => state,
@@ -701,62 +730,6 @@ impl Api {
             .await));
         }
 
-        // What the SSO stamp becomes. It comes from the ID token's `auth_time`
-        // (which is bound to this handshake's state and nonce), never from our
-        // clock: see `sso_stamp`. The previous stamp counts only when this
-        // session already belongs to the same user, since a different user's
-        // sign-in replaces the session and starts it with no stamp.
-        let previous = match session.get_auth() {
-            Some(SessionAuthorization::User {
-                username: current, ..
-            }) if current == username => session
-                .get_last_sso_at()
-                .map(OffsetDateTime::unix_timestamp),
-            _ => None,
-        };
-        let now = OffsetDateTime::now_utc();
-        let new_stamp = sso_stamp(
-            response.auth_time,
-            started_at,
-            forced,
-            now.unix_timestamp(),
-            previous,
-        );
-
-        // Backstop: with HTTP step-up on, a sign-in that would leave the
-        // session without a fresh stamp is refused, so a provider that ignores
-        // the re-authentication request (or reports no `auth_time`) cannot buy
-        // a session that step-up would only bounce straight back to SSO. A
-        // forced return whose `auth_time` is stale signs in only if the
-        // session's existing stamp is still fresh; it keeps that stamp.
-        let step_up_interval = ctx
-            .services()
-            .config
-            .lock()
-            .await
-            .store
-            .step_up_interval
-            .as_ref()
-            .and_then(|s| s.http);
-        if let Some(interval) = step_up_interval {
-            let resulting = new_stamp
-                .or(previous)
-                .and_then(|at| OffsetDateTime::from_unix_timestamp(at).ok());
-            if !is_recent_enough(resulting, interval, now) {
-                warn!(
-                    username = %username,
-                    forced,
-                    has_auth_time = response.auth_time.is_some(),
-                    "SSO login refused: the provider did not report a recent enough authentication"
-                );
-                return Ok(Err(SsoFailure::at(
-                    &return_to,
-                    SsoLoginError::SsoFailed,
-                    "The SSO provider did not report a recent authentication",
-                )));
-            }
-        }
-
         // Stored before any remaining factor so back-channel logout and SLO
         // can find the session even when TOTP or an approval is still pending.
         let login_state = || SsoLoginState {
@@ -782,7 +755,7 @@ impl Api {
                     // user who only ever logs in via password would never
                     // re-SSO and the step-up gate would silently become a
                     // no-op.
-                    if let Some(at) = new_stamp.or(previous)
+                    if let Some(at) = resulting_stamp
                         && let Ok(at) = OffsetDateTime::from_unix_timestamp(at)
                     {
                         session.set_last_sso_at(at);
@@ -913,6 +886,65 @@ impl Api {
             .collect();
         Ok(GetSsoKubernetesConfigsResponse::Ok(Json(configs)))
     }
+}
+
+/// The SSO return was refused: the session would be left without a recent
+/// stamp.
+struct StampRefused;
+
+/// The stamp the session holds after an SSO return by `username`, in unix
+/// seconds, or `StampRefused`.
+///
+/// It comes from the ID token's `auth_time` (bound to this handshake's state
+/// and nonce), never from our clock: see `sso_stamp`. The previous stamp counts
+/// only when the session already belongs to the same user, since a different
+/// user's sign-in replaces the session and starts it with no stamp.
+///
+/// With HTTP step-up on, a return that would leave the session without a
+/// stamp that [`is_recent_enough`] is refused, so a provider that ignores the
+/// re-authentication request (or reports no `auth_time`) cannot buy a session
+/// that step-up would only bounce straight back to SSO. A forced return whose
+/// `auth_time` is stale signs in only if the session's existing stamp is still
+/// recent enough; it keeps that stamp. `None` means the session ends up with no
+/// stamp, and the caller clears it.
+fn resulting_sso_stamp(
+    session: &Session,
+    username: &str,
+    response: &SsoLoginResponse,
+    started_at: i64,
+    forced: bool,
+    now: OffsetDateTime,
+    step_up_interval: Option<Duration>,
+) -> Result<Option<i64>, StampRefused> {
+    let previous = match session.get_auth() {
+        Some(SessionAuthorization::User {
+            username: current, ..
+        }) if current == username => session
+            .get_last_sso_at()
+            .map(OffsetDateTime::unix_timestamp),
+        _ => None,
+    };
+    let new_stamp = sso_stamp(
+        response.auth_time,
+        started_at,
+        forced,
+        now.unix_timestamp(),
+        previous,
+    );
+    let resulting = new_stamp.or(previous);
+    if let Some(interval) = step_up_interval {
+        let recent = resulting.and_then(|at| OffsetDateTime::from_unix_timestamp(at).ok());
+        if !is_recent_enough(recent, interval, now) {
+            warn!(
+                username = %username,
+                forced,
+                has_auth_time = response.auth_time.is_some(),
+                "SSO login refused: the provider did not report a recent enough authentication"
+            );
+            return Err(StampRefused);
+        }
+    }
+    Ok(resulting)
 }
 
 #[cfg(test)]
