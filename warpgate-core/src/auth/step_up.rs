@@ -46,6 +46,50 @@ pub fn is_fresh(
     now - last <= interval_td
 }
 
+/// How far an identity provider's clock may differ from ours, in seconds,
+/// before [`sso_stamp`] stops trusting a time it reports.
+pub const SSO_STAMP_SKEW_SECS: i64 = 120;
+
+/// Decide what to write as the "last SSO" stamp after an SSO handshake returns.
+///
+/// The stamp records when the user last authenticated at the identity
+/// provider, so it comes from the ID token's `auth_time`, never from our own
+/// clock: an SSO session the provider merely resumed must not look fresh.
+///
+/// All times are unix seconds. `Some(x)` means write `x`; `None` means leave
+/// the stamp as it is.
+///
+/// - `auth_time` absent -> `None`.
+/// - `auth_time` more than [`SSO_STAMP_SKEW_SECS`] ahead of `now` -> `None`.
+/// - `forced` (the handshake demanded a fresh login) and `auth_time` more than
+///   the skew before `started_at` -> `None`: the provider did not log the user
+///   in again.
+/// - Otherwise the candidate is `auth_time` clamped to `now`, written only if
+///   it is later than `previous`, so a stamp never moves backwards.
+#[must_use]
+pub const fn sso_stamp(
+    auth_time: Option<i64>,
+    started_at: i64,
+    forced: bool,
+    now: i64,
+    previous: Option<i64>,
+) -> Option<i64> {
+    let Some(auth_time) = auth_time else {
+        return None;
+    };
+    if auth_time > now.saturating_add(SSO_STAMP_SKEW_SECS) {
+        return None;
+    }
+    if forced && auth_time < started_at.saturating_sub(SSO_STAMP_SKEW_SECS) {
+        return None;
+    }
+    let candidate = if auth_time < now { auth_time } else { now };
+    match previous {
+        Some(previous) if candidate <= previous => None,
+        _ => Some(candidate),
+    }
+}
+
 /// Where an open, key-authenticated connection stands against its step-up window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StepUpWindow {
@@ -685,6 +729,131 @@ mod tests {
         let now = OffsetDateTime::now_utc();
         let last = at(now, 60); // 1 min in the future
         assert!(is_fresh(Some(last), hours(12), now));
+    }
+
+    const T0: i64 = 1_800_000_000;
+
+    #[test]
+    fn sso_stamp_uses_auth_time_not_the_clock() {
+        // The provider says the user logged in 10 minutes ago; that is the
+        // stamp, not `now`.
+        let now = T0 + 600;
+        assert_eq!(sso_stamp(Some(T0), T0 + 590, false, now, None), Some(T0));
+        assert_eq!(
+            sso_stamp(Some(T0), T0 + 590, false, now, Some(T0 - 1)),
+            Some(T0)
+        );
+    }
+
+    #[test]
+    fn sso_stamp_ignores_missing_auth_time() {
+        assert_eq!(sso_stamp(None, T0, false, T0, None), None);
+        assert_eq!(sso_stamp(None, T0, true, T0, Some(T0 - 5)), None);
+    }
+
+    #[test]
+    fn forced_sso_stamp_ignores_auth_time_before_the_handshake() {
+        // A forced handshake that returns a login from before it began did not
+        // re-authenticate the user.
+        let started = T0 + 1000;
+        let now = started + 5;
+        assert_eq!(
+            sso_stamp(
+                Some(started - SSO_STAMP_SKEW_SECS - 1),
+                started,
+                true,
+                now,
+                None
+            ),
+            None
+        );
+        // Within the skew allowance of the start it is accepted.
+        assert_eq!(
+            sso_stamp(
+                Some(started - SSO_STAMP_SKEW_SECS),
+                started,
+                true,
+                now,
+                None
+            ),
+            Some(started - SSO_STAMP_SKEW_SECS)
+        );
+        // A login after the start is accepted.
+        assert_eq!(
+            sso_stamp(Some(started + 2), started, true, now, None),
+            Some(started + 2)
+        );
+    }
+
+    #[test]
+    fn sso_stamp_accepts_an_old_auth_time_when_not_forced_and_newer_than_previous() {
+        let started = T0 + 10_000;
+        let now = started + 5;
+        let old = T0 + 100;
+        assert_eq!(sso_stamp(Some(old), started, false, now, None), Some(old));
+        assert_eq!(
+            sso_stamp(Some(old), started, false, now, Some(old - 1)),
+            Some(old)
+        );
+        // Not newer than what is already stored: left alone.
+        assert_eq!(sso_stamp(Some(old), started, false, now, Some(old)), None);
+        assert_eq!(
+            sso_stamp(Some(old), started, false, now, Some(old + 1)),
+            None
+        );
+    }
+
+    #[test]
+    fn sso_stamp_clamps_future_auth_time_within_skew() {
+        let now = T0;
+        assert_eq!(
+            sso_stamp(Some(now + SSO_STAMP_SKEW_SECS), now, false, now, None),
+            Some(now)
+        );
+        assert_eq!(sso_stamp(Some(now + 1), now, true, now, None), Some(now));
+    }
+
+    #[test]
+    fn sso_stamp_ignores_auth_time_beyond_skew() {
+        let now = T0;
+        assert_eq!(
+            sso_stamp(Some(now + SSO_STAMP_SKEW_SECS + 1), now, false, now, None),
+            None
+        );
+        assert_eq!(
+            sso_stamp(
+                Some(now + SSO_STAMP_SKEW_SECS + 1),
+                now,
+                true,
+                now,
+                Some(now - 50)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn sso_stamp_never_moves_backwards() {
+        let now = T0 + 1000;
+        // Older, equal: unchanged.
+        assert_eq!(
+            sso_stamp(Some(T0 + 10), now, false, now, Some(T0 + 20)),
+            None
+        );
+        assert_eq!(
+            sso_stamp(Some(T0 + 20), now, false, now, Some(T0 + 20)),
+            None
+        );
+        // A previous stamp ahead of the clock (skew) is not overwritten by now.
+        assert_eq!(
+            sso_stamp(Some(now + 60), now, false, now, Some(now + 90)),
+            None
+        );
+        // Newer: moves forward.
+        assert_eq!(
+            sso_stamp(Some(T0 + 30), now, false, now, Some(T0 + 20)),
+            Some(T0 + 30)
+        );
     }
 
     async fn setup_db() -> DatabaseConnection {
