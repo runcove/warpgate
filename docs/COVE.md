@@ -89,19 +89,20 @@ With `force=1`:
 - a ticket session gets 403 (above);
 - the authorize request carries `prompt=login` (except where the provider
   type rejects it; see the per-provider paragraph below) and `max_age=0`, so
-  the identity provider asks the user to sign in again rather than resume its
-  own session. Every other SSO start (the login page's provider buttons, the
-  auto-redirect) never sends `prompt`, and sends `max_age` in seconds when
-  HTTP step-up is configured, nothing otherwise. That `max_age` is
+  an identity provider that honours them asks the user to sign in again
+  rather than resume its own session. Every other SSO start (the login page's
+  provider buttons, the auto-redirect) never sends `prompt`, and sends
+  `max_age` in seconds when HTTP step-up is configured, nothing otherwise. That `max_age` is
   `step_up_interval.http` less a margin of a quarter of it (at most one hour),
   never below zero, so a login the provider takes as recent is stamped fresh
   for at least the margin after the return, and never outlasts the interval.
   The return applies the same value: a stamp not newer than now less that
   `max_age` does not count as recent;
-- a `force=1` or step-up start (every one, not only `force=1`) also sends the
-  OpenID Connect `claims` parameter
+- every `force=1` start and every start while HTTP step-up is configured also
+  sends the OpenID Connect `claims` parameter
   `{"id_token":{"auth_time":{"essential":true}}}`, for providers that include
-  `auth_time` only when asked.
+  `auth_time` only when asked. SSH-only step-up sends neither `claims` nor
+  `max_age`.
 
 Per provider type:
 
@@ -116,21 +117,32 @@ Per provider type:
   "Session age claims" turned on (Settings > Advanced Settings), in addition
   to the `claims` request. What users see: on Google, `force=1` essentially
   never yields a fresh stamp (a `force=1` return stamps only from an
-  `auth_time` not older than the handshake, see below), so cove refuses every
-  request that needs a fresh sign-in. Under HTTP step-up, a user whose Google
-  session is older than the `max_age` gets `sso_failed` on every plain start
-  until they sign out of Google; retrying does not help. Where Google reports
-  no `auth_time` at all, a sign-in under step-up succeeds only on a session
-  whose existing stamp is still recent.
-- **Apple** gets `claims` and, on `force=1`, `prompt=login`. Whether Apple
-  honours them is unverified.
-- **Entra** (`azure`) and `custom` providers get `prompt=login`; whether they
-  report `auth_time` is the provider's behaviour.
+  `auth_time` not older than the handshake, see below), so cove refuses a
+  request that needs a fresh sign-in unless the user actually signed in at
+  Google during that round (no Google session, for example after signing out
+  of Google) and the app reports `auth_time`. Under HTTP step-up, where Google
+  does report `auth_time`, a user whose Google session is older than the
+  `max_age` and whose Warpgate session holds no recent stamp gets `sso_failed`
+  on every plain start until they sign out of Google; retrying does not help.
+  Where Google reports no `auth_time` at all (the default for a Google app),
+  no Google sign-in ever stamps. Under HTTP step-up it succeeds only on a
+  session that already holds a recent stamp for the same user, which only a
+  return that carried `auth_time` (another provider) can have written; with
+  Google as the only provider, nobody can sign in, and signing out of Google
+  does not help.
+- **Apple** gets `max_age` and `claims` on every HTTP step-up start, and
+  `prompt=login` plus `max_age=0` on `force=1`. Whether Apple honours them is
+  unverified.
+- **Entra** (`azure`) and `custom` providers are treated the same way: `max_age`
+  and `claims` on every HTTP step-up start, and `prompt=login` plus `max_age=0`
+  on `force=1`. Whether they honour them, and whether they report `auth_time`,
+  is the provider's behaviour.
 
 Confirm each provider (Google, Apple, Entra and every `custom` one) before
-turning step-up on. Check a plain step-up start as well as `force=1`: every
-step-up start sends `claims` and `max_age`, so a provider that rejects
-`claims` would break every sign-in under step-up, not only the `force=1` ones.
+turning HTTP step-up on. Check a plain step-up start as well as `force=1`:
+every start under HTTP step-up sends `claims` and `max_age`, so a provider that
+rejects `claims` would break every sign-in under step-up, not only the
+`force=1` ones.
 
 The return stamps the session's `last_sso_at`. A password, OTP or passkey
 sign-in never does, so `?login=password` never makes a session fresh.
@@ -166,9 +178,9 @@ step-up on, its users cannot sign in. Confirm that the provider returns
 
 Another site can still navigate the browser through `/sso/auto-start?force=1`
 (an unauthenticated GET; the session cookie is `SameSite=Lax`, so it is sent
-on a top-level navigation). `force=1` makes the user sign in again at the
-identity provider, so no stamp is refreshed without a fresh sign-in, but a
-user who is shown that prompt may complete it. `last_sso_at` is still not an
+on a top-level navigation). `force=1` asks the provider to make the user sign
+in again, so no stamp is refreshed without a fresh sign-in, but a user who is
+shown that prompt may complete it. `last_sso_at` is still not an
 intent token and not a CSRF token: a verifier (cove) must keep its own CSRF
 check and must not read a recent `last_sso_at` as proof that the user chose
 this action.
