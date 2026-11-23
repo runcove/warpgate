@@ -87,26 +87,50 @@ With `force=1`:
 - an unknown `provider`, or none named among several, gets the login page
   (302 to `/@warpgate#/login`, with `next`), never an error;
 - a ticket session gets 403 (above);
-- the authorize request carries `prompt=login` and `max_age=0`, so the
-  identity provider asks the user to sign in again rather than resume its own
-  session. Every other SSO start (the login page's provider buttons, the
+- the authorize request carries `prompt=login` (except where the provider
+  type rejects it; see the per-provider paragraph below) and `max_age=0`, so
+  the identity provider asks the user to sign in again rather than resume its
+  own session. Every other SSO start (the login page's provider buttons, the
   auto-redirect) never sends `prompt`, and sends `max_age` in seconds when
   HTTP step-up is configured, nothing otherwise. That `max_age` is
   `step_up_interval.http` less a margin of a quarter of it (at most one hour),
-  never below zero, so a login the provider takes as recent keeps a stamp that
-  outlasts the interval by the margin. The return applies the same value: a
-  stamp not newer than now less that `max_age` does not count as recent;
-- a `force=1` or step-up start also sends the OpenID Connect `claims`
-  parameter `{"id_token":{"auth_time":{"essential":true}}}`, for providers
-  that include `auth_time` only when asked.
+  never below zero, so a login the provider takes as recent is stamped fresh
+  for at least the margin after the return, and never outlasts the interval.
+  The return applies the same value: a stamp not newer than now less that
+  `max_age` does not count as recent;
+- a `force=1` or step-up start (every one, not only `force=1`) also sends the
+  OpenID Connect `claims` parameter
+  `{"id_token":{"auth_time":{"essential":true}}}`, for providers that include
+  `auth_time` only when asked.
 
-Per provider type: Google rejects `prompt=login`, so a `google` provider gets
-`max_age=0` and the `claims` parameter without `prompt`, and a `force=1`
-return there still stamps only from an `auth_time` not older than the handshake
-(see below); if Google does not report one, the user cannot sign in under HTTP
-step-up. Entra (`azure`) and `custom` providers get `prompt=login`; whether
-they report `auth_time` is the provider's behaviour, so confirm it for each
-before turning step-up on.
+Per provider type:
+
+- **Google** rejects `prompt=login`, so a `google` provider gets `max_age` and
+  the `claims` parameter without `prompt`. Google does not support Google
+  Account reauth requests
+  (developers.google.com/identity/siwg/security-bundle); `max_age` is not
+  among Google's documented authorize parameters, and `prompt` allows only
+  `none`, `consent` and `select_account`
+  (developers.google.com/identity/openid-connect/reference). Google returns
+  `auth_time` only when the Google app is In production, Verified, and has
+  "Session age claims" turned on (Settings > Advanced Settings), in addition
+  to the `claims` request. What users see: on Google, `force=1` essentially
+  never yields a fresh stamp (a `force=1` return stamps only from an
+  `auth_time` not older than the handshake, see below), so cove refuses every
+  request that needs a fresh sign-in. Under HTTP step-up, a user whose Google
+  session is older than the `max_age` gets `sso_failed` on every plain start
+  until they sign out of Google; retrying does not help. Where Google reports
+  no `auth_time` at all, a sign-in under step-up succeeds only on a session
+  whose existing stamp is still recent.
+- **Apple** gets `claims` and, on `force=1`, `prompt=login`. Whether Apple
+  honours them is unverified.
+- **Entra** (`azure`) and `custom` providers get `prompt=login`; whether they
+  report `auth_time` is the provider's behaviour.
+
+Confirm each provider (Google, Apple, Entra and every `custom` one) before
+turning step-up on. Check a plain step-up start as well as `force=1`: every
+step-up start sends `claims` and `max_age`, so a provider that rejects
+`claims` would break every sign-in under step-up, not only the `force=1` ones.
 
 The return stamps the session's `last_sso_at`. A password, OTP or passkey
 sign-in never does, so `?login=password` never makes a session fresh.
