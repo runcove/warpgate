@@ -755,10 +755,10 @@ impl Api {
                     // user who only ever logs in via password would never
                     // re-SSO and the step-up gate would silently become a
                     // no-op.
-                    if let Some(at) = resulting_stamp
-                        && let Ok(at) = OffsetDateTime::from_unix_timestamp(at)
+                    match resulting_stamp.and_then(|at| OffsetDateTime::from_unix_timestamp(at).ok())
                     {
-                        session.set_last_sso_at(at);
+                        Some(at) => session.set_last_sso_at(at),
+                        None => session.clear_last_sso_at(),
                     }
                     state.emit_authenticated_event_once();
                     if let Some(ip) = client_ip {
@@ -957,8 +957,10 @@ mod tests {
     use super::{
         SsoFailure, SsoLoginError, blocked_address_failure, finish_sso_return,
         is_safe_redirect_target, make_redirect_url, next_with_login_error, post_login_redirect,
-        rejected_credential_failure,
+        rejected_credential_failure, resulting_sso_stamp,
     };
+    use crate::common::SessionExt;
+    use crate::step_up::StepUpSessionExt;
     use crate::test_db::{insert_user, memory_db, services};
 
     /// `GET /sso/logout` is the deprecated operation: 405 with `Allow: POST`,
@@ -1459,5 +1461,108 @@ mod tests {
             format!("{ORIGIN}/cove/login?login_error=access_denied")
         );
         assert!(holds_role(&services, user_id, role_id).await);
+    }
+
+    fn hours(h: u64) -> std::time::Duration {
+        std::time::Duration::from_secs(h * 3600)
+    }
+
+    fn user_session(username: &str) -> poem::session::Session {
+        let session = poem::session::Session::default();
+        session.set_auth(warpgate_common_http::SessionAuthorization::User {
+            user_id: Uuid::new_v4(),
+            username: username.into(),
+        });
+        session
+    }
+
+    fn response_with(auth_time: Option<i64>) -> SsoLoginResponse {
+        SsoLoginResponse {
+            auth_time,
+            ..sso_response(&[])
+        }
+    }
+
+    /// Alice returns with a fresh login; Bob then returns on the same session
+    /// with no `auth_time`, or a stale one. Alice's stamp is not Bob's.
+    #[test]
+    fn another_users_return_does_not_inherit_the_sessions_stamp() {
+        let now = time::OffsetDateTime::now_utc();
+        let t = now.unix_timestamp();
+        let session = user_session("alice");
+
+        let alice = resulting_sso_stamp(
+            &session,
+            "alice",
+            &response_with(Some(t - 10)),
+            t,
+            false,
+            now,
+            Some(hours(12)),
+        );
+        let stamp = alice.ok().flatten().expect("alice's return is accepted");
+        assert_eq!(stamp, t - 10);
+        session.set_last_sso_at(time::OffsetDateTime::from_unix_timestamp(stamp).unwrap());
+
+        for auth_time in [None, Some(t - 20 * 3600)] {
+            let bob = resulting_sso_stamp(
+                &session,
+                "bob",
+                &response_with(auth_time),
+                t,
+                false,
+                now,
+                Some(hours(12)),
+            );
+            assert!(bob.is_err(), "bob must not ride on alice's stamp");
+        }
+
+        // The same user's return with no `auth_time` keeps the stamp.
+        let again = resulting_sso_stamp(
+            &session,
+            "alice",
+            &response_with(None),
+            t,
+            false,
+            now,
+            Some(hours(12)),
+        );
+        assert_eq!(again.ok().flatten(), Some(t - 10));
+    }
+
+    /// Without step-up another user's return is accepted but leaves no stamp,
+    /// so the caller clears the previous user's.
+    #[test]
+    fn another_users_return_without_step_up_leaves_no_stamp() {
+        let now = time::OffsetDateTime::now_utc();
+        let t = now.unix_timestamp();
+        let session = user_session("alice");
+        session.set_last_sso_at(time::OffsetDateTime::from_unix_timestamp(t - 10).unwrap());
+
+        let bob = resulting_sso_stamp(&session, "bob", &response_with(None), t, false, now, None);
+        assert_eq!(bob.ok(), Some(None));
+    }
+
+    /// A login `interval - 5 s` old is inside the interval but not inside
+    /// `max_age`: refused. One inside `max_age` is accepted.
+    #[test]
+    fn a_return_needs_an_auth_time_inside_max_age() {
+        let now = time::OffsetDateTime::now_utc();
+        let t = now.unix_timestamp();
+        let interval = hours(12);
+        let session = user_session("alice");
+
+        let near_edge = response_with(Some(t - 12 * 3600 + 5));
+        assert!(
+            resulting_sso_stamp(&session, "alice", &near_edge, t, false, now, Some(interval))
+                .is_err()
+        );
+        let inside = response_with(Some(t - 10 * 3600));
+        assert_eq!(
+            resulting_sso_stamp(&session, "alice", &inside, t, false, now, Some(interval))
+                .ok()
+                .flatten(),
+            Some(t - 10 * 3600)
+        );
     }
 }
