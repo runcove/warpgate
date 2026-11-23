@@ -59,7 +59,9 @@ pub struct StatementClaims {
     pub name: String,
     /// From the cookie session, never from a request's made-up authorization
     pub auth: StatementAuth,
-    /// The session's last SSO return, Unix seconds; `null` when it never did SSO
+    /// When the identity provider says the user last signed in (the ID token's
+    /// `auth_time` at the session's last SSO return), Unix seconds; `null` when
+    /// the session never did SSO
     pub last_sso_at: Option<i64>,
     pub iat: i64,
     pub exp: i64,
