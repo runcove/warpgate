@@ -899,6 +899,7 @@ mod tests {
         let client = SsoClient::new(config.clone()).unwrap();
 
         // Handshake A completes normally, with a login from an hour ago.
+        let an_hour_ago = unix_now() - 3600;
         let a = client
             .start_login(RETURN_URL.into(), Reauth::None)
             .await
@@ -906,12 +907,12 @@ mod tests {
         let a_token = sign(
             &key,
             "k1",
-            &id_token_claims(&config, a.nonce.secret(), Some(unix_now() - 3600)),
+            &id_token_claims(&config, a.nonce.secret(), Some(an_hour_ago)),
         );
         *slot.lock().unwrap() = a_token.clone();
         assert_eq!(
             a.verify_code("code".into()).await.unwrap().auth_time,
-            Some(unix_now() - 3600)
+            Some(an_hour_ago)
         );
 
         // Handshake B is forced. A's valid token, replayed on B's return, is
