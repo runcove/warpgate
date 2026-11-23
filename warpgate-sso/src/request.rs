@@ -17,6 +17,14 @@ pub struct SsoLoginRequest {
     pub(crate) redirect_url: RedirectUrl,
     pub(crate) pkce_verifier: Option<PkceCodeVerifier>,
     pub(crate) config: SsoInternalProviderConfig,
+    /// When the handshake began, in unix seconds. A handshake stored before
+    /// this field existed reads as `0`.
+    #[serde(default)]
+    pub(crate) started_at: i64,
+    /// Whether the handshake demanded a fresh login at the provider
+    /// (`Reauth::Force`).
+    #[serde(default)]
+    pub(crate) forced: bool,
 }
 
 impl SsoLoginRequest {
@@ -26,6 +34,16 @@ impl SsoLoginRequest {
 
     pub const fn csrf_token(&self) -> &CsrfToken {
         &self.csrf_token
+    }
+
+    /// When the handshake began, in unix seconds.
+    pub const fn started_at(&self) -> i64 {
+        self.started_at
+    }
+
+    /// Whether the handshake demanded a fresh login at the provider.
+    pub const fn forced(&self) -> bool {
+        self.forced
     }
 
     pub fn verify_state(&self, state: &str) -> bool {
@@ -45,7 +63,18 @@ impl SsoLoginRequest {
         let result = SsoClient::new(config.clone())?
             .finish_login(self.pkce_verifier, self.redirect_url, &self.nonce, code)
             .await?;
-        Ok(map_sso_result(&config, result).await)
+        // The one place `auth_time` is read: from the ID token `finish_login`
+        // verified against this handshake's own nonce. Every other path that
+        // maps claims (the bearer-token flow) leaves it `None`, because a token
+        // not bound to a handshake of ours says nothing about when the user
+        // last signed in here, and a replayed older token must never stamp.
+        let auth_time = result
+            .claims
+            .auth_time()
+            .map(|auth_time| auth_time.timestamp());
+        let mut response = map_sso_result(&config, result).await;
+        response.auth_time = auth_time;
+        Ok(response)
     }
 }
 
@@ -127,6 +156,8 @@ pub async fn map_sso_result(
         access_roles: access_groups,
         admin_roles: admin_groups,
         id_token: result.token.clone(),
+        // Never read from the claims here: see `SsoLoginRequest::verify_code`.
+        auth_time: None,
         subject: result.claims.subject().to_string(),
         sid: result
             .claims

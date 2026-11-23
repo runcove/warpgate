@@ -11,7 +11,7 @@ use tracing::{debug, warn};
 use warpgate_common::WarpgateError;
 use warpgate_common_http::auth::UnauthenticatedRequestContext;
 use warpgate_common_http::ext::construct_external_url;
-use warpgate_sso::{SsoClient, SsoLoginRequest, SsoReturnUrlDomainPreference};
+use warpgate_sso::{Reauth, SsoClient, SsoLoginRequest, SsoReturnUrlDomainPreference};
 
 use crate::api::sso_provider_list::is_safe_redirect_target;
 use crate::common::{host_is_subdomain_of_or_equal, is_ticket_session, should_auto_sso_redirect};
@@ -182,7 +182,9 @@ pub(crate) async fn start_sso_and_get_auth_url(
     // `config` while a single login is mid-flight against the IdP.
     drop(config);
 
-    let sso_req = client.start_login(return_url.to_string()).await?;
+    let sso_req = client
+        .start_login(return_url.to_string(), Reauth::None)
+        .await?;
 
     let url = sso_req.auth_url().to_string();
     // The OAuth `state` (CSRF token) the IdP echoes back on the callback — the

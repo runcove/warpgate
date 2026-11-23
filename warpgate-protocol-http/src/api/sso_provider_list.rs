@@ -1277,6 +1277,7 @@ mod tests {
             access_roles: Some(groups.iter().map(|group| (*group).to_string()).collect()),
             admin_roles: None,
             id_token: ID_TOKEN.parse().unwrap(),
+            auth_time: None,
             subject: "subject-1".into(),
             sid: None,
             preferred_username: None,
