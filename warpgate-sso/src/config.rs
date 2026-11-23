@@ -305,6 +305,14 @@ impl SsoInternalProviderConfig {
         }
     }
 
+    /// Whether the provider accepts `prompt=login` on an authorize request.
+    /// Google rejects it, so a forced login there relies on `max_age=0` and on
+    /// the `auth_time` check at the return.
+    #[inline]
+    pub const fn supports_prompt_login(&self) -> bool {
+        !matches!(self, Self::Google { .. })
+    }
+
     #[inline]
     pub const fn auth_type(&self) -> AuthType {
         #[allow(clippy::match_like_matches_macro)]

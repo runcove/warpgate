@@ -146,6 +146,10 @@ pub enum Reauth {
     Force,
 }
 
+/// The `claims` authorize parameter that asks for `auth_time` in the ID token
+/// (OpenID Connect Core, section 5.5).
+const AUTH_TIME_CLAIMS_REQUEST: &str = r#"{"id_token":{"auth_time":{"essential":true}}}"#;
+
 /// The current time in unix seconds.
 fn unix_now() -> i64 {
     SystemTime::now()
@@ -306,10 +310,18 @@ impl SsoClient {
                 auth_req = auth_req.set_max_age(max_age);
             }
             Reauth::Force => {
-                auth_req = auth_req
-                    .add_prompt(CoreAuthPrompt::Login)
-                    .set_max_age(Duration::ZERO);
+                if self.config.supports_prompt_login() {
+                    auth_req = auth_req.add_prompt(CoreAuthPrompt::Login);
+                }
+                auth_req = auth_req.set_max_age(Duration::ZERO);
             }
+        }
+
+        // Providers that include `auth_time` only when asked (OpenID Connect
+        // Core 5.5) are asked for it. Sent whenever a re-authentication
+        // setting is in play; the plain login is left as it was.
+        if reauth != Reauth::None {
+            auth_req = auth_req.add_extra_param("claims", AUTH_TIME_CLAIMS_REQUEST);
         }
 
         for (k, v) in self.config.extra_parameters() {
@@ -551,6 +563,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
+    use openidconnect::ClientId;
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
@@ -968,6 +981,46 @@ mod tests {
         assert!(has(&query, "max_age", "0"), "{query:?}");
         assert!(request.forced());
         assert!((before..=unix_now()).contains(&request.started_at()));
+    }
+
+    #[tokio::test]
+    async fn a_reauth_request_asks_for_auth_time_in_the_id_token() {
+        let (config, _, _) = stand_in_idp().await;
+        let client = SsoClient::new(config).unwrap();
+        for reauth in [Reauth::Force, Reauth::MaxAge(Duration::from_secs(3600))] {
+            let request = client
+                .start_login(RETURN_URL.into(), reauth)
+                .await
+                .unwrap();
+            let query = query(&request);
+            assert!(
+                has(
+                    &query,
+                    "claims",
+                    r#"{"id_token":{"auth_time":{"essential":true}}}"#
+                ),
+                "{query:?}"
+            );
+        }
+        let request = client
+            .start_login(RETURN_URL.into(), Reauth::None)
+            .await
+            .unwrap();
+        assert!(!query(&request).iter().any(|(k, _)| k == "claims"));
+    }
+
+    #[test]
+    fn google_takes_no_prompt_login() {
+        let google = SsoInternalProviderConfig::Google {
+            client_id: ClientId::new("c".into()),
+            client_secret: ClientSecret::new("s".into()),
+            service_account_email: None,
+            service_account_key: None,
+            admin_email: None,
+            role_mappings: None,
+            admin_role_mappings: None,
+        };
+        assert!(!google.supports_prompt_login());
     }
 
     #[tokio::test]
