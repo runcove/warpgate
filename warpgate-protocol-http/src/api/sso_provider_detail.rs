@@ -1071,10 +1071,11 @@ mod ticket_session_tests {
     }
 
     #[tokio::test]
-    async fn a_plain_start_sends_the_step_up_interval_as_max_age_only_when_set() {
+    async fn a_plain_start_sends_the_step_up_interval_less_its_margin_as_max_age_only_when_set() {
         let mut b = browser(Some(Duration::from_secs(3600))).await;
         let started = b.start(PLAIN_START).await;
-        assert_eq!(started.query["max_age"], "3600");
+        // 3600 s less a quarter of it.
+        assert_eq!(started.query["max_age"], "2700");
         assert!(!started.query.contains_key("prompt"));
 
         let mut b = browser(None).await;
