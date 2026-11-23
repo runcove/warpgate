@@ -51,14 +51,15 @@ const REAUTH_MARGIN_CAP: Duration = Duration::from_secs(3600);
 
 /// The `max_age` an SSO start sends, and the age the SSO return accepts, for
 /// an HTTP step-up `interval`: the interval less a margin of a quarter of it
-/// (at most an hour), never below zero.
+/// in whole seconds (at most an hour), never below zero.
 ///
 /// The margin keeps a login the provider accepts as recent from being stamped
 /// so close to the interval that the step-up gate closes the session seconds
 /// later. The start and the return both call this, so they cannot drift.
 #[must_use]
 pub fn reauth_max_age(interval: Duration) -> Duration {
-    interval.saturating_sub((interval / 4).min(REAUTH_MARGIN_CAP))
+    let margin = Duration::from_secs(interval.as_secs() / 4).min(REAUTH_MARGIN_CAP);
+    interval.saturating_sub(margin)
 }
 
 /// Whether `stamp` is recent enough for an SSO return under HTTP step-up
