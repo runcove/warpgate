@@ -161,19 +161,23 @@ handshake is refused and never stamps. The stamp is written only when:
 
 - `auth_time` is present, and at most 120 s ahead of Warpgate's clock (a
   later one is ignored; one within the 120 s is clamped to now);
-- for a `force=1` handshake, `auth_time` is not more than 120 s before the
-  handshake began (an identity provider that ignored `prompt=login` and sent
-  an old sign-in time does not advance the stamp);
+- for a `force=1` handshake the window is tighter: `auth_time` is within 30 s
+  of the handshake's start (an identity provider that ignored `prompt=login`
+  and sent an old sign-in time does not advance the stamp) and at most 30 s
+  ahead of Warpgate's clock, and it is stamped exactly as given, never
+  clamped to now;
 - it is later than the stamp the session already has, so a stamp never moves
   backwards.
 
-Otherwise the return still signs the user in and leaves the stamp as it was,
-with one exception: when HTTP step-up is on and the session would be left with
-no recent stamp (newer than now less the `max_age` above), the sign-in is
+Otherwise a plain return still signs the user in and leaves the stamp as it
+was, with one exception: when HTTP step-up is on and the session would be left
+with no recent stamp (newer than now less the `max_age` above), the sign-in is
 refused (the `sso_failed` return), before the credential is submitted. A
-`force=1` return whose `auth_time` is stale therefore signs in only on a
-session whose existing stamp is still recent; a different user's return never
-inherits the session's stamp.
+`force=1` return is stricter, with or without step-up: if it yields no new
+stamp (`auth_time` absent, not a number, more than 30 s ahead, more than 30 s
+before the handshake began, or not later than the session's existing stamp) the
+sign-in is refused the same way and nothing is written. A different user's
+return never inherits the session's stamp.
 
 Known limit: a sign-in whose age is exactly the `max_age` can be refused once
 and pass on retry. The return counts a stamp as recent only when it is strictly

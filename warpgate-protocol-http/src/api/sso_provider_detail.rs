@@ -963,6 +963,12 @@ mod ticket_session_tests {
     impl SigningIdp {
         /// Makes the token endpoint answer with an ID token for `nonce`.
         fn issue(&self, nonce: &str, auth_time: Option<i64>) {
+            self.issue_raw(nonce, auth_time.map(serde_json::Value::from));
+        }
+
+        /// As `issue`, with the `auth_time` claim given as raw JSON so a
+        /// malformed one can be sent.
+        fn issue_raw(&self, nonce: &str, auth_time: Option<serde_json::Value>) {
             let now = unix_now();
             let mut claims = serde_json::json!({
                 "iss": self.issuer,
@@ -976,7 +982,7 @@ mod ticket_session_tests {
                 "preferred_username": "alice",
             });
             if let Some(auth_time) = auth_time {
-                claims["auth_time"] = serde_json::json!(auth_time);
+                claims["auth_time"] = auth_time;
             }
             let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
             header.kid = Some("k1".into());
@@ -1039,6 +1045,21 @@ mod ticket_session_tests {
         /// `nonce` carrying `auth_time`.
         async fn finish(&mut self, started: &Started, nonce: &str, auth_time: Option<i64>) {
             self.idp.issue(nonce, auth_time);
+            self.get(&format!(
+                "/api/sso/return?code=code&state={}",
+                started.state
+            ))
+            .await;
+        }
+
+        /// As `finish`, with `auth_time` as raw JSON.
+        async fn finish_raw(
+            &mut self,
+            started: &Started,
+            nonce: &str,
+            auth_time: Option<serde_json::Value>,
+        ) {
+            self.idp.issue_raw(nonce, auth_time);
             self.get(&format!(
                 "/api/sso/return?code=code&state={}",
                 started.state
@@ -1122,7 +1143,8 @@ mod ticket_session_tests {
 
         // Even a token bound to the forced handshake does not advance the
         // stamp when its auth_time predates the handshake: the provider did
-        // not log the user in again. The sign-in goes through; the stamp stays.
+        // not log the user in again. The forced sign-in is refused; the
+        // stamp stays.
         let forced = b.start(FORCE_START).await;
         b.finish(&forced, &forced.nonce, Some(old + 10)).await;
         assert_eq!(b.stamp().await, old.to_string());
@@ -1155,7 +1177,7 @@ mod ticket_session_tests {
     }
 
     #[tokio::test]
-    async fn a_stale_forced_return_signs_in_on_a_fresh_stamp_and_keeps_it() {
+    async fn a_stale_forced_return_is_refused_even_over_a_fresh_stamp() {
         let mut b = browser(Some(Duration::from_secs(3600))).await;
         let started = b.start(PLAIN_START).await;
         let recent = unix_now() - 60;
@@ -1163,11 +1185,75 @@ mod ticket_session_tests {
         assert_eq!(b.stamp().await, recent.to_string());
 
         // The provider reports a login from before the forced handshake: the
-        // stamp does not advance, and the still-fresh one carries the session.
+        // forced return is refused, so the stamp does not advance. (The
+        // session was already signed in; it is untouched.)
         let forced = b.start(FORCE_START).await;
         b.finish(&forced, &forced.nonce, Some(unix_now() - 1800))
             .await;
-        assert_eq!(b.kind().await, "user");
         assert_eq!(b.stamp().await, recent.to_string());
+    }
+
+    /// Forced returns on a fresh browser with step-up NOT configured: each
+    /// is refused, so no session and no stamp.
+    async fn assert_forced_return_refused(auth_time: Option<serde_json::Value>) {
+        let mut b = browser(None).await;
+        let started = b.start(FORCE_START).await;
+        b.finish_raw(&started, &started.nonce, auth_time.clone())
+            .await;
+        assert_eq!(b.kind().await, "none", "{auth_time:?}");
+        assert_eq!(b.stamp().await, "none", "{auth_time:?}");
+    }
+
+    #[tokio::test]
+    async fn a_forced_return_without_auth_time_is_refused_without_step_up() {
+        assert_forced_return_refused(None).await;
+    }
+
+    #[tokio::test]
+    async fn a_forced_return_with_a_malformed_auth_time_is_refused_without_step_up() {
+        for bad in [
+            serde_json::json!("yesterday"),
+            serde_json::json!(true),
+            serde_json::json!({"t": 1}),
+            serde_json::json!(null),
+        ] {
+            assert_forced_return_refused(Some(bad)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_forced_return_with_a_future_auth_time_is_refused_without_step_up() {
+        assert_forced_return_refused(Some((unix_now() + 3600).into())).await;
+    }
+
+    #[tokio::test]
+    async fn a_forced_return_with_an_auth_time_before_the_request_is_refused_without_step_up() {
+        assert_forced_return_refused(Some((unix_now() - 3600).into())).await;
+    }
+
+    #[tokio::test]
+    async fn a_forced_return_boundary_is_30_s_each_side() {
+        // Behind the clock, the request began about now: -31 refused, -29 let in.
+        assert_forced_return_refused(Some((unix_now() - 31 - 2).into())).await;
+        // Ahead of the clock: +31 refused (with margin for the test's own time).
+        assert_forced_return_refused(Some((unix_now() + 33).into())).await;
+        for (offset, ok) in [(-25, true), (25, true)] {
+            let mut b = browser(None).await;
+            let started = b.start(FORCE_START).await;
+            let at = unix_now() + offset;
+            b.finish(&started, &started.nonce, Some(at)).await;
+            assert_eq!(b.kind().await == "user", ok, "{offset}");
+            assert_eq!(b.stamp().await, at.to_string(), "{offset}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_forced_return_stamps_exactly_the_auth_time_even_a_little_ahead() {
+        let mut b = browser(None).await;
+        let started = b.start(FORCE_START).await;
+        let ahead = unix_now() + 20;
+        b.finish(&started, &started.nonce, Some(ahead)).await;
+        assert_eq!(b.kind().await, "user");
+        assert_eq!(b.stamp().await, ahead.to_string());
     }
 }

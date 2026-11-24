@@ -901,13 +901,16 @@ struct StampRefused;
 /// only when the session already belongs to the same user, since a different
 /// user's sign-in replaces the session and starts it with no stamp.
 ///
+/// A forced return (the handshake demanded a fresh login) whose `auth_time`
+/// yields no new stamp is always refused, with or without step-up: the
+/// provider did not show the user logging in again, and the session keeps no
+/// older stamp to stand in for it.
+///
 /// With HTTP step-up on, a return that would leave the session without a
 /// stamp that [`is_recent_enough`] is refused, so a provider that ignores the
 /// re-authentication request (or reports no `auth_time`) cannot buy a session
-/// that step-up would only bounce straight back to SSO. A forced return whose
-/// `auth_time` is stale signs in only if the session's existing stamp is still
-/// recent enough; it keeps that stamp. `None` means the session ends up with no
-/// stamp, and the caller clears it.
+/// that step-up would only bounce straight back to SSO. `None` means the
+/// session ends up with no stamp, and the caller clears it.
 fn resulting_sso_stamp(
     session: &Session,
     username: &str,
@@ -932,6 +935,14 @@ fn resulting_sso_stamp(
         now.unix_timestamp(),
         previous,
     );
+    if forced && new_stamp.is_none() {
+        warn!(
+            username = %username,
+            has_auth_time = response.auth_time.is_some(),
+            "SSO login refused: a forced sign-in carried no usable fresh auth_time"
+        );
+        return Err(StampRefused);
+    }
     let resulting = new_stamp.or(previous);
     if let Some(interval) = step_up_interval {
         let recent = resulting.and_then(|at| OffsetDateTime::from_unix_timestamp(at).ok());

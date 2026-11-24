@@ -84,6 +84,11 @@ pub fn is_recent_enough(
 /// before [`sso_stamp`] stops trusting a time it reports.
 pub const SSO_STAMP_SKEW_SECS: i64 = 120;
 
+/// The tighter allowance for a forced (`force=1`) return, in seconds, both
+/// before the handshake began and ahead of our clock: [`sso_stamp`] accepts a
+/// forced `auth_time` only within `[started_at - 30, now + 30]`.
+pub const FORCED_SSO_SKEW_SECS: i64 = 30;
+
 /// Decide what to write as the "last SSO" stamp after an SSO handshake returns.
 ///
 /// The stamp records when the user last authenticated at the identity
@@ -94,12 +99,15 @@ pub const SSO_STAMP_SKEW_SECS: i64 = 120;
 /// the stamp as it is.
 ///
 /// - `auth_time` absent -> `None`.
-/// - `auth_time` more than [`SSO_STAMP_SKEW_SECS`] ahead of `now` -> `None`.
-/// - `forced` (the handshake demanded a fresh login) and `auth_time` more than
-///   the skew before `started_at` -> `None`: the provider did not log the user
-///   in again.
-/// - Otherwise the candidate is `auth_time` clamped to `now`, written only if
-///   it is later than `previous`, so a stamp never moves backwards.
+/// - Unforced: `auth_time` more than [`SSO_STAMP_SKEW_SECS`] ahead of `now` ->
+///   `None`; otherwise the candidate is `auth_time` clamped to `now`.
+/// - Forced (the handshake demanded a fresh login): `auth_time` outside
+///   `[started_at - FORCED_SSO_SKEW_SECS, now + FORCED_SSO_SKEW_SECS]` ->
+///   `None`; otherwise the candidate is exactly `auth_time`, never clamped, so
+///   our own clock never stands in for the provider's.
+///
+/// The candidate is written only if it is later than `previous`, so a stamp
+/// never moves backwards.
 #[must_use]
 pub const fn sso_stamp(
     auth_time: Option<i64>,
@@ -111,13 +119,19 @@ pub const fn sso_stamp(
     let Some(auth_time) = auth_time else {
         return None;
     };
-    if auth_time > now.saturating_add(SSO_STAMP_SKEW_SECS) {
-        return None;
-    }
-    if forced && auth_time < started_at.saturating_sub(SSO_STAMP_SKEW_SECS) {
-        return None;
-    }
-    let candidate = if auth_time < now { auth_time } else { now };
+    let candidate = if forced {
+        if auth_time > now.saturating_add(FORCED_SSO_SKEW_SECS)
+            || auth_time < started_at.saturating_sub(FORCED_SSO_SKEW_SECS)
+        {
+            return None;
+        }
+        auth_time
+    } else {
+        if auth_time > now.saturating_add(SSO_STAMP_SKEW_SECS) {
+            return None;
+        }
+        if auth_time < now { auth_time } else { now }
+    };
     match previous {
         Some(previous) if candidate <= previous => None,
         _ => Some(candidate),
@@ -793,7 +807,7 @@ mod tests {
         let now = started + 5;
         assert_eq!(
             sso_stamp(
-                Some(started - SSO_STAMP_SKEW_SECS - 1),
+                Some(started - FORCED_SSO_SKEW_SECS - 1),
                 started,
                 true,
                 now,
@@ -804,18 +818,44 @@ mod tests {
         // Within the skew allowance of the start it is accepted.
         assert_eq!(
             sso_stamp(
-                Some(started - SSO_STAMP_SKEW_SECS),
+                Some(started - FORCED_SSO_SKEW_SECS),
                 started,
                 true,
                 now,
                 None
             ),
-            Some(started - SSO_STAMP_SKEW_SECS)
+            Some(started - FORCED_SSO_SKEW_SECS)
         );
         // A login after the start is accepted.
         assert_eq!(
             sso_stamp(Some(started + 2), started, true, now, None),
             Some(started + 2)
+        );
+    }
+
+    #[test]
+    fn forced_sso_stamp_window_is_30_s_each_side() {
+        let started = T0 + 1000;
+        let now = started + 5;
+        // Before the request: -31 refused, -29 accepted as given.
+        assert_eq!(
+            sso_stamp(Some(started - 31), started, true, now, None),
+            None
+        );
+        assert_eq!(
+            sso_stamp(Some(started - 29), started, true, now, None),
+            Some(started - 29)
+        );
+        // Ahead of the clock: +31 refused, +29 accepted as given, not `now`.
+        assert_eq!(sso_stamp(Some(now + 31), started, true, now, None), None);
+        assert_eq!(
+            sso_stamp(Some(now + 29), started, true, now, None),
+            Some(now + 29)
+        );
+        // The unforced path keeps its 120 s allowance.
+        assert_eq!(
+            sso_stamp(Some(now + 100), started, false, now, None),
+            Some(now)
         );
     }
 
@@ -844,7 +884,28 @@ mod tests {
             sso_stamp(Some(now + SSO_STAMP_SKEW_SECS), now, false, now, None),
             Some(now)
         );
-        assert_eq!(sso_stamp(Some(now + 1), now, true, now, None), Some(now));
+    }
+
+    #[test]
+    fn forced_sso_stamp_is_auth_time_itself_never_now() {
+        // Forced, a future auth_time within the skew is stamped as given, not
+        // replaced by our clock; unforced it is clamped to `now`.
+        let now = T0;
+        for ahead in [1, FORCED_SSO_SKEW_SECS] {
+            assert_eq!(
+                sso_stamp(Some(now + ahead), now, true, now, None),
+                Some(now + ahead)
+            );
+            assert_eq!(
+                sso_stamp(Some(now + ahead), now, false, now, None),
+                Some(now)
+            );
+        }
+        // A past auth_time inside the window is stamped as given too.
+        assert_eq!(
+            sso_stamp(Some(now - 5), now, true, now, None),
+            Some(now - 5)
+        );
     }
 
     #[test]
@@ -856,7 +917,7 @@ mod tests {
         );
         assert_eq!(
             sso_stamp(
-                Some(now + SSO_STAMP_SKEW_SECS + 1),
+                Some(now + FORCED_SSO_SKEW_SECS + 1),
                 now,
                 true,
                 now,
