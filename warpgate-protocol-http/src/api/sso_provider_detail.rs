@@ -1191,6 +1191,7 @@ mod ticket_session_tests {
         b.finish(&forced, &forced.nonce, Some(unix_now() - 1800))
             .await;
         assert_eq!(b.stamp().await, recent.to_string());
+        assert_eq!(b.kind().await, "user");
     }
 
     /// A provider that answers the forced handshake from its own session
@@ -1296,8 +1297,13 @@ mod ticket_session_tests {
     async fn a_forced_return_boundary_is_30_s_each_side() {
         // Behind the clock, the request began about now: -31 refused, -29 let in.
         assert_forced_return_refused(Some((unix_now() - 31 - 2).into())).await;
-        // Ahead of the clock: +31 refused (with margin for the test's own time).
-        assert_forced_return_refused(Some((unix_now() + 33).into())).await;
+        // Ahead of the clock: checked against the clock at the return, which
+        // a loaded test run reaches seconds after this line, so a tight +31
+        // races. +90 is past the forced 30 s window but inside the unforced
+        // 120 s skew, so it still shows the forced window applies; the exact
+        // +/-30 s edges are pinned on a fixed clock in warpgate-core's
+        // forced_sso_stamp_window_is_30_s_each_side.
+        assert_forced_return_refused(Some((unix_now() + 90).into())).await;
         for (offset, ok) in [(-25, true), (25, true)] {
             let mut b = browser(None).await;
             let started = b.start(FORCE_START).await;
