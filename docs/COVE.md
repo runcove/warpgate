@@ -13,13 +13,22 @@ Only a safe `next` qualifies: a site-relative path starting with a single `/`
 (not `//`, not `/\`, not an absolute URL). The redirect goes to the origin the
 SSO return URL named, so `next` can never carry the browser off-site.
 
-`/sso/auto-start` is the one entry that also takes an absolute `next`: an
-`https://` URL whose host is Warpgate's configured `external_host` (or control-plane host) or a
-whole-label subdomain of it (`a.example.com` for `example.com`, never
-`badexample.com`), on the port Warpgate is configured to be reached on (443 by
-default). Plain `http`, user info, `//host`, a trailing dot, an IP address, a
-backslash or whitespace, and any other host or port are dropped, and the
-browser lands on the login page instead.
+Every SSO entry (`/sso/auto-start` and `/sso/providers/{name}/start`) also
+takes an absolute `next`: an `https://` URL whose host is Warpgate's
+configured `external_host` (or control-plane host) or a whole-label subdomain
+of it (`a.example.com` for `example.com`, never `badexample.com`). Its port
+must be `http.external_port`, else the listen port (8888 by default); an
+`https` URL with no port means 443. Plain `http`, user info, `//host`, a
+trailing dot or empty label, an IP address, a backslash or whitespace, and any
+other host or port are refused. `/sso/auto-start` drops a refused `next` at
+once; the SSO return checks it again, and a refused one lands the browser on
+the login page. An allowed absolute `next` is followed in its canonical form
+(lower-case host, punycode).
+
+A failure of the sign-in does not carry `login_error` or `retry_after` to an
+absolute `next`: those go only to a relative `next`. After a failure with an
+absolute `next` the browser goes to `/@warpgate?login_error=...`, or gets an
+error response where the code could not be verified.
 
 ### Parameters
 

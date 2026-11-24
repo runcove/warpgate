@@ -29,7 +29,7 @@ use crate::api::auth_scheme::AuthedSession;
 use crate::api::common::{emit_unknown_authentication_failed_event, logout};
 use crate::common::{
     SessionExt, authorize_session, gateway_pages_origin, get_or_create_auth_state_for_request,
-    session_id_for_login,
+    session_cookie_base_host, session_id_for_login,
 };
 use crate::session::SessionStore;
 use crate::step_up::StepUpSessionExt;
@@ -387,10 +387,13 @@ impl NextOrigins {
                 .await
                 .ok()
                 .and_then(|url| host_port(&url)),
-            cookie: construct_external_url(None, config, None)
-                .await
-                .ok()
-                .and_then(|url| host_port(&url)),
+            cookie: match (
+                session_cookie_base_host(config).await,
+                construct_external_url(None, config, None).await.ok(),
+            ) {
+                (Some(host), Some(url)) => url.port_or_known_default().map(|port| (host, port)),
+                _ => None,
+            },
         }
     }
 }
@@ -409,11 +412,11 @@ pub(crate) fn is_allowed_next(next: &str, origins: &NextOrigins) -> bool {
 ///   starts with `https://` (any case) and no third slash;
 /// - it parses, with scheme `https`, no userinfo, and a domain host (never an
 ///   IP literal) with no trailing dot;
-/// - the host is the control-plane host, or the cookie domain, or a
-///   whole-label subdomain of it (`a.example.com` for `example.com`, never
+/// - the host (no empty label, so no trailing dot) is the control-plane host,
+///   or the cookie domain, or a whole-label subdomain of it (`a.example.com` for `example.com`, never
 ///   `evilexample.com`);
-/// - the port, default `443` when none is written, is the one Warpgate is
-///   configured to be reached on at that host.
+/// - the port (`443` when none is written) is the configured external port,
+///   else the listen port.
 ///
 /// The parser lower-cases the host and turns IDNA into punycode, so hosts are
 /// compared as ASCII.
@@ -445,7 +448,7 @@ fn is_allowed_absolute_next(next: &str, origins: &NextOrigins) -> bool {
     let Some(port) = url.port_or_known_default() else {
         return false;
     };
-    if host.is_empty() || host.ends_with('.') {
+    if host.split('.').any(str::is_empty) {
         return false;
     }
     let is_control = origins
@@ -467,12 +470,15 @@ fn is_allowed_absolute_next(next: &str, origins: &NextOrigins) -> bool {
 /// checked before they meet here — the path by [`is_safe_redirect_target`],
 /// the origin by `construct_external_url`'s domain whitelist — so neither a
 /// crafted `next` nor a forged `Host` header can send the user off-site. An
-/// absolute `next` that [`is_allowed_absolute_next`] still allows goes as it
-/// is.
+/// absolute `next` that [`is_allowed_absolute_next`] still allows goes as the
+/// parser's canonical form (lower-case host, punycode).
 fn post_login_redirect(next: Option<&str>, return_origin: &str, origins: &NextOrigins) -> String {
     match next {
         Some(next) if is_safe_redirect_target(next) => format!("{return_origin}{next}"),
-        Some(next) if is_allowed_absolute_next(next, origins) => next.to_owned(),
+        Some(next) if is_allowed_absolute_next(next, origins) => url::Url::parse(next).map_or_else(
+            |_| format!("{return_origin}/@warpgate#/login"),
+            String::from,
+        ),
         _ => format!("{return_origin}/@warpgate#/login"),
     }
 }
@@ -1248,6 +1254,7 @@ mod tests {
             ("nul", "https://cove.test/\0"),
             ("encoded dot lookalike", "https://cove%2etest.evil.net/x"),
             ("empty label", "https://.cove.test/x"),
+            ("empty inner label", "https://a..cove.test/x"),
             ("other scheme", "javascript:alert(1)"),
             ("empty", ""),
             ("bare scheme", "https://"),
@@ -1291,6 +1298,22 @@ mod tests {
                 &origins()
             ),
             "https://gate.example/@warpgate#/login"
+        );
+    }
+
+    #[test]
+    fn an_allowed_absolute_next_is_returned_in_canonical_form() {
+        let origins = NextOrigins {
+            control: None,
+            cookie: Some(("xn--bcher-kva.test".into(), 443)),
+        };
+        assert_eq!(
+            post_login_redirect(
+                Some("https://WWW.B\u{dc}cher.test/Page"),
+                "https://gate.example",
+                &origins
+            ),
+            "https://www.xn--bcher-kva.test/Page"
         );
     }
 

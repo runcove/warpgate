@@ -1084,13 +1084,17 @@ mod ticket_session_tests {
 
     /// Where the browser ends up after a forced sign-in started with `next`.
     async fn landing_after_sso(next: &str) -> String {
+        landing_after_start(&format!(
+            "{FORCE_START}&next={}",
+            utf8_percent_encode_all(next)
+        ))
+        .await
+    }
+
+    /// Where the browser ends up after a sign-in begun at `start_path`.
+    async fn landing_after_start(start_path: &str) -> String {
         let mut b = browser(None).await;
-        let started = b
-            .start(&format!(
-                "{FORCE_START}&next={}",
-                utf8_percent_encode_all(next)
-            ))
-            .await;
+        let started = b.start(start_path).await;
         b.idp.issue(&started.nonce, Some(unix_now()));
         let resp = b
             .get(&format!(
@@ -1098,18 +1102,25 @@ mod ticket_session_tests {
                 started.state
             ))
             .await;
-        assert_eq!(b.kind().await, "user", "{next}");
+        assert_eq!(b.kind().await, "user", "{start_path}");
         location(&resp)
     }
 
     #[tokio::test]
     async fn an_allowed_absolute_next_is_where_the_browser_lands_after_sso() {
-        for next in [
-            "https://cove.warpgate.test/vms?x=1#top",
-            "https://WARPGATE.test/page",
-            "https://warpgate.test/@warpgate#/profile",
+        // The canonical form: lower-case host.
+        for (next, landing) in [
+            (
+                "https://cove.warpgate.test/vms?x=1#top",
+                "https://cove.warpgate.test/vms?x=1#top",
+            ),
+            ("https://WARPGATE.test/page", "https://warpgate.test/page"),
+            (
+                "https://warpgate.test/@warpgate#/profile",
+                "https://warpgate.test/@warpgate#/profile",
+            ),
         ] {
-            assert_eq!(landing_after_sso(next).await, next);
+            assert_eq!(landing_after_sso(next).await, landing);
         }
         // Relative paths still resolve against the return origin.
         let landing = landing_after_sso("/vms?x=1").await;
@@ -1133,6 +1144,29 @@ mod ticket_session_tests {
             assert!(!landing.contains("evil"), "{next}: {landing}");
             assert!(!landing.contains("cove."), "{next}: {landing}");
         }
+    }
+
+    #[tokio::test]
+    async fn the_plain_provider_start_drops_a_refused_absolute_next_at_the_return() {
+        for next in ["https://evil.example/x", "http://cove.warpgate.test/x"] {
+            let landing = landing_after_start(&format!(
+                "{PLAIN_START}?next={}",
+                utf8_percent_encode_all(next)
+            ))
+            .await;
+            assert!(landing.ends_with("/@warpgate#/login"), "{next}: {landing}");
+            assert!(!landing.contains("evil"), "{next}: {landing}");
+            assert!(!landing.contains("cove."), "{next}: {landing}");
+        }
+        // An allowed one goes through the same entry.
+        assert_eq!(
+            landing_after_start(&format!(
+                "{PLAIN_START}?next={}",
+                utf8_percent_encode_all("https://cove.warpgate.test/vms")
+            ))
+            .await,
+            "https://cove.warpgate.test/vms"
+        );
     }
 
     #[tokio::test]
