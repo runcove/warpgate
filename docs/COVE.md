@@ -186,6 +186,13 @@ treats a login exactly that old as still recent and resumes its session. The
 retry is older than `max_age`, so the provider asks for a new sign-in, which
 passes.
 
+Known limit: an identity provider that answers `prompt=login` / `max_age=0`
+from its own session, without asking the user to sign in again, returns the
+same `auth_time` as before. That is not later than the session's stamp, so a
+`force=1` step-up fails with the no-recent-authentication refusal
+(`sso_failed`). The user must sign in again at the identity provider (sign out
+there, or end its session) and retry.
+
 An identity provider that does not return `auth_time` never stamps; with HTTP
 step-up on, its users cannot sign in. Confirm that the provider returns
 `auth_time` after `prompt=login` before relying on it.

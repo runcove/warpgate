@@ -1193,6 +1193,40 @@ mod ticket_session_tests {
         assert_eq!(b.stamp().await, recent.to_string());
     }
 
+    /// A provider that answers the forced handshake from its own session
+    /// reports the same `auth_time` as the sign-in it already stamped. That
+    /// time can sit inside the forced window, so only "not newer than the
+    /// stamp" refuses it, and the user gets the same no-recent-authentication
+    /// refusal as every other return that yields no new stamp.
+    #[tokio::test]
+    async fn a_forced_return_with_an_unchanged_auth_time_is_refused_as_no_new_stamp() {
+        let mut b = browser(None).await;
+        let started = b.start(PLAIN_START).await;
+        let signed_in = unix_now() - 5;
+        b.finish(&started, &started.nonce, Some(signed_in)).await;
+        assert_eq!(b.stamp().await, signed_in.to_string());
+
+        let forced = b.start(FORCE_START).await;
+        b.idp.issue(&forced.nonce, Some(signed_in));
+        let resp = b
+            .get(&format!("/api/sso/return?code=code&state={}", forced.state))
+            .await;
+        assert_eq!(resp.0.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert!(
+            location(&resp).ends_with(
+                "/@warpgate?login_error=The+SSO+provider+did+not+report+a+recent+authentication"
+            ),
+            "{}",
+            location(&resp)
+        );
+        assert_eq!(b.stamp().await, signed_in.to_string());
+
+        // Control: one second newer is a fresh login and is stamped.
+        let forced = b.start(FORCE_START).await;
+        b.finish(&forced, &forced.nonce, Some(signed_in + 1)).await;
+        assert_eq!(b.stamp().await, (signed_in + 1).to_string());
+    }
+
     /// Forced returns on a fresh browser with step-up NOT configured: each
     /// is refused, so no session and no stamp.
     async fn assert_forced_return_refused(auth_time: Option<serde_json::Value>) {
