@@ -16,7 +16,7 @@ use uuid::Uuid;
 use warpgate_common::WarpgateError;
 use warpgate_common::auth::AuthCredential;
 use warpgate_common_http::auth::UnauthenticatedRequestContext;
-use warpgate_common_http::ext::construct_external_url;
+use warpgate_common_http::ext::{construct_control_plane_url, construct_external_url};
 use warpgate_common_http::logging::get_client_ip_addr;
 use warpgate_common_http::{SessionAuthorization, warpgate_csp_with_script_nonce};
 use warpgate_core::ConfigProvider;
@@ -366,16 +366,115 @@ pub(crate) fn is_safe_redirect_target(next: &str) -> bool {
     !rest.starts_with(['/', '\\'])
 }
 
-/// Resolves the post-login redirect against the origin the identity provider
-/// returned the browser to. Both halves are checked before they meet here — the
-/// path by [`is_safe_redirect_target`], the origin by `construct_external_url`'s
-/// domain whitelist — so neither a crafted `next` nor a forged `Host` header can
-/// send the user off-site.
-fn post_login_redirect(next: Option<&str>, return_origin: &str) -> String {
-    let next = next
-        .filter(|next| is_safe_redirect_target(next))
-        .unwrap_or("/@warpgate#/login");
-    format!("{return_origin}{next}")
+/// The hosts an absolute `next` may name, each with the port Warpgate is
+/// reached on there. Built from the config, never from the request, so a
+/// forged `Host` header cannot widen it.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct NextOrigins {
+    /// The control-plane host (`http.external_host`, else `external_host`).
+    control: Option<(String, u16)>,
+    /// The session cookie's domain (`external_host`): it and its subdomains.
+    cookie: Option<(String, u16)>,
+}
+
+impl NextOrigins {
+    pub(crate) async fn from_config(config: &warpgate_common::WarpgateConfig) -> Self {
+        fn host_port(url: &url::Url) -> Option<(String, u16)> {
+            Some((url.host_str()?.to_owned(), url.port_or_known_default()?))
+        }
+        Self {
+            control: construct_control_plane_url(config)
+                .await
+                .ok()
+                .and_then(|url| host_port(&url)),
+            cookie: construct_external_url(None, config, None)
+                .await
+                .ok()
+                .and_then(|url| host_port(&url)),
+        }
+    }
+}
+
+/// A post-login `next` the caller may carry: a site-relative path
+/// ([`is_safe_redirect_target`]) or an allowed absolute URL
+/// ([`is_allowed_absolute_next`]).
+pub(crate) fn is_allowed_next(next: &str, origins: &NextOrigins) -> bool {
+    is_safe_redirect_target(next) || is_allowed_absolute_next(next, origins)
+}
+
+/// Whether `next` is an absolute URL the browser may be sent to after
+/// sign-in, because the session cookie is shared with its host. Stricter than
+/// the web UI's `sanitizeRedirect`. All of these hold:
+/// - the raw text has no control character, whitespace or backslash, and
+///   starts with `https://` (any case) and no third slash;
+/// - it parses, with scheme `https`, no userinfo, and a domain host (never an
+///   IP literal) with no trailing dot;
+/// - the host is the control-plane host, or the cookie domain, or a
+///   whole-label subdomain of it (`a.example.com` for `example.com`, never
+///   `evilexample.com`);
+/// - the port, default `443` when none is written, is the one Warpgate is
+///   configured to be reached on at that host.
+///
+/// The parser lower-cases the host and turns IDNA into punycode, so hosts are
+/// compared as ASCII.
+fn is_allowed_absolute_next(next: &str, origins: &NextOrigins) -> bool {
+    const PREFIX: &str = "https://";
+    if next
+        .chars()
+        .any(|c| c.is_control() || c.is_whitespace() || c == '\\')
+    {
+        return false;
+    }
+    let Some(head) = next.get(..PREFIX.len()) else {
+        return false;
+    };
+    if !head.eq_ignore_ascii_case(PREFIX)
+        || next.get(PREFIX.len()..).is_none_or(|r| r.starts_with('/'))
+    {
+        return false;
+    }
+    let Ok(url) = url::Url::parse(next) else {
+        return false;
+    };
+    if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
+        return false;
+    }
+    let Some(url::Host::Domain(host)) = url.host() else {
+        return false;
+    };
+    let Some(port) = url.port_or_known_default() else {
+        return false;
+    };
+    if host.is_empty() || host.ends_with('.') {
+        return false;
+    }
+    let is_control = origins
+        .control
+        .as_ref()
+        .is_some_and(|(own, own_port)| host == own && port == *own_port);
+    let under_cookie = origins.cookie.as_ref().is_some_and(|(base, base_port)| {
+        port == *base_port
+            && (host == base
+                || host
+                    .strip_suffix(base.as_str())
+                    .is_some_and(|label| label.len() > 1 && label.ends_with('.')))
+    });
+    is_control || under_cookie
+}
+
+/// Resolves the post-login redirect. A relative `next` is resolved against the
+/// origin the identity provider returned the browser to; both halves are
+/// checked before they meet here — the path by [`is_safe_redirect_target`],
+/// the origin by `construct_external_url`'s domain whitelist — so neither a
+/// crafted `next` nor a forged `Host` header can send the user off-site. An
+/// absolute `next` that [`is_allowed_absolute_next`] still allows goes as it
+/// is.
+fn post_login_redirect(next: Option<&str>, return_origin: &str, origins: &NextOrigins) -> String {
+    match next {
+        Some(next) if is_safe_redirect_target(next) => format!("{return_origin}{next}"),
+        Some(next) if is_allowed_absolute_next(next, origins) => next.to_owned(),
+        _ => format!("{return_origin}/@warpgate#/login"),
+    }
 }
 
 /// Whole seconds from now to `expires_at`; zero once it has passed.
@@ -778,13 +877,18 @@ impl Api {
         }
         drop(state);
 
+        let next_origins = NextOrigins::from_config(&*services.config.lock().await).await;
         finish_sso_return(
             services,
             provider_config,
             &response,
             refused,
             &return_to,
-            post_login_redirect(context.next_url.as_deref(), &context.return_origin),
+            post_login_redirect(
+                context.next_url.as_deref(),
+                &context.return_origin,
+                &next_origins,
+            ),
         )
         .await
     }
@@ -967,9 +1071,9 @@ mod tests {
     use warpgate_sso::{SsoLoginResponse, SsoProviderConfig};
 
     use super::{
-        SsoFailure, SsoLoginError, blocked_address_failure, finish_sso_return,
-        is_safe_redirect_target, make_redirect_url, next_with_login_error, post_login_redirect,
-        rejected_credential_failure, resulting_sso_stamp,
+        NextOrigins, SsoFailure, SsoLoginError, blocked_address_failure, finish_sso_return,
+        is_allowed_next, is_safe_redirect_target, make_redirect_url, next_with_login_error,
+        post_login_redirect, rejected_credential_failure, resulting_sso_stamp,
     };
     use crate::common::SessionExt;
     use crate::step_up::StepUpSessionExt;
@@ -1075,10 +1179,129 @@ mod tests {
         assert!(!is_safe_redirect_target("http://evil.com"));
     }
 
+    /// Warpgate at `cove.test` (also its cookie domain), its control plane at
+    /// `portal.cove.test`, both on 443.
+    fn origins() -> NextOrigins {
+        NextOrigins {
+            control: Some(("portal.cove.test".into(), 443)),
+            cookie: Some(("cove.test".into(), 443)),
+        }
+    }
+
+    #[test]
+    fn the_allow_list_takes_what_it_should() {
+        for next in [
+            "/vms",
+            "https://portal.cove.test/@warpgate",
+            "https://cove.test/page?x=1#frag",
+            "https://cove.test",
+            "https://a.cove.test/page",
+            "https://a.b.cove.test/page",
+            "https://COVE.Test/page",
+            "https://A.Cove.TEST/page",
+            "HTTPS://cove.test/page",
+            "https://cove.test:443/page",
+        ] {
+            assert!(is_allowed_next(next, &origins()), "{next}");
+        }
+    }
+
+    #[test]
+    fn the_allow_list_refuses_what_it_should() {
+        for (why, next) in [
+            ("lookalike suffix", "https://evilcove.test/x"),
+            ("cookie domain as a suffix", "https://cove.test.evil.net/x"),
+            ("outside host", "https://evil.example/x"),
+            ("plain http", "http://cove.test/x"),
+            ("userinfo", "https://user@cove.test/x"),
+            ("userinfo with password", "https://user:pw@cove.test/x"),
+            (
+                "userinfo naming our host",
+                "https://cove.test@evil.example/x",
+            ),
+            (
+                "userinfo naming a lookalike",
+                "https://cove.test:pw@evil.example/",
+            ),
+            ("scheme-relative", "//cove.test/x"),
+            ("slash backslash", "/\\cove.test"),
+            ("double backslash", "\\\\cove.test"),
+            (
+                "backslash in the authority",
+                "https://evil.example\\@cove.test/",
+            ),
+            ("backslash after the scheme", "https:\\\\cove.test/"),
+            ("one slash", "https:/cove.test/x"),
+            ("three slashes", "https:///cove.test/x"),
+            ("trailing dot", "https://cove.test./x"),
+            ("wrong port", "https://cove.test:8443/x"),
+            ("port on a subdomain", "https://a.cove.test:444/x"),
+            (
+                "port on the control host",
+                "https://portal.cove.test:8443/x",
+            ),
+            ("ip literal", "https://127.0.0.1/x"),
+            ("whitespace", "https://cove.test/x y"),
+            ("leading space", " https://cove.test/x"),
+            ("tab", "https://cove.test/\tx"),
+            ("newline", "https://cove.test/\nx"),
+            ("nul", "https://cove.test/\0"),
+            ("encoded dot lookalike", "https://cove%2etest.evil.net/x"),
+            ("empty label", "https://.cove.test/x"),
+            ("other scheme", "javascript:alert(1)"),
+            ("empty", ""),
+            ("bare scheme", "https://"),
+        ] {
+            assert!(!is_allowed_next(next, &origins()), "{why}: {next:?}");
+        }
+    }
+
+    #[test]
+    fn idna_hosts_are_compared_as_punycode() {
+        let origins = NextOrigins {
+            control: None,
+            cookie: Some(("xn--bcher-kva.test".into(), 443)),
+        };
+        assert!(is_allowed_next("https://b\u{fc}cher.test/x", &origins));
+        assert!(is_allowed_next("https://www.b\u{fc}cher.test/x", &origins));
+        assert!(!is_allowed_next("https://bucher.test/x", &origins));
+    }
+
+    #[test]
+    fn nothing_absolute_is_allowed_without_a_configured_host() {
+        let none = NextOrigins::default();
+        assert!(!is_allowed_next("https://cove.test/x", &none));
+        assert!(is_allowed_next("/vms", &none));
+    }
+
+    #[test]
+    fn an_allowed_absolute_next_is_the_redirect_as_it_is() {
+        assert_eq!(
+            post_login_redirect(
+                Some("https://a.cove.test/page?x=1"),
+                "https://gate.example",
+                &origins()
+            ),
+            "https://a.cove.test/page?x=1"
+        );
+        assert_eq!(
+            post_login_redirect(
+                Some("https://evil.example/x"),
+                "https://gate.example",
+                &origins()
+            ),
+            "https://gate.example/@warpgate#/login"
+        );
+    }
+
     #[test]
     fn redirect_is_resolved_against_the_return_origin() {
         assert_eq!(
-            post_login_redirect(Some("/foo?x=1"), "https://gate.example:8888"),
+            post_login_redirect(
+                Some("/foo?x=1"),
+                "https://gate.example:8888",
+                &NextOrigins::default()
+            ),
             "https://gate.example:8888/foo?x=1"
         );
     }
@@ -1092,7 +1315,7 @@ mod tests {
             None,
         ] {
             assert_eq!(
-                post_login_redirect(next, "https://gate.example"),
+                post_login_redirect(next, "https://gate.example", &NextOrigins::default()),
                 "https://gate.example/@warpgate#/login",
                 "{next:?} must not leave the return origin"
             );

@@ -13,6 +13,14 @@ Only a safe `next` qualifies: a site-relative path starting with a single `/`
 (not `//`, not `/\`, not an absolute URL). The redirect goes to the origin the
 SSO return URL named, so `next` can never carry the browser off-site.
 
+`/sso/auto-start` is the one entry that also takes an absolute `next`: an
+`https://` URL whose host is Warpgate's configured `external_host` (or control-plane host) or a
+whole-label subdomain of it (`a.example.com` for `example.com`, never
+`badexample.com`), on the port Warpgate is configured to be reached on (443 by
+default). Plain `http`, user info, `//host`, a trailing dot, an IP address, a
+backslash or whitespace, and any other host or port are dropped, and the
+browser lands on the login page instead.
+
 ### Parameters
 
 | Parameter     | When                         | Value                                   |

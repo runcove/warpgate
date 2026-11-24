@@ -14,7 +14,7 @@ use warpgate_common_http::ext::construct_external_url;
 use warpgate_core::auth::step_up::reauth_max_age;
 use warpgate_sso::{Reauth, SsoClient, SsoLoginRequest, SsoReturnUrlDomainPreference};
 
-use crate::api::sso_provider_list::is_safe_redirect_target;
+use crate::api::sso_provider_list::{NextOrigins, is_allowed_next};
 use crate::common::{host_is_subdomain_of_or_equal, is_ticket_session, should_auto_sso_redirect};
 
 pub struct Api;
@@ -280,7 +280,7 @@ impl Api {
     ///
     /// Unauthenticated by design (mirrors `/sso/providers` + `/sso/*/start`):
     /// it only ever *initiates* a login, and the resulting `next` is validated
-    /// against [`is_safe_redirect_target`] before use.
+    /// against [`is_allowed_next`] before use.
     #[oai(
         path = "/sso/auto-start",
         method = "get",
@@ -297,9 +297,10 @@ impl Api {
         force: Query<Option<String>>,
         provider: Query<Option<String>>,
     ) -> Result<Response<AutoStartSsoResponse>, WarpgateError> {
-        // Drop an unsafe `next` (javascript:, //host, ...) rather than propagate
-        // it into either redirect target.
-        let next = next.0.filter(|n| is_safe_redirect_target(n));
+        // Drop an unsafe `next` (javascript:, //host, an absolute URL off our
+        // hosts, ...) rather than propagate it into either redirect target.
+        let origins = NextOrigins::from_config(&*ctx.services().config.lock().await).await;
+        let next = next.0.filter(|n| is_allowed_next(n, &origins));
         let has_password_bypass = login.0.as_deref() == Some("password");
         let force = force.0.as_deref() == Some("1");
 
@@ -677,6 +678,9 @@ mod ticket_session_tests {
         {
             let mut config = services.config.lock().await;
             config.store.external_host = Some(HOST.into());
+            // Warpgate is reached on 443, so an absolute `next` on it carries
+            // no port.
+            config.store.http.external_port = Some(443);
             config.store.sso_providers = providers;
             if let Some(http) = step_up_http {
                 config.store.step_up_interval = Some(warpgate_common::StepUpIntervalConfig {
@@ -1076,6 +1080,80 @@ mod ticket_session_tests {
             let resp = self.get("/kind").await;
             resp.0.into_body().into_string().await.unwrap()
         }
+    }
+
+    /// Where the browser ends up after a forced sign-in started with `next`.
+    async fn landing_after_sso(next: &str) -> String {
+        let mut b = browser(None).await;
+        let started = b
+            .start(&format!(
+                "{FORCE_START}&next={}",
+                utf8_percent_encode_all(next)
+            ))
+            .await;
+        b.idp.issue(&started.nonce, Some(unix_now()));
+        let resp = b
+            .get(&format!(
+                "/api/sso/return?code=code&state={}",
+                started.state
+            ))
+            .await;
+        assert_eq!(b.kind().await, "user", "{next}");
+        location(&resp)
+    }
+
+    #[tokio::test]
+    async fn an_allowed_absolute_next_is_where_the_browser_lands_after_sso() {
+        for next in [
+            "https://cove.warpgate.test/vms?x=1#top",
+            "https://WARPGATE.test/page",
+            "https://warpgate.test/@warpgate#/profile",
+        ] {
+            assert_eq!(landing_after_sso(next).await, next);
+        }
+        // Relative paths still resolve against the return origin.
+        let landing = landing_after_sso("/vms?x=1").await;
+        assert!(landing.ends_with("/vms?x=1"), "{landing}");
+        assert!(landing.starts_with("http"), "{landing}");
+    }
+
+    #[tokio::test]
+    async fn a_refused_absolute_next_is_dropped_and_the_browser_lands_on_the_login_page() {
+        for next in [
+            "https://evilwarpgate.test/x",
+            "https://warpgate.test.evil.net/x",
+            "https://evil.example/x",
+            "http://cove.warpgate.test/x",
+            "https://user@cove.warpgate.test/x",
+            "https://cove.warpgate.test:8443/x",
+            "https://cove.warpgate.test./x",
+        ] {
+            let landing = landing_after_sso(next).await;
+            assert!(landing.ends_with("/@warpgate#/login"), "{next}: {landing}");
+            assert!(!landing.contains("evil"), "{next}: {landing}");
+            assert!(!landing.contains("cove."), "{next}: {landing}");
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_start_keeps_an_allowed_absolute_next_on_the_login_page_and_drops_a_refused_one() {
+        let issuer = stand_in_idp().await;
+        let (app, _) = app(vec![provider("a", &issuer), provider("b", &issuer)]).await;
+        let cli = TestClient::new(app);
+        let mut cookie = None;
+        let start = |next: &str| {
+            format!(
+                "/api/sso/auto-start?force=1&next={}",
+                utf8_percent_encode_all(next)
+            )
+        };
+        let resp = fetch(&cli, &mut cookie, &start("https://cove.warpgate.test/vms")).await;
+        assert_eq!(
+            location(&resp),
+            "/@warpgate#/login?next=https%3A%2F%2Fcove%2Ewarpgate%2Etest%2Fvms"
+        );
+        let resp = fetch(&cli, &mut cookie, &start("https://evil.example/vms")).await;
+        assert_eq!(location(&resp), "/@warpgate#/login");
     }
 
     const FORCE_START: &str = "/api/sso/auto-start?force=1";
