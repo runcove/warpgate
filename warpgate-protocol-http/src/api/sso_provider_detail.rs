@@ -1227,6 +1227,33 @@ mod ticket_session_tests {
         assert_eq!(b.stamp().await, (signed_in + 1).to_string());
     }
 
+    /// A forced return whose `auth_time` is OLDER than the session's stamp but
+    /// still inside the forced window is a replayed or stale sign-in: it gets
+    /// the same refusal and leaves the stamp alone.
+    #[tokio::test]
+    async fn a_forced_return_with_an_older_auth_time_is_refused_as_no_new_stamp() {
+        let mut b = browser(None).await;
+        let started = b.start(PLAIN_START).await;
+        let signed_in = unix_now() - 5;
+        b.finish(&started, &started.nonce, Some(signed_in)).await;
+        assert_eq!(b.stamp().await, signed_in.to_string());
+
+        let forced = b.start(FORCE_START).await;
+        b.idp.issue(&forced.nonce, Some(signed_in - 5));
+        let resp = b
+            .get(&format!("/api/sso/return?code=code&state={}", forced.state))
+            .await;
+        assert_eq!(resp.0.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert!(
+            location(&resp).ends_with(
+                "/@warpgate?login_error=The+SSO+provider+did+not+report+a+recent+authentication"
+            ),
+            "{}",
+            location(&resp)
+        );
+        assert_eq!(b.stamp().await, signed_in.to_string());
+    }
+
     /// Forced returns on a fresh browser with step-up NOT configured: each
     /// is refused, so no session and no stamp.
     async fn assert_forced_return_refused(auth_time: Option<serde_json::Value>) {
