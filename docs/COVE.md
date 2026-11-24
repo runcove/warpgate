@@ -130,6 +130,9 @@ Per provider type:
   return that carried `auth_time` (another provider) can have written; with
   Google as the only provider, nobody can sign in, and signing out of Google
   does not help.
+  Do not turn on HTTP step-up when Google is the only SSO provider: Google
+  rejects `prompt=login`, so it gets no `prompt`, and it does not document
+  `max_age`, so it cannot be made to ask the user to sign in again.
 - **Apple** gets `max_age` and `claims` on every HTTP step-up start, and
   `prompt=login` plus `max_age=0` on `force=1`. Whether Apple honours them is
   unverified.
@@ -171,6 +174,13 @@ refused (the `sso_failed` return), before the credential is submitted. A
 `force=1` return whose `auth_time` is stale therefore signs in only on a
 session whose existing stamp is still recent; a different user's return never
 inherits the session's stamp.
+
+Known limit: a sign-in whose age is exactly the `max_age` can be refused once
+and pass on retry. The return counts a stamp as recent only when it is strictly
+newer than now less `max_age` (`is_recent_enough`), while an identity provider
+treats a login exactly that old as still recent and resumes its session. The
+retry is older than `max_age`, so the provider asks for a new sign-in, which
+passes.
 
 An identity provider that does not return `auth_time` never stamps; with HTTP
 step-up on, its users cannot sign in. Confirm that the provider returns
