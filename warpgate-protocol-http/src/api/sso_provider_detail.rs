@@ -949,7 +949,12 @@ mod ticket_session_tests {
     async fn signing_idp() -> SigningIdp {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let issuer = format!("http://{}", listener.local_addr().unwrap());
+        // The issuer URL keys the process-wide discovery cache (JWKS
+        // included, 300 s), and a later test's listener can be handed a port an
+        // earlier test freed. A port-only issuer would then verify this
+        // provider's tokens against that test's key, so it carries a unique path.
+        let id = uuid::Uuid::new_v4();
+        let issuer = format!("http://{}/{id}", listener.local_addr().unwrap());
         let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
         // An uncompressed SEC1 point: 0x04, then x, then y.
         let point = key_pair.public_key_raw();
@@ -970,7 +975,7 @@ mod ticket_session_tests {
             "id_token_signing_alg_values_supported": ["ES256"],
         });
         let slot = Arc::new(StdMutex::new(String::new()));
-        let app = Route::new()
+        let provider = Route::new()
             .at(
                 "/.well-known/openid-configuration",
                 get(poem::endpoint::make_sync(move |_| {
@@ -985,6 +990,7 @@ mod ticket_session_tests {
             )
             .at("/token", poem::post(token_endpoint))
             .data(slot.clone());
+        let app = Route::new().nest(format!("/{id}"), provider);
         let acceptor = poem::listener::TcpAcceptor::from_tokio(listener).unwrap();
         tokio::spawn(poem::Server::new_with_acceptor(acceptor).run(app));
         SigningIdp { issuer, slot, key }
