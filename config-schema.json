@@ -938,7 +938,7 @@
           }
         },
         "http": {
-          "description": "Per-session step-up interval for HTTP (stored on the Poem session).",
+          "description": "Per-session step-up interval for HTTP (stored on the Poem session).\n\nThe session's stamp is the ID token's `auth_time`. An SSO start sends\n`max_age` of this interval less a margin (a quarter of it, at most one\nhour), and a return whose `auth_time` is missing or not newer than now\nless that `max_age` is refused, unless the session already holds a stamp\nthat is. A provider that does not report `auth_time` cannot sign users in\nwhile this is set.",
           "type": [
             "string",
             "null"

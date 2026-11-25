@@ -165,6 +165,11 @@ pub(crate) enum Commands {
     },
     /// Show Warpgate's SSH client keys
     ClientKeys,
+    /// Manage the keys that sign session statements
+    StatementKeys {
+        #[clap(subcommand)]
+        action: crate::commands::statement_keys::StatementKeysCommand,
+    },
     /// Run Warpgate
     Run {
         /// Enable an API token (passed via the `WARPGATE_ADMIN_TOKEN` env var) that automatically maps to the first admin user
@@ -277,6 +282,9 @@ async fn _main() -> Result<()> {
             destination,
         ),
         Commands::ClientKeys => crate::commands::client_keys::command(&params).await,
+        Commands::StatementKeys { action } => {
+            crate::commands::statement_keys::command(&params, action).await
+        }
         Commands::RecoverAccess { username } => {
             crate::commands::recover_access::command(&params, username.as_ref()).await
         }

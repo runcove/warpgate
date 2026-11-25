@@ -13,6 +13,27 @@ Only a safe `next` qualifies: a site-relative path starting with a single `/`
 (not `//`, not `/\`, not an absolute URL). The redirect goes to the origin the
 SSO return URL named, so `next` can never carry the browser off-site.
 
+Every SSO entry (`/sso/auto-start` and `/sso/providers/{name}/start`) also
+takes an absolute `next`: an `https://` URL whose host is either the
+control-plane host (`http.external_host` when set, else `external_host`),
+matched exactly, or the cookie domain (`external_host`) or a whole-label
+subdomain of it (`a.example.com` for `example.com`, never `badexample.com`).
+The control-plane host's port must be the one written in `http.external_host`
+if it has one, else `http.external_port`, else the listen port (8888 by
+default). The cookie domain and its subdomains take `http.external_port`, else
+the listen port; a port written in `external_host` does not count. An `https`
+URL with no port means 443. Plain `http`, user info, `//host`, a
+trailing dot or empty label, an IP address, a backslash or whitespace, and any
+other host or port are refused. `/sso/auto-start` drops a refused `next` at
+once; the SSO return checks it again, and a refused one lands the browser on
+the login page. An allowed absolute `next` is followed in its canonical form
+(lower-case host, punycode).
+
+A failure of the sign-in does not carry `login_error` or `retry_after` to an
+absolute `next`: those go only to a relative `next`. After a failure with an
+absolute `next` the browser goes to `/@warpgate?login_error=...`, or gets an
+error response where the code could not be verified.
+
 ### Parameters
 
 | Parameter     | When                         | Value                                   |
@@ -50,6 +71,303 @@ Warpgate logs the real underlying reason server-side.
   SSO process) has no `next` to return to and takes the fallback.
 - An existing Warpgate session cookie may survive a failed retry. Treat a
   request that arrives with `login_error` as a failure whatever the session says.
+
+### A fifth outcome: 403 for a ticket session
+
+A browser session opened with a ticket never signs in, by any route, so it
+never becomes a user session. Each of these answers `403 Forbidden` with a
+plain-text body (sign out, then sign in with single sign-on), and stores and
+changes nothing:
+
+- the SSO start: `/@warpgate/api/sso/auto-start` (with or without `force`)
+  and `/@warpgate/api/sso/providers/<name>/start`, and the login page's own
+  auto-redirect;
+- the SSO return (`/@warpgate/api/sso/return`), checked before the handshake
+  is looked up, so the session stays a ticket session;
+- the completion of any other sign-in: password, OTP, passkey.
+
+This is not a `login_error` code and is never sent to `next`: the browser
+gets the 403 itself. The four codes above are unchanged.
+
+## Always start SSO: `/sso/auto-start?force=1`
+
+`GET /@warpgate/api/sso/auto-start?force=1` starts SSO even when the browser
+is already signed in, and whether or not `sso_auto_redirect` is on.
+
+| Query      | Meaning                                                              |
+|------------|----------------------------------------------------------------------|
+| `force`    | Only the exact value `1` turns this on. Anything else: today's behaviour. |
+| `provider` | Optional, used only with `force=1`: the SSO provider's name, compared exactly. |
+| `next`     | Where the browser returns after the sign-in; the safe-redirect rule above applies, an unsafe one is dropped. |
+| `login`    | `login=password` still wins: the login page with the password form, no SSO. |
+
+With `force=1`:
+
+- a configured `provider` is started (302 to the identity provider);
+- with no `provider` and exactly one configured, that one is started;
+- an unknown `provider`, or none named among several, gets the login page
+  (302 to `/@warpgate#/login`, with `next`), never an error;
+- a ticket session gets 403 (above);
+- the authorize request carries `prompt=login` (except where the provider
+  type rejects it; see the per-provider paragraph below) and `max_age=0`, so
+  an identity provider that honours them asks the user to sign in again
+  rather than resume its own session. Every other SSO start (the login page's
+  provider buttons, the auto-redirect) never sends `prompt`, and sends
+  `max_age` in seconds when HTTP step-up is configured, nothing otherwise. That `max_age` is
+  `step_up_interval.http` less a margin of a quarter of it (at most one hour),
+  never below zero, so a login the provider takes as recent is stamped fresh
+  for at least the margin after the return, and never outlasts the interval.
+  The return applies the same value: a stamp not newer than now less that
+  `max_age` does not count as recent;
+- every `force=1` start and every start while HTTP step-up is configured also
+  sends the OpenID Connect `claims` parameter
+  `{"id_token":{"auth_time":{"essential":true}}}`, for providers that include
+  `auth_time` only when asked. SSH-only step-up sends neither `claims` nor
+  `max_age`.
+
+Per provider type:
+
+- **Google** rejects `prompt=login`, so a `google` provider gets `max_age` and
+  the `claims` parameter without `prompt`. Google does not support Google
+  Account reauth requests
+  (developers.google.com/identity/siwg/security-bundle); `max_age` is not
+  among Google's documented authorize parameters, and `prompt` allows only
+  `none`, `consent` and `select_account`
+  (developers.google.com/identity/openid-connect/reference). Google returns
+  `auth_time` only when the Google app is In production, Verified, and has
+  "Session age claims" turned on (Settings > Advanced Settings), in addition
+  to the `claims` request. What users see: on Google, `force=1` essentially
+  never yields a fresh stamp (a `force=1` return stamps only from an
+  `auth_time` not older than the handshake, see below), so cove refuses a
+  request that needs a fresh sign-in unless the user actually signed in at
+  Google during that round (no Google session, for example after signing out
+  of Google) and the app reports `auth_time`. Under HTTP step-up, where Google
+  does report `auth_time`, a user whose Google session is older than the
+  `max_age` and whose Warpgate session holds no recent stamp gets `sso_failed`
+  on every plain start until they sign out of Google; retrying does not help.
+  Where Google reports no `auth_time` at all (the default for a Google app),
+  no Google sign-in ever stamps. Under HTTP step-up it succeeds only on a
+  session that already holds a recent stamp for the same user, which only a
+  return that carried `auth_time` (another provider) can have written; with
+  Google as the only provider, nobody can sign in, and signing out of Google
+  does not help.
+  Do not turn on HTTP step-up when Google is the only SSO provider: Google
+  rejects `prompt=login`, so it gets no `prompt`, and it does not document
+  `max_age`, so it cannot be made to ask the user to sign in again.
+- **Apple** gets `max_age` and `claims` on every HTTP step-up start, and
+  `prompt=login` plus `max_age=0` on `force=1`. Whether Apple honours them is
+  unverified.
+- **Entra** (`azure`) and `custom` providers are treated the same way: `max_age`
+  and `claims` on every HTTP step-up start, and `prompt=login` plus `max_age=0`
+  on `force=1`. Whether they honour them, and whether they report `auth_time`,
+  is the provider's behaviour.
+
+Confirm each provider (Google, Apple, Entra and every `custom` one) before
+turning HTTP step-up on. Check a plain step-up start as well as `force=1`:
+every start under HTTP step-up sends `claims` and `max_age`, so a provider that
+rejects `claims` would break every sign-in under step-up, not only the
+`force=1` ones.
+
+The return stamps the session's `last_sso_at`. A password, OTP or passkey
+sign-in never does, so `?login=password` never makes a session fresh.
+
+### What `last_sso_at` means
+
+`last_sso_at` means "the identity provider says the user last signed in at
+time t". Warpgate stamps it, at an SSO return, from the `auth_time` claim of
+the ID token that return exchanged, never from its own clock
+(`warpgate-core/src/auth/step_up.rs`, `sso_stamp`). That token is bound to the
+handshake by its single-use `state` and its `nonce`, so a token from another
+handshake is refused and never stamps. The stamp is written only when:
+
+- `auth_time` is present, and at most 120 s ahead of Warpgate's clock (a
+  later one is ignored; one within the 120 s is clamped to now);
+- for a `force=1` handshake the window is tighter: `auth_time` is within 30 s
+  of the handshake's start (an identity provider that ignored `prompt=login`
+  and sent an old sign-in time does not advance the stamp) and at most 30 s
+  ahead of Warpgate's clock, and it is stamped exactly as given, never
+  clamped to now;
+- it is later than the stamp the session already has, so a stamp never moves
+  backwards.
+
+Otherwise a plain return still signs the user in and leaves the stamp as it
+was, with one exception: when HTTP step-up is on and the session would be left
+with no recent stamp (newer than now less the `max_age` above), the sign-in is
+refused (the `sso_failed` return), before the credential is submitted. A
+`force=1` return is stricter, with or without step-up: if it yields no new
+stamp (`auth_time` absent, not a number, more than 30 s ahead, more than 30 s
+before the handshake began, or not later than the session's existing stamp) the
+sign-in is refused the same way and nothing is written. A different user's
+return never inherits the session's stamp.
+
+Known limit: a sign-in whose age is exactly the `max_age` can be refused once
+and pass on retry. The return counts a stamp as recent only when it is strictly
+newer than now less `max_age` (`is_recent_enough`), while an identity provider
+treats a login exactly that old as still recent and resumes its session. The
+retry is older than `max_age`, so the provider asks for a new sign-in, which
+passes.
+
+Known limit: an identity provider that answers `prompt=login` / `max_age=0`
+from its own session, without asking the user to sign in again, returns the
+same `auth_time` as before. That is not later than the session's stamp, so a
+`force=1` step-up fails with the no-recent-authentication refusal
+(`sso_failed`). The user must sign in again at the identity provider (sign out
+there, or end its session) and retry.
+
+An identity provider that does not return `auth_time` never stamps; with HTTP
+step-up on, its users cannot sign in. Confirm that the provider returns
+`auth_time` after `prompt=login` before relying on it.
+
+Another site can still navigate the browser through `/sso/auto-start?force=1`
+(an unauthenticated GET; the session cookie is `SameSite=Lax`, so it is sent
+on a top-level navigation). `force=1` asks the provider to make the user sign
+in again, so no stamp is refreshed without a fresh sign-in, but a user who is
+shown that prompt may complete it. `last_sso_at` is still not an
+intent token and not a CSRF token: a verifier (cove) must keep its own CSRF
+check and must not read a recent `last_sso_at` as proof that the user chose
+this action.
+
+Cove's side: for one request that needs a fresh sign-in, start one `force=1`
+round. If the statement from the session it returns to does not carry a
+`last_sso_at` of at least cove's own request start less 120 s, refuse the
+request; do not start a second round. The signed statement
+carries no `auth_time` of its own.
+
+## Signed session statement: `x-warpgate-session-freshness`
+
+An HTTP target with `signed_statement` on (a boolean in the target's HTTP
+options, off by default, settable through the admin API only) receives, on
+every proxied request from a browser session that signed in as a user, one
+header:
+
+    x-warpgate-session-freshness: v1.<kid>.<payload>.<sig>
+
+It is set last, after the target's configured headers and URL credentials,
+with one copy upstream, on plain and WebSocket requests. A request with no
+signed-in session (and the public-target bypass) carries none; so does a
+Warpgate with no statement key. The admin API refuses a configured header
+whose name starts with `x-warpgate-` (case-insensitive).
+
+A session started with a ticket carries none, even when it was a user session
+before: a ticket for the same user, presented on a user session, makes it a
+ticket session, and its `last_sso_at` is cleared. A target bound to a host
+(`external_host` non-empty) outside Warpgate's own external host and its
+subdomains (the session cookie domain) carries none either, for anyone; one
+bound to that host or a subdomain of it is treated like any other target
+(whole DNS labels, case-insensitive, one trailing dot and any port ignored).
+If Warpgate's own host cannot be determined, a bound host gets none. The statement is
+made only while the session's authorization is a user's, so `auth` is always
+`user`; the field is kept so a verifier need not guess.
+
+`payload` is base64url (no padding) of JSON with exactly these 11 keys, in this order, each exactly once:
+`aud` (target id), `sub` (user id), `name` (username), `auth` (always
+`user`), `last_sso_at` (Unix seconds or `null`), `iat`, `exp` (`iat` + 30),
+`jti`, `m` (method), `p` (upstream path and query as forwarded), `sh` (session
+hash or `null`). Only `last_sso_at` and `sh` may be `null`. A verifier rejects
+a payload with a missing key, a repeated key, any other key (so there is no
+`tid` and no `auth_time`), or a `jti` that does not decode to exactly 16 bytes.
+Check this on the text as received: a JSON parser that keeps the last of two
+equal keys hides a repeat.
+
+- `jti` is base64url (no padding) of 16 bytes from the operating system's
+  random number generator, new for every statement, inside the signed bytes.
+  A receiver keeps a replay cache keyed on `(kid, jti)`, holding each entry
+  until `exp` plus any clock leeway the verifier allows (at least the 30
+  seconds a statement lives), and refuses a statement it has already seen. The
+  cache is shared across verifier replicas: one shared store, not one per
+  process.
+- `last_sso_at` is the identity provider's sign-in time (the ID token's
+  `auth_time`), as in "What `last_sso_at` means" above. No other sign-in time
+  is in the statement: there is no `auth_time`.
+- `sh` is base64url (no padding) of SHA-256 over the length-prefixed
+  `cove-session-hash-v1` and the Warpgate session id in hyphenated lowercase;
+  `null` when the browser session has no id.
+- `sig` is base64url (no padding) of the 64-byte Ed25519 signature over, for
+  each of `cove-session-freshness-v1`, `kid` and the `payload` text exactly as
+  sent: a 4-byte big-endian length, then the bytes.
+- `kid` is base64url (no padding) of SHA-256 of the raw 32-byte public key.
+
+A verifier checks the version, looks `kid` up among the keys it pinned,
+verifies the signature over the bytes it received, then reads the payload,
+and checks `aud`, `m`, `p` and `exp` against its own request. A verifier must
+check `auth == "user"` before it trusts `last_sso_at`: a statement with any
+other `auth` says nothing about a fresh sign-in. Even then `last_sso_at` only
+says the identity provider reported the user's last sign-in at that time (see
+"What `last_sso_at` means"); it does not show the user's intent, and the verifier's own CSRF check stays.
+
+### Keys
+
+`GET /@warpgate/api/statement-keys` (no authentication; a host bound to a
+target answers 404) returns `[{kid, alg: "Ed25519", public_key, signing}]`;
+`signing` is true for the one key that signs. The list is empty, and nothing
+is signed, when `WARPGATE_ENCRYPTION_KEY` is not set. The private half is
+stored encrypted, never shown by any API, UI or log.
+
+Rotation is on the host: `warpgate statement-keys list | add-next | promote
+<kid> | retire <kid>`. Publish first: `add-next`, pin the new key in every
+verifier, `promote` (the signing key becomes `retiring`), wait at least 5
+seconds, then `retire` the old one. Each running node keeps its signing key
+cached for up to 5 seconds, so it can still sign with the old key just after
+`promote`; `retire` deletes the key at once, and a verifier that has dropped it
+refuses those statements. `promote` refuses while a `retiring` key exists;
+`retire` refuses the signing key. `retire` does not enforce the 5 second wait
+after `promote`: an early `retire` deletes the key while a node may still sign
+with it, and those statements fail closed at a verifier that has dropped the
+key.
+
+### Shared test vector
+
+Seed: the 32 bytes 0, 1, ..., 31. Session id
+`01234567-89ab-cdef-0123-456789abcdef`. Fields: `aud`
+`6f1b0c3e-0000-4000-8000-000000000001`, `sub`
+`9a7e5b2c-0000-4000-8000-000000000002`, `name` `alice`, `auth` `user`,
+`last_sso_at` 1795000000, `iat` 1795000100, `exp` 1795000130, `jti` the 16
+bytes `0xA5` (`paWlpaWlpaWlpaWlpaWlpQ`), `m` `POST`, `p`
+`/vms/dev/delete?confirm=1`.
+
+- public key: `A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg`
+- `kid`: `Vkdap1RjR0wChd9dvyvKtz2mUTWIOem3dIGy6rEHcIw`
+- `sh`: `csYevRtBmdkph9kYTknQH15jWwvnGD8dkDC7ixc-y2I`
+- header value (accept):
+
+```
+v1.Vkdap1RjR0wChd9dvyvKtz2mUTWIOem3dIGy6rEHcIw.eyJhdWQiOiI2ZjFiMGMzZS0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJzdWIiOiI5YTdlNWIyYy0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDIiLCJuYW1lIjoiYWxpY2UiLCJhdXRoIjoidXNlciIsImxhc3Rfc3NvX2F0IjoxNzk1MDAwMDAwLCJpYXQiOjE3OTUwMDAxMDAsImV4cCI6MTc5NTAwMDEzMCwianRpIjoicGFXbHBhV2xwYVdscGFXbHBhV2xwUSIsIm0iOiJQT1NUIiwicCI6Ii92bXMvZGV2L2RlbGV0ZT9jb25maXJtPTEiLCJzaCI6ImNzWWV2UnRCbWRrcGg5a1lUa25RSDE1ald3dm5HRDhka0RDN2l4Yy15MkkifQ.uMiCuNaQvmp4o1EhcG1nAlRZSMB9KWAsVLOf0raV4Ac4rH7g6QCMPxDu84VkRz5SMMAya77y09S5S52ZQZygDw
+```
+
+Same fields with `last_sso_at` `null` and `sh` `null` (a password sign-in on a
+browser session with no session id); accept:
+
+```
+v1.Vkdap1RjR0wChd9dvyvKtz2mUTWIOem3dIGy6rEHcIw.eyJhdWQiOiI2ZjFiMGMzZS0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJzdWIiOiI5YTdlNWIyYy0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDIiLCJuYW1lIjoiYWxpY2UiLCJhdXRoIjoidXNlciIsImxhc3Rfc3NvX2F0IjpudWxsLCJpYXQiOjE3OTUwMDAxMDAsImV4cCI6MTc5NTAwMDEzMCwianRpIjoicGFXbHBhV2xwYVdscGFXbHBhV2xwUSIsIm0iOiJQT1NUIiwicCI6Ii92bXMvZGV2L2RlbGV0ZT9jb25maXJtPTEiLCJzaCI6bnVsbH0.6quPIPTzEvC7xdK8SXvc4vUo1xjOWYShKvJDMs7FyJCOpv4Sttou5oMDodRPqZZ79auxivVlzs8o7FU6ynJuBw
+```
+
+Signed with the same key, correct signatures, but refuse each: the payload
+breaks the 11-key rule.
+
+- `missing_jti`: no `jti` (10 keys).
+```
+v1.Vkdap1RjR0wChd9dvyvKtz2mUTWIOem3dIGy6rEHcIw.eyJhdWQiOiI2ZjFiMGMzZS0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJzdWIiOiI5YTdlNWIyYy0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDIiLCJuYW1lIjoiYWxpY2UiLCJhdXRoIjoidXNlciIsImxhc3Rfc3NvX2F0IjoxNzk1MDAwMDAwLCJpYXQiOjE3OTUwMDAxMDAsImV4cCI6MTc5NTAwMDEzMCwibSI6IlBPU1QiLCJwIjoiL3Ztcy9kZXYvZGVsZXRlP2NvbmZpcm09MSIsInNoIjoiY3NZZXZSdEJtZGtwaDlrWVRrblFIMTVqV3d2bkdEOGRrREM3aXhjLXkySSJ9.LlWIYgZU1-DrGdhAGyH2qpBo9KK-TYJLNPiVtLAMlMrL8ilgWVJBHRqZM2bLxwbHzFbzdRCIzpy_EU08NkmrDA
+```
+- `duplicate_m`: `m` twice (12 entries).
+```
+v1.Vkdap1RjR0wChd9dvyvKtz2mUTWIOem3dIGy6rEHcIw.eyJhdWQiOiI2ZjFiMGMzZS0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJzdWIiOiI5YTdlNWIyYy0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDIiLCJuYW1lIjoiYWxpY2UiLCJhdXRoIjoidXNlciIsImxhc3Rfc3NvX2F0IjoxNzk1MDAwMDAwLCJpYXQiOjE3OTUwMDAxMDAsImV4cCI6MTc5NTAwMDEzMCwianRpIjoicGFXbHBhV2xwYVdscGFXbHBhV2xwUSIsIm0iOiJQT1NUIiwicCI6Ii92bXMvZGV2L2RlbGV0ZT9jb25maXJtPTEiLCJtIjoiR0VUIiwic2giOiJjc1lldlJ0Qm1ka3BoOWtZVGtuUUgxNWpXd3ZuR0Q4ZGtEQzdpeGMteTJJIn0.FTUDKcyMFenG1CGdLFDKDVuIfNSE8c36qmLwzdFDlU5u7QVVrqTNMW-Xcny_15F_Ewny1VQOh40pya40T8qeDA
+```
+- `duplicate_m_for_missing_sh`: `m` twice and no `sh` (11 entries, wrong set).
+```
+v1.Vkdap1RjR0wChd9dvyvKtz2mUTWIOem3dIGy6rEHcIw.eyJhdWQiOiI2ZjFiMGMzZS0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJzdWIiOiI5YTdlNWIyYy0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDIiLCJuYW1lIjoiYWxpY2UiLCJhdXRoIjoidXNlciIsImxhc3Rfc3NvX2F0IjoxNzk1MDAwMDAwLCJpYXQiOjE3OTUwMDAxMDAsImV4cCI6MTc5NTAwMDEzMCwianRpIjoicGFXbHBhV2xwYVdscGFXbHBhV2xwUSIsIm0iOiJQT1NUIiwicCI6Ii92bXMvZGV2L2RlbGV0ZT9jb25maXJtPTEiLCJtIjoiR0VUIn0.T9VZ1vDmIVsJGhs-JzUIIuv7irHuHt0iEoXyPXGbZ_fZu7m3RPmbwCQbK851TaMZ2-QHh2qyeMDKuvLkhQpoAw
+```
+- `extra_tid`: an extra key `tid`.
+```
+v1.Vkdap1RjR0wChd9dvyvKtz2mUTWIOem3dIGy6rEHcIw.eyJhdWQiOiI2ZjFiMGMzZS0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJzdWIiOiI5YTdlNWIyYy0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDIiLCJuYW1lIjoiYWxpY2UiLCJhdXRoIjoidXNlciIsImxhc3Rfc3NvX2F0IjoxNzk1MDAwMDAwLCJpYXQiOjE3OTUwMDAxMDAsImV4cCI6MTc5NTAwMDEzMCwianRpIjoicGFXbHBhV2xwYVdscGFXbHBhV2xwUSIsIm0iOiJQT1NUIiwicCI6Ii92bXMvZGV2L2RlbGV0ZT9jb25maXJtPTEiLCJ0aWQiOiJ0Iiwic2giOiJjc1lldlJ0Qm1ka3BoOWtZVGtuUUgxNWpXd3ZuR0Q4ZGtEQzdpeGMteTJJIn0.mp4oOH_lLO2uil8-pbN3uSK5Et-SDDk2WnnelimGXv4cY_NjR8B5ZExQp6Fv8hWB8C0xKuPk9ySviLEzfln3Bg
+```
+- `null_name`: `name` is `null`.
+```
+v1.Vkdap1RjR0wChd9dvyvKtz2mUTWIOem3dIGy6rEHcIw.eyJhdWQiOiI2ZjFiMGMzZS0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJzdWIiOiI5YTdlNWIyYy0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDIiLCJuYW1lIjpudWxsLCJhdXRoIjoidXNlciIsImxhc3Rfc3NvX2F0IjoxNzk1MDAwMDAwLCJpYXQiOjE3OTUwMDAxMDAsImV4cCI6MTc5NTAwMDEzMCwianRpIjoicGFXbHBhV2xwYVdscGFXbHBhV2xwUSIsIm0iOiJQT1NUIiwicCI6Ii92bXMvZGV2L2RlbGV0ZT9jb25maXJtPTEiLCJzaCI6ImNzWWV2UnRCbWRrcGg5a1lUa25RSDE1ald3dm5HRDhka0RDN2l4Yy15MkkifQ.3SToDp5y6Uu_vKJeul7Wj6p9NEuJRCUqSlb_YFIvUNLA_DrcGntx6J-2NdlurPh2RZ-sdjqTqn8NsUHL6LkSBA
+```
+- `short_jti`: `jti` decodes to 15 bytes.
+```
+v1.Vkdap1RjR0wChd9dvyvKtz2mUTWIOem3dIGy6rEHcIw.eyJhdWQiOiI2ZjFiMGMzZS0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJzdWIiOiI5YTdlNWIyYy0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDIiLCJuYW1lIjoiYWxpY2UiLCJhdXRoIjoidXNlciIsImxhc3Rfc3NvX2F0IjoxNzk1MDAwMDAwLCJpYXQiOjE3OTUwMDAxMDAsImV4cCI6MTc5NTAwMDEzMCwianRpIjoicGFXbHBhV2xwYVdscGFXbHBhV2wiLCJtIjoiUE9TVCIsInAiOiIvdm1zL2Rldi9kZWxldGU_Y29uZmlybT0xIiwic2giOiJjc1lldlJ0Qm1ka3BoOWtZVGtuUUgxNWpXd3ZuR0Q4ZGtEQzdpeGMteTJJIn0.0pdcx6NyS6DRj4xlvmmsydOnPfm0uWHlCZUHdXH6Bl--3SfRixQy9j840ui9nhBgZzDaXeZnO-O-kKFBDRxACg
+```
 
 ## Recordings a separate reader can read: `--recordings-keep-group-read`
 

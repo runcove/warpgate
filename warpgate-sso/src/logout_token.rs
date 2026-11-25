@@ -139,7 +139,7 @@ fn now() -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use serde_json::json;
 
     use super::*;
@@ -198,6 +198,25 @@ mod tests {
         assert!(claims(v).into_logout(NOW).is_err());
     }
 
+    /// A freshly generated P-256 key, with the JWKS publishing it as `k1`.
+    pub(crate) fn signing_key() -> (serde_json::Value, jsonwebtoken::EncodingKey) {
+        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        // An uncompressed SEC1 point: 0x04, then x, then y.
+        let point = key_pair.public_key_raw();
+        let coordinate = |range| data_encoding::BASE64URL_NOPAD.encode(point.get(range).unwrap());
+        let jwks = json!({ "keys": [{
+            "kty": "EC",
+            "crv": "P-256",
+            "kid": "k1",
+            "use": "sig",
+            "x": coordinate(1..33),
+            "y": coordinate(33..65),
+        }]});
+        let key =
+            jsonwebtoken::EncodingKey::from_ec_pem(key_pair.serialize_pem().as_bytes()).unwrap();
+        (jwks, key)
+    }
+
     /// A provider publishing a freshly generated P-256 key as `k1`, and the
     /// key to sign its tokens with.
     fn provider() -> (
@@ -213,21 +232,8 @@ mod tests {
             "scopes": [],
         }))
         .unwrap();
-        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
-        // An uncompressed SEC1 point: 0x04, then x, then y.
-        let point = key_pair.public_key_raw();
-        let coordinate = |range| data_encoding::BASE64URL_NOPAD.encode(point.get(range).unwrap());
-        let jwks = serde_json::from_value(json!({ "keys": [{
-            "kty": "EC",
-            "crv": "P-256",
-            "kid": "k1",
-            "use": "sig",
-            "x": coordinate(1..33),
-            "y": coordinate(33..65),
-        }]}))
-        .unwrap();
-        let key =
-            jsonwebtoken::EncodingKey::from_ec_pem(key_pair.serialize_pem().as_bytes()).unwrap();
+        let (jwks, key) = signing_key();
+        let jwks = serde_json::from_value(jwks).unwrap();
         (
             config,
             crate::metadata::tests::metadata(&json!({})).set_jwks(jwks),
@@ -235,7 +241,11 @@ mod tests {
         )
     }
 
-    fn sign(key: &jsonwebtoken::EncodingKey, kid: &str, claims: &serde_json::Value) -> String {
+    pub(crate) fn sign(
+        key: &jsonwebtoken::EncodingKey,
+        kid: &str,
+        claims: &serde_json::Value,
+    ) -> String {
         let mut header = Header::new(jsonwebtoken::Algorithm::ES256);
         header.kid = Some(kid.into());
         jsonwebtoken::encode(&header, claims, key).unwrap()

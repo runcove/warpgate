@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use time::OffsetDateTime;
 use tokio::sync::Mutex;
-use tracing::{Instrument, info};
+use tracing::{Instrument, info, warn};
 use uuid::Uuid;
 use warpgate_common::auth::{AuthResult, AuthState, AuthStateUserInfo, CredentialKind};
 use warpgate_common::helpers::username::username_eq_ci;
@@ -599,12 +599,18 @@ async fn try_auto_sso_redirect(req: &Request) -> poem::Result<Option<Response>> 
         ctx.0,
         &provider_name,
         next,
+        false,
     )
     .await?
     {
         crate::api::sso_provider_detail::StartSsoOutcome::Ok(url) => {
             Ok(Some(Redirect::temporary(url).into_response()))
         }
+        // A ticket session may not start a sign-in: refused outright, never
+        // handed on to the login page.
+        crate::api::sso_provider_detail::StartSsoOutcome::TicketSession => Ok(Some(
+            crate::api::sso_provider_detail::ticket_session_refusal().into_response(),
+        )),
         // Provider vanished between the count check and the start (race), or the
         // request host is incompatible with the provider's return-URL domain.
         // Fall through to the normal login page rather than erroring.
@@ -1050,6 +1056,15 @@ pub async fn authorize_session(
         .await
         .context("Session not in request")?;
 
+    // A ticket session never becomes a user session, by any sign-in: the
+    // ticket's target restriction would be lost with it. Checked before
+    // anything is written. The SSO start and return refuse it on their own
+    // as well.
+    if is_ticket_session(session) {
+        warn!("Sign-in refused: the browser session is authorized by a ticket");
+        return Err(WarpgateError::TicketSessionSignIn);
+    }
+
     let mut server_handle = session_middleware
         .lock()
         .await
@@ -1110,6 +1125,16 @@ pub async fn authorize_session(
     warpgate_common_http::auth::stamp_session_auth_time(session);
 
     Ok(())
+}
+
+/// Whether the browser session is authorized by a ticket. Such a session
+/// may not sign in: [`authorize_session`], the SSO start and the SSO return
+/// each refuse it with 403.
+pub(crate) fn is_ticket_session(session: &Session) -> bool {
+    matches!(
+        session.get_auth(),
+        Some(SessionAuthorization::Ticket { .. })
+    )
 }
 
 /// Ends the user session behind this browser session and clears the browser
@@ -2419,12 +2444,38 @@ mod sign_in_completion_tests {
         }
     }
 
+    /// Marks the browser session as opened with a ticket.
+    #[handler]
+    fn as_ticket(session: &Session, user: Data<&AuthStateUserInfo>) {
+        session.set_auth(SessionAuthorization::Ticket {
+            user_id: user.id,
+            username: user.username.clone(),
+            target_id: Uuid::from_u128(7),
+            ticket_id: Some(Uuid::from_u128(8)),
+        });
+    }
+
+    /// The browser session's authorization kind and whether it carries an
+    /// SSO stamp.
+    #[handler]
+    fn state(session: &Session) -> String {
+        use crate::step_up::StepUpSessionExt;
+        let kind = match session.get_auth() {
+            Some(SessionAuthorization::User { .. }) => "user",
+            Some(SessionAuthorization::Ticket { .. }) => "ticket",
+            None => "none",
+        };
+        format!("{kind} sso={}", session.get_last_sso_at().is_some())
+    }
+
     async fn app(db: &DatabaseConnection, user: AuthStateUserInfo) -> impl Endpoint {
         let services = services(db.clone()).await;
         services.config.lock().await.store.http.client_ip_header = Some(IP_HEADER.into());
         let ctx = UnauthenticatedRequestContext::new(services).await;
         let storage = SharedSessionStorage::new(db.clone());
         Route::new()
+            .at("/as-ticket", get(as_ticket))
+            .at("/state", get(state))
             .at("/complete", get(complete))
             .data(SessionStore::new())
             .data(ctx)
@@ -2477,6 +2528,61 @@ mod sign_in_completion_tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body, "alice");
         assert_eq!(open_sessions_of(&db, &user).await, 1);
+    }
+
+    fn cookie_of(resp: &poem::test::TestResponse) -> String {
+        resp.0
+            .headers()
+            .get("set-cookie")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(';').next())
+            .map(ToOwned::to_owned)
+            .expect("a cookie")
+    }
+
+    /// A password, OTP, passkey or API sign-in completes through
+    /// `authorize_session` alone: on a ticket session it is refused with 403
+    /// before anything is written, and the session stays a ticket session.
+    #[tokio::test]
+    async fn a_sign_in_on_a_ticket_session_is_refused_and_it_stays_a_ticket() {
+        let db = memory_db().await;
+        let user = alice(&db, serde_json::Value::Null).await;
+        let cli = TestClient::new(app(&db, user.clone()).await);
+
+        let resp = cli.get("/as-ticket").send().await;
+        resp.assert_status_is_ok();
+        let cookie = cookie_of(&resp);
+
+        let resp = cli
+            .get("/complete")
+            .header("cookie", &cookie)
+            .header(IP_HEADER, "10.1.2.3")
+            .send()
+            .await;
+        resp.assert_status(StatusCode::FORBIDDEN);
+        assert_eq!(open_sessions_of(&db, &user).await, 0);
+
+        let resp = cli.get("/state").header("cookie", &cookie).send().await;
+        resp.assert_text("ticket sso=false").await;
+    }
+
+    /// A sign-in that is not an SSO return never stamps the SSO clock.
+    #[tokio::test]
+    async fn a_sign_in_without_sso_upgrades_to_user_and_never_stamps_the_sso_clock() {
+        let db = memory_db().await;
+        let user = alice(&db, serde_json::Value::Null).await;
+        let cli = TestClient::new(app(&db, user.clone()).await);
+
+        let resp = cli
+            .get("/complete")
+            .header(IP_HEADER, "10.1.2.3")
+            .send()
+            .await;
+        resp.assert_status_is_ok();
+        let cookie = cookie_of(&resp);
+
+        let resp = cli.get("/state").header("cookie", &cookie).send().await;
+        resp.assert_text("user sso=false").await;
     }
 
     #[tokio::test]

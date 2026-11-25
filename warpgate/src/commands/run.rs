@@ -108,6 +108,8 @@ pub async fn command(params: &GlobalParams, enable_admin_token: bool) -> Result<
     let keys_path = config.store.ssh.keys_path(params);
     warpgate_protocol_ssh::ensure_host_keys(&services.db, &keys_path).await?;
     warpgate_protocol_ssh::ensure_client_keys(&services.db, &keys_path).await?;
+    // The key that signs session statements, only with an encryption key.
+    warpgate_core::statement_keys::ensure_statement_key(&services.db).await?;
 
     // Encrypt before listeners start
     if warpgate_core::backfill_credential_encryption(&services.db).await?

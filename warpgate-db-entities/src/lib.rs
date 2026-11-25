@@ -27,6 +27,7 @@ macro_rules! with_every_entity {
             SessionApprovalRequest,
             SshClientKey,
             SsoCredential,
+            StatementKey,
             Target,
             TargetGroup,
             TargetRoleAssignment,

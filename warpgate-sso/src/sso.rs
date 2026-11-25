@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use openidconnect::core::{
     CoreAuthDisplay, CoreAuthPrompt, CoreAuthenticationFlow, CoreClientAuthMethod,
@@ -132,6 +133,32 @@ pub struct SsoResult {
     pub raw_id_token_claims: Option<serde_json::Value>,
 }
 
+/// How hard an authorize request asks the provider to re-authenticate the user
+/// rather than resume its own SSO session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reauth {
+    /// Let the provider decide.
+    None,
+    /// `max_age=<secs>`: the provider re-authenticates a user whose last login
+    /// there is older than this.
+    MaxAge(Duration),
+    /// `prompt=login` and `max_age=0`: always a fresh login.
+    Force,
+}
+
+/// The `claims` authorize parameter that asks for `auth_time` in the ID token
+/// (OpenID Connect Core, section 5.5).
+const AUTH_TIME_CLAIMS_REQUEST: &str = r#"{"id_token":{"auth_time":{"essential":true}}}"#;
+
+/// The current time in unix seconds.
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| i64::try_from(elapsed.as_secs()).ok())
+        .unwrap_or_default()
+}
+
 pub struct SsoClient {
     config: SsoInternalProviderConfig,
     http_client: reqwest::Client,
@@ -261,7 +288,12 @@ impl SsoClient {
             .is_some())
     }
 
-    pub async fn start_login(&self, redirect_url: String) -> Result<SsoLoginRequest, SsoError> {
+    pub async fn start_login(
+        &self,
+        redirect_url: String,
+        reauth: Reauth,
+    ) -> Result<SsoLoginRequest, SsoError> {
+        let started_at = unix_now();
         let redirect_url = RedirectUrl::new(redirect_url)?;
         let client: WarpgateClient = make_client(&self.config, &self.http_client).await?;
         let mut auth_req = client
@@ -271,6 +303,26 @@ impl SsoClient {
                 Nonce::new_random,
             )
             .set_redirect_uri(Cow::Owned(redirect_url.clone()));
+
+        match reauth {
+            Reauth::None => {}
+            Reauth::MaxAge(max_age) => {
+                auth_req = auth_req.set_max_age(max_age);
+            }
+            Reauth::Force => {
+                if self.config.supports_prompt_login() {
+                    auth_req = auth_req.add_prompt(CoreAuthPrompt::Login);
+                }
+                auth_req = auth_req.set_max_age(Duration::ZERO);
+            }
+        }
+
+        // Providers that include `auth_time` only when asked (OpenID Connect
+        // Core 5.5) are asked for it. Sent whenever a re-authentication
+        // setting is in play; the plain login is left as it was.
+        if reauth != Reauth::None {
+            auth_req = auth_req.add_extra_param("claims", AUTH_TIME_CLAIMS_REQUEST);
+        }
 
         for (k, v) in self.config.extra_parameters() {
             auth_req = auth_req.add_extra_param(k, v);
@@ -297,6 +349,8 @@ impl SsoClient {
             pkce_verifier,
             redirect_url,
             config: self.config.clone(),
+            started_at,
+            forced: reauth == Reauth::Force,
         })
     }
 
@@ -506,12 +560,20 @@ impl SsoClient {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use openidconnect::ClientId;
     use serde_json::json;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
 
     use super::{
-        AuthType, ClientSecret, GroupClaim, advertises_secret_post, flatten_group_claim,
-        resolve_auth_type, secret_survives_basic_auth,
+        AuthType, ClientSecret, GroupClaim, Reauth, SsoClient, advertises_secret_post,
+        flatten_group_claim, resolve_auth_type, secret_survives_basic_auth, unix_now,
     };
+    use crate::SsoInternalProviderConfig;
+    use crate::logout_token::tests::{sign, signing_key};
     use crate::metadata::tests::metadata;
 
     fn survives(secret: &str) -> bool {
@@ -660,5 +722,331 @@ mod tests {
                 "val2".to_string(),
             ]
         );
+    }
+
+    /// Answers one HTTP request: discovery, the key set, or the token endpoint
+    /// handing back whatever `id_token` currently holds.
+    async fn serve(mut socket: TcpStream, doc: &serde_json::Value, id_token: &Mutex<String>) {
+        let mut received = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        let (head, mut body_len) = loop {
+            let text = String::from_utf8_lossy(&received).into_owned();
+            if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                let wanted = head
+                    .lines()
+                    .filter_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(str::trim)
+                            .map(str::to_owned)
+                    })
+                    .find_map(|value| value.parse::<usize>().ok())
+                    .unwrap_or(0);
+                break (head.to_owned(), wanted.saturating_sub(body.len()));
+            }
+            match socket.read(&mut chunk).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => received.extend(chunk.iter().take(n)),
+            }
+        };
+        while body_len > 0 {
+            match socket.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => body_len = body_len.saturating_sub(n),
+            }
+        }
+        let path = head
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or_default();
+        let body = match path {
+            "/.well-known/openid-configuration" => doc["discovery"].to_string(),
+            "/jwks" => doc["jwks"].to_string(),
+            "/token" => serde_json::json!({
+                "access_token": "access",
+                "token_type": "bearer",
+                "id_token": id_token.lock().unwrap().clone(),
+            })
+            .to_string(),
+            _ => String::new(),
+        };
+        let status = if body.is_empty() {
+            "404 Not Found"
+        } else {
+            "200 OK"
+        };
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = socket.write_all(response.as_bytes()).await;
+        let _ = socket.shutdown().await;
+    }
+
+    /// An identity provider on a loopback port that signs ID tokens with a
+    /// fresh P-256 key. The token its token endpoint returns is whatever the
+    /// test last put in the returned slot.
+    async fn stand_in_idp() -> (
+        SsoInternalProviderConfig,
+        Arc<Mutex<String>>,
+        jsonwebtoken::EncodingKey,
+    ) {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let issuer = format!("http://{}", listener.local_addr().unwrap());
+        let (jwks, key) = signing_key();
+        let doc = serde_json::json!({
+            "jwks": jwks,
+            "discovery": {
+                "issuer": issuer,
+                "authorization_endpoint": format!("{issuer}/authorize"),
+                "token_endpoint": format!("{issuer}/token"),
+                "jwks_uri": format!("{issuer}/jwks"),
+                "response_types_supported": ["code"],
+                "subject_types_supported": ["public"],
+                "id_token_signing_alg_values_supported": ["ES256"],
+            },
+        });
+        let id_token = Arc::new(Mutex::new(String::new()));
+        let slot = id_token.clone();
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                let doc = doc.clone();
+                let id_token = id_token.clone();
+                tokio::spawn(async move { serve(socket, &doc, &id_token).await });
+            }
+        });
+        let config = serde_json::from_value(serde_json::json!({
+            "type": "custom",
+            "client_id": "warpgate",
+            "client_secret": "secret",
+            "issuer_url": issuer,
+            "scopes": [],
+        }))
+        .unwrap();
+        (config, slot, key)
+    }
+
+    /// ID token claims for `nonce`, issued by the stand-in provider now.
+    fn id_token_claims(
+        config: &SsoInternalProviderConfig,
+        nonce: &str,
+        auth_time: Option<i64>,
+    ) -> serde_json::Value {
+        let now = unix_now();
+        let mut claims = serde_json::json!({
+            "iss": config.issuer_url().unwrap().to_string(),
+            "sub": "alice",
+            "aud": "warpgate",
+            "iat": now,
+            "exp": now + 300,
+            "nonce": nonce,
+        });
+        if let Some(auth_time) = auth_time {
+            claims["auth_time"] = serde_json::json!(auth_time);
+        }
+        claims
+    }
+
+    const RETURN_URL: &str = "http://localhost/sso/return";
+
+    #[tokio::test]
+    async fn id_token_auth_time_reaches_login_response() {
+        let (config, slot, key) = stand_in_idp().await;
+        let client = SsoClient::new(config.clone()).unwrap();
+        let auth_time = unix_now() - 3600;
+
+        let request = client
+            .start_login(RETURN_URL.into(), Reauth::None)
+            .await
+            .unwrap();
+        let nonce = request.nonce.secret().clone();
+        *slot.lock().unwrap() = sign(
+            &key,
+            "k1",
+            &id_token_claims(&config, &nonce, Some(auth_time)),
+        );
+        let response = request.verify_code("code".into()).await.unwrap();
+        assert_eq!(response.auth_time, Some(auth_time));
+
+        // A token that does not say when the user logged in carries none.
+        let request = client
+            .start_login(RETURN_URL.into(), Reauth::None)
+            .await
+            .unwrap();
+        let nonce = request.nonce.secret().clone();
+        *slot.lock().unwrap() = sign(&key, "k1", &id_token_claims(&config, &nonce, None));
+        let response = request.verify_code("code".into()).await.unwrap();
+        assert_eq!(response.auth_time, None);
+    }
+
+    #[tokio::test]
+    async fn token_with_another_handshakes_nonce_is_refused() {
+        let (config, slot, key) = stand_in_idp().await;
+        let client = SsoClient::new(config.clone()).unwrap();
+
+        let ours = client
+            .start_login(RETURN_URL.into(), Reauth::None)
+            .await
+            .unwrap();
+        let theirs = client
+            .start_login(RETURN_URL.into(), Reauth::None)
+            .await
+            .unwrap();
+        let their_nonce = theirs.nonce.secret().clone();
+        *slot.lock().unwrap() = sign(
+            &key,
+            "k1",
+            &id_token_claims(&config, &their_nonce, Some(unix_now())),
+        );
+
+        assert!(ours.verify_code("code".into()).await.is_err());
+        // The same token is good for the handshake it was issued to.
+        assert!(theirs.verify_code("code".into()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn forced_return_refuses_replayed_older_id_token() {
+        let (config, slot, key) = stand_in_idp().await;
+        let client = SsoClient::new(config.clone()).unwrap();
+
+        // Handshake A completes normally, with a login from an hour ago.
+        let an_hour_ago = unix_now() - 3600;
+        let a = client
+            .start_login(RETURN_URL.into(), Reauth::None)
+            .await
+            .unwrap();
+        let a_token = sign(
+            &key,
+            "k1",
+            &id_token_claims(&config, a.nonce.secret(), Some(an_hour_ago)),
+        );
+        *slot.lock().unwrap() = a_token.clone();
+        assert_eq!(
+            a.verify_code("code".into()).await.unwrap().auth_time,
+            Some(an_hour_ago)
+        );
+
+        // Handshake B is forced. A's valid token, replayed on B's return, is
+        // refused and yields no response, so no `auth_time` reaches a caller.
+        let b = client
+            .start_login(RETURN_URL.into(), Reauth::Force)
+            .await
+            .unwrap();
+        assert!(b.forced());
+        *slot.lock().unwrap() = a_token;
+        let result = b.verify_code("code".into()).await;
+        assert!(result.is_err(), "replayed token must be refused");
+    }
+
+    #[tokio::test]
+    async fn a_bearer_token_response_never_carries_auth_time() {
+        let (config, _, key) = stand_in_idp().await;
+        let client = SsoClient::new(config.clone()).unwrap();
+        // Signed, audience-correct and carrying an auth_time, but bound to no
+        // handshake of ours: it must not be usable as a stamp.
+        let token = sign(
+            &key,
+            "k1",
+            &id_token_claims(&config, "unrelated", Some(unix_now())),
+        );
+        let response = client.verify_id_token_to_response(&token).await.unwrap();
+        assert_eq!(response.auth_time, None);
+    }
+
+    fn query(request: &crate::SsoLoginRequest) -> Vec<(String, String)> {
+        request
+            .auth_url()
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect()
+    }
+
+    fn has(query: &[(String, String)], key: &str, value: &str) -> bool {
+        query.iter().any(|(k, v)| k == key && v == value)
+    }
+
+    #[tokio::test]
+    async fn force_puts_prompt_login_and_max_age_zero_in_the_authorize_url() {
+        let (config, _, _) = stand_in_idp().await;
+        let client = SsoClient::new(config).unwrap();
+        let before = unix_now();
+        let request = client
+            .start_login(RETURN_URL.into(), Reauth::Force)
+            .await
+            .unwrap();
+        let query = query(&request);
+        assert!(has(&query, "prompt", "login"), "{query:?}");
+        assert!(has(&query, "max_age", "0"), "{query:?}");
+        assert!(request.forced());
+        assert!((before..=unix_now()).contains(&request.started_at()));
+    }
+
+    #[tokio::test]
+    async fn a_reauth_request_asks_for_auth_time_in_the_id_token() {
+        let (config, _, _) = stand_in_idp().await;
+        let client = SsoClient::new(config).unwrap();
+        for reauth in [Reauth::Force, Reauth::MaxAge(Duration::from_secs(3600))] {
+            let request = client.start_login(RETURN_URL.into(), reauth).await.unwrap();
+            let query = query(&request);
+            assert!(
+                has(
+                    &query,
+                    "claims",
+                    r#"{"id_token":{"auth_time":{"essential":true}}}"#
+                ),
+                "{query:?}"
+            );
+        }
+        let request = client
+            .start_login(RETURN_URL.into(), Reauth::None)
+            .await
+            .unwrap();
+        assert!(!query(&request).iter().any(|(k, _)| k == "claims"));
+    }
+
+    #[test]
+    fn google_takes_no_prompt_login() {
+        let google = SsoInternalProviderConfig::Google {
+            client_id: ClientId::new("c".into()),
+            client_secret: ClientSecret::new("s".into()),
+            service_account_email: None,
+            service_account_key: None,
+            admin_email: None,
+            role_mappings: None,
+            admin_role_mappings: None,
+        };
+        assert!(!google.supports_prompt_login());
+    }
+
+    #[tokio::test]
+    async fn max_age_puts_max_age_and_no_prompt_in_the_authorize_url() {
+        let (config, _, _) = stand_in_idp().await;
+        let client = SsoClient::new(config).unwrap();
+        let request = client
+            .start_login(RETURN_URL.into(), Reauth::MaxAge(Duration::from_secs(3600)))
+            .await
+            .unwrap();
+        let query = query(&request);
+        assert!(has(&query, "max_age", "3600"), "{query:?}");
+        assert!(!query.iter().any(|(k, _)| k == "prompt"), "{query:?}");
+        assert!(!request.forced());
+    }
+
+    #[tokio::test]
+    async fn no_reauth_leaves_the_authorize_url_as_it_was() {
+        let (config, _, _) = stand_in_idp().await;
+        let client = SsoClient::new(config).unwrap();
+        let request = client
+            .start_login(RETURN_URL.into(), Reauth::None)
+            .await
+            .unwrap();
+        let query = query(&request);
+        assert!(
+            !query.iter().any(|(k, _)| k == "prompt" || k == "max_age"),
+            "{query:?}"
+        );
+        assert!(!request.forced());
     }
 }

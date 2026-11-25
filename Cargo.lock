@@ -1468,9 +1468,9 @@ dependencies = [
 
 [[package]]
 name = "cookie"
-version = "0.18.2"
+version = "0.18.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a373e3602691c3cdea496d2f0ee5935151e6168fe87739483c463db1b2f2f87"
+checksum = "d55f2d6c30eeec7d5c6f98bd4395d4abb1895629eab97ee6522d340623615f8a"
 dependencies = [
  "aes-gcm 0.10.3",
  "base64 0.22.1",
@@ -9111,6 +9111,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "data-encoding",
+ "ed25519-dalek 3.0.0",
  "enum_dispatch",
  "futures",
  "governor",
@@ -9133,6 +9134,7 @@ dependencies = [
  "sea-orm",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
  "thiserror 2.0.21",
  "time",
  "tokio",
@@ -9269,13 +9271,16 @@ dependencies = [
  "cookie",
  "data-encoding",
  "delegate",
+ "ed25519-dalek 3.0.0",
  "futures",
  "html-escape",
  "http",
+ "jsonwebtoken",
  "libc",
  "percent-encoding",
  "poem",
  "poem-openapi",
+ "rcgen",
  "regex",
  "reqwest 0.13.5",
  "russh",
@@ -9552,6 +9557,7 @@ dependencies = [
  "openidconnect",
  "rcgen",
  "reqwest 0.12.28",
+ "rustls",
  "schemars 1.2.3",
  "serde",
  "serde_json",

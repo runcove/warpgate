@@ -8,7 +8,7 @@ use warpgate_common::encryption::{Keyring, env_keyring};
 use warpgate_common::{
     SshHostKeyKind, StoredSecrets, TargetOptions, WarpgateError, emit_runtime_warning,
 };
-use warpgate_db_entities::{Parameters, SecretBackend, SshClientKey, Target};
+use warpgate_db_entities::{Parameters, SecretBackend, SshClientKey, StatementKey, Target};
 
 use crate::cluster::alive_nodes;
 
@@ -194,6 +194,12 @@ async fn probe_undecryptable(db: &DatabaseConnection) -> Result<Vec<String>, War
         }
     }
 
+    for key in StatementKey::Entity::find().all(db).await? {
+        if key.secret_key.reveal().is_err() {
+            undecryptable.push(format!("session statement key `{}`", key.kid));
+        }
+    }
+
     let parameters = Parameters::Entity::get(db).await?;
     for (kind, key) in [
         (SshHostKeyKind::Ed25519, &parameters.ssh_host_key_ed25519),
@@ -257,6 +263,15 @@ async fn rewrite_all(db: &DatabaseConnection) -> Result<usize, WarpgateError> {
         }
     }
 
+    for key in StatementKey::Entity::find().all(db).await? {
+        let mut secret_key = key.secret_key.clone();
+        if matches!(secret_key.maybe_reencrypt(), Ok(true)) {
+            let mut model: StatementKey::ActiveModel = key.into();
+            model.secret_key = Set(secret_key);
+            rewritten += update_unless_deleted(model.update(db).await)?;
+        }
+    }
+
     let parameters = Parameters::Entity::get(db).await?;
     let mut model = Parameters::ActiveModel {
         id: Set(parameters.id),
@@ -288,5 +303,58 @@ fn update_unless_deleted<M>(result: Result<M, DbErr>) -> Result<usize, WarpgateE
         Ok(_) => Ok(1),
         Err(DbErr::RecordNotUpdated) => Ok(0),
         Err(e) => Err(e.into()),
+    }
+}
+
+#[cfg(test)]
+mod statement_key_tests {
+    use sea_orm::{Database, EntityTrait, Set};
+    use time::OffsetDateTime;
+    use warpgate_common::StoredSecret;
+    use warpgate_db_entities::StatementKey::{self, StatementKeySlot};
+
+    use super::*;
+
+    async fn memory_db() -> DatabaseConnection {
+        warpgate_db_entities::Parameters::set_config_migration_values(
+            warpgate_db_entities::Parameters::ConfigMigrationValues::default(),
+        );
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        warpgate_db_migrations::migrate_database(&db).await.unwrap();
+        db
+    }
+
+    async fn add_key(db: &DatabaseConnection, kid: &str, slot: StatementKeySlot, secret: &str) {
+        StatementKey::ActiveModel {
+            kid: Set(kid.into()),
+            public_key: Set("pub".into()),
+            secret_key: Set(StoredSecret::from(secret.to_owned())),
+            slot: Set(slot),
+            created_at: Set(OffsetDateTime::now_utc()),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+    }
+
+    /// The statement keys are part of the credential check: a key stored
+    /// under an envelope no configured key opens is reported by name (never
+    /// by value), and a readable one is not; the rewrite pass reads every row.
+    #[tokio::test]
+    async fn the_statement_keys_are_probed_and_rewritten() {
+        let db = memory_db().await;
+        add_key(&db, "readable", StatementKeySlot::Active, "c2VlZA").await;
+        assert!(probe_undecryptable(&db).await.unwrap().is_empty());
+
+        let envelope = "wgenc:v1:abcdef12:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        add_key(&db, "locked", StatementKeySlot::Next, envelope).await;
+        assert_eq!(
+            probe_undecryptable(&db).await.unwrap(),
+            ["session statement key `locked`"]
+        );
+
+        rewrite_all(&db).await.unwrap();
+        let rows = StatementKey::Entity::find().all(&db).await.unwrap();
+        assert_eq!(rows.len(), 2);
     }
 }

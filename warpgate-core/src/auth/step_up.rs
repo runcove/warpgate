@@ -46,6 +46,98 @@ pub fn is_fresh(
     now - last <= interval_td
 }
 
+/// The longest margin [`reauth_max_age`] leaves below the step-up interval.
+const REAUTH_MARGIN_CAP: Duration = Duration::from_secs(3600);
+
+/// The `max_age` an SSO start sends, and the age the SSO return accepts, for
+/// an HTTP step-up `interval`: the interval less a margin of a quarter of it
+/// in whole seconds (at most an hour), never below zero.
+///
+/// The margin keeps a login the provider accepts as recent from being stamped
+/// so close to the interval that the step-up gate closes the session seconds
+/// later. The start and the return both call this, so they cannot drift.
+#[must_use]
+pub fn reauth_max_age(interval: Duration) -> Duration {
+    let margin = Duration::from_secs(interval.as_secs() / 4).min(REAUTH_MARGIN_CAP);
+    interval.saturating_sub(margin)
+}
+
+/// Whether `stamp` is recent enough for an SSO return under HTTP step-up
+/// `interval`: newer than `now` less [`reauth_max_age`]. `None` is never
+/// recent enough.
+#[must_use]
+pub fn is_recent_enough(
+    stamp: Option<OffsetDateTime>,
+    interval: Duration,
+    now: OffsetDateTime,
+) -> bool {
+    let Some(stamp) = stamp else {
+        return false;
+    };
+    let Ok(max_age) = time::Duration::try_from(reauth_max_age(interval)) else {
+        return false;
+    };
+    now - stamp < max_age
+}
+
+/// How far an identity provider's clock may differ from ours, in seconds,
+/// before [`sso_stamp`] stops trusting a time it reports.
+pub const SSO_STAMP_SKEW_SECS: i64 = 120;
+
+/// The tighter allowance for a forced (`force=1`) return, in seconds, both
+/// before the handshake began and ahead of our clock: [`sso_stamp`] accepts a
+/// forced `auth_time` only within `[started_at - 30, now + 30]`.
+pub const FORCED_SSO_SKEW_SECS: i64 = 30;
+
+/// Decide what to write as the "last SSO" stamp after an SSO handshake returns.
+///
+/// The stamp records when the user last authenticated at the identity
+/// provider, so it comes from the ID token's `auth_time`, never from our own
+/// clock: an SSO session the provider merely resumed must not look fresh.
+///
+/// All times are unix seconds. `Some(x)` means write `x`; `None` means leave
+/// the stamp as it is.
+///
+/// - `auth_time` absent -> `None`.
+/// - Unforced: `auth_time` more than [`SSO_STAMP_SKEW_SECS`] ahead of `now` ->
+///   `None`; otherwise the candidate is `auth_time` clamped to `now`.
+/// - Forced (the handshake demanded a fresh login): `auth_time` outside
+///   `[started_at - FORCED_SSO_SKEW_SECS, now + FORCED_SSO_SKEW_SECS]` ->
+///   `None`; otherwise the candidate is exactly `auth_time`, never clamped, so
+///   our own clock never stands in for the provider's.
+///
+/// The candidate is written only if it is later than `previous`, so a stamp
+/// never moves backwards.
+#[must_use]
+pub const fn sso_stamp(
+    auth_time: Option<i64>,
+    started_at: i64,
+    forced: bool,
+    now: i64,
+    previous: Option<i64>,
+) -> Option<i64> {
+    let Some(auth_time) = auth_time else {
+        return None;
+    };
+    let candidate = if forced {
+        if auth_time > now.saturating_add(FORCED_SSO_SKEW_SECS)
+            || auth_time < started_at.saturating_sub(FORCED_SSO_SKEW_SECS)
+        {
+            return None;
+        }
+        auth_time
+    } else {
+        if auth_time > now.saturating_add(SSO_STAMP_SKEW_SECS) {
+            return None;
+        }
+        if auth_time < now { auth_time } else { now }
+    };
+    match previous {
+        Some(previous) if candidate <= previous => None,
+        _ => Some(candidate),
+    }
+}
+
 /// Where an open, key-authenticated connection stands against its step-up window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StepUpWindow {
@@ -685,6 +777,224 @@ mod tests {
         let now = OffsetDateTime::now_utc();
         let last = at(now, 60); // 1 min in the future
         assert!(is_fresh(Some(last), hours(12), now));
+    }
+
+    const T0: i64 = 1_800_000_000;
+
+    #[test]
+    fn sso_stamp_uses_auth_time_not_the_clock() {
+        // The provider says the user logged in 10 minutes ago; that is the
+        // stamp, not `now`.
+        let now = T0 + 600;
+        assert_eq!(sso_stamp(Some(T0), T0 + 590, false, now, None), Some(T0));
+        assert_eq!(
+            sso_stamp(Some(T0), T0 + 590, false, now, Some(T0 - 1)),
+            Some(T0)
+        );
+    }
+
+    #[test]
+    fn sso_stamp_ignores_missing_auth_time() {
+        assert_eq!(sso_stamp(None, T0, false, T0, None), None);
+        assert_eq!(sso_stamp(None, T0, true, T0, Some(T0 - 5)), None);
+    }
+
+    #[test]
+    fn forced_sso_stamp_ignores_auth_time_before_the_handshake() {
+        // A forced handshake that returns a login from before it began did not
+        // re-authenticate the user.
+        let started = T0 + 1000;
+        let now = started + 5;
+        assert_eq!(
+            sso_stamp(
+                Some(started - FORCED_SSO_SKEW_SECS - 1),
+                started,
+                true,
+                now,
+                None
+            ),
+            None
+        );
+        // Within the skew allowance of the start it is accepted.
+        assert_eq!(
+            sso_stamp(
+                Some(started - FORCED_SSO_SKEW_SECS),
+                started,
+                true,
+                now,
+                None
+            ),
+            Some(started - FORCED_SSO_SKEW_SECS)
+        );
+        // A login after the start is accepted.
+        assert_eq!(
+            sso_stamp(Some(started + 2), started, true, now, None),
+            Some(started + 2)
+        );
+    }
+
+    #[test]
+    fn forced_sso_stamp_window_is_30_s_each_side() {
+        let started = T0 + 1000;
+        let now = started + 5;
+        // Before the request: -31 refused, -29 accepted as given.
+        assert_eq!(
+            sso_stamp(Some(started - 31), started, true, now, None),
+            None
+        );
+        assert_eq!(
+            sso_stamp(Some(started - 29), started, true, now, None),
+            Some(started - 29)
+        );
+        // Ahead of the clock: +31 refused, +29 accepted as given, not `now`.
+        assert_eq!(sso_stamp(Some(now + 31), started, true, now, None), None);
+        assert_eq!(
+            sso_stamp(Some(now + 29), started, true, now, None),
+            Some(now + 29)
+        );
+        // The unforced path keeps its 120 s allowance.
+        assert_eq!(
+            sso_stamp(Some(now + 100), started, false, now, None),
+            Some(now)
+        );
+    }
+
+    #[test]
+    fn sso_stamp_accepts_an_old_auth_time_when_not_forced_and_newer_than_previous() {
+        let started = T0 + 10_000;
+        let now = started + 5;
+        let old = T0 + 100;
+        assert_eq!(sso_stamp(Some(old), started, false, now, None), Some(old));
+        assert_eq!(
+            sso_stamp(Some(old), started, false, now, Some(old - 1)),
+            Some(old)
+        );
+        // Not newer than what is already stored: left alone.
+        assert_eq!(sso_stamp(Some(old), started, false, now, Some(old)), None);
+        assert_eq!(
+            sso_stamp(Some(old), started, false, now, Some(old + 1)),
+            None
+        );
+    }
+
+    #[test]
+    fn sso_stamp_clamps_future_auth_time_within_skew() {
+        let now = T0;
+        assert_eq!(
+            sso_stamp(Some(now + SSO_STAMP_SKEW_SECS), now, false, now, None),
+            Some(now)
+        );
+    }
+
+    #[test]
+    fn forced_sso_stamp_is_auth_time_itself_never_now() {
+        // Forced, a future auth_time within the skew is stamped as given, not
+        // replaced by our clock; unforced it is clamped to `now`.
+        let now = T0;
+        for ahead in [1, FORCED_SSO_SKEW_SECS] {
+            assert_eq!(
+                sso_stamp(Some(now + ahead), now, true, now, None),
+                Some(now + ahead)
+            );
+            assert_eq!(
+                sso_stamp(Some(now + ahead), now, false, now, None),
+                Some(now)
+            );
+        }
+        // A past auth_time inside the window is stamped as given too.
+        assert_eq!(
+            sso_stamp(Some(now - 5), now, true, now, None),
+            Some(now - 5)
+        );
+    }
+
+    #[test]
+    fn sso_stamp_ignores_auth_time_beyond_skew() {
+        let now = T0;
+        assert_eq!(
+            sso_stamp(Some(now + SSO_STAMP_SKEW_SECS + 1), now, false, now, None),
+            None
+        );
+        assert_eq!(
+            sso_stamp(
+                Some(now + FORCED_SSO_SKEW_SECS + 1),
+                now,
+                true,
+                now,
+                Some(now - 50)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn sso_stamp_never_moves_backwards() {
+        let now = T0 + 1000;
+        // Older, equal: unchanged.
+        assert_eq!(
+            sso_stamp(Some(T0 + 10), now, false, now, Some(T0 + 20)),
+            None
+        );
+        assert_eq!(
+            sso_stamp(Some(T0 + 20), now, false, now, Some(T0 + 20)),
+            None
+        );
+        // A previous stamp ahead of the clock (skew) is not overwritten by now.
+        assert_eq!(
+            sso_stamp(Some(now + 60), now, false, now, Some(now + 90)),
+            None
+        );
+        // Newer: moves forward.
+        assert_eq!(
+            sso_stamp(Some(T0 + 30), now, false, now, Some(T0 + 20)),
+            Some(T0 + 30)
+        );
+    }
+
+    #[test]
+    fn reauth_max_age_leaves_a_margin_of_a_quarter_capped_at_an_hour() {
+        // 12h: the margin is capped at 1h.
+        assert_eq!(reauth_max_age(hours(12)), hours(11));
+        // 2h: a quarter is 30 min.
+        assert_eq!(
+            reauth_max_age(hours(2)),
+            Duration::from_secs(2 * 3600 - 1800)
+        );
+        assert_eq!(reauth_max_age(Duration::ZERO), Duration::ZERO);
+        assert_eq!(
+            reauth_max_age(Duration::from_secs(3)),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            reauth_max_age(Duration::MAX),
+            Duration::MAX - REAUTH_MARGIN_CAP
+        );
+    }
+
+    #[test]
+    fn a_login_just_inside_the_interval_is_not_recent_enough() {
+        let now = OffsetDateTime::now_utc();
+        let interval = hours(12);
+        // The provider session is `interval - 5 s` old: inside the interval,
+        // but it would expire seconds after the return.
+        let auth_time = now.unix_timestamp() - 12 * 3600 + 5;
+        let stamp = sso_stamp(Some(auth_time), 0, false, now.unix_timestamp(), None);
+        let stamp = stamp.and_then(|at| OffsetDateTime::from_unix_timestamp(at).ok());
+        assert!(!is_recent_enough(stamp, interval, now));
+        assert!(is_fresh(stamp, interval, now));
+    }
+
+    #[test]
+    fn a_login_inside_max_age_is_recent_enough() {
+        let now = OffsetDateTime::now_utc();
+        let interval = hours(12);
+        let max_age = reauth_max_age(interval).as_secs().cast_signed();
+        let inside = OffsetDateTime::from_unix_timestamp(now.unix_timestamp() - max_age + 1);
+        assert!(is_recent_enough(inside.ok(), interval, now));
+        // Exactly max_age old is not newer than `now - max_age`.
+        let edge = OffsetDateTime::from_unix_timestamp(now.unix_timestamp() - max_age);
+        assert!(!is_recent_enough(edge.ok(), interval, now));
+        assert!(!is_recent_enough(None, interval, now));
     }
 
     async fn setup_db() -> DatabaseConnection {
