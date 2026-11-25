@@ -1433,7 +1433,8 @@ mod ticket_session_tests {
 
     #[tokio::test]
     async fn a_forced_return_boundary_is_30_s_each_side() {
-        // Behind the clock, the request began about now: -31 refused, -29 let in.
+        // Behind the clock, the request began about now: -33 refused (past 30 s,
+        // with 2 s for the test's own delay), -25 let in.
         assert_forced_return_refused(Some((unix_now() - 31 - 2).into())).await;
         // Ahead of the clock: checked against the clock at the return, which
         // a loaded test run reaches seconds after this line, so a tight +31

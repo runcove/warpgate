@@ -114,6 +114,10 @@ With `force=1`:
 - an unknown `provider`, or none named among several, gets the login page
   (302 to `/@warpgate#/login`, with `next`), never an error;
 - a ticket session gets 403 (above);
+- a return with no fresh stamp is refused: Warpgate refuses a forced return
+  that yields no new stamp, with `login_error=sso_failed` on the `next` (see
+  "What `last_sso_at` means"), so a `force=1` that comes back succeeds only
+  with a fresh stamp;
 - the authorize request carries `prompt=login` (except where the provider
   type rejects it; see the per-provider paragraph below) and `max_age=0`, so
   an identity provider that honours them asks the user to sign in again
@@ -203,8 +207,12 @@ refused (the `sso_failed` return), before the credential is submitted. A
 `force=1` return is stricter, with or without step-up: if it yields no new
 stamp (`auth_time` absent, not a number, more than 30 s ahead, more than 30 s
 before the handshake began, or not later than the session's existing stamp) the
-sign-in is refused the same way and nothing is written. A different user's
-return never inherits the session's stamp.
+sign-in is refused the same way and nothing is written. This holds with
+step-up off too, so any `force=1` return can fail with `sso_failed`. An
+identity provider whose clock is more than 30 s behind Warpgate's reports an
+`auth_time` more than 30 s before the handshake began, so every `force=1`
+against it fails until the clocks agree. A different user's return never
+inherits the session's stamp.
 
 Known limit: a sign-in whose age is exactly the `max_age` can be refused once
 and pass on retry. The return counts a stamp as recent only when it is strictly
@@ -235,7 +243,7 @@ this action.
 
 Cove's side: for one request that needs a fresh sign-in, start one `force=1`
 round. If the statement from the session it returns to does not carry a
-`last_sso_at` of at least cove's own request start less 120 s, refuse the
+`last_sso_at` of at least cove's own request start less 30 s, refuse the
 request; do not start a second round. The signed statement
 carries no `auth_time` of its own.
 
