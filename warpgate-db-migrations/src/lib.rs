@@ -525,6 +525,42 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
+    /// Rolling back the statement-key migration refuses while any
+    /// `http_sessions` row remains, before it drops anything: the table and
+    /// the `seaql_migrations` row stay. With the rows gone it succeeds.
+    #[tokio::test]
+    async fn rolling_back_statement_keys_requires_no_http_sessions() {
+        use sea_orm::{ConnectionTrait, Statement};
+
+        set_config_migration_values(ConfigMigrationValues::default());
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        migrate_database(&db).await.unwrap();
+
+        let backend = db.get_database_backend();
+        db.execute(Statement::from_string(
+            backend,
+            "INSERT INTO http_sessions (id, expires, data, updated) \
+             VALUES ('s1', NULL, '{}', CURRENT_TIMESTAMP)",
+        ))
+        .await
+        .unwrap();
+
+        let error = migrate_database_down(&db, 1).await.unwrap_err().to_string();
+        assert!(
+            error.contains("refusing to roll back m00098_cove_statement_keys"),
+            "{error}"
+        );
+        assert!(table_exists(&db, "cove_statement_keys").await);
+        assert!(applied(&db, "m00098_cove_statement_keys").await);
+
+        db.execute(Statement::from_string(backend, "DELETE FROM http_sessions"))
+            .await
+            .unwrap();
+        migrate_database_down(&db, 1).await.unwrap();
+        assert!(!table_exists(&db, "cove_statement_keys").await);
+        assert!(!applied(&db, "m00098_cove_statement_keys").await);
+    }
+
     /// The statement-key table comes with the last migration, on a database
     /// that already ran the earlier ones, and keeps one row per slot.
     #[tokio::test]

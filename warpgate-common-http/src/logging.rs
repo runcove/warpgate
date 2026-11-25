@@ -145,6 +145,57 @@ mod tests {
     use super::*;
 
     #[test]
+    fn handoff_token_value_is_redacted() {
+        let uri: Uri = "/@warpgate/handoff?warpgate-handoff=s3cret"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            redacted_uri(&uri),
+            "/@warpgate/handoff?warpgate-handoff=redacted"
+        );
+    }
+
+    /// The handoff challenge is redacted on the control plane's handoff
+    /// start, and inside a `next` that returns there (the login page's and
+    /// the SSO start's), as are a ticket and a handoff token in a `next`.
+    /// Every query value is redacted, so a `next` is replaced whole.
+    #[test]
+    fn handoff_challenge_is_redacted_where_it_travels() {
+        for (uri, expected) in [
+            (
+                "/@warpgate/handoff/start?challenge=s3cret",
+                "/@warpgate/handoff/start?challenge=redacted",
+            ),
+            (
+                "/@warpgate/api/sso/providers/x/start?next=%2F%40warpgate%2Fhandoff%2Fstart%3Fchallenge%3Ds3cret",
+                "/@warpgate/api/sso/providers/x/start?next=redacted",
+            ),
+            (
+                "/@warpgate/api/sso/providers/x/start?next=%2Fapp%3Fwarpgate-ticket%3Ds3cret%26a%3D1",
+                "/@warpgate/api/sso/providers/x/start?next=redacted",
+            ),
+            (
+                "/@warpgate/api/auth/state?next=%2Fx%3Fwarpgate-handoff%3Ds3cret",
+                "/@warpgate/api/auth/state?next=redacted",
+            ),
+        ] {
+            let parsed: Uri = uri.parse().unwrap();
+            let logged = redacted_uri(&parsed);
+            assert!(!logged.contains("s3cret"), "{uri}");
+            assert_eq!(logged, expected, "{uri}");
+        }
+        // Elsewhere `challenge` is an application's own parameter, and its
+        // value is redacted like any other.
+        for (uri, expected) in [
+            ("/app?challenge=1", "/app?challenge=redacted"),
+            ("/app?next=%2Fapp%3Fchallenge%3D1", "/app?next=redacted"),
+        ] {
+            let parsed: Uri = uri.parse().unwrap();
+            assert_eq!(redacted_uri(&parsed), expected, "{uri}");
+        }
+    }
+
+    #[test]
     fn ticket_query_value_is_redacted() {
         let uri: Uri = "/app/x?a=1&warpgate-ticket=s3cret&b=2".parse().unwrap();
         assert_eq!(

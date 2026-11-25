@@ -91,19 +91,21 @@ impl StepUpSessionExt for Session {
     }
 }
 
-/// Stamps a completed SSO sign-in at `now` on the browser session, and raises
-/// its user session's shared stamp ([`HttpSsoStamp`]) to the same second: a
+/// Stamps a completed SSO sign-in on the browser session, and raises its user
+/// session's shared stamp ([`HttpSsoStamp`]) to the same second. `at` is the
+/// time the identity provider reports for the sign-in (the ID token's
+/// `auth_time`, resolved by the SSO return), not the current time. A
 /// target-host session of that user session carrying an earlier stamp is
 /// then refused ([`is_superseded`]). The SSO return's only way to stamp.
 pub(crate) async fn stamp_sso<C: ConnectionTrait>(
     session: &Session,
     db: &C,
-    now: OffsetDateTime,
+    at: OffsetDateTime,
 ) -> Result<(), WarpgateError> {
     // The session keeps whole seconds; the shared stamp must compare equal.
-    let now = OffsetDateTime::from_unix_timestamp(now.unix_timestamp()).unwrap_or(now);
-    session.set_last_sso_at(now);
-    raise_shared_stamp(session, db, Some(now)).await
+    let at = OffsetDateTime::from_unix_timestamp(at.unix_timestamp()).unwrap_or(at);
+    session.set_last_sso_at(at);
+    raise_shared_stamp(session, db, Some(at)).await
 }
 
 /// Raises the shared stamp of `session`'s user session to `stamp`, if both

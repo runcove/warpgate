@@ -42,6 +42,9 @@ impl MigrationTrait for Migration {
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        // Before anything is dropped: a refusal must leave the table in place
+        // on every backend, MySQL (which commits each DDL statement) included.
+        crate::helpers::refuse_down_while_http_sessions_remain(manager, self.name()).await?;
         manager
             .drop_table(
                 Table::drop()

@@ -115,8 +115,9 @@ With `force=1`:
   (302 to `/@warpgate#/login`, with `next`), never an error;
 - a ticket session gets 403 (above);
 - a return with no fresh stamp is refused: Warpgate refuses a forced return
-  that yields no new stamp, with `login_error=sso_failed` on the `next` (see
-  "What `last_sso_at` means"), so a `force=1` that comes back succeeds only
+  that yields no new stamp, with `login_error=sso_failed` on a relative `next`
+  (an absolute `next` gets `/@warpgate?login_error=...` instead; see "What
+  `last_sso_at` means"), so a `force=1` that comes back succeeds only
   with a fresh stamp;
 - the authorize request carries `prompt=login` (except where the provider
   type rejects it; see the per-provider paragraph below) and `max_age=0`, so
@@ -244,7 +245,9 @@ this action.
 Cove's side: for one request that needs a fresh sign-in, start one `force=1`
 round. If the statement from the session it returns to does not carry a
 `last_sso_at` of at least cove's own request start less 30 s, refuse the
-request; do not start a second round. The signed statement
+request; do not start a second round. The 30 s figure assumes cove's clock
+agrees with Warpgate's: a clock that runs ahead of Warpgate's shrinks the
+window, one that runs behind widens it. The signed statement
 carries no `auth_time` of its own.
 
 ## Signed session statement: `x-warpgate-session-freshness`
@@ -800,7 +803,9 @@ A browser gets a session on a target's own hostname through a one-time
 handoff from the control-plane host; that session carries the time of the
 SSO sign-in it was handed off from. When the same sign-in (user session)
 completes a later SSO sign-in, a step-up, Warpgate records the later time for
-every node to see.
+every node to see, but only when the provider reports a later `auth_time` for
+it. A re-sign-in the provider answers from its own session, with the same or
+an older `auth_time`, records nothing and ends no target-host session.
 
 - From then on, every target-host session still carrying an earlier sign-in
   is refused on its next request and deleted, so it never acts again. The
@@ -926,7 +931,7 @@ Each step of a handoff is rate-limited per client address, on each node.
 ## Rolling back to the previous release
 
 The way back from this release is to deploy the previous release,
-v0.30.2-cove.29. That release refuses to start on a database this release
+v0.30.2-cove.31. That release refuses to start on a database this release
 has migrated (`Migration file of version 'm00097_cove_http_sso_stamps' is
 missing`), so the database goes back first:
 
@@ -934,15 +939,16 @@ missing`), so the database goes back first:
 2. With the database's own client (`sqlite3`, `psql` or `mysql`), delete
    every row of `http_sessions`: `DELETE FROM http_sessions;`. The previous
    release cannot use this release's sessions, so they must go. This step is
-   required: step 3 refuses while any row remains, and leaves the two
-   handoff tables as they were when it refuses.
+   required: step 3 refuses while any row remains, and a refusal drops
+   nothing, on any backend: all three tables stay as they were.
 3. Once, against the shared database, with this release's binary and config:
    `warpgate --config <config> migrate-database -3 --destructive`. This
    reverts `m00098_cove_statement_keys`, `m00097_cove_http_sso_stamps` and
    `m00096_cove_http_handoffs`, dropping their three tables. They hold only short-lived handoffs,
    sign-in times and the statement signing keys; the previous release uses none of
-   them. The statement-key table goes first, so a refusal here can leave it
-   already dropped; the other two tables stay.
+   them. Each of the three reverts checks `http_sessions` before it drops
+   anything, so a refused rollback drops nothing on any backend, MySQL
+   included.
 4. Deploy the previous release.
 
 The check in step 3 relies on step 1: no node may be running to write a

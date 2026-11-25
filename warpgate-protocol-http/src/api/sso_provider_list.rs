@@ -684,7 +684,7 @@ pub(crate) fn is_allowed_next(next: &str, origins: &NextOrigins) -> bool {
 }
 
 /// Whether `next` is an absolute URL the browser may be sent to after
-/// sign-in, because the session cookie is shared with its host. Stricter than
+/// sign-in, because a host under the cookie domain is one the browser may be sent to (the session cookie itself is host-only). Stricter than
 /// the web UI's `sanitizeRedirect`. All of these hold:
 /// - the raw text has no control character, whitespace or backslash, and
 ///   starts with `https://` (any case) and no third slash;
@@ -2013,8 +2013,15 @@ mod tests {
             };
             // The stamp is the provider's `auth_time`: this return reports
             // the sign-in as just done.
+            // `?auth_time=N` makes the provider report that time instead.
+            let auth_time = req
+                .uri()
+                .query()
+                .and_then(|query| query.strip_prefix("auth_time="))
+                .and_then(|value| value.parse().ok())
+                .unwrap_or_else(|| OffsetDateTime::now_utc().unix_timestamp());
             let response = SsoLoginResponse {
-                auth_time: Some(OffsetDateTime::now_utc().unix_timestamp()),
+                auth_time: Some(auth_time),
                 ..sso_response(&[])
             };
             let outcome =
@@ -2055,7 +2062,20 @@ mod tests {
             cli: &TestClient<impl poem::Endpoint>,
             cookie: Option<String>,
         ) -> (String, Uuid, OffsetDateTime) {
-            let mut req = cli.get("/sso-return").header("host", "gate.example");
+            sign_in_reporting(cli, cookie, None).await
+        }
+
+        /// [`sign_in`], with the provider reporting `auth_time` (default: now).
+        async fn sign_in_reporting(
+            cli: &TestClient<impl poem::Endpoint>,
+            cookie: Option<String>,
+            auth_time: Option<i64>,
+        ) -> (String, Uuid, OffsetDateTime) {
+            let path = auth_time.map_or_else(
+                || "/sso-return".to_owned(),
+                |at| format!("/sso-return?auth_time={at}"),
+            );
+            let mut req = cli.get(path).header("host", "gate.example");
             if let Some(cookie) = &cookie {
                 req = req.header("cookie", cookie);
             }
@@ -2123,6 +2143,49 @@ mod tests {
             bound.set_last_sso_at(first);
             assert!(is_superseded(&bound, &db).await.unwrap());
             bound.set_last_sso_at(second);
+            assert!(!is_superseded(&bound, &db).await.unwrap());
+        }
+
+        /// A non-forced return whose `auth_time` is the one already stamped,
+        /// or older, leaves the session's stamp and the shared stamp where
+        /// they were: a provider answering from its own session ends no
+        /// target-host session.
+        #[tokio::test]
+        async fn an_unchanged_or_older_auth_time_does_not_raise_the_shared_stamp() {
+            let (services, _, _) = alice_without_ops().await;
+            services.config.lock().await.store.sso_providers = vec![provider_config()];
+            let db = services.db.clone();
+            let ctx = UnauthenticatedRequestContext::new(services).await;
+            let cli = TestClient::new(
+                Route::new()
+                    .at("/sso-return", get(sso_return))
+                    .at("/state", get(state))
+                    .data(SessionStore::new())
+                    .data(SharedSessionStorage::new(db.clone()))
+                    .data(ctx)
+                    .with(ServerSession::new(
+                        session_cookie_config(),
+                        SharedSessionStorage::new(db.clone()),
+                    )),
+            );
+
+            let (mut cookie, user_session, first) = sign_in(&cli, None).await;
+            for auth_time in [first.unix_timestamp(), first.unix_timestamp() - 60] {
+                let (cookie_after, session_after, stamp) =
+                    sign_in_reporting(&cli, Some(cookie), Some(auth_time)).await;
+                cookie = cookie_after;
+                assert_eq!(session_after, user_session, "the user session changed");
+                assert_eq!(stamp, first, "auth_time {auth_time} moved the stamp");
+                assert_eq!(
+                    HttpSsoStamp::latest(&db, user_session).await.unwrap(),
+                    Some(first),
+                    "auth_time {auth_time} raised the shared stamp"
+                );
+            }
+
+            let bound = Session::default();
+            bound.set(SESSION_ID_SESSION_KEY, UserSessionId(user_session));
+            bound.set_last_sso_at(first);
             assert!(!is_superseded(&bound, &db).await.unwrap());
         }
     }
