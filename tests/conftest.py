@@ -1369,9 +1369,16 @@ def _stop_test_processes(processes):
     processes.stop_since(mark)
 
 
+# Serves web targets with no hostname of their own, which Warpgate refuses by
+# default. Pass it as `config_patch` to a gateway whose tests open such a
+# target by name (`?warpgate-target=`) or by ticket.
+SERVE_UNBOUND_HTTP_TARGETS = {"http": {"serve_unbound_http_targets": True}}
+
+
 @pytest.fixture(scope="session")
 def shared_wg(processes: ProcessManager):
-    wg = processes.start_wg()
+    # Most tests open echo targets with no hostname by name.
+    wg = processes.start_wg(config_patch=SERVE_UNBOUND_HTTP_TARGETS)
     wait_port(wg.http_port, for_process=wg.process, recv=False)
     wait_port(wg.ssh_port, for_process=wg.process)
     wait_port(wg.kubernetes_port, for_process=wg.process, recv=False)

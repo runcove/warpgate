@@ -76,6 +76,8 @@ def loopback_wg(processes: ProcessManager):
             "http": {
                 "listen": f"127.0.0.1:{port}",
                 "plain_http_on_loopback": True,
+                # Its echo targets have no hostname and are opened by name.
+                "serve_unbound_http_targets": True,
             }
         },
     )

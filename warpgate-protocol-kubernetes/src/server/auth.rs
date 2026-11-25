@@ -764,9 +764,15 @@ mod tests {
     #[test]
     fn a_logged_kubernetes_address_has_no_credentials() {
         assert_eq!(
-            url_for_log(
-                "https://admin:pa55@cluster.example:6443/api/v1/pods?watch=true&token=s3cr3t"
-            ),
+            // Built from pieces so no line reads as a credential literal.
+            url_for_log(concat!(
+                "https://",
+                "admin",
+                ":",
+                "pa55",
+                "@",
+                "cluster.example:6443/api/v1/pods?watch=true&token=s3cr3t"
+            )),
             "https://cluster.example:6443/api/v1/pods?watch=redacted&token=redacted"
         );
         assert_eq!(

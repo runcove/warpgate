@@ -61,7 +61,7 @@ pub async fn logout(
     session_middleware: &Mutex<SessionStore>,
     db: &DatabaseConnection,
 ) {
-    end_login(session, session_middleware, db).await;
+    end_login(session, None, session_middleware, db).await;
     session.purge();
     info!("Logout requested");
 }
@@ -69,20 +69,24 @@ pub async fn logout(
 /// Ends the browser session's login and detaches it from this node, leaving
 /// the browser session's own contents to the caller.
 ///
-/// The login is ended first, in its own transaction. Once it is ended, no
-/// node accepts a cookie that still carries its authorization
+/// The login is ended first, in its own transaction, which also deletes every
+/// stored browser session of that login but `keep`, the storage id of the
+/// caller's own browser session when the caller goes on to write it
+/// (`UserSession::revoke_keeping`): the target-host sessions handed off from
+/// it, on every node, end with it. Once
+/// it is ended, no node accepts a cookie that still carries its authorization
 /// (`SessionStore::handle_for_request`), and a request still in flight cannot
 /// write the authorization back (`SharedSessionStorage::update_session`).
 /// The store is locked only to detach the session, not while waiting for the
 /// database.
 pub async fn end_login(
     session: &Session,
+    keep: Option<&str>,
     session_middleware: &Mutex<SessionStore>,
     db: &DatabaseConnection,
 ) {
     if let Some(id) = session.get_session_id()
-        && let Err(error) =
-            entities::UserSession::mark_ended_including_target_sessions(db, id).await
+        && let Err(error) = entities::UserSession::revoke_keeping(db, id, keep).await
     {
         error!(%error, %id, "Could not end the user session at logout");
     }
@@ -269,6 +273,21 @@ mod logout_tests {
         Ok(id.0.to_string())
     }
 
+    /// A new browser session on a target host sharing alice's user session
+    /// (its id in the query), as a handoff redeem leaves one: the user
+    /// session id and a bound authorization, no control-plane authorization.
+    #[handler]
+    fn bind(req: &Request, session: &Session) {
+        let id: Uuid = req.uri().query().unwrap().parse().unwrap();
+        session.set(crate::session::SESSION_ID_SESSION_KEY, UserSessionId(id));
+        session.set_bound_auth(crate::common::BoundSessionAuthorization {
+            user_id: ALICE,
+            username: "alice".into(),
+            target_id: Uuid::from_u128(2),
+            hostname: "vm1.warp.example".into(),
+        });
+    }
+
     /// Who the cookie is logged in as.
     #[handler]
     fn whoami(session: &Session) -> String {
@@ -318,6 +337,11 @@ mod logout_tests {
         let session = <&Session>::from_request_without_body(&req).await?.clone();
         let auth = session
             .get_auth()
+            .or_else(|| {
+                session
+                    .get_bound_auth()
+                    .map(|bound| bound.as_session_authorization())
+            })
             .ok_or_else(|| poem::Error::from_status(poem::http::StatusCode::UNAUTHORIZED))?;
         let ctx = Data::<&UnauthenticatedRequestContext>::from_request_without_body(&req)
             .await?
@@ -344,6 +368,7 @@ mod logout_tests {
         Route::new()
             .at("/login", get(log_in))
             .at("/whoami", get(whoami))
+            .at("/bind", get(bind))
             .at("/seed/sso-login", get(seed_sso_login))
             .at("/gated", get(gated).around(step_up_gate))
             .nest(
@@ -616,6 +641,41 @@ mod logout_tests {
         assert!(
             stored.is_some_and(|entries| entries.contains_key(AFTER_GATE)),
             "the write after the gate was lost"
+        );
+    }
+
+    /// On a target host, a stale stamp drops only that host's browser
+    /// session (the caller then starts a new handoff): the shared user
+    /// session, which the control plane and every other bound host use,
+    /// stays open.
+    #[tokio::test]
+    async fn step_up_on_a_bound_host_keeps_the_shared_login() {
+        let db = memory_db().await;
+        let storage = SharedSessionStorage::new(db.clone());
+        let services = services(db.clone()).await;
+        services.config.lock().await.store.step_up_interval = Some(StepUpIntervalConfig {
+            http: Some(Duration::from_secs(3600)),
+            ..Default::default()
+        });
+        let cli = TestClient::new(app_with(services, storage.clone()).await);
+        let login = log_in_as_alice(&cli).await;
+        let resp = cli.get(format!("/bind?{}", login.id.0)).send().await;
+        resp.assert_status_is_ok();
+        let bound = session_cookie(&resp).expect("the bind sets a cookie");
+        let (_, bound_storage_id) = bound.split_once('=').unwrap();
+
+        let resp = cli.get("/gated").header("cookie", &bound).send().await;
+        resp.assert_status_is_ok();
+        resp.assert_text("stepped up").await;
+
+        assert!(!is_ended(&db, login.id).await, "the shared login was ended");
+        assert!(
+            !is_stored(&db, bound_storage_id).await,
+            "the target-host browser session survived"
+        );
+        assert!(
+            is_stored(&db, &login.storage_id).await,
+            "the control-plane browser session was dropped"
         );
     }
 }

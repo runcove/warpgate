@@ -192,12 +192,16 @@ impl<E: Endpoint> Endpoint for OriginCheckEndpoint<E> {
     }
 }
 
-/// On a plain-HTTP loopback listener, refuses with 403 a state-changing
-/// request (or websocket upgrade) proxied to a target that carries a Warpgate
-/// session cookie unless it comes from Warpgate's own origin, by the same
-/// rule as Warpgate's own routes
-/// ([`OriginCheckRequest::is_same_origin_on_loopback`]). Other listeners are
-/// not affected.
+/// Refuses with 403 a state-changing request (or websocket upgrade) proxied
+/// to a target that carries a Warpgate session cookie unless it comes from
+/// the origin it is sent to, by the loopback rule
+/// ([`OriginCheckRequest::is_same_origin_on_loopback`]): `Origin` must be
+/// that origin, else Fetch Metadata must say `same-origin` or `none`; with
+/// neither header it is refused. On a plain-HTTP loopback listener that
+/// origin is the listener's own; elsewhere it is the target's own (the
+/// trusted scheme and host), so a page on one target's host cannot act as
+/// the user on another's. A request without a session cookie acts as no one
+/// and is left alone.
 #[derive(Clone)]
 pub struct TargetOriginCheckMiddleware;
 
@@ -217,9 +221,14 @@ impl<E: Endpoint> Endpoint for TargetOriginCheckEndpoint<E> {
     type Output = Response;
 
     async fn call(&self, req: Request) -> poem::Result<Self::Output> {
-        if is_plain_http_loopback(&req) {
-            let check = origin_check_request(&req, is_cluster_peer_request(&req));
-            if check.is_checked() && !loopback_request_allowed(&req, &check) {
+        let check = origin_check_request(&req, is_cluster_peer_request(&req));
+        if check.is_checked() && carries_session_cookie(&req) {
+            let own = if is_plain_http_loopback(&req) {
+                loopback_own_origin(&req)
+            } else {
+                target_own_origin(&req)
+            };
+            if !check.is_same_origin_on_loopback(own.as_ref()) {
                 warn!(
                     method = %check.method,
                     path = check.path,
@@ -232,6 +241,18 @@ impl<E: Endpoint> Endpoint for TargetOriginCheckEndpoint<E> {
         }
         Ok(self.inner.call(req).await?.into_response())
     }
+}
+
+/// Off loopback, the origin a target is served on for this request: the
+/// trusted scheme and the trusted Host (or X-Forwarded-Host), port included.
+/// A page on another target's host is another origin.
+fn target_own_origin(req: &Request) -> Option<Origin> {
+    let ctx = req.data::<UnauthenticatedRequestContext>()?;
+    let host = ctx.trusted_host_header(req)?;
+    Url::parse(&format!("{}://{host}", ctx.trusted_proto(req)))
+        .ok()
+        .map(|url| url.origin())
+        .filter(Origin::is_tuple)
 }
 
 #[cfg(test)]
@@ -691,15 +712,192 @@ mod tests {
         }
     }
 
+    /// Off loopback, a state-changing request carrying a session cookie must
+    /// come from the target's own origin (trusted scheme and host, port
+    /// included): a page on a sibling target's host is refused, and so is a
+    /// request with neither `Origin` nor `Sec-Fetch-Site`. Without a session
+    /// cookie, or for a read, anything passes.
     #[tokio::test]
-    async fn target_route_is_unchecked_off_loopback() {
-        let cli = TestClient::new(proxied_route(false));
-        for sender in [
-            Sender::OwnOrigin,
-            Sender::OtherPort,
-            Sender::NoBrowserHeaders,
+    async fn target_route_off_loopback_allows_only_the_targets_own_origin() {
+        let services = crate::test_db::services(crate::test_db::memory_db().await).await;
+        let app = Route::new()
+            .nest_no_strip(
+                "/",
+                make_sync(|_| "proxied").with(TargetOriginCheckMiddleware),
+            )
+            .data(UnauthenticatedRequestContext::new(services).await)
+            .data(PlainHttpListener(false));
+        let cli = TestClient::new(app);
+        const HOST: &str = "vm.warpgate.example.test:8443";
+        const COOKIE: &str = "__Host-warpgate-http-session=abc";
+        let post = |origin: Option<&str>, site: Option<&str>, cookie: bool| {
+            let mut req = cli.post("/vms/somevm/start").header("host", HOST);
+            if cookie {
+                req = req.header("cookie", COOKIE);
+            }
+            if let Some(origin) = origin {
+                req = req.header("origin", origin.to_owned());
+            }
+            if let Some(site) = site {
+                req = req.header("sec-fetch-site", site.to_owned());
+            }
+            req
+        };
+        for (origin, site, cookie, expected) in [
+            (Some(TARGET), Some("same-origin"), true, StatusCode::OK),
+            (None, Some("same-origin"), true, StatusCode::OK),
+            (None, Some("none"), true, StatusCode::OK),
+            (
+                Some("https://vm2.warpgate.example.test:8443"),
+                Some("same-site"),
+                true,
+                StatusCode::FORBIDDEN,
+            ),
+            (Some(MAIN), Some("same-site"), true, StatusCode::FORBIDDEN),
+            (
+                Some("http://vm.warpgate.example.test:8443"),
+                None,
+                true,
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                Some(FOREIGN),
+                Some("cross-site"),
+                true,
+                StatusCode::FORBIDDEN,
+            ),
+            (None, Some("same-site"), true, StatusCode::FORBIDDEN),
+            (None, None, true, StatusCode::FORBIDDEN),
+            (Some(FOREIGN), Some("cross-site"), false, StatusCode::OK),
+            (None, None, false, StatusCode::OK),
         ] {
-            assert_eq!(web_ui_requests(&cli, sender).await, [StatusCode::OK; 5]);
+            assert_eq!(
+                post(origin, site, cookie).send().await.0.status(),
+                expected,
+                "{origin:?} {site:?} {cookie}"
+            );
+        }
+        // A read is not checked, from anywhere.
+        cli.get("/vms")
+            .header("host", HOST)
+            .header("cookie", COOKIE)
+            .header("origin", FOREIGN)
+            .send()
+            .await
+            .assert_status_is_ok();
+    }
+
+    /// Two targets on hosts of their own under one parent domain, and a
+    /// browser signed in on both. Its requests to the first host carry that
+    /// host's session cookie whatever page sends them (the hosts are
+    /// same-site), under the browser's cookie name and through the cookie
+    /// gate, as served. A page on the second host changes nothing on the
+    /// first: not through the target, by any method or a websocket, and not
+    /// by signing that host's session out.
+    #[tokio::test]
+    async fn a_page_on_one_target_host_cannot_act_on_another() {
+        use crate::middleware::CookieGateMiddleware;
+
+        const HOST: &str = "vm.warpgate.example.test:8443";
+        const SIBLING: &str = "https://vm2.warpgate.example.test:8443";
+        const COOKIE: &str = "__Host-warpgate-http-session=abc; theme=dark";
+
+        let services = crate::test_db::services(crate::test_db::memory_db().await).await;
+        // What reached the route: whether the session cookie came through
+        // the gate, under the name it has inside.
+        let seen = |req: Request| {
+            let session = req
+                .headers()
+                .get_all(header::COOKIE)
+                .iter()
+                .any(|value| value.as_bytes().starts_with(b"warpgate-http-session=abc"));
+            if session { "session" } else { "no session" }
+        };
+        let app = Route::new()
+            .nest("/@warpgate", make_sync(seen).with(OriginCheckMiddleware))
+            .nest_no_strip("/", make_sync(seen).with(TargetOriginCheckMiddleware))
+            .with(CookieGateMiddleware::new(false, None))
+            .data(PlainHttpListener(false))
+            .data(UnauthenticatedRequestContext::new(services).await);
+
+        let send = async |method: Method, path: &str, from: Option<&str>, signed_in: bool| {
+            let websocket = method == Method::GET;
+            let mut headers = vec![("host", HOST)];
+            if signed_in {
+                headers.push(("cookie", COOKIE));
+            }
+            if let Some(from) = from {
+                let site = if from == TARGET {
+                    "same-origin"
+                } else {
+                    "same-site"
+                };
+                headers.push(("origin", from));
+                headers.push(("sec-fetch-site", site));
+            }
+            if websocket {
+                headers.push(("upgrade", "websocket"));
+                headers.push(("connection", "Upgrade"));
+            }
+            let response = app.get_response(request(method, path, &headers)).await;
+            let status = response.status();
+            let body = response.into_body().into_string().await.unwrap();
+            (status, body)
+        };
+
+        // GET here is a websocket upgrade.
+        let methods = [
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+            Method::GET,
+        ];
+        for method in methods {
+            let path = "/vms/somevm/start";
+            // The target's own page acts, as the session.
+            let (status, body) = send(method.clone(), path, Some(TARGET), true).await;
+            assert_eq!(
+                (status, body.as_str()),
+                (StatusCode::OK, "session"),
+                "{method}"
+            );
+            // The other target's page does not, with or without `Origin`.
+            for from in [Some(SIBLING), Some(MAIN)] {
+                let (status, _) = send(method.clone(), path, from, true).await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{method} {from:?}");
+            }
+            let headers = [
+                ("host", HOST),
+                ("cookie", COOKIE),
+                ("sec-fetch-site", "same-site"),
+                ("upgrade", "websocket"),
+            ];
+            let headers = if method == Method::GET {
+                &headers[..]
+            } else {
+                &headers[..3]
+            };
+            let response = app
+                .get_response(request(method.clone(), path, headers))
+                .await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method}");
+            // Without the session it acts as no one, so it is not this
+            // check's to refuse.
+            let (status, body) = send(method.clone(), path, Some(SIBLING), false).await;
+            assert_eq!(
+                (status, body.as_str()),
+                (StatusCode::OK, "no session"),
+                "{method}"
+            );
+        }
+
+        // Signing this host's session out is its own page's to do.
+        let (status, _) = send(Method::POST, LOGOUT, Some(TARGET), true).await;
+        assert_eq!(status, StatusCode::OK);
+        for signed_in in [true, false] {
+            let (status, _) = send(Method::POST, LOGOUT, Some(SIBLING), signed_in).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "signed in: {signed_in}");
         }
     }
 

@@ -3,6 +3,7 @@ mod approval_gate;
 mod catchall;
 mod client_cache;
 mod common;
+mod handoff;
 mod health;
 mod loopback_owner;
 mod middleware;
@@ -62,7 +63,7 @@ use crate::api::common::forward_ws_to_session_owner;
 use crate::client_cache::HttpClientCache;
 use crate::common::{endpoint_auth, page_auth};
 use crate::middleware::{
-    CookieHostMiddleware, LOOPBACK_SESSION_COOKIE_MAX_AGE_CAP, LoopbackHostMiddleware,
+    CookieGateMiddleware, LOOPBACK_SESSION_COOKIE_MAX_AGE_CAP, LoopbackHostMiddleware,
     LoopbackSessionCookieMiddleware, ManagementScopeMiddleware, OriginCheckMiddleware,
     SecurityHeadersMiddleware, TargetOriginCheckMiddleware, TicketMiddleware, limit_request_body,
 };
@@ -187,28 +188,16 @@ impl ProtocolServer for HTTPProtocolServer {
             cookie_max_age
         };
 
-        // Set cookie domain to base host (e.g., ".warp.example.com") so it works for
-        // the base host and all its subdomains (e.g., "foo.warp.example.com"), but not
-        // for its parent or sibling domains. The info API reports the same host
-        // (`cookie_domain`), and the login page sends the browser on only to it
-        // and its subdomains.
+        // The base host (e.g., ".warp.example.com") the session cookie used to be
+        // shared across: the cookie is host-only now (`CookieGateMiddleware`),
+        // and this is only where a browser's old cookie is expired. The info API
+        // reports the same host (`cookie_domain`), and the login page sends the
+        // browser on only to it and its subdomains.
         let base_cookie_domain: Option<String> = {
             let config = self.services.config.lock().await;
-            if let Some(host) = crate::common::session_cookie_base_host(&config).await {
-                let domain = format!(".{host}");
-                tracing::info!(
-                    "Cookie domain configured: {} (base host: {}) - cookies will work for {} and all its subdomains",
-                    domain,
-                    host,
-                    host
-                );
-                Some(domain)
-            } else {
-                tracing::warn!(
-                    "Failed to determine cookie domain - external_host may not be configured. Cookies will be scoped to request host, which may prevent cross-subdomain authentication."
-                );
-                None
-            }
+            crate::common::session_cookie_base_host(&config)
+                .await
+                .map(|host| format!(".{host}"))
         };
 
         // /@warpgate/ routes
@@ -269,6 +258,12 @@ impl ProtocolServer for HTTPProtocolServer {
                         }),
                 )
                 .at("/api/logo", poem::get(api::logo::api_get_logo))
+                // The target-host handoff (`handoff`): begun on the bound
+                // host, minted on the control plane, redeemed on the bound
+                // host. Outside `/api`, which is the API service's.
+                .at(handoff::BEGIN_PATH, poem::get(handoff::begin_endpoint))
+                .at(handoff::START_PATH, poem::get(handoff::start_endpoint))
+                .at(handoff::REDEEM_PATH, poem::get(handoff::redeem_endpoint))
                 // Liveness, from memory only; see health.rs.
                 .at("/api/health", health::health_endpoint)
                 .at(
@@ -368,13 +363,15 @@ impl ProtocolServer for HTTPProtocolServer {
                 crate::common::session_cookie_config().max_age(session_cookie_max_age),
                 session_storage.clone(),
             ))
-            .with(CookieHostMiddleware::new(base_cookie_domain))
             .with(cluster_peer_extension())
             .boxed()
             .with_if(
                 plain_http,
                 LoopbackSessionCookieMiddleware::new(session_cookie_max_age),
             )
+            // Outside every reader of the session cookie: the only place the
+            // browser's Warpgate cookies are read and written.
+            .with(CookieGateMiddleware::new(plain_http, base_cookie_domain))
             .data(PlainHttpListener(plain_http))
             .data(UnauthenticatedRequestContext::new(self.services.clone()).await)
             .data(http_client_cache.clone())
@@ -393,6 +390,7 @@ impl ProtocolServer for HTTPProtocolServer {
             )
             .boxed();
 
+        let handoff_db = self.services.db.clone();
         tokio::spawn(async move {
             loop {
                 let live = {
@@ -409,6 +407,17 @@ impl ProtocolServer for HTTPProtocolServer {
                     warn!(%error, "Failed to expire stored HTTP sessions");
                 }
                 sso_request_store.vacuum().await;
+                if let Err(error) =
+                    handoff::purge_expired(&handoff_db, time::OffsetDateTime::now_utc()).await
+                {
+                    warn!(%error, "Failed to purge expired target-host handoffs");
+                }
+                handoff::vacuum_rate_limit();
+                if let Err(error) =
+                    warpgate_db_entities::HttpSsoStamp::purge_ended(&handoff_db).await
+                {
+                    warn!(%error, "Failed to purge the SSO stamps of ended sessions");
+                }
                 tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             }
         });

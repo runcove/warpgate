@@ -9273,6 +9273,7 @@ dependencies = [
  "delegate",
  "ed25519-dalek 3.0.0",
  "futures",
+ "governor",
  "html-escape",
  "http",
  "jsonwebtoken",

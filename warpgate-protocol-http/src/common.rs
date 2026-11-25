@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use anyhow::Context;
-use http::StatusCode;
+use http::{Method, StatusCode};
 use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use poem::error::InternalServerError;
 use poem::session::{CookieConfig, Session};
@@ -54,13 +54,18 @@ pub const PROTOCOL_NAME: Protocol = Protocol::Http;
 static TARGET_SESSION_KEY: &str = "target_name";
 static AUTH_SESSION_KEY: &str = "auth";
 static AUTH_SSO_LOGIN_STATE: &str = "auth_sso_login_state";
+/// A target-host session's authorization ([`BoundSessionAuthorization`]).
+/// Kept apart from [`AUTH_SESSION_KEY`] so that no code reading that key,
+/// an older release's included, takes it for a sign-in that counts anywhere.
+pub(crate) static BOUND_AUTH_SESSION_KEY: &str = "cove_bound_auth";
 pub static SESSION_COOKIE_NAME: &str = "warpgate-http-session";
 /// The session cookie's name in the browser on a plain-HTTP loopback listener
 /// (`http.plain_http_on_loopback`); see `LoopbackSessionCookieMiddleware`.
 pub static LOOPBACK_SESSION_COOKIE_NAME: &str = "warpgate-loopback-session";
-/// The session cookie's `__Host-` name (not yet issued).
+/// The session cookie's name in the browser on a TLS listener; see
+/// `CookieGateMiddleware`.
 pub static HOST_SESSION_COOKIE_NAME: &str = "__Host-warpgate-http-session";
-/// The target-host handoff cookie (not yet issued).
+/// The nonce of a target-host handoff (`crate::handoff`).
 pub static HANDOFF_COOKIE_NAME: &str = "__Host-warpgate-handoff";
 
 /// Every cookie name Warpgate owns. A target never sees one of these in a
@@ -86,7 +91,9 @@ pub static WARPGATE_COOKIE_NAMES: [&str; 4] = [
 /// already spent. The cookie is `SameSite=Lax` instead: it is sent on a
 /// top-level navigation from another site and across the base domain and its
 /// subdomains (one site), but not on a form POST or a background request from
-/// another site's page. `CookieHostMiddleware` stamps `Lax` again on HTTPS.
+/// another site's page. In the browser it is the host-only
+/// `__Host-warpgate-http-session` (`CookieGateMiddleware`), so it is sent to
+/// the host that set it only.
 /// The one flow this costs is an SSO provider that posts its response back
 /// (`response_mode=form_post`, Apple): that POST arrives without the session,
 /// so the handshake bound to it is not found and sign-in fails;
@@ -305,7 +312,60 @@ impl SsoLoginState {
     }
 }
 
+/// A browser session on a host bound to an HTTP target, given by a handoff
+/// from the control plane (`crate::handoff`). It counts only for requests to
+/// that target on that host ([`BoundSessionAuthorization::counts_on`]), and it
+/// shares the user session of the control-plane sign-in it came from, so
+/// signing out there ends it too.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BoundSessionAuthorization {
+    pub user_id: Uuid,
+    pub username: String,
+    pub target_id: Uuid,
+    pub hostname: String,
+}
+
+impl BoundSessionAuthorization {
+    /// Whether this session counts for a request whose host is bound to
+    /// `bound` (`(target id, binding)`, `None` for a host that is not bound),
+    /// on `path`: a request proxied to its own target on its own host, or the
+    /// host-local sign-out. Never on Warpgate's other routes, and never on
+    /// another host.
+    pub fn counts_on(&self, bound: Option<(Uuid, &str)>, method: &Method, path: &str) -> bool {
+        let Some((target_id, binding)) = bound else {
+            return false;
+        };
+        if target_id != self.target_id
+            || !warpgate_common::same_binding_hostname(binding, &self.hostname)
+        {
+            return false;
+        }
+        match warpgate_surface_path(path) {
+            None => true,
+            Some(path) => path == "/api/auth/logout" && method == Method::POST,
+        }
+    }
+
+    pub fn as_session_authorization(&self) -> SessionAuthorization {
+        SessionAuthorization::User {
+            user_id: self.user_id,
+            username: self.username.clone(),
+        }
+    }
+}
+
+/// Whether `session` is a target-host session only: it carries the bound
+/// authorization and none of its own. Its user session id is the one it
+/// shares with the control-plane sign-in, so a login started on it must not
+/// use that id.
+pub(crate) fn is_target_host_session(session: &Session) -> bool {
+    session.get_auth().is_none() && session.get_bound_auth().is_some()
+}
+
 pub trait SessionExt {
+    /// The target-host session's authorization, if this is one.
+    fn get_bound_auth(&self) -> Option<BoundSessionAuthorization>;
+    fn set_bound_auth(&self, auth: BoundSessionAuthorization);
     fn get_target_name(&self) -> Option<String>;
     fn set_target_name(&self, target_name: String);
     fn get_auth(&self) -> Option<SessionAuthorization>;
@@ -320,6 +380,14 @@ pub trait SessionExt {
 }
 
 impl SessionExt for Session {
+    fn get_bound_auth(&self) -> Option<BoundSessionAuthorization> {
+        self.get(BOUND_AUTH_SESSION_KEY)
+    }
+
+    fn set_bound_auth(&self, auth: BoundSessionAuthorization) {
+        self.set(BOUND_AUTH_SESSION_KEY, auth);
+    }
+
     fn get_target_name(&self) -> Option<String> {
         self.get(TARGET_SESSION_KEY)
     }
@@ -388,15 +456,7 @@ pub async fn _inner_auth<E: Endpoint + 'static>(
     {
         // Pull the interval first; absent config -> feature off, skip the
         // session read entirely to keep the hot path cheap.
-        let interval = ctx
-            .services()
-            .config
-            .lock()
-            .await
-            .store
-            .step_up_interval
-            .as_ref()
-            .and_then(|s| s.http);
+        let interval = http_step_up_interval(ctx.services()).await;
         if interval.is_some() {
             let session = <&Session>::from_request_without_body(&req).await?;
             let last_sso_at = session.get_last_sso_at();
@@ -411,30 +471,70 @@ pub async fn _inner_auth<E: Endpoint + 'static>(
                     has_stamp = last_sso_at.is_some(),
                     "HTTP step-up required: session last_sso_at is stale or missing"
                 );
-                // A full logout rather than dropping only the auth claim: on
-                // 0.29.1 the browser session's server handle stays attributed
-                // to this user, and a cookie that no longer names the user is
-                // refused (401) by `SessionStore::handle_for_request` on every
-                // route off the login path. The login entry points would
-                // replace such a session (`SessionStore::handle_for_login`),
-                // but the logout leaves nothing stale to refuse or replace.
-                // SSO handshakes in flight live outside the Poem session, so
-                // nothing the re-login needs is lost. The login is ended as in
-                // `logout`, but the browser session is cleared, not purged: a
-                // purged session ignores every later write in this request,
-                // and the caller goes on to the login flow.
-                let session_middleware =
-                    Data::<&Arc<Mutex<SessionStore>>>::from_request_without_body(&req).await?;
-                crate::api::common::end_login(session, session_middleware.0, &ctx.services().db)
-                    .await;
-                session.clear();
-                info!("Logout requested");
+                if session.get_auth().is_none() && session.get_bound_auth().is_some() {
+                    // A target-host session shares its user session with the
+                    // control plane and every other bound host: drop only
+                    // this host's browser session. The caller then starts a
+                    // new handoff, which carries the control plane's stamp
+                    // and sends the browser to sign in there if that is
+                    // stale too. Ending the login here would let any page on
+                    // a sibling host sign the user out everywhere.
+                    session.purge();
+                    return Ok(Err(req));
+                }
+                force_step_up(&req, session).await?;
                 return Ok(Err(req));
             }
         }
     }
 
     return ep.call(req).await.map(Ok);
+}
+
+/// The control plane's forced re-login when its session's SSO stamp is
+/// stale: ends the login, then clears the browser session for the login flow
+/// the caller sends it to.
+///
+/// A full logout rather than dropping only the auth claim: on 0.29.1 the
+/// browser session's server handle stays attributed to this user, and a
+/// cookie that no longer names the user is refused (401) by
+/// `SessionStore::handle_for_request` on every route off the login path. The
+/// login entry points would replace such a session
+/// (`SessionStore::handle_for_login`), but the logout leaves nothing stale to
+/// refuse or replace. SSO handshakes in flight live outside the Poem session,
+/// so nothing the re-login needs is lost. The login is ended as in `logout`,
+/// but the browser session is cleared, not purged: a purged session ignores
+/// every later write in this request, and the caller goes on to the login
+/// flow.
+pub(crate) async fn force_step_up(req: &Request, session: &Session) -> poem::Result<()> {
+    let ctx = Data::<&UnauthenticatedRequestContext>::from_request_without_body(req).await?;
+    let session_middleware =
+        Data::<&Arc<Mutex<SessionStore>>>::from_request_without_body(req).await?;
+    let keep = storage_session_id(<&CookieJar>::from_request_without_body(req).await?);
+    crate::api::common::end_login(
+        session,
+        keep.as_deref(),
+        session_middleware.0,
+        &ctx.services().db,
+    )
+    .await;
+    session.clear();
+    info!("Logout requested");
+    Ok(())
+}
+
+/// The configured HTTP step-up interval; `None` when step-up is off.
+pub(crate) async fn http_step_up_interval(
+    services: &warpgate_core::Services,
+) -> Option<std::time::Duration> {
+    services
+        .config
+        .lock()
+        .await
+        .store
+        .step_up_interval
+        .as_ref()
+        .and_then(|s| s.http)
 }
 
 // TODO unify both based on the accept header
@@ -463,7 +563,10 @@ pub fn page_auth<E: Endpoint + 'static>(e: E) -> impl Endpoint {
                 // to the resolved public target. `_inner_auth`'s SSO step-up
                 // logic is gated on `Session(User { .. })` and so is also
                 // skipped.
-                let (req, auth) = onto_public_target_session(req, target_id);
+                let checked = req
+                    .data::<AuthenticatedRequestContext>()
+                    .map(|actx| actx.auth.clone());
+                let (req, auth) = onto_public_target_session(req, target_id, checked.as_ref());
                 let synthetic_ctx = ctx.to_authenticated(RequestAuthorization::Session(auth));
                 return Ok(ep.data(synthetic_ctx).call(req).await?.into_response());
             }
@@ -559,6 +662,10 @@ async fn try_auto_sso_redirect(req: &Request) -> poem::Result<Option<Response>> 
     // Cheap gates first — avoid the DB read + config lock unless the request
     // could actually be redirected.
     if !is_navigation || has_password_bypass || is_management_path {
+        return Ok(None);
+    }
+    // A bound host signs no one in: its visitors get a handoff instead.
+    if !matches!(gateway_pages_for(req).await, GatewayPages::Here) {
         return Ok(None);
     }
 
@@ -684,12 +791,18 @@ fn onto_throwaway_public_session(mut req: Request, target_id: Uuid) -> Request {
 /// Picks the session and the target-scoped authorization a public-target
 /// request is served under.
 ///
-/// A visitor whose cookie session is logged in as a user keeps that session:
-/// the proxied request carries their username, and the target session opens
-/// under their own user session. The authorization is a `Ticket` for the
-/// target in their name, so the catchall's Ticket arm skips the role check
-/// and the target session is stamped with the same user the session already
-/// holds. Nothing is written to their session.
+/// The visitor is named only by `checked`, the authorization
+/// [`inject_request_authorization`] accepted for this request on this host,
+/// never by what the cookie session holds: on a host bound to a target that
+/// is the target-host session handed off for this target and host
+/// ([`BoundSessionAuthorization::counts_on`]), and never a control-plane
+/// sign-in, which counts on no bound host.
+///
+/// A visitor accepted as a user keeps their session: the proxied request
+/// carries their username, and the target session opens under their own user
+/// session. The authorization is a `Ticket` for the target in their name, so
+/// the catchall's Ticket arm skips the role check and the target session is
+/// stamped with the same user. Nothing is written to their session.
 ///
 /// A visitor holding a ticket issued for this same target keeps its own
 /// session too, whether the ticket came in a header (a temporary session keyed
@@ -699,13 +812,33 @@ fn onto_throwaway_public_session(mut req: Request, target_id: Uuid) -> Request {
 /// id stays attached to it. A ticket is scoped to the one target it was
 /// issued for, so a ticket for any other target asserts no identity here.
 ///
-/// Anyone else (anonymous, or holding a ticket for a different target) is
-/// moved onto the throwaway `<public>` session.
-fn onto_public_target_session(req: Request, target_id: Uuid) -> (Request, SessionAuthorization) {
-    let visitor = req
-        .extensions()
-        .get::<Session>()
-        .and_then(SessionExt::get_auth);
+/// Anyone else (anonymous, a session not accepted here, a session that
+/// would name someone other than `checked` upstream, or a ticket for a
+/// different target) is moved onto the throwaway `<public>` session.
+fn onto_public_target_session(
+    req: Request,
+    target_id: Uuid,
+    checked: Option<&RequestAuthorization>,
+) -> (Request, SessionAuthorization) {
+    // The proxy names the user the request's session holds (its own
+    // authorization, else its target-host one), so a visitor is kept on
+    // that session only when it names the same user as `checked`.
+    let session_user = req.extensions().get::<Session>().and_then(|session| {
+        session
+            .get_auth()
+            .or_else(|| {
+                session
+                    .get_bound_auth()
+                    .map(|bound| bound.as_session_authorization())
+            })
+            .map(|auth| auth.user_id())
+    });
+    let visitor = match checked {
+        Some(RequestAuthorization::Session(auth)) if session_user == Some(auth.user_id()) => {
+            Some(auth.clone())
+        }
+        _ => None,
+    };
     match visitor {
         Some(SessionAuthorization::User { user_id, username }) => (
             req,
@@ -828,25 +961,23 @@ pub fn gateway_redirect(req: &Request) -> Response {
 }
 
 /// Where an unauthenticated navigation goes to sign in. A host bound to an
-/// HTTP target serves no login page (`is_served_on_bound_host`), so there the
-/// browser is sent to the control-plane host's login page
-/// ([`bound_host_login_location`]); elsewhere it is [`gateway_redirect`]. If
-/// the host's binding cannot be resolved, or no control-plane host is
-/// configured, there is no login page to send it to and it gets a plain 401.
+/// HTTP target serves no login page (`is_served_on_bound_host`) and honours no
+/// control-plane session, so there the browser starts a handoff
+/// ([`handoff_redirect`]), which signs it in on the control-plane host if it
+/// is not already; elsewhere it is [`gateway_redirect`]. If the host's binding
+/// cannot be resolved, no control-plane host is configured, or the request
+/// is not an HTTPS navigation, it gets a plain 401.
 pub(crate) async fn login_redirect(req: &Request) -> Response {
     match gateway_pages_for(req).await {
         GatewayPages::Here => gateway_redirect(req),
         GatewayPages::ControlPlane {
             control_plane,
             binding,
-        } => {
-            let path = next_after_login(req).unwrap_or_default();
-            redirect_navigations(
-                req,
-                bound_host_login_location(&control_plane, &binding, &path),
-                StatusCode::UNAUTHORIZED,
-            )
-        }
+            target_id,
+        } => match handoff_redirect(req, &control_plane, target_id, &binding).await {
+            Some(response) => response,
+            None => StatusCode::UNAUTHORIZED.into_response(),
+        },
         GatewayPages::Unavailable => StatusCode::UNAUTHORIZED.into_response(),
     }
 }
@@ -862,6 +993,7 @@ pub(crate) enum GatewayPages {
     ControlPlane {
         control_plane: url::Url,
         binding: String,
+        target_id: Uuid,
     },
     /// The host is, or may be, bound, and there is nowhere to send the
     /// browser: the lookup failed or no control-plane host is configured.
@@ -888,6 +1020,7 @@ pub(crate) async fn gateway_pages_for(req: &Request) -> GatewayPages {
         (Ok(control_plane), Some(binding)) => GatewayPages::ControlPlane {
             control_plane,
             binding,
+            target_id: target.id,
         },
         _ => {
             tracing::warn!(target = %target.name, "No control-plane host is configured to send a browser on a bound host to");
@@ -896,25 +1029,86 @@ pub(crate) async fn gateway_pages_for(req: &Request) -> GatewayPages {
     }
 }
 
-/// The control-plane login page for a visitor to the host a target is bound
-/// to (`binding`, the target's stored `external_host`), with `next` the
-/// absolute address of `path` on that host ([`bound_host_return_url`]). Both
-/// origins come from configuration and the target row, never from the
-/// request's Host. A `path` that would not stay on the bound host is dropped.
-pub(crate) fn bound_host_login_location(
+/// Starts a handoff for an unauthenticated navigation on the host bound to
+/// `target_id` at `binding` (`crate::handoff`): records it, gives the browser
+/// the nonce cookie, and sends it to the control plane's handoff start. The
+/// page to return to is this request's path on this host. `None` for a
+/// request that is not a navigation, not over HTTPS (the nonce cookie is a
+/// `__Host-` cookie), or when the handoff cannot be recorded. A source
+/// address past its rate limit, or a full handoff store, gets a plain
+/// refusal and records nothing.
+async fn handoff_redirect(
+    req: &Request,
     control_plane: &url::Url,
+    target_id: Uuid,
     binding: &str,
-    path: &str,
-) -> String {
-    let mut location = format!(
-        "{}/@warpgate#/login",
-        control_plane.origin().ascii_serialization()
-    );
-    if let Some(next) = bound_host_return_url(control_plane.scheme(), binding, path) {
-        location.push_str("?next=");
-        location.extend(utf8_percent_encode(&next, NON_ALPHANUMERIC));
+) -> Option<Response> {
+    if !is_https_navigation(req) {
+        return None;
     }
+    let next = next_after_login(req).filter(|next| next.starts_with('/'))?;
+    open_handoff(req, control_plane, target_id, binding, &next).await
+}
+
+/// Whether `req` is a top-level navigation over HTTPS, as a handoff needs:
+/// its nonce cookie is a `__Host-` cookie.
+pub fn is_https_navigation(req: &Request) -> bool {
+    req.data::<UnauthenticatedRequestContext>()
+        .is_some_and(|ctx| ctx.trusted_proto(req) == http::uri::Scheme::HTTPS)
+        && is_navigation_request(req)
+}
+
+/// Opens a handoff for the host bound to `target_id` at `binding`, to come
+/// back to `next` (a path on that host), and answers with the nonce cookie
+/// and the redirect to the control plane's handoff start. Shared by
+/// [`handoff_redirect`] and the handoff's begin route
+/// (`crate::handoff::begin_endpoint`); it changes no session. `None` when
+/// the handoff cannot be recorded; a source address past its rate limit, or
+/// a full handoff store, gets a plain refusal and records nothing.
+pub async fn open_handoff(
+    req: &Request,
+    control_plane: &url::Url,
+    target_id: Uuid,
+    binding: &str,
+    next: &str,
+) -> Option<Response> {
+    let ctx = req.data::<UnauthenticatedRequestContext>()?;
+    if !crate::handoff::within_rate_limit(req, ctx.services(), crate::handoff::Step::Open).await {
+        return Some(crate::handoff::rate_limited());
+    }
+    let opened = crate::handoff::open(
+        &ctx.services().db,
+        target_id,
+        binding,
+        next,
+        OffsetDateTime::now_utc(),
+    )
+    .await
+    .inspect_err(|error| tracing::error!(%error, "Could not record a target-host handoff"))
+    .ok()?;
+    let Some(opened) = opened else {
+        return Some(crate::handoff::busy());
+    };
+    let mut location = control_plane.clone();
+    location.set_path(&format!("/@warpgate{}", crate::handoff::START_PATH));
+    location.set_query(None);
     location
+        .query_pairs_mut()
+        .append_pair(crate::handoff::HANDOFF_CHALLENGE_PARAM, &opened.challenge);
+    let nonce_cookie = format!(
+        "{HANDOFF_COOKIE_NAME}={}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age={}",
+        opened.nonce,
+        crate::handoff::OPEN_LIFETIME.as_secs()
+    );
+    Some(
+        Response::builder()
+            .status(StatusCode::SEE_OTHER)
+            .header(http::header::LOCATION, location.as_str())
+            .header(http::header::SET_COOKIE, nonce_cookie)
+            .header(http::header::REFERRER_POLICY, "no-referrer")
+            .header(http::header::CACHE_CONTROL, "no-store")
+            .finish(),
+    )
 }
 
 /// `path` on the host a target is bound to, as an absolute URL with the
@@ -1008,6 +1202,12 @@ pub async fn get_auth_state_for_request(
         .await
         .context("Session not in request")?;
 
+    // A target-host session names the user session it shares with the
+    // control plane, under which that sign-in's own auth state is kept: it
+    // carries no login attempt of its own.
+    if is_target_host_session(session) {
+        return Ok(None);
+    }
     let Some(session_id) = session.get_session_id() else {
         return Ok(None);
     };
@@ -1227,6 +1427,56 @@ pub async fn inject_request_authorization<E: Endpoint + 'static>(
     let is_cluster_peer = is_cluster_peer_request(&req);
 
     let mut session_auth = session.get_auth();
+    // A control-plane sign-in never counts on a host bound to a target, and a
+    // target-host session counts only for its own target on its own host
+    // (`BoundSessionAuthorization::counts_on`). If the host cannot be
+    // resolved, neither counts.
+    let bound_auth = session.get_bound_auth();
+    let signed_in = matches!(session_auth, Some(SessionAuthorization::User { .. }));
+    let mut bound_session_counts = false;
+    if (signed_in || bound_auth.is_some()) && !is_cluster_peer {
+        let host_target = target_bound_to_request_host(&ctx, &req).await;
+        if let Err(error) = &host_target {
+            tracing::warn!(%error, "Could not resolve the request host to a target; ignoring the session");
+        }
+        if signed_in && !matches!(host_target, Ok(None)) {
+            tracing::debug!("Control-plane session ignored on a host bound to a target");
+            session_auth = None;
+        }
+        if let (None, Some(bound)) = (&session_auth, &bound_auth) {
+            let target = host_target.ok().flatten();
+            let binding = target.as_ref().and_then(|t| host_binding(&t.options));
+            let here = target
+                .as_ref()
+                .zip(binding.as_deref())
+                .map(|(t, b)| (t.id, b));
+            if bound.counts_on(here, req.method(), req.uri().path()) {
+                // A later SSO sign-in of the same user session (a step-up)
+                // ends every target-host session carrying an earlier one, on
+                // its next request: it is purged, so it never counts again,
+                // and the browser starts a new handoff, which carries the
+                // later sign-in.
+                match crate::step_up::is_superseded(session, &ctx.services().db).await {
+                    Ok(false) => {
+                        session_auth = Some(bound.as_session_authorization());
+                        bound_session_counts = true;
+                    }
+                    Ok(true) => {
+                        tracing::info!(
+                            username = %bound.username,
+                            "Target-host session ended: its user session has signed in again since"
+                        );
+                        session.purge();
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "Could not check the target-host session's sign-in; ignoring the session");
+                    }
+                }
+            } else {
+                tracing::debug!("Target-host session ignored outside its own target and host");
+            }
+        }
+    }
     // On a host bound to an HTTP target, outside the login flow, neither the
     // session nor a token counts (see `credentials_refused_on_bound_host`).
     // Looked up only for a request that carries either.
@@ -1235,7 +1485,7 @@ pub async fn inject_request_authorization<E: Endpoint + 'static>(
         && credentials_refused_on_bound_host(&ctx, &req).await;
     // A forwarded request's Host is the cluster SNI name by construction, so the
     // origin check below would reject - and clear - a session that is fine.
-    if session_auth.is_some() && !is_cluster_peer {
+    if session_auth.is_some() && !is_cluster_peer && !bound_session_counts {
         // Host binding only means something when `external_host` pins an
         // origin. Without it the external URL is derived from Host header
         let (base_host, control_plane_host, accepted) = {
@@ -1455,21 +1705,60 @@ mod tests {
         }
     }
 
+    /// A target-host session counts for its own target on its own host
+    /// (port, case and a trailing dot aside), on proxied paths and the
+    /// host-local sign-out only.
     #[test]
-    fn bound_host_login_location_is_on_the_control_plane() {
-        use super::bound_host_login_location;
+    fn bound_session_counts_only_on_its_own_target_and_host() {
+        use http::Method;
 
-        let control_plane = url::Url::parse("https://admin.example.test:8443").unwrap();
-        assert_eq!(
-            bound_host_login_location(&control_plane, "vm.example.test:8443", "/app?a=1"),
-            "https://admin.example.test:8443/@warpgate#/login?next=\
-             https%3A%2F%2Fvm%2Eexample%2Etest%3A8443%2Fapp%3Fa%3D1"
-        );
-        // No `next` rather than one off the bound host.
-        assert_eq!(
-            bound_host_login_location(&control_plane, "vm.example.test", ".evil.example/"),
-            "https://admin.example.test:8443/@warpgate#/login"
-        );
+        use super::BoundSessionAuthorization;
+
+        let target_id = uuid::Uuid::new_v4();
+        let auth = BoundSessionAuthorization {
+            user_id: uuid::Uuid::new_v4(),
+            username: "alice".into(),
+            target_id,
+            hostname: "vm.example.test:8443".into(),
+        };
+        let here = Some((target_id, "vm.example.test:8443"));
+        for (bound, method, path, expected) in [
+            (here, Method::GET, "/", true),
+            (here, Method::POST, "/app/form", true),
+            (here, Method::DELETE, "/api/things/1", true),
+            (
+                Some((target_id, "VM.example.test.")),
+                Method::GET,
+                "/",
+                true,
+            ),
+            (here, Method::POST, "/@warpgate/api/auth/logout", true),
+            (here, Method::POST, "/_warpgate/api/auth/logout", true),
+            (here, Method::GET, "/@warpgate/api/auth/logout", false),
+            (here, Method::GET, "/@warpgate/api/info", false),
+            (here, Method::GET, "/@warpgate", false),
+            (here, Method::GET, "/@warpgate/admin/api/users", false),
+            (here, Method::POST, "/@warpgate/api/sso/logout", false),
+            (None, Method::GET, "/", false),
+            (
+                Some((uuid::Uuid::new_v4(), "vm.example.test:8443")),
+                Method::GET,
+                "/",
+                false,
+            ),
+            (
+                Some((target_id, "vm2.example.test:8443")),
+                Method::GET,
+                "/",
+                false,
+            ),
+        ] {
+            assert_eq!(
+                auth.counts_on(bound, &method, path),
+                expected,
+                "{bound:?} {method} {path}"
+            );
+        }
     }
 
     /// A ticket in the address of a request sent to the login page is not
@@ -1794,11 +2083,69 @@ mod public_session_tests {
     use poem::web::{Data, Path};
     use poem::{Endpoint, EndpointExt, Request, Route, get, handler};
     use uuid::Uuid;
-    use warpgate_common_http::SessionAuthorization;
+    use warpgate_common_http::{RequestAuthorization, SessionAuthorization};
 
-    use super::{SessionExt, onto_public_target_session, public_session_authorization};
+    use super::{SessionExt, public_session_authorization};
     use crate::middleware::ticket::{TemporaryTicketSession, ticket_session_key};
     use crate::proxy::upstream_headers_for_test;
+
+    /// [`super::onto_public_target_session`] with the authorization the
+    /// request's session holds, as `inject_request_authorization` accepts it
+    /// on a host where that session counts.
+    fn onto_public_target_session(
+        req: Request,
+        target_id: Uuid,
+    ) -> (Request, SessionAuthorization) {
+        let checked = req
+            .extensions()
+            .get::<Session>()
+            .and_then(SessionExt::get_auth)
+            .map(RequestAuthorization::Session);
+        super::onto_public_target_session(req, target_id, checked.as_ref())
+    }
+
+    /// The visitor is named by the authorization accepted for the request,
+    /// never by what its session holds: a session signed in as a user, or
+    /// holding a ticket for this target, that was not accepted here (as a
+    /// control-plane sign-in is not on a target's own host) is served as
+    /// `<public>` on the throwaway session, and its own session is left
+    /// alone.
+    #[tokio::test]
+    async fn a_session_not_accepted_here_names_no_one() {
+        for held in [
+            SessionAuthorization::User {
+                user_id: user_id_of("alice"),
+                username: "alice".into(),
+            },
+            SessionAuthorization::Ticket {
+                user_id: user_id_of("alice"),
+                username: "alice".into(),
+                target_id: TARGET,
+                ticket_id: Some(TICKET),
+            },
+        ] {
+            let session = Session::default();
+            session.set_auth(held.clone());
+
+            // Not accepted at all, or accepted as someone the session does
+            // not name upstream.
+            let bob = RequestAuthorization::Session(SessionAuthorization::User {
+                user_id: user_id_of("bob"),
+                username: "bob".into(),
+            });
+            for checked in [None, Some(&bob)] {
+                let mut req = Request::builder().finish();
+                req.extensions_mut().insert(session.clone());
+
+                let (req, auth) = super::onto_public_target_session(req, TARGET, checked);
+
+                assert!(auth.user_id().is_nil(), "{held:?} {checked:?}: {auth:?}");
+                assert_eq!(session_key(&req), Some((Uuid::nil(), TARGET, None)));
+                let upstream = upstream_headers_for_test(&req).await;
+                assert_eq!(warpgate_headers(&upstream), Vec::<String>::new());
+            }
+        }
+    }
 
     const TARGET: Uuid = Uuid::from_u128(7);
     const OTHER_TARGET: Uuid = Uuid::from_u128(8);

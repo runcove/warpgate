@@ -200,13 +200,7 @@ async fn forward_http_inner(
 ) -> poem::Result<Response> {
     reject_second_hop(req)?;
 
-    let mut headers = poem::http::HeaderMap::new();
-    let filter = ForwardFilter::new(req.headers());
-    for (name, value) in req.headers() {
-        if should_forward(&filter, name) || (identity.forwards_cookie() && name == COOKIE) {
-            headers.insert(name.clone(), value.clone());
-        }
-    }
+    let headers = forwarded_headers(req.headers(), identity.forwards_cookie());
 
     let mut request = services
         .cluster
@@ -351,6 +345,62 @@ fn should_forward(filter: &ForwardFilter, name: &HeaderName) -> bool {
     filter.allows(name) && name != CONTENT_LENGTH && name != TRANSFER_ENCODING && name != COOKIE
 }
 
+/// The session cookie's name inside a node, behind its cookie gate.
+const INNER_SESSION_COOKIE_NAME: &[u8] = b"warpgate-http-session";
+/// The session cookie's name in a browser on a TLS listener, the only name
+/// a node's cookie gate accepts it under there.
+const HOST_SESSION_COOKIE_NAME: &[u8] = b"__Host-warpgate-http-session";
+
+/// The headers a forwarded request carries to the peer. With
+/// `forwards_cookie`, every `Cookie` header is passed on (the cookie gate
+/// splits the browser's cookies over two), and the session cookie goes under
+/// the browser's name: the peer's gate reads the request as a browser's and
+/// drops the inner name as the old domain-wide cookie.
+fn forwarded_headers(
+    request_headers: &poem::http::HeaderMap,
+    forwards_cookie: bool,
+) -> poem::http::HeaderMap {
+    let mut headers = poem::http::HeaderMap::new();
+    let filter = ForwardFilter::new(request_headers);
+    for (name, value) in request_headers {
+        if forwards_cookie && name == COOKIE {
+            headers.append(COOKIE, browser_cookie_header(value));
+        } else if should_forward(&filter, name) {
+            headers.insert(name.clone(), value.clone());
+        }
+    }
+    headers
+}
+
+/// `value` with an exact inner session cookie pair renamed to the browser's
+/// name; every other byte is kept as it is.
+fn browser_cookie_header(value: &poem::http::HeaderValue) -> poem::http::HeaderValue {
+    let mut renamed = false;
+    let mut out = Vec::with_capacity(value.len() + 8);
+    for (index, pair) in value.as_bytes().split(|byte| *byte == b';').enumerate() {
+        if index > 0 {
+            out.push(b';');
+        }
+        let rest = pair.trim_ascii_start();
+        out.extend_from_slice(pair.get(..pair.len() - rest.len()).unwrap_or_default());
+        match rest
+            .strip_prefix(INNER_SESSION_COOKIE_NAME)
+            .filter(|tail| tail.first() == Some(&b'='))
+        {
+            Some(tail) => {
+                renamed = true;
+                out.extend_from_slice(HOST_SESSION_COOKIE_NAME);
+                out.extend_from_slice(tail);
+            }
+            None => out.extend_from_slice(rest),
+        }
+    }
+    if !renamed {
+        return value.clone();
+    }
+    poem::http::HeaderValue::from_bytes(&out).unwrap_or_else(|_| value.clone())
+}
+
 pub trait ReparseForwardedResponse: Sized {
     fn reparse_forwarded_response(
         response: Response,
@@ -397,7 +447,7 @@ mod tests {
 
     use poem::http::HeaderMap;
 
-    use super::{ForwardFilter, should_forward as should_forward_with};
+    use super::{ForwardFilter, forwarded_headers, should_forward as should_forward_with};
 
     fn should_forward(name: &HeaderName) -> bool {
         should_forward_with(&ForwardFilter::new(&HeaderMap::new()), name)
@@ -514,5 +564,53 @@ mod tests {
             &filter,
             &HeaderName::from_static("x-other")
         ));
+    }
+
+    /// A forwarded login step carries both of the cookie gate's `Cookie`
+    /// headers, the session under the name the peer's gate accepts, and the
+    /// other header's bytes (not ASCII here) unchanged.
+    #[test]
+    fn a_forwarded_login_step_keeps_every_cookie_header() {
+        use poem::http::HeaderValue;
+        use poem::http::header::COOKIE;
+        let mut headers = HeaderMap::new();
+        headers.append(
+            COOKIE,
+            HeaderValue::from_static("warpgate-http-session=s3ss; x=1"),
+        );
+        let other = HeaderValue::from_bytes("planted=caf\u{e9}; y=2".as_bytes()).unwrap();
+        headers.append(COOKIE, other.clone());
+        headers.append("accept", HeaderValue::from_static("*/*"));
+
+        let forwarded = forwarded_headers(&headers, true);
+        let cookies: Vec<_> = forwarded.get_all(COOKIE).iter().cloned().collect();
+        assert_eq!(
+            cookies,
+            vec![
+                HeaderValue::from_static("__Host-warpgate-http-session=s3ss; x=1"),
+                other,
+            ]
+        );
+        assert!(forwarded.contains_key("accept"));
+
+        // Without the browser's cookie, none is forwarded.
+        assert!(!forwarded_headers(&headers, false).contains_key(COOKIE));
+    }
+
+    /// Only the exact session pair is renamed.
+    #[test]
+    fn only_the_exact_session_pair_is_renamed() {
+        use poem::http::HeaderValue;
+        use poem::http::header::COOKIE;
+        let mut headers = HeaderMap::new();
+        headers.append(
+            COOKIE,
+            HeaderValue::from_static("warpgate-http-session-x=1;warpgate-http-session=2"),
+        );
+        let forwarded = forwarded_headers(&headers, true);
+        assert_eq!(
+            forwarded.get(COOKIE).unwrap(),
+            "warpgate-http-session-x=1;__Host-warpgate-http-session=2"
+        );
     }
 }

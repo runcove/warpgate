@@ -196,6 +196,7 @@ mod tests {
             mfa_setup_location(GatewayPages::ControlPlane {
                 control_plane: url::Url::parse("https://admin.example.test:8443").unwrap(),
                 binding: "vm.example.test:8443".into(),
+                target_id: uuid::Uuid::nil(),
             })
             .as_deref(),
             Some("https://admin.example.test:8443/@warpgate#/mfa-setup")

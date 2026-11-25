@@ -57,6 +57,9 @@ pub fn load_config(params: &GlobalParams, secure: bool) -> Result<WarpgateConfig
     // An error, not a warning: refused at start-up, and a reload that sets it
     // keeps the running config.
     config.store.http.check_plain_http_on_loopback()?;
+    if let Some(warning) = config.store.http.serve_unbound_http_targets_warning() {
+        emit_config_warning(warning);
+    }
     if let Some(step_up) = &config.store.step_up_interval {
         step_up.check_exempt_max_session()?;
     }
@@ -214,6 +217,10 @@ mod tests {
         deserialize_store_collecting_ignored(value).unwrap()
     }
 
+    /// `load_config` clears the process-wide config warnings, so the tests
+    /// that load a config take turns.
+    static LOADING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn write_config(dir: &tempfile::TempDir, step_up: &str) -> GlobalParams {
         let path = dir.path().join("warpgate.yaml");
         std::fs::write(&path, format!("step_up_interval:\n  ssh: 12h\n{step_up}")).unwrap();
@@ -241,6 +248,9 @@ mod tests {
 
     #[test]
     fn exempt_max_session_is_checked_when_the_config_loads() {
+        let _loading = LOADING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::tempdir().unwrap();
         for (value, ok) in [
             ("0s", false),
@@ -257,6 +267,9 @@ mod tests {
     /// so a refused value never replaces a good config.
     #[test]
     fn a_refused_reload_leaves_the_previous_config_in_force() {
+        let _loading = LOADING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::tempdir().unwrap();
         let params = write_config(&dir, "  exempt_max_session: 2h\n");
         let mut running = load_config(&params, false).unwrap();
@@ -277,6 +290,28 @@ mod tests {
             before
         );
         assert_eq!(before, Duration::from_secs(7200));
+    }
+
+    /// `http.serve_unbound_http_targets: true` in the config file is warned
+    /// about when the config loads, into the warnings the admin info API
+    /// returns (`config_warnings`).
+    #[test]
+    fn serving_unbound_targets_is_warned_about_at_load() {
+        let _loading = LOADING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("warpgate.yaml");
+        std::fs::write(&path, "http:\n  serve_unbound_http_targets: true\n").unwrap();
+        let params = GlobalParams::new(path, false).unwrap();
+        let config = load_config(&params, false).unwrap();
+        assert!(config.store.http.serve_unbound_http_targets);
+        assert!(
+            warpgate_common::warnings()
+                .iter()
+                .any(|warning| warning.contains("serve_unbound_http_targets")),
+            "no start-up warning"
+        );
     }
 
     #[test]

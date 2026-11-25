@@ -332,6 +332,19 @@ impl SharedSessionStorage {
         Ok(())
     }
 
+    /// Whether the user session `id` exists and has not ended. `None`, a
+    /// browser session naming no user session, is not open.
+    async fn login_is_open(&self, id: Option<UserSessionId>) -> poem::Result<bool> {
+        let Some(id) = id else {
+            return Ok(false);
+        };
+        Ok(UserSession::Entity::find_by_id(id)
+            .one(&self.db)
+            .await
+            .map_err(InternalServerError)?
+            .is_some_and(|row| row.ended.is_none()))
+    }
+
     fn user_session_id_of(entries: &BTreeMap<String, Value>) -> Option<UserSessionId> {
         entries
             .get(SESSION_ID_SESSION_KEY)
@@ -388,6 +401,16 @@ impl SessionStorage for SharedSessionStorage {
 
         let entries: BTreeMap<String, Value> =
             serde_json::from_str(&model.data).map_err(InternalServerError)?;
+        if entries.contains_key(crate::common::BOUND_AUTH_SESSION_KEY)
+            && !self
+                .login_is_open(Self::user_session_id_of(&entries))
+                .await?
+        {
+            // A target-host session counts only while the sign-in it was
+            // handed off from is open; once that ends it loads as nothing,
+            // on every node.
+            return Ok(None);
+        }
         self.record_loaded(session_id);
         Ok(Some(entries))
     }

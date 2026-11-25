@@ -232,6 +232,13 @@ impl Api {
         ctx: Data<&UnauthenticatedRequestContext>,
         session_middleware: Data<&Arc<Mutex<SessionStore>>>,
     ) -> poem::Result<LogoutResponse> {
+        // A target-host session ends only itself: the user session it shares
+        // with the control-plane sign-in stays (see `crate::handoff`), even
+        // when the session also carries an authorization.
+        if session.get_bound_auth().is_some() {
+            session.purge();
+            return Ok(LogoutResponse::Success);
+        }
         if local_logout_disabled(session, &*ctx.services().config.lock().await) {
             return Ok(LogoutResponse::LocalLogoutDisabled);
         }
@@ -936,7 +943,7 @@ mod tests {
 
     /// A node's session middleware over the shared table, with the session
     /// cookie config production uses. Production also gives the cookie a max
-    /// age and its host attributes (`CookieHostMiddleware`), which these tests
+    /// age and its host attributes (`CookieGateMiddleware`), which these tests
     /// neither add nor assert: they compare cookie values only.
     fn node(routes: Route, storage: SharedSessionStorage) -> impl Endpoint {
         routes.data(storage.clone()).with(ServerSession::new(

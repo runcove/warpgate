@@ -1,5 +1,5 @@
 mod body_limit;
-mod cookie_host;
+mod cookie_gate;
 mod loopback_cookie;
 mod loopback_host;
 mod management_scope;
@@ -9,7 +9,7 @@ mod security_headers;
 pub(crate) mod ticket;
 
 pub use body_limit::*;
-pub use cookie_host::*;
+pub use cookie_gate::*;
 pub use loopback_cookie::*;
 pub use loopback_host::*;
 pub use management_scope::*;

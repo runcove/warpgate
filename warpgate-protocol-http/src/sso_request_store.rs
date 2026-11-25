@@ -6,8 +6,7 @@
 //! `verify_state`. That is unsafe under concurrency:
 //!
 //!  * The session is a single read-modify-write blob per request. Two requests
-//!    that race — trivially common once the session cookie is scoped to the
-//!    parent domain and shared across every subdomain tab, plus the auto-SSO
+//!    that race — trivially common with several tabs on one host, the auto-SSO
 //!    redirect and the SPA's background auth-state polls — clobber each other's
 //!    session writes (last writer wins). The handshake stored by `/start` is
 //!    dropped before the IdP callback arrives.

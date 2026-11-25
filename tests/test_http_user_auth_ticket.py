@@ -181,7 +181,7 @@ class TestHTTPUserAuthTicket:
         assert response.status_code == 303
         assert response.headers["Location"] == "/some/path?a=1"
         assert response.headers["Referrer-Policy"] == "no-referrer"
-        assert "warpgate-http-session" in response.cookies
+        assert "__Host-warpgate-http-session" in response.cookies
         assert uses_left() == 2
 
         # The clean address is served on the session alone, spending nothing.
@@ -276,17 +276,17 @@ class TestHTTPUserAuthTicket:
             f"{url}/@warpgate/api/auth/login",
             json={"username": f"nobody-{uuid4()}", "password": "x"},
         )
-        planted = attacker.cookies.get("warpgate-http-session")
+        planted = attacker.cookies.get("__Host-warpgate-http-session")
         assert planted
 
         victim = requests.Session()
         victim.verify = False
-        victim.cookies.set("warpgate-http-session", planted, domain="localhost.local")
+        victim.cookies.set("__Host-warpgate-http-session", planted, domain="localhost.local")
         response = victim.get(
             f"{url}/some/path?warpgate-ticket={secret}", allow_redirects=False
         )
         assert response.status_code // 100 == 2
-        assert response.cookies.get("warpgate-http-session") not in (None, planted)
+        assert response.cookies.get("__Host-warpgate-http-session") not in (None, planted)
 
         response = attacker.get(
             f"{url}/some/path?warpgate-target={target.name}", allow_redirects=False

@@ -96,7 +96,7 @@ fn request_auth_user_id(session: &Session) -> Option<Uuid> {
     match session.get_auth() {
         Some(SessionAuthorization::User { user_id, .. })
         | Some(SessionAuthorization::Ticket { user_id, .. }) => Some(user_id),
-        None => None,
+        None => session.get_bound_auth().map(|auth| auth.user_id),
     }
 }
 
@@ -202,10 +202,18 @@ impl SessionStore {
         req: &Request,
         ctx: &UnauthenticatedRequestContext,
     ) -> poem::Result<UserBoundHandle> {
+        let session = <&Session>::from_request_without_body(req).await?;
+        if crate::common::is_target_host_session(session) {
+            // A target-host session names the user session it shares with the
+            // control plane and every bound host: a login started here gets a
+            // fresh one, so it can neither take over nor (as another user)
+            // end that shared sign-in.
+            session.clear();
+            return Ok(UserBoundHandle(self.create_handle_for(req, ctx).await?));
+        }
         match self.resolve_handle(req, ctx).await? {
             Resolved::Handle(handle) => Ok(handle),
             Resolved::Refused(refusal) => {
-                let session = <&Session>::from_request_without_body(req).await?;
                 let old_session_id = session.get_session_id();
                 // `clear`, not `purge`: a purged session ignores every later
                 // write, so the replacement's session id would be dropped and
@@ -707,7 +715,7 @@ mod stale_cookie_login_tests {
     use poem::web::Data;
     use poem::{Endpoint, EndpointExt, Route, get, handler};
     use sea_orm::sea_query::Expr;
-    use sea_orm::{ColumnTrait, QueryFilter};
+    use sea_orm::{ActiveModelTrait, ColumnTrait, QueryFilter, Set};
     use time::OffsetDateTime;
     use warpgate_common::auth::AuthStateUserInfo;
     use warpgate_core::Services;
@@ -840,6 +848,92 @@ mod stale_cookie_login_tests {
         Ok(describe(id, session))
     }
 
+    /// A target-host session of alice's: bound auth only, naming her live
+    /// user session, under which her control-plane sign-in also keeps an
+    /// auth state.
+    #[handler]
+    async fn seed_bound(
+        req: &Request,
+        session: &Session,
+        store: Data<&Store>,
+        ctx: Data<&UnauthenticatedRequestContext>,
+    ) -> poem::Result<String> {
+        let handle = store.lock().await.handle_for_request(req, ctx.0).await?;
+        let alice = AuthStateUserInfo {
+            id: ALICE,
+            username: "alice".into(),
+        };
+        handle.lock().await.set_user_info(alice).await?;
+        let id = handle.lock().await.user_session_id();
+        // The control plane's own browser session, which backs the shared
+        // user session as it does in production.
+        HttpSession::ActiveModel {
+            id: Set(format!("control-plane-{id}")),
+            expires: Set(None),
+            data: Set("{}".to_owned()),
+            updated: Set(OffsetDateTime::now_utc()),
+            user_session_id: Set(Some(id)),
+            ..Default::default()
+        }
+        .insert(&ctx.services().db)
+        .await
+        .map_err(WarpgateError::from)?;
+        ctx.services()
+            .create_auth_state(
+                &id,
+                "alice",
+                crate::common::PROTOCOL_NAME,
+                "",
+                &[warpgate_common::auth::CredentialKind::Password],
+                None,
+                None,
+            )
+            .await?;
+        session.set_bound_auth(crate::common::BoundSessionAuthorization {
+            user_id: ALICE,
+            username: "alice".into(),
+            target_id: Uuid::new_v4(),
+            hostname: "vm.example.com".into(),
+        });
+        Ok(describe(id, session))
+    }
+
+    /// A completed sign-in as bob, from its login entry on.
+    #[handler]
+    async fn login_as_bob(
+        req: &Request,
+        session: &Session,
+        ctx: Data<&UnauthenticatedRequestContext>,
+    ) -> poem::Result<String> {
+        crate::common::session_id_for_login(req, ctx.0)
+            .await
+            .map_err(poem::Error::from)?;
+        crate::common::authorize_session(
+            req,
+            ctx.0,
+            AuthStateUserInfo {
+                id: BOB,
+                username: "bob".into(),
+            },
+        )
+        .await
+        .map_err(poem::Error::from)?;
+        let id = session.get_session_id().expect("a user session");
+        Ok(describe(id, session))
+    }
+
+    /// Whether the browser session finds a login attempt of its own.
+    #[handler]
+    async fn auth_state(
+        req: &Request,
+        ctx: Data<&UnauthenticatedRequestContext>,
+    ) -> poem::Result<String> {
+        let state = crate::common::get_auth_state_for_request(req, ctx.0)
+            .await
+            .map_err(poem::Error::from)?;
+        Ok(state.is_some().to_string())
+    }
+
     async fn app() -> impl Endpoint {
         let ctx = UnauthenticatedRequestContext::new(services().await).await;
         app_on(ctx, MemoryStorage::new())
@@ -853,6 +947,9 @@ mod stale_cookie_login_tests {
             .at("/seed/other-user", get(seed_other_user))
             .at("/seed/gone-with-auth", get(seed_gone_with_auth))
             .at("/seed/ended-with-auth", get(seed_ended_with_auth))
+            .at("/seed/bound", get(seed_bound))
+            .at("/login-as-bob", get(login_as_bob))
+            .at("/auth-state", get(auth_state))
             .data(store)
             .data(ctx)
             .with(ServerSession::new(CookieConfig::default(), storage))
@@ -990,5 +1087,84 @@ mod stale_cookie_login_tests {
         let (cookie, _) = seed(&cli, "/seed/other-user").await;
         let resp = cli.get("/other").header("cookie", &cookie).send().await;
         resp.assert_status(poem::http::StatusCode::UNAUTHORIZED);
+    }
+
+    async fn user_session_ended(ctx_db: &sea_orm::DatabaseConnection, id: UserSessionId) -> bool {
+        UserSession::Entity::find_by_id(id)
+            .one(ctx_db)
+            .await
+            .unwrap()
+            .is_none_or(|row| row.ended.is_some())
+    }
+
+    async fn bound_app() -> (impl Endpoint, sea_orm::DatabaseConnection) {
+        let services = services().await;
+        let db = services.db.clone();
+        let ctx = UnauthenticatedRequestContext::new(services).await;
+        let storage = SharedSessionStorage::new(db.clone());
+        (app_on(ctx, storage.clone()).data(storage), db)
+    }
+
+    /// A login started on a target-host session gets a user session of its
+    /// own: the one the target-host session shares stays open.
+    #[tokio::test]
+    async fn login_on_a_target_host_session_starts_a_new_user_session() {
+        let (app, db) = bound_app().await;
+        let cli = TestClient::new(app);
+        let (cookie, shared) = seed(&cli, "/seed/bound").await;
+        let shared_id = UserSessionId(shared.split(' ').next().unwrap().parse().unwrap());
+
+        let resp = cli.get("/login").header("cookie", &cookie).send().await;
+        resp.assert_status_is_ok();
+        let body = resp.0.into_body().into_string().await.unwrap();
+        let (fresh_id, user) = body.split_once(' ').unwrap();
+        assert_ne!(
+            fresh_id,
+            shared_id.to_string(),
+            "the shared session was reused"
+        );
+        assert_eq!(user, "nobody");
+        assert!(!user_session_ended(&db, shared_id).await);
+    }
+
+    /// Signing in as another user from a target-host session leaves the
+    /// shared sign-in open.
+    #[tokio::test]
+    async fn another_users_login_on_a_target_host_session_keeps_the_shared_sign_in() {
+        let (app, db) = bound_app().await;
+        let cli = TestClient::new(app);
+        let (cookie, shared) = seed(&cli, "/seed/bound").await;
+        let shared_id = UserSessionId(shared.split(' ').next().unwrap().parse().unwrap());
+
+        let resp = cli
+            .get("/login-as-bob")
+            .header("cookie", &cookie)
+            .send()
+            .await;
+        resp.assert_status_is_ok();
+        let body = resp.0.into_body().into_string().await.unwrap();
+        let (bob_id, user) = body.split_once(' ').unwrap();
+        assert_ne!(bob_id, shared_id.to_string());
+        assert_eq!(user, "bob");
+        assert!(
+            !user_session_ended(&db, shared_id).await,
+            "the shared sign-in was ended"
+        );
+    }
+
+    /// The control-plane sign-in's auth state, kept under the user session a
+    /// target-host session names, is not that session's login attempt.
+    #[tokio::test]
+    async fn a_target_host_session_finds_no_auth_state_of_the_shared_sign_in() {
+        let (app, _db) = bound_app().await;
+        let cli = TestClient::new(app);
+        let (cookie, _) = seed(&cli, "/seed/bound").await;
+        let resp = cli
+            .get("/auth-state")
+            .header("cookie", &cookie)
+            .send()
+            .await;
+        resp.assert_status_is_ok();
+        resp.assert_text("false").await;
     }
 }

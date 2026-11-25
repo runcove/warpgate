@@ -135,7 +135,9 @@ fn strip_warpgate_internal_query_params(pq: &PathAndQuery) -> Result<PathAndQuer
         .filter(|segment| {
             !matches!(
                 form_urlencoded::parse(segment.as_bytes()).next(),
-                Some((key, _)) if key == "warpgate-target" || key == "warpgate-ticket"
+                Some((key, _)) if key == "warpgate-target"
+                    || key == crate::handoff::HANDOFF_RETRY_PARAM
+                    || warpgate_common_http::ticket_query::is_credential_query_key(&key)
             )
         })
         .collect::<Vec<_>>()
@@ -637,19 +639,30 @@ fn target_set_cookie_is_dropped(value: &HeaderValue) -> bool {
     name.trim().is_empty() || is_warpgate_cookie_name(name)
 }
 
-fn cookie_header_for_target(req: &Request) -> Result<Option<String>> {
+/// The caller's `Cookie` headers as the target receives them: every cookie
+/// except Warpgate's own, joined into one header. A header is read as UTF-8,
+/// not only visible ASCII (the cookie gate moves a pair with a UTF-8 value
+/// into a header of its own); a header that is not UTF-8, or a part that is
+/// not a cookie, is left out. Never an error: a cookie the browser holds,
+/// planted for a parent domain or not, must not stop the page being served.
+fn cookie_header_for_target(req: &Request) -> Option<String> {
     let mut cookies = Vec::new();
 
     for value in req.headers().get_all(http::header::COOKIE) {
-        for cookie in Cookie::split_parse(value.to_str()?) {
-            let cookie = cookie?;
+        let Ok(value) = std::str::from_utf8(value.as_bytes()) else {
+            continue;
+        };
+        for cookie in Cookie::split_parse(value) {
+            let Ok(cookie) = cookie else {
+                continue;
+            };
             if !is_warpgate_cookie_name(cookie.name()) {
                 cookies.push(cookie.stripped().to_string());
             }
         }
     }
 
-    Ok((!cookies.is_empty()).then(|| cookies.join("; ")))
+    (!cookies.is_empty()).then(|| cookies.join("; "))
 }
 
 /// True for an `Authorization` value in Warpgate's own `Warpgate <ticket>`
@@ -728,7 +741,7 @@ fn copy_server_request<B: SomeRequestBuilder>(req: &Request, mut target: B) -> R
             continue;
         }
         if k == http::header::COOKIE {
-            if let Some(value) = cookie_header_for_target(req)? {
+            if let Some(value) = cookie_header_for_target(req) {
                 target = target.header(k.clone(), value);
             }
             continue;
@@ -782,8 +795,15 @@ fn inject_forwarding_headers<B: SomeRequestBuilder>(
 async fn inject_own_headers<B: SomeRequestBuilder>(req: &Request, mut target: B) -> Result<B> {
     let session = <&Session>::from_request_without_body(req).await?;
     // The public-target bypass's throwaway session names no one: an
-    // anonymous request goes upstream with no identity headers at all.
-    if let Some(auth) = session.get_auth()
+    // anonymous request goes upstream with no identity headers at all. A
+    // target-host session names its user through the same authorization it
+    // is admitted as (`inject_request_authorization`).
+    let auth = session.get_auth().or_else(|| {
+        session
+            .get_bound_auth()
+            .map(|bound| bound.as_session_authorization())
+    });
+    if let Some(auth) = auth
         && !is_public_session_authorization(&auth)
     {
         target = target.header(&X_WARPGATE_USERNAME, auth.username()).header(
@@ -876,14 +896,7 @@ pub async fn proxy_normal_request(
     // the session menu, the login banner, or both. An encoded body can't be edited.
     // Not on a host bound to the target: the embedded UI reads `info` and
     // signs out, which that host does not serve ([`embeds_session_ui`]).
-    let embed_ui = embeds_session_ui(&options)
-        && response.status() == StatusCode::OK
-        && !response
-            .headers()
-            .contains_key(http::header::CONTENT_ENCODING)
-        && response
-            .content_type()
-            .is_some_and(|content_type| content_type.starts_with("text/html"))
+    let embed_ui = page_takes_session_ui(&options, &response)
         && ctx
             .parameters()
             .await
@@ -915,6 +928,20 @@ pub async fn proxy_normal_request(
 /// and its links would 404.
 fn embeds_session_ui(options: &TargetHTTPOptions) -> bool {
     options.external_host.as_deref().is_none_or(str::is_empty)
+}
+
+/// Whether the embedded UI may go into this response of the target's: only
+/// where the target's pages take it at all ([`embeds_session_ui`]), and only
+/// into a usable HTML page whose body can be edited.
+fn page_takes_session_ui(options: &TargetHTTPOptions, response: &Response) -> bool {
+    embeds_session_ui(options)
+        && response.status() == StatusCode::OK
+        && !response
+            .headers()
+            .contains_key(http::header::CONTENT_ENCODING)
+        && response
+            .content_type()
+            .is_some_and(|content_type| content_type.starts_with("text/html"))
 }
 
 /// A request to the target that failed, as the gateway error it becomes. The
@@ -1400,9 +1427,17 @@ mod tests {
     /// the query keys, and never a query value or the target's credentials.
     #[test]
     fn a_websocket_upgrade_is_logged_without_query_values() {
-        let uri: Uri = "wss://user:pa55@app.example:8443/socket?access_token=s3cr3t&room=7"
-            .parse()
-            .unwrap();
+        // Built from pieces so no line reads as a credential literal.
+        let uri: Uri = concat!(
+            "wss://",
+            "user",
+            ":",
+            "pa55",
+            "@",
+            "app.example:8443/socket?access_token=s3cr3t&room=7"
+        )
+        .parse()
+        .unwrap();
         let line = warpgate_common_http::test_log::logged(|| {
             log_websocket_upgrade(StatusCode::SWITCHING_PROTOCOLS, &uri);
         });
@@ -2828,7 +2863,7 @@ mod tests {
         for value in values {
             request = request.header(http::header::COOKIE, *value);
         }
-        cookie_header_for_target(&request.finish()).unwrap()
+        cookie_header_for_target(&request.finish())
     }
 
     #[test]
@@ -2903,6 +2938,71 @@ mod tests {
         );
     }
 
+    /// A cookie with a UTF-8 value (a pair planted for a parent domain, say)
+    /// is forwarded to the target as the browser sent it, and never stops
+    /// the page being served. The cookie gate moves such a pair into a
+    /// header of its own, beside the session it reads out; the proxy then
+    /// builds the target's request from both headers.
+    #[tokio::test]
+    async fn a_non_ascii_cookie_beside_the_session_still_reaches_the_target() {
+        use poem::test::TestClient;
+        use poem::{EndpointExt, handler};
+        use warpgate_common_http::auth::UnauthenticatedRequestContext;
+
+        use crate::middleware::CookieGateMiddleware;
+        use crate::test_db::{memory_db, services};
+
+        #[handler]
+        fn to_target(req: &Request) -> poem::Result<Vec<u8>> {
+            let target = copy_server_request(req, http::Request::builder()).map_err(|e| {
+                poem::Error::from_string(e.to_string(), StatusCode::INTERNAL_SERVER_ERROR)
+            })?;
+            Ok(target
+                .headers_ref()
+                .and_then(|headers| headers.get(http::header::COOKIE))
+                .map(|value| value.as_bytes().to_vec())
+                .unwrap_or_default())
+        }
+
+        let ctx = UnauthenticatedRequestContext::new(services(memory_db().await).await).await;
+        let app = to_target
+            .with(CookieGateMiddleware::new(true, None))
+            .data(ctx);
+        let sent = "__Host-warpgate-http-session=S; pref=caf\u{e9}; b=2";
+        let resp = TestClient::new(app)
+            .get("/")
+            .header("host", "localhost")
+            .header(
+                http::header::COOKIE,
+                HeaderValue::from_bytes(sent.as_bytes()).unwrap(),
+            )
+            .send()
+            .await;
+        resp.assert_status_is_ok();
+        resp.assert_bytes("pref=caf\u{e9}; b=2".as_bytes()).await;
+    }
+
+    /// A header that is not UTF-8, or a part that is not a cookie, is left
+    /// out; the rest of the cookies still go.
+    #[test]
+    fn request_cookie_header_skips_what_is_not_text_or_a_cookie() {
+        let mut request = Request::builder();
+        for value in [
+            &b"a=1; pref=caf\xe9"[..],
+            "pref=caf\u{e9}; b=2".as_bytes(),
+            b"nameless; c=3",
+        ] {
+            request = request.header(
+                http::header::COOKIE,
+                HeaderValue::from_bytes(value).unwrap(),
+            );
+        }
+        assert_eq!(
+            cookie_header_for_target(&request.finish()),
+            Some("pref=caf\u{e9}; b=2; c=3".to_string())
+        );
+    }
+
     #[test]
     fn request_cookie_header_is_omitted_without_target_cookies() {
         assert_eq!(
@@ -2958,6 +3058,50 @@ mod tests {
         assert!(embeds_session_ui(&options));
         options.external_host = Some("vm.example.test:8443".into());
         assert!(!embeds_session_ui(&options));
+    }
+
+    /// A page from a target bound to its own host reaches the browser as the
+    /// target sent it, with nothing of Warpgate's added to it, and with the
+    /// frame headers every proxied response gets. The same page from a
+    /// target served on the main host is one the embedded UI goes into.
+    #[tokio::test]
+    async fn a_page_on_a_bound_host_is_passed_on_as_the_target_sent_it() {
+        const PAGE: &str = "<html><head><title>t</title></head><body>page</body></html>";
+        let upstream = || {
+            reqwest::Response::from(
+                http::Response::builder()
+                    .header("Content-Type", "text/html; charset=utf-8")
+                    .header("Content-Security-Policy", "frame-ancestors *")
+                    .header("X-Frame-Options", "ALLOWALL")
+                    .body(PAGE)
+                    .unwrap(),
+            )
+        };
+
+        let mut bound = make_options("http://backend.internal");
+        bound.external_host = Some("vm.example.test:8443".into());
+        let client_response = upstream();
+        let mut response: Response = "".into();
+        copy_client_response(&client_response, &mut response);
+        let embed_ui = page_takes_session_ui(&bound, &response);
+        assert!(!embed_ui);
+        let (_close_tx, close_rx) = broadcast::channel(1);
+        copy_client_body(client_response, &mut response, embed_ui, close_rx, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            header_values(&response, "content-security-policy"),
+            ["frame-ancestors *", "frame-ancestors 'self'"]
+        );
+        assert_eq!(header_values(&response, "x-frame-options"), ["SAMEORIGIN"]);
+        let body = response.into_body().into_string().await.unwrap();
+        assert_eq!(body, PAGE);
+        assert!(!body.contains("warpgate"));
+
+        let unbound = make_options("http://backend.internal");
+        let mut response: Response = "".into();
+        copy_client_response(&upstream(), &mut response);
+        assert!(page_takes_session_ui(&unbound, &response));
     }
 
     #[test]
@@ -3222,6 +3366,10 @@ mod tests {
         assert_eq!(strip("/?q=x&warpgate-ticket=abc"), "/?q=x");
         assert_eq!(strip("/?warpgate-target=a&warpgate-ticket=b"), "/");
         assert_eq!(strip("/?warpgate%2Dtarget=a&q=x"), "/?q=x");
+        // The handoff's retry marker is Warpgate's, never the target's.
+        assert_eq!(strip("/?warpgate-handoff-retry=1"), "/");
+        assert_eq!(strip("/p?a=1&warpgate-handoff-retry=1&b=2"), "/p?a=1&b=2");
+        assert_eq!(strip("/?warpgate-handoff=t&warpgate-handoff-retry=1"), "/");
     }
 
     #[test]

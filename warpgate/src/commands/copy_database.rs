@@ -35,6 +35,7 @@ macro_rules! with_every_table_in_order {
             // Referencing the tables above
             Ticket,
             UserSession,
+            HttpSsoStamp,
             TargetSession,
             Recording,
             TicketRequest,

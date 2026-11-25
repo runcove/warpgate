@@ -146,3 +146,52 @@ pub async fn services(db: DatabaseConnection) -> Services {
         pending_revocations: Default::default(),
     }
 }
+
+/// An open HTTP user session for `user_id`, as a completed sign-in leaves it.
+pub async fn insert_open_user_session(
+    db: &DatabaseConnection,
+    user_id: Uuid,
+) -> warpgate_common::UserSessionId {
+    use sea_orm::ActiveModelTrait;
+    use sea_orm::ActiveValue::Set;
+    let id = warpgate_common::UserSessionId(Uuid::new_v4());
+    warpgate_db_entities::UserSession::ActiveModel {
+        id: Set(id),
+        username: Set(Some("user".into())),
+        user_id: Set(Some(user_id)),
+        remote_address: Set("127.0.0.1:443".into()),
+        started: Set(time::OffsetDateTime::now_utc()),
+        ended: Set(None),
+        protocol: Set("HTTP".into()),
+        node_id: Set(None),
+        auth_state_node_id: Set(None),
+    }
+    .insert(db)
+    .await
+    .unwrap();
+    id
+}
+
+/// Whether the user session `id` is still open.
+pub async fn user_session_open(
+    db: &DatabaseConnection,
+    id: warpgate_common::UserSessionId,
+) -> bool {
+    use sea_orm::EntityTrait;
+    warpgate_db_entities::UserSession::Entity::find_by_id(id)
+        .one(db)
+        .await
+        .unwrap()
+        .is_some_and(|row| row.ended.is_none())
+}
+
+/// Whether a browser session is stored under the `name=id` cookie pair.
+pub async fn browser_session_stored(db: &DatabaseConnection, cookie: &str) -> bool {
+    use sea_orm::EntityTrait;
+    let (_, id) = cookie.split_once('=').unwrap();
+    warpgate_db_entities::HttpSession::Entity::find_by_id(id.to_owned())
+        .one(db)
+        .await
+        .unwrap()
+        .is_some()
+}

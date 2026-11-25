@@ -561,7 +561,7 @@
             "description": ""
           },
           "400": {
-            "description": "The request originates from a domain that has no cookie domain relationship\nwith `external_host` while `return_url_domain` is `external_host`"
+            "description": "`return_url_domain` is `external_host`, and the sign-in did not start on\nthe control-plane host: in that mode a sign-in must start there"
           },
           "403": {
             "description": "The browser session is authorized by a ticket, which never signs in",

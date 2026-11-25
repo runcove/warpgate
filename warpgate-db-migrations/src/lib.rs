@@ -125,8 +125,12 @@ mod m00089_cove_open_session_indexes;
 mod m00090_cove_pending_session_closes;
 // Users whose sessions are all still to be closed after a saved edit.
 mod m00095_cove_pending_user_closes;
+// One-time handoffs of a sign-in to a host bound to an HTTP target.
+mod m00096_cove_http_handoffs;
+// The latest SSO sign-in of each HTTP user session.
+mod m00097_cove_http_sso_stamps;
 // Keys that sign session statements for HTTP targets with `signed_statement`.
-mod m00096_cove_statement_keys;
+mod m00098_cove_statement_keys;
 
 pub(crate) mod helpers;
 
@@ -239,7 +243,9 @@ impl MigratorTrait for Migrator {
             Box::new(m00089_cove_open_session_indexes::Migration),
             Box::new(m00090_cove_pending_session_closes::Migration),
             Box::new(m00095_cove_pending_user_closes::Migration),
-            Box::new(m00096_cove_statement_keys::Migration),
+            Box::new(m00096_cove_http_handoffs::Migration),
+            Box::new(m00097_cove_http_sso_stamps::Migration),
+            Box::new(m00098_cove_statement_keys::Migration),
         ]
     }
 }
@@ -304,17 +310,27 @@ pub async fn migrate_database(connection: &DatabaseConnection) -> Result<(), DbE
     Ok(())
 }
 
-/// Apply `steps` pending migrations.
+/// Apply `steps` pending migrations, under the same lock as
+/// [`migrate_database`], so they never run alongside a node starting up and
+/// migrating forward, or a rollback.
 pub async fn migrate_database_up(connection: &DatabaseConnection, steps: u32) -> Result<(), DbErr> {
-    run_maybe_in_tx(connection, Direction::Up, Some(steps)).await
+    run_locked(connection, MIGRATION_LOCK_KEY, async move || {
+        run_maybe_in_tx(connection, Direction::Up, Some(steps)).await
+    })
+    .await
 }
 
-/// Revert `steps` applied migrations.
+/// Revert `steps` applied migrations, under the same lock as
+/// [`migrate_database`], so a rollback never runs alongside a node starting up
+/// and migrating forward.
 pub async fn migrate_database_down(
     connection: &DatabaseConnection,
     steps: u32,
 ) -> Result<(), DbErr> {
-    run_maybe_in_tx(connection, Direction::Down, Some(steps)).await
+    run_locked(connection, MIGRATION_LOCK_KEY, async move || {
+        run_maybe_in_tx(connection, Direction::Down, Some(steps)).await
+    })
+    .await
 }
 
 enum Direction {
@@ -372,6 +388,138 @@ mod tests {
         migrate_database(&db).await.unwrap();
         migrate_database_down(&db, 1).await.unwrap();
         migrate_database_up(&db, 1).await.unwrap();
+
+        db.close().await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    async fn table_exists(db: &sea_orm::DatabaseConnection, table: &str) -> bool {
+        use sea_orm::{ConnectionTrait, Statement};
+        db.query_one(Statement::from_sql_and_values(
+            db.get_database_backend(),
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+            [table.into()],
+        ))
+        .await
+        .unwrap()
+        .is_some()
+    }
+
+    async fn applied(db: &sea_orm::DatabaseConnection, version: &str) -> bool {
+        use sea_orm::{ConnectionTrait, Statement};
+        db.query_one(Statement::from_sql_and_values(
+            db.get_database_backend(),
+            "SELECT version FROM seaql_migrations WHERE version = ?",
+            [version.into()],
+        ))
+        .await
+        .unwrap()
+        .is_some()
+    }
+
+    /// Rolling back the two cove HTTP handoff migrations refuses while any
+    /// `http_sessions` row remains, and the refusal leaves both tables and
+    /// their `seaql_migrations` rows in place. With the rows gone it succeeds.
+    #[tokio::test]
+    async fn rolling_back_cove_http_migrations_requires_no_http_sessions() {
+        use sea_orm::{ConnectionTrait, Statement};
+
+        set_config_migration_values(ConfigMigrationValues::default());
+        let path = std::env::temp_dir().join(format!(
+            "warpgate-migrations-sessions-{}.sqlite3",
+            std::process::id()
+        ));
+        let mut opt = ConnectOptions::new(format!("sqlite://{}?mode=rwc", path.display()));
+        opt.max_connections(100);
+        let db = Database::connect(opt).await.unwrap();
+        migrate_database(&db).await.unwrap();
+        // The statement-key migration comes after these two: set it aside so
+        // the rollback under test starts at m00097.
+        migrate_database_down(&db, 1).await.unwrap();
+
+        let tables = ["cove_http_handoffs", "cove_http_sso_stamps"];
+        let versions = ["m00096_cove_http_handoffs", "m00097_cove_http_sso_stamps"];
+        let backend = db.get_database_backend();
+        db.execute(Statement::from_string(
+            backend,
+            "INSERT INTO http_sessions (id, expires, data, updated) \
+             VALUES ('s1', NULL, '{}', CURRENT_TIMESTAMP)",
+        ))
+        .await
+        .unwrap();
+
+        let error = migrate_database_down(&db, 2).await.unwrap_err().to_string();
+        assert!(error.contains("m00097_cove_http_sso_stamps"), "{error}");
+        assert!(error.contains("DELETE FROM http_sessions;"), "{error}");
+        for (table, version) in tables.iter().zip(versions) {
+            assert!(table_exists(&db, table).await, "{table} dropped");
+            assert!(applied(&db, version).await, "{version} unrecorded");
+        }
+
+        db.execute(Statement::from_string(backend, "DELETE FROM http_sessions"))
+            .await
+            .unwrap();
+        migrate_database_down(&db, 2).await.unwrap();
+        for (table, version) in tables.iter().zip(versions) {
+            assert!(!table_exists(&db, table).await, "{table} kept");
+            assert!(!applied(&db, version).await, "{version} still recorded");
+        }
+        assert!(applied(&db, "m00095_cove_pending_user_closes").await);
+
+        db.close().await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// A rollback left one step done (m00097 reverted, a session written
+    /// before m00096) is finished by deleting the rows again and reverting
+    /// m00096 alone: m00096 refuses on its own while a row remains, keeping
+    /// its table and its `seaql_migrations` row.
+    #[tokio::test]
+    async fn rolling_back_m00096_alone_requires_no_http_sessions() {
+        use sea_orm::{ConnectionTrait, Statement};
+
+        set_config_migration_values(ConfigMigrationValues::default());
+        let path = std::env::temp_dir().join(format!(
+            "warpgate-migrations-m00096-{}.sqlite3",
+            std::process::id()
+        ));
+        let mut opt = ConnectOptions::new(format!("sqlite://{}?mode=rwc", path.display()));
+        opt.max_connections(100);
+        let db = Database::connect(opt).await.unwrap();
+        migrate_database(&db).await.unwrap();
+        // The statement-key migration comes after these two: set it aside so
+        // the rollback under test starts at m00097.
+        migrate_database_down(&db, 1).await.unwrap();
+
+        migrate_database_down(&db, 1).await.unwrap();
+        assert!(!table_exists(&db, "cove_http_sso_stamps").await);
+        assert!(!applied(&db, "m00097_cove_http_sso_stamps").await);
+
+        let backend = db.get_database_backend();
+        db.execute(Statement::from_string(
+            backend,
+            "INSERT INTO http_sessions (id, expires, data, updated) \
+             VALUES ('s1', NULL, '{}', CURRENT_TIMESTAMP)",
+        ))
+        .await
+        .unwrap();
+
+        let error = migrate_database_down(&db, 1).await.unwrap_err().to_string();
+        assert!(
+            error.contains("refusing to roll back m00096_cove_http_handoffs"),
+            "{error}"
+        );
+        assert!(error.contains("DELETE FROM http_sessions;"), "{error}");
+        assert!(table_exists(&db, "cove_http_handoffs").await);
+        assert!(applied(&db, "m00096_cove_http_handoffs").await);
+
+        db.execute(Statement::from_string(backend, "DELETE FROM http_sessions"))
+            .await
+            .unwrap();
+        migrate_database_down(&db, 1).await.unwrap();
+        assert!(!table_exists(&db, "cove_http_handoffs").await);
+        assert!(!applied(&db, "m00096_cove_http_handoffs").await);
+        assert!(applied(&db, "m00095_cove_pending_user_closes").await);
 
         db.close().await.unwrap();
         std::fs::remove_file(path).unwrap();

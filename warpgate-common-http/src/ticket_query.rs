@@ -5,12 +5,29 @@
 
 use url::form_urlencoded;
 
+/// The query parameter a target-host handoff token travels in (the HTTP
+/// protocol's handoff). Kept out of the same places as a ticket.
+pub const HANDOFF_QUERY_PARAM: &str = "warpgate-handoff";
+
+/// The query parameter the handoff challenge travels in to the control
+/// plane's handoff start (`/@warpgate/handoff/start`). Elsewhere a parameter
+/// of that name is an application's own. Log lines keep its value out as
+/// they keep out every query value ([`crate::logging::redacted_uri`]).
+pub const HANDOFF_CHALLENGE_QUERY_PARAM: &str = "challenge";
+
+/// Whether a decoded query key carries a credential that must not leave
+/// Warpgate: `warpgate-ticket` (the parameter `TicketMiddleware` reads a
+/// ticket from) or [`HANDOFF_QUERY_PARAM`].
+pub fn is_credential_query_key(key: &str) -> bool {
+    key == "warpgate-ticket" || key == HANDOFF_QUERY_PARAM
+}
+
 /// True for a `key=value` pair of a query string whose key, once decoded, is
-/// `warpgate-ticket` -- the parameter `TicketMiddleware` reads a ticket from.
+/// a credential's ([`is_credential_query_key`]).
 pub fn is_ticket_query_pair(pair: &str) -> bool {
     form_urlencoded::parse(pair.as_bytes())
         .next()
-        .is_some_and(|(key, _)| key == "warpgate-ticket")
+        .is_some_and(|(key, _)| is_credential_query_key(&key))
 }
 
 /// `url` with every `warpgate-ticket` pair replaced by `replacement`, or
@@ -51,7 +68,8 @@ fn replace_ticket_query_pairs(url: &str, replacement: Option<&str>) -> String {
     rewritten
 }
 
-/// `url` with every `warpgate-ticket` query parameter removed, the rest kept
+/// `url` with every `warpgate-ticket` (and handoff token) query parameter
+/// removed, the rest kept
 /// exactly (see [`replace_ticket_query_pairs`]).
 pub fn without_ticket_query_param(url: &str) -> String {
     replace_ticket_query_pairs(url, None)
@@ -62,6 +80,19 @@ mod tests {
     use super::without_ticket_query_param;
 
     const SECRET: &str = "s3cr3t-ticket-value";
+
+    /// A handoff token goes the same way as a ticket.
+    #[test]
+    fn removing_drops_a_handoff_token_too() {
+        assert_eq!(
+            without_ticket_query_param("/@warpgate/handoff?warpgate-handoff=tok&a=1"),
+            "/@warpgate/handoff?a=1"
+        );
+        assert_eq!(
+            without_ticket_query_param("/x?warpgate%2Dhandoff=tok"),
+            "/x"
+        );
+    }
 
     /// Every ticket pair goes, however its key is encoded; the other
     /// parameters and the fragment are kept exactly.
