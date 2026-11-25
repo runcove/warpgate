@@ -14,11 +14,15 @@ Only a safe `next` qualifies: a site-relative path starting with a single `/`
 SSO return URL named, so `next` can never carry the browser off-site.
 
 Every SSO entry (`/sso/auto-start` and `/sso/providers/{name}/start`) also
-takes an absolute `next`: an `https://` URL whose host is Warpgate's
-configured `external_host` (or control-plane host) or a whole-label subdomain
-of it (`a.example.com` for `example.com`, never `badexample.com`). Its port
-must be `http.external_port`, else the listen port (8888 by default); an
-`https` URL with no port means 443. Plain `http`, user info, `//host`, a
+takes an absolute `next`: an `https://` URL whose host is either the
+control-plane host (`http.external_host` when set, else `external_host`),
+matched exactly, or the cookie domain (`external_host`) or a whole-label
+subdomain of it (`a.example.com` for `example.com`, never `badexample.com`).
+The control-plane host's port must be the one written in `http.external_host`
+if it has one, else `http.external_port`, else the listen port (8888 by
+default). The cookie domain and its subdomains take `http.external_port`, else
+the listen port; a port written in `external_host` does not count. An `https`
+URL with no port means 443. Plain `http`, user info, `//host`, a
 trailing dot or empty label, an IP address, a backslash or whitespace, and any
 other host or port are refused. `/sso/auto-start` drops a refused `next` at
 once; the SSO return checks it again, and a refused one lands the browser on
