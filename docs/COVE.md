@@ -957,10 +957,14 @@ session while the rollback runs. On PostgreSQL the rollback also locks
 there is no equivalent lock, so the row count is advisory only: it is right
 when taken, and only step 1 keeps it right until the tables are dropped.
 On MySQL each table drop commits on its own, so a session written between
-the migrations leaves the rollback part done, with
-`m00098_cove_statement_keys` and `m00097_cove_http_sso_stamps` reverted and
-`m00096_cove_http_handoffs` refusing. To finish, stop whatever wrote it,
-delete the rows again and run `migrate-database -1 --destructive`.
+the migrations leaves the rollback part done: only
+`m00098_cove_statement_keys` reverted, with `m00097_cove_http_sso_stamps`
+refusing, or both of those reverted, with `m00096_cove_http_handoffs`
+refusing. To finish, stop whatever wrote it, delete the rows again, count
+the three migrations still listed in `seaql_migrations` and run
+`migrate-database -<that count> --destructive` (`-2` or `-1`), so all three
+are reverted before the previous release starts; it refuses to start while
+any of them is still applied.
 
 What users see afterwards:
 

@@ -592,12 +592,14 @@ fn next_with_login_error(next: &str, code: SsoLoginError, retry_after: Option<u6
 /// something new after this many is refused.
 const REDIRECT_TARGET_DECODE_LAYERS: usize = 4;
 
-/// Only site-relative paths are accepted as post-login redirect targets. An
-/// absolute URL names its own authority, so allowing one would let `?next=`
-/// carry the user to another site with a freshly authenticated session — the
-/// origin is decided by the SSO return URL, never by the caller. The one
-/// check for every `next` Warpgate redirects to: the SSO paths' and the
-/// target-host handoff's begin route's (`crate::handoff::begin_endpoint`).
+/// Whether `next` is a site-relative post-login redirect target. This check
+/// refuses every absolute URL: one names its own authority, so allowing it
+/// would let `?next=` carry the user to another site with a freshly
+/// authenticated session. Every `next` Warpgate redirects to passes it,
+/// except at the SSO entry, which uses [`is_allowed_next`] and so also takes
+/// an absolute URL on the allow-list of [`is_allowed_absolute_next`]. The
+/// target-host handoff's begin route (`crate::handoff::begin_endpoint`) uses
+/// this check alone.
 ///
 /// `next` and each layer it percent-decodes to must be site-relative
 /// ([`is_site_relative_layer`]), so an encoded `//`, `/\` or scheme cannot
@@ -684,15 +686,16 @@ pub(crate) fn is_allowed_next(next: &str, origins: &NextOrigins) -> bool {
 }
 
 /// Whether `next` is an absolute URL the browser may be sent to after
-/// sign-in, because a host under the cookie domain is one the browser may be sent to (the session cookie itself is host-only). Stricter than
-/// the web UI's `sanitizeRedirect`. All of these hold:
+/// sign-in, because a host under the cookie domain is one the browser may be
+/// sent to (the session cookie itself is host-only). Stricter than the web
+/// UI's `sanitizeRedirect`. All of these hold:
 /// - the raw text has no control character, whitespace or backslash, and
 ///   starts with `https://` (any case) and no third slash;
 /// - it parses, with scheme `https`, no userinfo, and a domain host (never an
 ///   IP literal) with no trailing dot;
 /// - the host (no empty label, so no trailing dot) is the control-plane host,
-///   or the cookie domain, or a whole-label subdomain of it (`a.example.com` for `example.com`, never
-///   `evilexample.com`);
+///   or the cookie domain, or a whole-label subdomain of it
+///   (`a.example.com` for `example.com`, never `evilexample.com`);
 /// - the port (`443` when none is written) is the configured external port,
 ///   else the listen port.
 ///
