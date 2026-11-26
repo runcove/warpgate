@@ -130,7 +130,10 @@ NATIVE_CODE = {
                  ("2.1.2+zstd.1.5.7", ("LICENSE.BSD-3-Clause", "zstd/LICENSE"),
                   "the zstd C library, compiled by its build script, taken under BSD-3-Clause")),
     "signal-hook": (("0.4.4", (), "src/low_level/extract.c is the crate's own code, under the crate's licence"),
-                    ("0.4.5", (), "src/low_level/extract.c is the crate's own code, under the crate's licence")),
+                    ("0.4.5", (), "src/low_level/extract.c is the crate's own code, under the crate's licence"),
+                    ("0.4.6", (), "src/low_level/extract.c is the crate's own code, under the crate's licence")),
+    "linux-raw-sys": (("0.12.1", (), "a -sys name only: Rust bindings generated from Linux's headers, "
+                                     "with no build script and no native file"),),
     "linux-loader": (("0.13.2", (), "the C++ under docs/ writes test fixtures and is never compiled in"),
                      ("0.14.0", (), "the C++ under docs/ writes test fixtures and is never compiled in")),
 }
