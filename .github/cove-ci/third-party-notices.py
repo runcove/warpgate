@@ -191,8 +191,12 @@ class Refused(Exception):
 
 def satisfied(expression, have):
     """Whether the SPDX `expression` is met by the licence ids in `have`.
-    AND binds tighter than OR; `/` is cargo's old spelling of OR. Anything
-    this does not understand (WITH, a stray token) raises ValueError."""
+    AND binds tighter than OR; `/` is cargo's old spelling of OR. `A WITH B`
+    is ONE term, met only when the exact string "A WITH B" is in `have`: an
+    exception is a different grant, so the bare `A` never meets it. Anything
+    this does not understand (a stray token, WITH at the start or after a
+    bracket, with no exception id after it, or twice in a row) raises
+    ValueError."""
     tokens = re.findall(r"\(|\)|/|[A-Za-z0-9.+-]+", expression)
     if "".join(tokens) != re.sub(r"\s+", "", expression) or not tokens:
         raise ValueError(f"cannot read the licence expression {expression!r}")
@@ -215,7 +219,14 @@ def satisfied(expression, have):
             raise ValueError(f"cannot read the licence expression {expression!r}")
         pos += 1
         if peek() == "WITH":
-            raise ValueError(f"{expression!r} uses WITH, which this does not handle")
+            pos += 1
+            exception = peek()
+            if exception is None or exception in ("(", ")", "/", "AND", "OR", "WITH"):
+                raise ValueError(f"cannot read the licence expression {expression!r}")
+            pos += 1
+            if peek() == "WITH":
+                raise ValueError(f"cannot read the licence expression {expression!r}")
+            return f"{tok} WITH {exception}" in have
         return tok in have
 
     def both():
