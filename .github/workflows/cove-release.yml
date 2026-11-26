@@ -1089,6 +1089,22 @@ jobs:
             echo
             echo "BUILDINFO ends with the release record (tag, commit, sha256 of the binary and the notices, workflow run, runner image). Workflow ref of this run: $WORKFLOW_REF."
           } > "$RUNNER_TEMP/notes.md"
+          # The token is read-only, so the Release's notes cannot be amended later: the annotated
+          # tag's message (an advisory goes there), signature block removed, follows the template.
+          # A lightweight tag or an empty message leaves the template alone. The message is
+          # untrusted text, only written out with printf '%s\n', never evaluated.
+          # This checkout is one commit deep with no tags, so the tag object is fetched (just this
+          # tag, from the public repo); if that fails the step FAILS, before any Release exists,
+          # because notes that silently lose an advisory are what this step is here to prevent.
+          if ! git fetch --no-tags --depth=1 origin "+refs/tags/$TAG:refs/tags/$TAG"; then
+            echo "::error::could not fetch the tag object of $TAG, so the Release notes cannot carry its message; no Release was created."
+            exit 1
+          fi
+          tag_msg=$(bash "$GITHUB_WORKSPACE/wfci/.github/cove-ci/release-notes-tag-message.sh")
+          if [ -n "$tag_msg" ]; then
+            echo >> "$RUNNER_TEMP/notes.md"
+            printf '%s\n' "$tag_msg" >> "$RUNNER_TEMP/notes.md"
+          fi
           files=()
           for n in "${expected[@]}"; do files+=("$R/$n"); done
           gh release create "$TAG" --verify-tag --draft --title "$TAG" --notes-file "$RUNNER_TEMP/notes.md" "${files[@]}"
